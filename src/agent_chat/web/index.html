@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Agent room · Agent chat</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/markdown.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <button class="scrim" id="scrim" aria-label="Close panel" hidden></button>
+  <div class="workspace">
+    <aside class="sidebar" id="sidebar" aria-label="Conversations">
+      <a class="brand" href="/" aria-label="Agent chat">
+        <span class="brand-mark">ir<span>.</span></span>
+        <span>AGENT CHAT<small>Agent workspace</small></span>
+      </a>
+      <div class="room-label">COMMUNICATIONS</div>
+      <button class="room-button selected" id="all-conversations" aria-pressed="true">
+        <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
+      </button>
+      <div class="section-label"><span>AGENTS &amp; SUBAGENTS</span><span id="agent-count">0</span></div>
+      <nav class="agent-list" id="agent-list" aria-label="Filter by agent"></nav>
+      <div class="sidebar-footer"><span class="workspace-dot"></span><span>Local workspace<small>One shared conversation</small></span></div>
+    </aside>
+
+    <main class="main">
+      <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false">Resources <span id="mobile-resource-count">0</span></button></div>
+      <div class="conversation-header">
+        <h1 id="conversation-title">All conversations</h1>
+        <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
+      </div>
+      <div class="toolbar">
+        <label class="search"><span aria-hidden="true">⌕</span><input type="search" id="search" placeholder="Search messages or agents…" aria-label="Search messages or agents"><kbd aria-hidden="true">/</kbd></label>
+        <label class="status-filter"><span class="sr-only">Acknowledgement filter</span><select id="ack-filter"><option value="all">All messages</option><option value="pending">Awaiting acknowledgement</option><option value="acknowledged">Acknowledged</option></select></label>
+      </div>
+      <div class="connection-notice" id="connection-notice" hidden>Connection interrupted. Reconnecting automatically… <button id="retry-button">Retry now</button></div>
+      <div class="feed-wrap">
+        <section class="feed" id="feed" aria-label="Agent messages" tabindex="0">
+          <div class="history-row"><button id="load-older" class="quiet-button" hidden>Load earlier messages</button></div>
+          <div id="messages"></div>
+          <div class="empty-state" id="empty-state"><div class="empty-icon" aria-hidden="true">···</div><h3 id="empty-title">Connecting to your agents</h3><p id="empty-description">Their conversation will appear here.</p></div>
+        </section>
+        <button class="new-messages" id="new-messages" hidden>New messages ↓</button>
+      </div>
+      <form class="composer" id="composer">
+        <div class="composer-reply" id="composer-reply" hidden>
+          <button class="reply-context" id="reply-context" type="button"><strong id="reply-label"></strong><span id="reply-excerpt"></span></button>
+          <button class="cancel-reply" id="cancel-reply" type="button" aria-label="Cancel reply">×</button>
+        </div>
+        <label class="sr-only" for="message-input">Your message</label>
+        <div class="mention-list" id="mention-list" role="listbox" aria-label="Agent mentions" hidden></div>
+        <div class="composer-input-row">
+          <textarea id="message-input" placeholder="Message all agents, or @tag recipients…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
+          <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
+        </div>
+        <span class="composer-status" id="composer-status" role="status" hidden></span>
+      </form>
+    </main>
+
+    <aside class="resources-panel" id="resources-panel" aria-label="Shared resources">
+      <div class="resource-summary"><span class="resource-summary-number" id="held-count">0</span><span>resources held<span id="waiting-count">No agents waiting</span></span></div>
+      <div class="resource-list" id="resource-list"></div>
+      <details class="available-resources" id="available-resources"><summary id="available-summary">Available resources</summary><div id="available-list"></div></details>
+      <div class="coordination-note"><span aria-hidden="true">↗</span><p>A message is a conversation.<br>Resource access needs its own reservation.</p></div>
+    </aside>
+  </div>
+  <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
+</body>
+</html>
