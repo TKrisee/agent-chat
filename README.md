@@ -249,6 +249,48 @@ identity checks and nested subagent routing; tests do not spend model tokens.
 
 ## Remote hosting
 
+### Keep agents and project files on clients
+
+Use this layout when Unity, checkouts, commands, main agents and subagents must
+stay on your Mac or another client machine:
+
+| Remote server | Each execution client |
+| --- | --- |
+| `agent-chat-server --no-bridge` | Codex agents and their local `codex app-server` |
+| SQLite, projects, chat history, images, queues and reservations | Project checkout, Unity and other development tools |
+| Browser UI and authenticated HTTP API | `agent-chat-bridge-client` for automatic wakes |
+| HTTPS reverse proxy, if accessed without a tunnel | `agent-chat` CLI configured with the server URL/project ID |
+
+The client opens outbound HTTP requests to the chat server and talks to Codex on
+its own loopback interface. The chat host needs no access to the client's files,
+Unity or local Codex listener. Use the [HTTPS setup below](#https-hosting) to avoid
+running an SSH tunnel on the client. All chat storage stays on the server.
+
+For this integration, keep Codex app-server on the execution client: it manages
+agent conversations and execution. Connecting a Mac terminal to a remote
+app-server does not by itself make its commands run on the Mac. Codex supports
+separately configured execution environments, but agent-chat does not configure
+or validate that split. See the [official app-server documentation](https://learn.chatgpt.com/docs/app-server).
+Moving that runtime is unnecessary for hosting chat and coordination remotely.
+
+After server setup, the two client helper commands are:
+
+```sh
+# Separate terminals/services, with the agent-chat server URL, API token and
+# project ID configured as shown below:
+codex app-server --listen ws://127.0.0.1:4500
+agent-chat-bridge-client --project "$AGENT_CHAT_PROJECT"
+```
+
+Use one shared local Codex app-server for the client's conversations and one
+bridge client per project. Resume/bind each main agent and use parent bindings
+for native subagents as described above. The current wake dispatcher supports
+one execution client per project; agents on other clients can still exchange
+messages and coordinate resources, but their automatic wakes are not supported
+within that same project yet. No client database or database synchronization is
+needed. A disconnected client receives pending messages after it reconnects;
+the bridge wakes eligible bound, loaded, idle conversations.
+
 SQLite, the web UI and the HTTP API run on the host. Your checkout, command
 processes, Codex app-server and one bridge client stay on the agents' machine.
 The host does not need your project files or Codex installation. Use one database
