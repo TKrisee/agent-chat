@@ -9,6 +9,7 @@ import signal
 import sqlite3
 import sys
 import threading
+import time
 
 from .bridge import Bridge, exclusive_bridge
 from .bridge_state import BridgeState
@@ -55,6 +56,32 @@ def run_bridge(db_path, endpoint, interval, stop):
         coord.close()
 
 
+def run_project_bridges(server, endpoint, interval, stop, retry_delay=5):
+    """Discover projects without restarting the web server or sharing SQLite handles."""
+    workers = {}
+    attempted = {}
+    def launch(project):
+        try:
+            path, _, _ = server.project_context(project)
+            run_bridge(path, endpoint, interval, stop)
+        except (CoordError, OSError, ValueError, sqlite3.Error) as error:
+            # A project owned by a remote dispatcher must not stop other rooms.
+            print(json.dumps({'bridge': 'blocked', 'project': project, 'error': str(error)}), file=sys.stderr, flush=True)
+    try:
+        while not stop.is_set():
+            for project in server.projects.list():
+                key = project['id']
+                if (key not in workers or not workers[key].is_alive()) and time.monotonic() - attempted.get(key, -float('inf')) >= retry_delay:
+                    worker = threading.Thread(target=launch, args=(key,), name='bridge-' + key, daemon=True)
+                    workers[key] = worker
+                    attempted[key] = time.monotonic()
+                    worker.start()
+            stop.wait(min(1, retry_delay))
+    finally:
+        deadline = time.monotonic() + 20
+        for worker in workers.values(): worker.join(max(0, deadline - time.monotonic()))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, prog='agent-chat-server')
     parser.add_argument('--db', default=os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or str(default_db()))
@@ -91,7 +118,7 @@ def main(argv=None):
         if not args.no_bridge:
             def run():
                 try:
-                    run_bridge(args.db, args.codex_server, args.interval, stop)
+                    run_project_bridges(server, args.codex_server, args.interval, stop)
                 except Exception as error:
                     failed.set()
                     print(json.dumps({'bridge': 'failed', 'error': str(error)}), file=sys.stderr, flush=True)

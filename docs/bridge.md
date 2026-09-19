@@ -9,6 +9,12 @@ wake-ups depend on Codex.
 
 ## Binding and lifecycle
 
+Select `AGENT_CHAT_PROJECT=PROJECT_ID` for local CLI/standalone bridge or hosted
+CLI/bridge-client commands. The combined local server discovers all projects.
+Each project has its own bindings, dispatcher lease and job history. One thread
+should be bound within only one project; do not reuse a conversation across rooms.
+
+
 1. Start `agent-chat-web` with the project's absolute `AGENT_CHAT_DB`.
 2. Start `codex app-server --listen ws://127.0.0.1:4500`.
 3. Resume existing conversations using `codex resume --remote ws://127.0.0.1:4500`.
@@ -86,7 +92,9 @@ After a lost response or process crash, the bridge checks the Codex queue and
 recent user-message history for its stable client ID. A positive match recovers
 the attempt. No match is **not** proof that no turn started: history can be
 truncated or unavailable. The job remains uncertain and blocks additional wake
-jobs for that thread. Messages still remain available through normal inbox checks.
+jobs for that thread. Invalid routes or job-state failures are reported after
+other independent threads have had a chance to dispatch; they do not monopolize
+the dispatcher. Transport failures reconnect before further dispatch. Messages still remain available through normal inbox checks.
 
 Stop the bridge before manual recovery (the commands enforce its process lock).
 Inspect the Codex conversation and its queue. Only after confirming the wake
@@ -108,7 +116,9 @@ transaction. The conservative recovery policy avoids accidental duplicate work.
 ## Protocol version
 
 The bridge uses the experimental queue APIs from the locally generated Codex
-0.154.0 schema. Initialization enables `experimentalApi`. Unsupported versions
+0.154.0 schema (`codex app-server generate-json-schema --experimental --out DIR`).
+The non-experimental schema omits the queue methods and direct-input capability;
+use the experimental schema when checking compatibility. Initialization enables `experimentalApi`. Unsupported versions
 report RPC errors; there is no fallback to a turn API with different admission
 semantics. See the [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 for transport and lifecycle details. Revalidate queue and thread capabilities
@@ -123,7 +133,7 @@ Use `agent-chat-server --no-bridge` on the database host and one
 through the same queue/reconciliation engine as local mode. HTTP response loss
 therefore retains durable intent and the existing uncertain-outcome policy.
 
-Remote wake metadata includes the server URL instead of the host's SQLite path.
+Remote wake metadata includes the server URL and project ID instead of the host's SQLite path.
 Agents retain their API configuration separately. All main/child bindings and
 messages remain in the hosted database. Only routes rooted in a session pinned
 to the client's machine are eligible. This version supports one active Codex

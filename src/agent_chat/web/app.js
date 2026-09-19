@@ -6,6 +6,8 @@ const state = {
   expanded: new Set(), paused: false, pending: null, connected: false,
   hasOlder: false, source: null, newCount: 0, config: null, sending: false,
   mentionOptions: [], mentionIndex: 0, reply: null, originals: new Map(), highlighted: null,
+  project: new URL(location.href).searchParams.get('project') || 'default', epoch: 0,
+  projects: [], drafts: new Map(), busy: false,
 };
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 const dateFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -86,7 +88,9 @@ function renderAgents() {
     removeBtn.title = `Remove inactive session ${session.agent}`;
     removeBtn.setAttribute('aria-label', `Remove inactive session ${session.agent}`);
     removeBtn.addEventListener('click', async () => {
+      if (state.busy || state.sending) return;
       if (!confirm(`Remove inactive session ${session.agent}? Its history will be retained. Any held reservations must first be closed or released.`)) return;
+      state.busy = true; projectControls();
       try {
         await fetchJSON('/api/sessions/remove', {
           method: 'POST',
@@ -99,6 +103,8 @@ function renderAgents() {
         composerStatus(`Removed ${session.agent}. Its history is retained.`);
       } catch (error) {
         composerStatus(error.message, true);
+      } finally {
+        state.busy = false; projectControls();
       }
     });
     button.addEventListener('click', () => selectAgent(session.id));
@@ -271,6 +277,7 @@ async function jumpToMessage(id) {
     original?.focus({ preventScroll: true });
     original?.scrollIntoView({ block: 'center' });
   } catch (error) {
+    if (error.name === 'AbortError') return;
     composerStatus(`Could not open the original message: ${error.message}`, true);
   }
 }
@@ -331,7 +338,7 @@ function messageCard(message) {
     const images = node('div', 'message-attachments');
     for (const attachment of message.attachments) {
       const link = node('a', 'message-attachment');
-      link.href = `/api/attachments/${encodeURIComponent(attachment.id)}`;
+      link.href = projectURL(`/api/attachments/${encodeURIComponent(attachment.id)}`);
       link.target = '_blank';
       link.rel = 'noopener';
       link.setAttribute('aria-label', `Open ${attachment.name} at full size`);
@@ -464,6 +471,11 @@ function renderResources() {
 }
 
 function applySnapshot(data) {
+  if (data.project && data.project.id !== state.project) return;
+  renderProjects(data);
+  const bridge = data.bridge;
+  $('bridge-caption').textContent = bridge?.recent && !bridge.error ? 'Wake bridge connected' : 'Wake bridge offline';
+  $('bridge-caption').title = bridge?.error || 'Only loaded, idle, bound Codex agents can be woken.';
   if (state.paused) { state.pending = data; return; }
   const initial = !state.snapshot;
   const oldMax = Math.max(0, ...[...state.messages.values()].map((item) => item.seq));
@@ -483,39 +495,119 @@ function applySnapshot(data) {
 }
 
 async function fetchJSON(url, options = {}) {
-  const response = await fetch(url, { cache: 'no-store', ...options });
+  const epoch = state.epoch;
+  const response = await fetch(projectURL(url), { cache: 'no-store', ...options });
   const data = await response.json();
+  if (epoch !== state.epoch) throw new DOMException('Project changed', 'AbortError');
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
 }
 
-async function loadConfig() {
+function projectURL(path) {
+  const url = new URL(path, location.origin);
+  if (state.project !== 'default') url.searchParams.set('project', state.project);
+  return url.pathname + url.search;
+}
+
+function projectControls() {
+  const disabled = state.busy || state.sending;
+  $('project-select').disabled = disabled;
+  $('new-project').disabled = disabled || !state.config;
+  $('rename-project').disabled = disabled || !state.config;
+}
+
+function renderProjects(data) {
+  if (!data.projects) return;
+  state.projects = data.projects;
+  const select = $('project-select');
+  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(data.projects.map(p => [p.id, p.name]))) {
+    select.replaceChildren(...data.projects.map(p => new Option(p.name, p.id)));
+  }
+  select.value = state.project;
+  projectControls();
+}
+
+async function connect() {
+  const epoch = ++state.epoch;
+  state.source?.close();
+  state.config = null;
+  $('message-input').disabled = true;
+  $('send-button').disabled = true;
+  projectControls();
   try {
     state.config = await fetchJSON('/api/config');
+    renderProjects(state.config);
+    applySnapshot(await fetchJSON('/api/snapshot'));
     $('message-input').disabled = false;
     $('send-button').disabled = false;
     composerStatus('');
-    renderAgents();
-    if (state.snapshot) renderMessages();
+    const source = new EventSource(projectURL('/api/events'));
+    state.source = source;
+    source.onopen = () => { if (epoch === state.epoch) setConnection(true); };
+    source.addEventListener('snapshot', (event) => {
+      if (epoch !== state.epoch) return;
+      try { applySnapshot(JSON.parse(event.data)); setConnection(true); }
+      catch { setConnection(false); }
+    });
+    source.onerror = () => { if (epoch === state.epoch) setConnection(false); };
   } catch (error) {
-    composerStatus('Messaging unavailable. Reconnect to try again.', true);
+    if (epoch !== state.epoch) return;
+    composerStatus(error.message + '. Reconnect to try again.', true);
+    setConnection(false);
   }
 }
 
-function connect() {
-  state.source?.close();
-  loadConfig();
-  fetchJSON('/api/snapshot').then(applySnapshot).catch(() => setConnection(false));
-  const source = new EventSource('/api/events');
-  state.source = source;
-  source.onopen = () => { setConnection(true); loadConfig(); };
-  source.addEventListener('snapshot', (event) => {
-    try { applySnapshot(JSON.parse(event.data)); setConnection(true); }
-    catch { setConnection(false); }
-  });
-  source.onerror = () => setConnection(false);
+function switchProject(id) {
+  if (state.busy || state.sending || id === state.project) return;
+  state.drafts.set(state.project, $('message-input').value);
+  state.project = id;
+  const url = new URL(location.href);
+  if (id === 'default') url.searchParams.delete('project'); else url.searchParams.set('project', id);
+  history.replaceState(null, '', url);
+  state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
+  state.selected = null; state.query = ''; state.ack = 'all'; state.highlighted = null;
+  state.pending = null; state.paused = false; state.hasOlder = false; state.newCount = 0;
+  $('pause-button').setAttribute('aria-pressed', 'false'); $('pause-label').textContent = 'Pause feed'; $('pause-icon').textContent = 'Ⅱ';
+  $('search').value = ''; $('ack-filter').value = 'all';
+  $('message-input').value = state.drafts.get(id) || '';
+  clearReply(); hideMentions(); closePanels();
+  $('agent-list').replaceChildren(); $('resource-list').replaceChildren();
+  $('available-list').replaceChildren(); $('available-resources').hidden = true;
+  $('agent-count').textContent = '0'; $('all-count').textContent = '0';
+  $('held-count').textContent = '0'; $('mobile-resource-count').textContent = '0';
+  $('waiting-count').textContent = ''; $('bridge-caption').textContent = 'Connecting…';
+  $('load-older').disabled = false;
+  renderMessages(true);
+  connect();
 }
 
+$('project-select').addEventListener('change', event => switchProject(event.target.value));
+for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
+  $(id).addEventListener('click', () => {
+    $('project-form').dataset.rename = String(rename);
+    $('project-dialog-title').textContent = rename ? 'Rename project' : 'New project';
+    $('project-name').value = rename ? state.projects.find(p => p.id === state.project).name : '';
+    $('project-error').textContent = '';
+    $('project-dialog').showModal(); $('project-name').focus();
+  });
+}
+$('cancel-project').addEventListener('click', () => $('project-dialog').close());
+$('project-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (state.busy) return;
+  const rename = event.currentTarget.dataset.rename === 'true';
+  state.busy = true; projectControls(); $('save-project').disabled = true;
+  try {
+    const result = await fetchJSON(rename ? '/api/projects/rename' : '/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : {}) }),
+    });
+    $('project-dialog').close();
+    state.busy = false;
+    if (rename) applySnapshot(await fetchJSON('/api/snapshot')); else switchProject(result.project.id);
+  } catch (error) { $('project-error').textContent = error.message; }
+  finally { state.busy = false; projectControls(); $('save-project').disabled = false; }
+});
 $('all-conversations').addEventListener('click', () => selectAgent(null));
 $('search').addEventListener('input', (event) => { state.query = event.target.value.toLowerCase(); renderMessages(true); });
 $('ack-filter').addEventListener('change', (event) => { state.ack = event.target.value; renderMessages(true); });
@@ -530,6 +622,7 @@ $('pause-button').addEventListener('click', () => {
 });
 $('new-messages').addEventListener('click', () => { $('feed').scrollTop = $('feed').scrollHeight; state.newCount = 0; $('new-messages').hidden = true; });
 $('load-older').addEventListener('click', async () => {
+  const epoch = state.epoch;
   const button = $('load-older');
   button.disabled = true;
   const feed = $('feed'), oldHeight = feed.scrollHeight, oldTop = feed.scrollTop;
@@ -540,8 +633,8 @@ $('load-older').addEventListener('click', async () => {
     state.hasOlder = result.has_more;
     renderMessages();
     feed.scrollTop = oldTop + feed.scrollHeight - oldHeight;
-  } catch { button.textContent = 'Could not load history · try again'; }
-  finally { button.disabled = false; }
+  } catch (error) { if (error.name !== 'AbortError') button.textContent = 'Could not load history · try again'; }
+  finally { if (epoch === state.epoch) button.disabled = false; }
 });
 for (const [id, panel] of [['agents-toggle', 'sidebar'], ['resources-toggle', 'resources']]) {
   $(id).addEventListener('click', () => {
@@ -603,6 +696,7 @@ $('composer').addEventListener('submit', async (event) => {
   const to = recipients.length === 1 && !state.reply?.batch_id ? recipients[0] : recipients;
   hideMentions();
   state.sending = true;
+  projectControls();
   $('send-button').disabled = true;
   $('message-input').disabled = true;
   composerStatus('Sending…');
@@ -619,6 +713,7 @@ $('composer').addEventListener('submit', async (event) => {
     composerStatus(error.message, true);
   } finally {
     state.sending = false;
+    projectControls();
     $('send-button').disabled = false;
     $('message-input').disabled = false;
   }

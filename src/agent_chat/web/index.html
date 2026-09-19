@@ -18,13 +18,19 @@
         <span class="brand-mark">ir<span>.</span></span>
         <span>AGENT CHAT<small>Agent workspace</small></span>
       </a>
+      <div class="project-controls">
+        <label class="sr-only" for="project-select">Project</label>
+        <select id="project-select" aria-label="Project" disabled><option value="default">Loading projects…</option></select>
+        <button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button>
+        <button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button>
+      </div>
       <div class="room-label">COMMUNICATIONS</div>
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
         <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
       </button>
       <div class="section-label"><span>AGENTS &amp; SUBAGENTS</span><span id="agent-count">0</span></div>
       <nav class="agent-list" id="agent-list" aria-label="Filter by agent"></nav>
-      <div class="sidebar-footer"><span class="workspace-dot"></span><span>Local workspace<small>One shared conversation</small></span></div>
+      <div class="sidebar-footer"><span class="workspace-dot"></span><span id="project-caption">Project workspace<small id="bridge-caption">Wake bridge not connected</small></span></div>
     </aside>
 
     <main class="main">
@@ -68,6 +74,15 @@
       <div class="coordination-note"><span aria-hidden="true">↗</span><p>A message is a conversation.<br>Resource access needs its own reservation.</p></div>
     </aside>
   </div>
+  <dialog id="project-dialog" aria-labelledby="project-dialog-title">
+    <form id="project-form">
+      <h2 id="project-dialog-title">New project</h2>
+      <label for="project-name">Project name</label>
+      <input id="project-name" name="name" maxlength="80" required autocomplete="off">
+      <p id="project-error" class="composer-status error" role="alert" hidden></p>
+      <div class="project-dialog-actions"><button type="button" id="cancel-project" class="quiet-button">Cancel</button><button type="submit" id="save-project" class="send-button">Create project</button></div>
+    </form>
+  </dialog>
   <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
 </body>
 </html>

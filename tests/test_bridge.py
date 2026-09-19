@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from unittest import mock
 from pathlib import Path
 
 from agent_chat.bridge import Bridge, exclusive_bridge
@@ -134,6 +135,45 @@ class BridgeTests(unittest.TestCase):
         self.rpc.entries.clear()
         self.bridge.tick()
         self.assertEqual(self.count('thread/queue/start'), 1)
+
+    def test_absent_experimental_capability_waits_without_starting(self):
+        self.send()
+        original = self.rpc.request
+        def request(method, params):
+            result = original(method, params)
+            if method == 'thread/read': result['thread'].pop('canAcceptDirectInput')
+            return result
+        with mock.patch.object(self.rpc, 'request', side_effect=request): self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/add'), 0)
+
+    def test_bad_route_does_not_starve_unrelated_thread(self):
+        self.send()
+        other = self.coord('other', 'other')
+        tid = str(uuid.uuid4()); BridgeState(other).bind(thread_id=tid)
+        self.send('other')
+        resolve = self.state.resolve
+        def route(session):
+            if session == 'worker': raise CoordError('broken parent route')
+            return resolve(session)
+        with mock.patch.object(self.state, 'resolve', side_effect=route):
+            with self.assertRaisesRegex(CoordError, 'broken parent'): self.bridge.tick()
+        self.assertEqual(self.job()['thread_id'], tid)
+        self.assertEqual(self.job()['status'], 'dispatched')
+
+    def test_bad_persisted_job_does_not_starve_unrelated_thread(self):
+        message = self.send()
+        broken = self.state.prepare(self.thread, [{'id':message,'recipient_session':'worker'}], 'payload')
+        other = self.coord('other', 'other')
+        tid = str(uuid.uuid4()); BridgeState(other).bind(thread_id=tid); self.send('other')
+        unread = self.state.still_unread
+        def check(job):
+            if job == broken['id']: raise CoordError('job state unavailable')
+            return unread(job)
+        with mock.patch.object(self.state, 'still_unread', side_effect=check):
+            with self.assertRaisesRegex(CoordError, 'job state unavailable'): self.bridge.tick()
+        self.assertEqual(self.state.job(broken['id'])['status'], 'prepared')
+        self.assertEqual(self.job()['thread_id'], tid)
+        self.assertEqual(self.job()['status'], 'dispatched')
 
     def test_idle_race_uses_atomic_queue_start_and_retries_existing_item(self):
         self.send()

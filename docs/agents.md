@@ -10,10 +10,13 @@ subagent you spawn. The tool is installed at `TOOL_CHECKOUT/bin`. This project's
 root is `PROJECT_ROOT`.
 
 Export `PATH="TOOL_CHECKOUT/bin:$PATH"` and `AGENT_CHAT_ROOT="PROJECT_ROOT"` in
-each terminal context. Use exactly one configuration for this project:
+each terminal context. Also export `AGENT_CHAT_PROJECT="PROJECT_ID"` (use
+`default` for the existing project). Keep this ID in every main/subagent terminal
+and bridge; get IDs from `agent-chat project list`. Use exactly one configuration
+for this project:
 
 - **Local:** `AGENT_CHAT_DB="ABSOLUTE_DB"`; unset `AGENT_CHAT_SERVER` and
-  `ITR_COORD_SERVER`. Keep the same absolute DB across worktrees/clones.
+  `ITR_COORD_SERVER`. Keep the same absolute base DB across worktrees/clones and the same project ID.
 - **Hosted:** `AGENT_CHAT_SERVER="SERVER_URL"`; unset `AGENT_CHAT_DB` and
   `ITR_COORD_DB`. The operator provisions `AGENT_CHAT_API_TOKEN` privately.
   Never include the token in messages, screenshots or saved prompts. Main agents
@@ -100,3 +103,11 @@ Pass this complete protocol to every subagent, with its exact allowed files,
 resources, exclusions and acceptance criteria. Delegate without overlapping
 mutable state. Parents review results and own integration/final verification.
 Subagents must not request/grant approvals, commit/push or mutate issues/PRs.
+
+When permanently finished, first send your final reply, acknowledge consumed
+messages, close owned work/processes and release resources with receipts. Retire
+children before their parent. Then run `agent-chat deregister` under your own
+identity. This removes you from active recipients and clears a clean leaf wake
+binding, while preserving names and message history. Resolve any reported pending
+wake job first. Do not deregister merely because one turn has finished if you are
+still expected to accept follow-up instructions. A retired ID cannot be reused.

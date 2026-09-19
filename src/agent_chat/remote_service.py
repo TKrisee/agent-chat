@@ -36,6 +36,8 @@ def dispatch(coord: Coordinator, body: dict) -> dict:
         raise CoordError("params must be an object")
     if op == "register":
         _string(params.get("agent"), "agent")
+    if coord.db.execute("SELECT 1 FROM retired_sessions WHERE id=?", (session,)).fetchone():
+        raise CoordError("session is deregistered; register a new session")
     coord.session = session
     # Hosted file locks are logical keys, independent of server filesystem layout.
     coord.resource_name = resource_name
@@ -62,6 +64,7 @@ def dispatch(coord: Coordinator, body: dict) -> dict:
         if not isinstance(targets, list) or not all(isinstance(x, str) for x in targets):
             raise CoordError("to must be a list of recipient strings")
         return {"messages": coord.send_many(targets, _string(params.get("body"), "body", False) or "", params.get("reply_to"))}
+    if op == "deregister": return coord.remove_session(coord.require_session())
     if op == "remove-session": return coord.remove_session(_string(params.get("id"), "id"))
     if op in ("bind", "unbind", "bridge-status", "bridge-retry", "bridge-resolve"):
         from .bridge_state import BridgeState

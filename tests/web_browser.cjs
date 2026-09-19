@@ -478,8 +478,79 @@ print(json.dumps({'history': history['id']}))
     await page.locator(`[data-message-id="${removal.history}"]`).waitFor();
     assert.equal((await page.request.get(fixtureInfo.url + '/api/messages/' + removal.history)).status(), 200, 'Removal keeps the recorded history available');
     assert.equal(await page.evaluate(() => localStorage.getItem('snapshot')), null, 'Removal never relies on a local snapshot');
+    assert.equal(await page.locator(`[data-message-id="${removal.history}"] .sender-button`).textContent(), 'removable', 'Removed agents keep their names');
+
+    // Project creation, drafts, reply clearing, scoping and live events.
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await input.fill('Default project draft');
+    await page.locator('#new-project').click();
+    await page.locator('#project-name').fill('Second project');
+    await page.locator('#save-project').click();
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled && document.querySelector('#project-select').value !== 'default');
+    const projectId = await page.locator('#project-select').inputValue();
+    assert.equal(await page.locator('.message').count(), 0);
+    assert.equal(await page.locator('#agent-count').textContent(), '0');
+    assert.equal(await input.inputValue(), '');
+    const secondCode = `
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / 'src'))
+from agent_chat.core import Coordinator
+from agent_chat.projects import Projects
+from agent_chat.web import operator_session
+db = Projects(sys.argv[1]).db_path(sys.argv[2])
+c = Coordinator(db, 'second-agent'); c.register('second-agent')
+print(json.dumps(c.send(operator_session(db), 'Second project live message')))
+c.close()
+`;
+    const secondMessage = JSON.parse(execFileSync(python, ['-c', secondCode, fixtureInfo.db, projectId], { cwd: root, encoding: 'utf8' }));
+    await page.locator(`[data-message-id="${secondMessage.id}"]`).waitFor();
+    await page.locator(`[data-message-id="${secondMessage.id}"] .reply-message`).click();
+    await input.fill('Second project draft');
+    await page.locator('#project-select').selectOption('default');
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled && document.querySelectorAll('.message').length > 0);
+    assert.equal(await input.inputValue(), 'Default project draft');
+    assert.equal(await page.locator('#composer-reply').isVisible(), false);
+    assert.equal(await page.locator(`[data-message-id="${secondMessage.id}"]`).count(), 0);
+    await page.locator('#project-select').selectOption(projectId);
+    await page.locator(`[data-message-id="${secondMessage.id}"]`).waitFor();
+    assert.equal(await input.inputValue(), 'Second project draft');
+    await page.locator('#rename-project').click();
+    await page.locator('#project-name').fill('Renamed project');
+    await page.locator('#save-project').click();
+    await page.waitForFunction(() => document.querySelector('#project-select').selectedOptions[0].textContent === 'Renamed project');
+    const projectSend = page.waitForResponse(r => r.url().includes('/api/messages?project=') && r.request().method() === 'POST');
+    await input.fill('Scoped broadcast'); await input.press('Control+Enter');
+    const scoped = await (await projectSend).json();
+    const scopedMessages = scoped.messages || [scoped];
+    assert.equal(scopedMessages.length, 1);
+    assert.equal(scopedMessages[0].recipient_session, 'second-agent');
+    await page.locator('#project-select').selectOption('default');
+    await page.locator('#load-older').waitFor();
+    const delayed = new Promise(resolve => page.route('**/api/messages?before=*', route => resolve(route)));
+    await page.locator('#load-older').click();
+    const oldRequest = await delayed;
+    await page.locator('#project-select').selectOption(projectId);
+    await page.locator(`[data-message-id="${secondMessage.id}"]`).waitFor();
+    await oldRequest.fulfill({ response: await oldRequest.fetch() });
+    await page.waitForTimeout(100);
+    assert.equal(await page.locator(`[data-message-id="${removal.history}"]`).count(), 0, 'Late history from another project stays out');
+    assert.equal(await page.locator('.message').count(), 2);
+    await page.unroute('**/api/messages?before=*');
+    await page.reload();
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    assert.equal(await page.locator('#project-select').inputValue(), projectId);
+    assert.equal(await page.locator(`[data-message-id="${removal.history}"]`).count(), 0);
+    await page.setViewportSize({width:390,height:844});
+    await page.locator('#agents-toggle').click();
+    assert.equal(await page.locator('#project-select').isVisible(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'projects-mobile.png'), animations: 'disabled' });
+    await page.setViewportSize({width:1440,height:1000});
+    await page.keyboard.press('Escape');
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'projects-desktop.png'), animations: 'disabled' });
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow'] }));
+    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow', 'retired history attribution', 'project creation and rename', 'project live events', 'per-project drafts and reply reset', 'scoped project broadcasts', 'late cross-project response isolation', 'project reload persistence', 'mobile project selector'] }));
   } finally {
     if (browser) await browser.close();
     fixture.kill('SIGTERM');

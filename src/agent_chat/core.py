@@ -56,6 +56,14 @@ def _now() -> float: return time.time()
 def _id(prefix: str) -> str: return prefix + "_" + secrets.token_urlsafe(24)
 
 
+def agent_labels(db):
+    labels = {}
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_sessions'").fetchone():
+        labels.update({row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM retired_sessions')})
+    labels.update({row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM sessions')})
+    return labels
+
+
 class Coordinator:
     def __init__(self, db_path: str | os.PathLike[str] | None = None,
                  session: str | None = None):
@@ -73,9 +81,15 @@ class Coordinator:
     def _schema(self) -> None:
         self.db.executescript("""
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS retired_sessions (
+          id TEXT PRIMARY KEY, agent TEXT NOT NULL, registered_at REAL NOT NULL,
+          removed_at REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS sessions (
           id TEXT PRIMARY KEY, agent TEXT NOT NULL, registered_at REAL NOT NULL,
           inbox_read_seq INTEGER NOT NULL DEFAULT 0);
+        CREATE TRIGGER IF NOT EXISTS reject_retired_session BEFORE INSERT ON sessions
+          WHEN EXISTS(SELECT 1 FROM retired_sessions WHERE id=NEW.id)
+          BEGIN SELECT RAISE(ABORT, 'session is deregistered; use a new identity'); END;
         CREATE TABLE IF NOT EXISTS messages (
           seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
           sender_session TEXT NOT NULL, recipient_session TEXT NOT NULL,
@@ -142,6 +156,8 @@ class Coordinator:
         if not agent or not agent.strip(): raise CoordError("agent must be nonempty")
         sid = self.session or _id("session")
         with self.tx() as db:
+            if db.execute("SELECT 1 FROM retired_sessions WHERE id=?", (sid,)).fetchone():
+                raise CoordError("session is deregistered; register a new session instead of reusing its ID")
             old = db.execute("SELECT agent FROM sessions WHERE id=?", (sid,)).fetchone()
             if old and old["agent"] != agent: raise CoordError("session is already registered to another agent")
             if not old: db.execute("INSERT INTO sessions(id,agent,registered_at) VALUES(?,?,?)", (sid, agent, _now()))
@@ -151,9 +167,8 @@ class Coordinator:
     def remove_session(self, session_id: str) -> dict[str, Any]:
         """Remove a coordination session (e.g. a finished subagent).
 
-        Removes only a fully closed session and deletes its session record.  Messages involving the session are kept
-        so conversation history is preserved (the agent shows as "Unknown
-        agent" thereafter).
+        Removes only a fully closed session. Messages and an identity tombstone
+        remain, preserving attribution without keeping an active recipient.
         """
         caller = self.require_session()
         if not session_id:
@@ -203,7 +218,13 @@ class Coordinator:
                 descendants = db.execute("SELECT session_id FROM bridge_bindings WHERE parent_session=?", (session_id,)).fetchall()
                 if descendants:
                     raise CoordError("session has bound bridge descendant(s): " + ", ".join(r["session_id"] for r in descendants))
-                binding = db.execute("SELECT 1 FROM bridge_bindings WHERE session_id=?", (session_id,)).fetchone()
+                binding = db.execute("SELECT * FROM bridge_bindings WHERE session_id=?", (session_id,)).fetchone()
+                route = binding
+                seen = set()
+                while route and not route['thread_id'] and route['parent_session'] not in seen:
+                    seen.add(route['parent_session'])
+                    route = db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (route['parent_session'],)).fetchone()
+                thread = route['thread_id'] if route else None
                 pending = False
                 if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_jobs'").fetchone() and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_deliveries'").fetchone():
                     pending = db.execute(
@@ -212,11 +233,13 @@ class Coordinator:
                            WHERE j.status NOT IN ('dispatched','cancelled')
                            AND (m.sender_session=? OR m.recipient_session=?) LIMIT 1""",
                         (session_id, session_id)).fetchone()
-                if binding or pending:
-                    raise CoordError("session has a bridge binding or unresolved bridge job; unbind and resolve it first")
+                route_pending = thread and db.execute("SELECT 1 FROM bridge_jobs WHERE thread_id=? AND status NOT IN ('dispatched','cancelled') LIMIT 1", (thread,)).fetchone()
+                if pending or route_pending:
+                    raise CoordError("session has an unresolved bridge job; resolve it before deregistering")
                 db.execute("DELETE FROM bridge_bindings WHERE session_id=?", (session_id,))
 
-            # Delete the session record.
+            db.execute("INSERT INTO retired_sessions(id,agent,registered_at,removed_at) SELECT id,agent,registered_at,? FROM sessions WHERE id=?", (_now(), session_id))
+            # Active recipients disappear; names remain available for history.
             db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
 
         return {"removed": session_id, "agent": agent_name}
@@ -246,10 +269,12 @@ class Coordinator:
         return result
 
     def _message_dicts(self, db: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        labels = agent_labels(db)
         attachments = self._attachment_metadata(db, [row["id"] for row in rows])
         replies = self._reply_metadata(db, [row["id"] for row in rows])
         batches = self._batch_metadata(db, [row["id"] for row in rows])
         return [{**{key: row[key] for key in ("id", "sender_session", "body", "created_at", "acked_at")},
+                 "sender_agent": labels.get(row["sender_session"]),
                  "attachments": attachments[row["id"]], **replies[row["id"]], **batches[row["id"]]} for row in rows]
 
     def _batch_metadata(self, db: sqlite3.Connection, message_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -264,13 +289,13 @@ class Coordinator:
             return result
         batch_marks = ",".join("?" for _ in batch_ids)
         deliveries: dict[str, list[dict[str, Any]]] = {batch_id: [] for batch_id in batch_ids}
+        labels = agent_labels(db)
         for row in db.execute(
-            f"""SELECT b.batch_id,m.id,m.recipient_session,m.acked_at,s.agent recipient_agent
+            f"""SELECT b.batch_id,m.id,m.recipient_session,m.acked_at
                  FROM message_batches b JOIN messages m ON m.id=b.message_id
-                 JOIN sessions s ON s.id=m.recipient_session
                  WHERE b.batch_id IN ({batch_marks}) ORDER BY m.seq""", batch_ids):
             deliveries[row["batch_id"]].append({"id": row["id"], "recipient_session": row["recipient_session"],
-                                                 "recipient_agent": row["recipient_agent"], "acked_at": row["acked_at"]})
+                                                 "recipient_agent": labels.get(row["recipient_session"]), "acked_at": row["acked_at"]})
         for row in memberships:
             result[row["message_id"]] = {"batch_id": row["batch_id"], "deliveries": deliveries[row["batch_id"]]}
         return result
@@ -283,13 +308,14 @@ class Coordinator:
         query = f"""SELECT r.message_id, r.reply_to, p.seq, p.sender_session, p.recipient_session, p.body
                      FROM message_replies r JOIN messages p ON p.id=r.reply_to
                      WHERE r.message_id IN ({marks})"""
+        labels = agent_labels(db)
         for row in db.execute(query, message_ids):
             result[row["message_id"]] = {
                 "reply_to": row["reply_to"],
                 "reply_preview": {"id": row["reply_to"], "seq": row["seq"],
                                   "sender_session": row["sender_session"],
                                   "recipient_session": row["recipient_session"],
-                                  "sender_agent": None, "body": row["body"][:240]},
+                                  "sender_agent": labels.get(row["sender_session"]), "body": row["body"][:240]},
             }
         return result
 
@@ -644,6 +670,9 @@ class ValidationGuard:
     def __init__(self,resource:str="validation-clone", token:str|None=None, db_path: str|None=None, session:str|None=None):
         if os.environ.get("AGENT_CHAT_SERVER") or os.environ.get("ITR_COORD_SERVER"):
             raise CoordError("ValidationGuard cannot use remote coordination; use agent-chat --server run")
+        if db_path is None and os.environ.get('AGENT_CHAT_PROJECT'):
+            from .projects import resolve_database
+            db_path = str(resolve_database(os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or default_db(), os.environ['AGENT_CHAT_PROJECT']))
         self.coord=Coordinator(db_path,session);self.resource=resource;self.token=token or os.environ.get("AGENT_CHAT_TOKEN") or os.environ.get("ITR_COORD_TOKEN","");self.run_id: str|None=None;self.seen:set[str]=set();self.safe_to_close=True
     def _emit_inbox(self)->None:
         messages=self.coord.inbox()["messages"]; new=[m for m in messages if m["id"] not in self.seen]
@@ -685,6 +714,7 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
         env = dict(
             os.environ,
             AGENT_CHAT_DB=resolved_db,
+            AGENT_CHAT_PROJECT=(c.db.execute("SELECT value FROM meta WHERE key='project_id'").fetchone() or ['default'])[0],
             AGENT_CHAT_SESSION=resolved_session,
             AGENT_CHAT_TOKEN=resolved_token,
             AGENT_CHAT_ROOT=resolved_root,
@@ -703,7 +733,10 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
             if proc is not None:
                 try:
                     os.killpg(proc.pid, sig)
-                except ProcessLookupError:
+                except (ProcessLookupError, PermissionError):
+                    # Darwin can report EPERM while a signalled group is
+                    # disappearing. Cleanup below must still prove its absence;
+                    # an inaccessible live group keeps the reservation open.
                     pass
 
         try:
@@ -775,6 +808,7 @@ def main(argv:list[str]|None=None)->int:
     x=sub.add_parser("recover");x.add_argument("resource");x.add_argument("--receipt",required=True)
     x=sub.add_parser("block");x.add_argument("resource");x.add_argument("--reason",required=True)
     x=sub.add_parser("remove-session");x.add_argument("id")
+    sub.add_parser("deregister", help="retire your own session after closing work")
     x=sub.add_parser("run");x.add_argument("resource");x.add_argument("--token");x.add_argument("command",nargs="*")
     a=p.parse_args(raw)
     if a.op=="run": a.command=run_tail or []
@@ -798,6 +832,7 @@ def main(argv:list[str]|None=None)->int:
         elif a.op=="recover":out=c.recover(a.resource,a.receipt)
         elif a.op=="block":out=c.block(a.resource,a.reason)
         elif a.op=="remove-session":out=c.remove_session(a.id)
+        elif a.op=="deregister":out=c.remove_session(c.require_session())
         else:
             out=run_command(c,a)
             return int(out["exit_code"])

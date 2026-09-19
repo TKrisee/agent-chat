@@ -11,12 +11,34 @@ import unittest
 from unittest import mock
 import urllib.request
 
-from agent_chat.core import Coordinator
+from agent_chat.core import Coordinator, CoordError
 from agent_chat import server
 from agent_chat.rpc import TransportError
 
 
 class ServerTests(unittest.TestCase):
+    def test_project_supervisor_retries_failed_worker_and_discovers_new_project(self):
+        stop = threading.Event()
+        calls = []
+        ready = threading.Event()
+        projects = [{'id':'default'}]
+        fake_server = mock.Mock()
+        fake_server.projects.list.side_effect = lambda: projects.copy()
+        fake_server.project_context.side_effect = lambda key: (key, None, None)
+        def run(path, endpoint, interval, event):
+            calls.append(path)
+            if path == 'default' and calls.count(path) == 1: raise CoordError('dispatcher in use')
+            if path == 'default': projects.append({'id':'new'})
+            if path == 'new': ready.set()
+            event.wait(3)
+        with mock.patch.object(server, 'run_bridge', side_effect=run):
+            supervisor = threading.Thread(target=server.run_project_bridges, args=(fake_server, 'ws://127.0.0.1:1', .01, stop, .02))
+            supervisor.start()
+            try: self.assertTrue(ready.wait(3))
+            finally: stop.set(); supervisor.join(3)
+        self.assertFalse(supervisor.is_alive())
+        self.assertEqual(calls, ['default','default','new'])
+
     def test_combined_server_serves_http_and_shuts_down_when_codex_offline(self):
         with tempfile.TemporaryDirectory(prefix='agent-chat-server-') as directory:
             db = str(Path(directory) / 'state.sqlite3')

@@ -33,7 +33,7 @@ class RemoteBridgeState:
     def job(self, job_id): return self.call('job', job_id=job_id)
     def resolve(self, session_id): return self.call('resolve', session_id=session_id)
     def still_unread(self, job_id): return self.call('still_unread', job_id=job_id)
-    def connection_metadata(self): return {'server': self.server_url}
+    def connection_metadata(self): return {'server': self.server_url, 'project': self.client.project}
     def prepare(self, thread_id, messages, payload):
         return self.call('prepare', thread_id=thread_id, messages=messages, payload=payload)
     def update(self, job_id, status, queue_id=None, error=None):
@@ -78,6 +78,7 @@ def main(argv=None):
     parser.add_argument('--server', default=os.environ.get('AGENT_CHAT_SERVER'))
     parser.add_argument('--api-token', '--token', dest='api_token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
     parser.add_argument('--codex-server', default='ws://127.0.0.1:4500')
+    parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT', 'default'))
     parser.add_argument('--state-file', help='private persistent worker identity; do not share between machines')
     parser.add_argument('--interval', type=float, default=2)
     parser.add_argument('--once', action='store_true')
@@ -93,8 +94,8 @@ def main(argv=None):
     previous, stop = {}, threading.Event()
     rpc = None
     try:
-        client = HttpClient(args.server, args.api_token)
-        with client_identity(args.server.rstrip('/'), args.state_file) as identity:
+        client = HttpClient(args.server, args.api_token, project=args.project)
+        with client_identity(args.server.rstrip('/') + ('#project=' + args.project if args.project != 'default' else ''), args.state_file) as identity:
             state = RemoteBridgeState(client, args.server.rstrip('/'), identity)
             if args.recover:
                 state.call('reset', confirm_stopped=True)

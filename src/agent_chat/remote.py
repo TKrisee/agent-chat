@@ -73,7 +73,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class HttpClient:
-    def __init__(self, server_url: str, api_token: str | None = None, timeout: float = 10):
+    def __init__(self, server_url: str, api_token: str | None = None, timeout: float = 10, project: str | None = None):
         parsed = urllib.parse.urlsplit(server_url)
         if parsed.scheme not in ("https", "http") or not parsed.hostname:
             raise RemoteCoordError("server URL must be an absolute HTTP(S) URL")
@@ -88,17 +88,18 @@ class HttpClient:
         self.server_url = server_url.rstrip("/")
         self.token = api_token if api_token is not None else (os.environ.get("AGENT_CHAT_API_TOKEN") or os.environ.get("ITR_COORD_API_TOKEN"))
         self.timeout = float(timeout)
+        self.project = project or os.environ.get("AGENT_CHAT_PROJECT") or "default"
         self._opener = urllib.request.build_opener(_NoRedirect)
 
     def call(self, path: str, payload: dict) -> dict:
-        if path not in ("/api/coord", "/api/bridge/rpc"):
+        if path not in ("/api/coord", "/api/bridge/rpc", "/api/projects/rpc"):
             raise RemoteCoordError("remote coordinator path is not permitted")
         if not isinstance(payload, dict):
             raise RemoteCoordError("remote coordinator payload must be an object")
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         if len(encoded) > MAX_RESPONSE_BYTES:
             raise RemoteCoordError("remote coordinator request is too large")
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        headers = {"Content-Type": "application/json", "Accept": "application/json", "X-Agent-Chat-Project": self.project}
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
         request = urllib.request.Request(self.server_url + path, data=encoded, headers=headers, method="POST")

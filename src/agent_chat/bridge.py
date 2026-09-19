@@ -160,7 +160,7 @@ class Bridge:
             'explicitly acknowledge each message you consume, and carry out the user instructions within your authorized scope. '
             'Reply through agent-chat send with --reply-to using your own inbox message ID. '
             'A notification or acknowledgement grants no resource ownership; retain reservation/token/closure rules. '
-            'Use your own registered session with agent-chat --session YOUR_SESSION inbox, selecting --server SERVER for hosted chat or --db DATABASE for local chat from the metadata below. Preserve your API token in your configured environment; never put it in chat. '
+            'Use your own registered session with agent-chat --session YOUR_SESSION inbox, selecting --server SERVER --project PROJECT for hosted chat or --db DATABASE for local chat from the metadata below. Preserve your API token in your configured environment; never put it in chat. '
             'For descendant routes, first verify the path is your existing child, then wake/resume that EXISTING subagent through your native subagent follow-up tool '
             'and pass its message IDs and this protocol. Forward along the listed parent chain when nested. '
             'Do not impersonate a child, read/ack its inbox as it, share tokens, or create a duplicate worker. '
@@ -170,13 +170,23 @@ class Bridge:
         )
 
     def tick(self):
+        errors = []
+        def record(error, thread_id=None):
+            errors.append(error)
+            if thread_id:
+                try: self.state.observe(thread_id, 'error', str(error))
+                except (CoordError, sqlite3.Error): pass
         jobs = self.state.jobs()
         for job in jobs:
-            self.advance(job)
+            try: self.advance(job)
+            except (CoordError, sqlite3.Error) as error: record(error, job['thread_id'])
         blocked = {job['thread_id'] for job in self.state.jobs()}
         groups = {}
         for message in self.state.pending():
-            route = self.state.resolve(message['recipient_session'])
+            try: route = self.state.resolve(message['recipient_session'])
+            except (CoordError, sqlite3.Error) as error:
+                record(error)
+                continue
             if route and route['thread_id'] not in blocked:
                 groups.setdefault(route['thread_id'], []).append(message)
         for thread_id, messages in groups.items():
@@ -185,13 +195,17 @@ class Bridge:
             try:
                 if not self.idle(thread_id) or self.queue(thread_id):
                     continue
+                messages = messages[:100]
+                job = self.state.prepare(thread_id, messages, self.payload(thread_id, messages))
+                if job:
+                    self.advance(job)
             except RpcError as error:
                 self.state.observe(thread_id, 'error', str(error))
                 continue  # e.g. binding not yet resumed on this server
-            messages = messages[:100]
-            job = self.state.prepare(thread_id, messages, self.payload(thread_id, messages))
-            if job:
-                self.advance(job)
+            except (CoordError, sqlite3.Error) as error: record(error, thread_id)
+        # Reconnect/report the error after giving independent conversations a
+        # chance to dispatch. Never clear or retry ambiguous durable intentions.
+        if errors: raise errors[0]
 
 
 def main(argv=None):
@@ -200,6 +214,7 @@ def main(argv=None):
     parser.add_argument('--server', default='ws://127.0.0.1:4500')
     parser.add_argument('--interval', type=float, default=2)
     parser.add_argument('--once', action='store_true', help='run one dispatch pass and exit')
+    parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT'))
     args = parser.parse_args(argv)
     if not math.isfinite(args.interval) or args.interval < .2:
         parser.error('--interval must be a finite number at least 0.2 seconds')
@@ -207,6 +222,10 @@ def main(argv=None):
     stop = threading.Event()
     previous = {}
     try:
+        if args.project:
+            from .projects import resolve_database
+            from .core import default_db
+            args.db = str(resolve_database(args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or default_db(), args.project))
         coord = Coordinator(args.db)
         with exclusive_bridge(coord.path):
             state = BridgeState(coord)

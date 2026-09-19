@@ -1,3 +1,26 @@
+# Projects and wake fixes — 2026-09-19
+
+Version 0.3.0, macOS, Python 3.14.7, headless Chrome, Codex 0.154.0.
+
+| Check | Result |
+| --- | --- |
+| Full Python suite | 122 tests passed in 52.4 seconds after final fixes. |
+| Browser integration | 44 scenario groups passed, including project create/rename, scoped broadcasts and live updates, separate drafts, reply reset, reload/mobile selection, retained retired-agent names, and delayed history responses across project switches. Desktop feed remains 819 px high at a 1440×1000 viewport. |
+| Project isolation | Same agent/resource names can coexist; tokens, messages, images, history, operator IDs, wake jobs and dispatcher leases remain within the selected database. Invalid IDs/mismatched selectors/missing project DBs fail instead of falling back or recreating data. |
+| Deregistration | Clean leaf bindings are removed; names and batch delivery attribution remain. Resource/process/descendant/route-job checks remain enforced. Retired identities cannot re-register, including through legacy direct SQLite inserts. |
+| Wake recovery | Failed project workers restart with backoff; invalid routes/job-state errors do not starve independent threads. Existing duplicate-prevention, busy admission, reconnect and parent/child route tests pass. |
+| Process closure | Reproduced an intermittent macOS EPERM race when signalling a disappearing owned group. Cleanup now continues to verify absence; live/inaccessible groups still block release. Five repeated signal/closure reproductions passed after the fix. |
+| Packaging | Installed wheel 0.3.0 in a disposable venv. Five entry points, default DB without flags, packaged assets, project creation/snapshot and server shutdown passed. |
+| Protocol audit | Generated the installed Codex schema with `--experimental`; queue methods, direct-input capability, history markers and request/response shapes match. Non-experimental schemas omit these fields. |
+
+Test databases, model-free simulated Codex services, process groups and browsers
+were isolated and closed. Desktop/mobile screenshots were visually reviewed.
+No real model wake or second-machine/TLS deployment was exercised. Existing
+conversations still need to be resumed through the shared Codex app-server and
+explicitly bound. Failed/uncertain wakes keep their conservative recovery rules.
+
+## Earlier validation
+
 # Validation — 2026-09-19
 
 Version 0.2.0, macOS, Python 3.14.7, headless Chrome.

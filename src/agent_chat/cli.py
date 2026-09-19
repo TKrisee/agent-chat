@@ -26,15 +26,26 @@ def main(argv=None):
     globals_parser.add_argument('--session')
     globals_parser.add_argument('--server')
     globals_parser.add_argument('--api-token')
+    globals_parser.add_argument('--project')
     global_raw = raw[:raw.index('--')] if '--' in raw else raw
     global_args, remainder = globals_parser.parse_known_args(global_raw)
     if '--' in raw:
         remainder += raw[raw.index('--'):]
     server = global_args.server or os.environ.get('AGENT_CHAT_SERVER') or os.environ.get('ITR_COORD_SERVER')
+    selected_project = global_args.project or os.environ.get('AGENT_CHAT_PROJECT')
+    if remainder and remainder[0] == 'project':
+        return _project_main(remainder[1:], global_args, server)
+    global_args.project = selected_project
     if server:
         if global_args.db:
             raise core.CoordError('--db and --server are mutually exclusive')
         return _remote_main(remainder, global_args, server)
+    if selected_project:
+        from .projects import resolve_database
+        base = global_args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or core.default_db()
+        raw = ['--db', str(resolve_database(base, selected_project))]
+        if global_args.session: raw += ['--session', global_args.session]
+        raw += remainder
     # Find the command after known global options, never words in a body/path.
     pos = 0
     while pos < len(raw) and (raw[pos] in ('--db', '--session') or raw[pos].startswith(('--db=', '--session='))):
@@ -93,6 +104,28 @@ def entrypoint():
         return 2
 
 
+def _project_main(raw, args, server):
+    parser = argparse.ArgumentParser(prog='agent-chat project')
+    sub = parser.add_subparsers(dest='op', required=True)
+    sub.add_parser('list')
+    create = sub.add_parser('create'); create.add_argument('--name', required=True)
+    rename = sub.add_parser('rename'); rename.add_argument('id'); rename.add_argument('--name', required=True)
+    values = vars(parser.parse_args(raw))
+    if server:
+        if args.db: raise core.CoordError('--db and --server are mutually exclusive')
+        from .remote import HttpClient
+        # Registry actions must work even if a user's previously selected ID is invalid.
+        result = HttpClient(server, args.api_token, project='default').call('/api/projects/rpc', values)
+    else:
+        from .projects import Projects
+        registry = Projects(args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or core.default_db())
+        if values['op'] == 'list': result = {'projects': registry.list()}
+        elif values['op'] == 'create': result = {'project': registry.create(values['name'])}
+        else: result = {'project': registry.rename(values['id'], values['name'])}
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def _remote_main(raw, global_args, server):
     """Client CLI for operations whose state lives exclusively on the server."""
     from .remote import HttpClient, client_host_id
@@ -111,6 +144,7 @@ def _remote_main(raw, global_args, server):
     x = sub.add_parser('block'); x.add_argument('resource'); x.add_argument('--reason', required=True)
     x = sub.add_parser('link-reply'); x.add_argument('id'); x.add_argument('--reply-to', required=True)
     x = sub.add_parser('remove-session'); x.add_argument('id')
+    sub.add_parser('deregister')
     x = sub.add_parser('bind'); x.add_argument('--thread'); x.add_argument('--parent-session'); x.add_argument('--agent-path')
     sub.add_parser('unbind'); sub.add_parser('bridge-status')
     x = sub.add_parser('bridge-retry'); x.add_argument('job_id'); x.add_argument('--confirm-not-started', action='store_true')
@@ -137,7 +171,7 @@ def _remote_main(raw, global_args, server):
             data = Path(raw_path).read_bytes()
             attachments.append({'name': Path(raw_path).name, 'content_base64': base64.b64encode(data).decode('ascii')})
         params['attachments'] = attachments
-    client, host = HttpClient(server, global_args.api_token), client_host_id()
+    client, host = HttpClient(server, global_args.api_token, project=global_args.project), client_host_id()
     def call(operation, values):
         return client.call('/api/coord', {'op': operation, 'session': session, 'host_id': host, 'params': values})
     if 'resource' in params:
@@ -208,6 +242,7 @@ def _remote_main(raw, global_args, server):
         try:
             for sig in (signal.SIGINT, signal.SIGTERM): old_handlers[sig] = signal.signal(sig, forward)
             env = dict(os.environ, AGENT_CHAT_SERVER=server, ITR_COORD_SERVER=server,
+                       AGENT_CHAT_PROJECT=client.project,
                        AGENT_CHAT_SESSION=session, ITR_COORD_SESSION=session,
                        AGENT_CHAT_TOKEN=params.get('token') or '', ITR_COORD_TOKEN=params.get('token') or '',
                        AGENT_CHAT_API_TOKEN=client.token or '', ITR_COORD_API_TOKEN=client.token or '',

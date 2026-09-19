@@ -18,7 +18,8 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
-from agent_chat.core import CoordError, Coordinator, default_db
+from agent_chat.core import CoordError, Coordinator, default_db, agent_labels
+from .projects import Projects
 
 from .auth import authorized, validate_config, origin
 
@@ -112,7 +113,7 @@ def snapshot(db_path, limit=500):
         now = time.time()
         sessions = [dict(row) for row in db.execute(
             'SELECT id,agent,registered_at FROM sessions ORDER BY registered_at,id')]
-        agents = {row['id']: row['agent'] for row in sessions}
+        agents = agent_labels(db)
         total = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
         rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY seq DESC LIMIT ?',
                           (limit,)).fetchall()
@@ -130,7 +131,13 @@ def snapshot(db_path, limit=500):
                                   owner_agent=agents.get(row['owner_session']),
                                   reservation_id=row['reservation_id'], state=state,
                                   deadline=row['deadline'], reason=row['reason'], queue=queue))
-        return dict(server_time=now, sessions=sessions, messages=messages,
+        bridge = None
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_runtime'").fetchone():
+            row = db.execute('SELECT * FROM bridge_runtime WHERE singleton=1').fetchone()
+            if row:
+                bridge = dict(row)
+                bridge['recent'] = row['pid'] != 0 and now - row['heartbeat'] < 30
+        return dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
                     resources=resources, total_messages=total,
                     history_truncated=total > len(messages))
 
@@ -139,7 +146,7 @@ def page(db_path, before=None, limit=200):
     if not 1 <= limit <= 200 or (before is not None and before < 1):
         raise ValueError('History requires a positive cursor and a limit from 1 to 200')
     with reader(db_path) as db:
-        agents = {row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM sessions')}
+        agents = agent_labels(db)
         where = 'WHERE seq<?' if before is not None else ''
         args = (before, limit + 1) if before is not None else (limit + 1,)
         rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages {where} ORDER BY seq DESC LIMIT ?', args).fetchall()
@@ -184,6 +191,9 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ':' in address[0] else socket.AF_INET
         self.public_url = validate_config(address[0], api_token, public_url)
         self.bridge_manager = None
+        self.projects = Projects(self.db_path)
+        self.project_contexts = {}
+        self.project_lock = threading.RLock()
         super().__init__(address, handler)
         try:
             self.sender_session = operator_session(self.db_path)
@@ -199,7 +209,25 @@ class WebServer(http.server.ThreadingHTTPServer):
         host = '[' + self.listen_host + ']' if ':' in self.listen_host else self.listen_host
         return self.public_url or origin(f'http://{host}:{self.server_port}')
 
+    def project_context(self, project):
+        item = self.projects.get(project)
+        if item['id'] == 'default':
+            return self.db_path, self.sender_session, self.bridge_manager
+        with self.project_lock:
+            if item['id'] not in self.project_contexts:
+                path = str(self.projects.db_path(item['id']))
+                if not Path(path).is_file(): raise CoordError('project database is missing; restore it before continuing')
+                sender = operator_session(path)
+                manager = None
+                if self.api_token:
+                    from .bridge_lease import BridgeManager
+                    manager = BridgeManager(path)
+                self.project_contexts[item['id']] = (path, sender, manager)
+            return self.project_contexts[item['id']]
+
     def server_close(self):
+        for _, _, manager in self.project_contexts.values():
+            if manager: manager.close()
         if self.bridge_manager:
             self.bridge_manager.close()
         super().server_close()
@@ -275,8 +303,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
+    def select_project(self):
+        query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        values = query.get('project', [])
+        headers = self.headers.get_all('X-Agent-Chat-Project', [])
+        if len(values) > 1 or len(headers) > 1 or (values and headers and values[0] != headers[0]):
+            raise CoordError('choose exactly one project')
+        project = (values or headers or ['default'])[0]
+        self.project = self.server.projects.get(project)
+        self.db_path, self.sender_session, self.bridge_manager = self.server.project_context(project)
+
+    def scoped(self, data):
+        if not hasattr(self, 'project') or self.project['id'] == 'default': return data
+        if isinstance(data, list): return [self.scoped(item) for item in data]
+        if isinstance(data, dict):
+            return {key: (value + '?project=' + self.project['id'] if key == 'url' and isinstance(value, str) and value.startswith('/api/attachments/') else self.scoped(value)) for key, value in data.items()}
+        return data
+
+    def project_snapshot(self):
+        return dict(snapshot(self.db_path), project=self.server.projects.get(self.project['id']), projects=self.server.projects.list())
+
     def json(self, code, data):
-        self.respond(code, json.dumps(data, separators=(',', ':')).encode(), 'application/json; charset=utf-8')
+        self.respond(code, json.dumps(self.scoped(data), separators=(',', ':')).encode(), 'application/json; charset=utf-8')
 
     def do_GET(self):
         if not self.trusted():
@@ -286,23 +334,28 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticate():
             return
         try:
-            if url.path == '/api/snapshot':
-                self.json(200, snapshot(self.server.db_path))
+            if url.path.startswith('/api/'):
+                self.select_project()
+            if url.path == '/api/projects':
+                self.json(200, {'projects': self.server.projects.list(), 'project': self.project})
+            elif url.path == '/api/snapshot':
+                self.json(200, self.project_snapshot())
             elif url.path == '/api/config':
-                self.json(200, {'sender': {'id': self.server.sender_session, 'agent': 'operator'},
-                                'csrf_token': self.server.csrf_token})
+                self.json(200, {'sender': {'id': self.sender_session, 'agent': 'operator'},
+                                'csrf_token': self.server.csrf_token, 'project': self.project,
+                                'projects': self.server.projects.list()})
             elif url.path == '/api/messages':
                 params = parse_qs(url.query)
                 before = int(params['before'][0]) if 'before' in params else None
                 limit = int(params.get('limit', ['200'])[0])
-                self.json(200, page(self.server.db_path, before, limit))
+                self.json(200, page(self.db_path, before, limit))
             elif url.path.startswith('/api/messages/'):
                 message_id = url.path.removeprefix('/api/messages/')
-                if url.query or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
+                if set(parse_qs(url.query)) - {'project'} or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
                     self.json(404, {'error': 'Not found'})
                     return
-                with reader(self.server.db_path) as db:
-                    agents = {row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM sessions')}
+                with reader(self.db_path) as db:
+                    agents = agent_labels(db)
                     row = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages WHERE id=?', (message_id,)).fetchone()
                     item = message_rows([row], agents, db)[0] if row else None
                 if item is None:
@@ -311,10 +364,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(200, item)
             elif url.path.startswith('/api/attachments/'):
                 attachment_id = url.path.removeprefix('/api/attachments/')
-                if url.query or not attachment_id.startswith('attachment_') or '/' in attachment_id:
+                if set(parse_qs(url.query)) - {'project'} or not attachment_id.startswith('attachment_') or '/' in attachment_id:
                     self.json(404, {'error': 'Not found'})
                     return
-                with reader(self.server.db_path) as db:
+                with reader(self.db_path) as db:
                     if not attachment_table(db):
                         self.json(404, {'error': 'Not found'})
                         return
@@ -343,39 +396,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(403, {'error': 'Untrusted host or origin'})
             return
         path = urlsplit(self.path).path
-        machine_api = path in ('/api/coord', '/api/bridge/rpc')
+        machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc')
         if not self.authenticate(bearer_only=machine_api):
+            return
+        try:
+            self.select_project()
+        except (CoordError, ValueError, sqlite3.Error, OSError) as error:
+            self.json(400, {'error': str(error)})
             return
         if machine_api:
             try:
                 data = self.read_json(60 * 1024 * 1024 if path == '/api/coord' else 1024 * 1024)
+                if path == '/api/projects/rpc':
+                    self.json(200, self.project_action(data))
+                    return
                 if path == '/api/coord':
                     from .remote_service import dispatch
-                    coord = Coordinator(self.server.db_path)
+                    coord = Coordinator(self.db_path)
                     coord.session = None
                     try:
                         result = dispatch(coord, data)
                     finally:
                         coord.close()
                 else:
-                    result = {'result': self.server.bridge_manager.dispatch(data)}
+                    result = {'result': self.bridge_manager.dispatch(data)}
                 self.json(200, result)
             except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if path not in ('/api/messages', '/api/sessions/remove'):
+        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename'):
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
             return
+        if path in ('/api/projects', '/api/projects/rename'):
+            try:
+                data = self.read_json()
+                result = self.project_action(dict(data, op='create' if path == '/api/projects' else 'rename'))
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
+            return
         if path == '/api/sessions/remove':
             try:
                 data = self.read_json()
                 if set(data) != {'id'} or not isinstance(data['id'], str) or not data['id']:
                     raise ValueError('Session id must be a nonempty string')
-                coord = Coordinator(self.server.db_path, self.server.sender_session)
+                coord = Coordinator(self.db_path, self.sender_session)
                 try:
                     result = coord.remove_session(data['id'])
                 finally:
@@ -403,13 +472,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             reply_to = data.get('reply_to')
             if reply_to is not None and (not isinstance(reply_to, str) or not reply_to):
                 raise ValueError('Reply parent is invalid')
-            with reader(self.server.db_path) as db:
+            with reader(self.db_path) as db:
                 if isinstance(recipient, str):
                     if not db.execute('SELECT 1 FROM sessions WHERE id=?', (recipient,)).fetchone():
                         raise ValueError('Recipient is not a registered agent session')
                 elif any(not db.execute('SELECT 1 FROM sessions WHERE id=?', (item,)).fetchone() for item in recipient):
                     raise ValueError('Recipient is not a registered agent session')
-            coord = Coordinator(self.server.db_path, self.server.sender_session)
+            coord = Coordinator(self.db_path, self.sender_session)
             try:
                 sent = coord.send_many(recipient, body.strip(), reply_to=reply_to) if is_many else coord.send(recipient, body.strip(), reply_to=reply_to)
             finally:
@@ -417,6 +486,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(200, {'messages': sent} if is_many else sent)
         except (CoordError, ValueError, sqlite3.Error, RuntimeError, OSError) as error:
             self.json(400, {'error': str(error)})
+
+    def project_action(self, data):
+        op = data.get('op')
+        if op == 'list' and set(data) == {'op'}:
+            return {'projects': self.server.projects.list()}
+        if op == 'create' and set(data) == {'op', 'name'}:
+            item = self.server.projects.create(data['name'])
+            self.server.project_context(item['id'])
+            return {'project': item, 'projects': self.server.projects.list()}
+        if op == 'rename' and set(data) == {'op', 'id', 'name'}:
+            return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.projects.list()}
+        raise CoordError('invalid project operation')
 
     def events(self):
         self.send_response(200)
@@ -427,7 +508,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         prior = None
         try:
             while not self.server.stop_event.is_set():
-                data = snapshot(self.server.db_path)
+                data = self.scoped(self.project_snapshot())
                 comparable = dict(data)
                 comparable.pop('server_time')
                 if comparable != prior:

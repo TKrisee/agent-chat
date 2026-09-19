@@ -283,11 +283,14 @@ class CoordTests(unittest.TestCase):
         failed, _ = self.release(claim, check=False)
         self.assertNotEqual(failed.returncode, 0)
         process.terminate()
-        process.communicate(timeout=15)
+        _, stderr = process.communicate(timeout=15)
         self.assertNotEqual(process.returncode, 0)
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
-        self.release(claim)
+        try:
+            self.release(claim)
+        except AssertionError as error:
+            self.fail(f'{error}\nGuarded process output: {stderr}')
 
     def test_guard_polls_messages_without_acknowledging_them(self):
         claim = self.request()
