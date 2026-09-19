@@ -1,3 +1,4 @@
+# Local chat data: SQLite, attachments, operator identity, logs and backups.
 .agent-chat/
 .itr-coord/
 .venv/
@@ -13,3 +14,4 @@ node_modules/
 *.sqlite3-wal
 *.web-session.json
 *.bridge.lock
+*.sqlite3-journal
