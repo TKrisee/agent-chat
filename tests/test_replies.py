@@ -9,7 +9,8 @@ import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-CLI = ROOT / 'bin' / 'agent-chat'
+# Keep coordinator regression coverage independent of the public HTTP client.
+CLI = [sys.executable, str(ROOT / 'src' / 'agent_chat' / 'core.py')]
 sys.path.insert(0, str(ROOT / 'src'))
 from agent_chat.core import CoordError, Coordinator
 
@@ -35,12 +36,12 @@ class ReplyTests(unittest.TestCase):
     def test_cli_send_and_inbox_include_reply_metadata(self):
         parent = self.send(self.a, self.b, 'parent')
         body = pathlib.Path(self.tmp.name) / 'body.txt'; body.write_text('child')
-        result = subprocess.run([str(CLI), '--db', str(self.db), '--session', self.b,
+        result = subprocess.run([*CLI, '--db', str(self.db), '--session', self.b,
                                  'send', '--to', self.a, '--body-file', str(body), '--reply-to', parent['id']],
                                 text=True, capture_output=True, check=True)
         child = json.loads(result.stdout)
         self.assertEqual(child['reply_to'], parent['id'])
-        result = subprocess.run([str(CLI), '--db', str(self.db), '--session', self.a,
+        result = subprocess.run([*CLI, '--db', str(self.db), '--session', self.a,
                                  'inbox', '--all'], text=True, capture_output=True, check=True)
         message = json.loads(result.stdout)['messages'][-1]
         self.assertEqual((message['reply_to'], message['reply_preview']['body']), (parent['id'], 'parent'))
@@ -66,7 +67,7 @@ class ReplyTests(unittest.TestCase):
         coord = Coordinator(self.db, self.b)
         try: coord.acknowledge(child['id'])
         finally: coord.close()
-        result = subprocess.run([str(CLI), '--db', str(self.db), '--session', self.a,
+        result = subprocess.run([*CLI, '--db', str(self.db), '--session', self.a,
                                  'link-reply', child['id'], '--reply-to', parent['id']],
                                 text=True, capture_output=True, check=True)
         self.assertTrue(json.loads(result.stdout)['linked'])

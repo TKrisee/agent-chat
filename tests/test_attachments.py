@@ -13,7 +13,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / 'bin' / 'agent-chat'
+# Keep coordinator regression coverage independent of the public HTTP client.
+CLI = [sys.executable, str(ROOT / 'src' / 'agent_chat' / 'core.py')]
 
 
 class AttachmentTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class AttachmentTests(unittest.TestCase):
         self.body.write_text('Screenshots attached.\n')
 
     def cli(self, *args, session='alpha', check=True):
-        result = subprocess.run([str(CLI), *args], cwd=ROOT,
+        result = subprocess.run([*CLI, *args], cwd=ROOT,
                                 env=dict(self.env, AGENT_CHAT_SESSION=session), text=True,
                                 capture_output=True, timeout=20)
         if check:

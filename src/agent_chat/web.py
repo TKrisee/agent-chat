@@ -2,24 +2,25 @@
 """Local live conversation viewer and operator messaging for agent-chat."""
 from __future__ import annotations
 
-import argparse
 import contextlib
+from email.parser import BytesParser
+from email.policy import default as email_policy
 import fcntl
 import http.server
 import json
 import os
 from pathlib import Path
 import secrets
-import signal
 import socket
 import sqlite3
-import sys
 import threading
 import time
+import tempfile
 from urllib.parse import parse_qs, urlsplit
 
-from agent_chat.core import CoordError, Coordinator, default_db, agent_labels
+from agent_chat.core import CoordError, Coordinator, agent_labels
 from .projects import Projects
+from .bridge_state import runtime_snapshot
 
 from .auth import authorized, validate_config, origin
 
@@ -31,7 +32,9 @@ STATIC = {
     '/style.css': ('style.css', 'text/css; charset=utf-8'),
 }
 MESSAGE_COLUMNS = 'seq,id,sender_session,recipient_session,body,created_at,acked_at'
-CSP = "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+UI_MESSAGE_LIMIT = 50
+MAX_MULTIPART_BYTES = 4 * 10 * 1024 * 1024 + 64 * 1024
+CSP = "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 
 @contextlib.contextmanager
@@ -107,7 +110,7 @@ def message_rows(rows, agents, db):
     return items
 
 
-def snapshot(db_path, limit=500):
+def snapshot(db_path, limit=UI_MESSAGE_LIMIT):
     """Read a consistent view without advancing inboxes or changing ownership."""
     with reader(db_path) as db:
         now = time.time()
@@ -131,18 +134,13 @@ def snapshot(db_path, limit=500):
                                   owner_agent=agents.get(row['owner_session']),
                                   reservation_id=row['reservation_id'], state=state,
                                   deadline=row['deadline'], reason=row['reason'], queue=queue))
-        bridge = None
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_runtime'").fetchone():
-            row = db.execute('SELECT * FROM bridge_runtime WHERE singleton=1').fetchone()
-            if row:
-                bridge = dict(row)
-                bridge['recent'] = row['pid'] != 0 and now - row['heartbeat'] < 30
+        bridge = runtime_snapshot(db, now)
         return dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
                     resources=resources, total_messages=total,
                     history_truncated=total > len(messages))
 
 
-def page(db_path, before=None, limit=200):
+def page(db_path, before=None, limit=UI_MESSAGE_LIMIT):
     if not 1 <= limit <= 200 or (before is not None and before < 1):
         raise ValueError('History requires a positive cursor and a limit from 1 to 200')
     with reader(db_path) as db:
@@ -347,7 +345,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif url.path == '/api/messages':
                 params = parse_qs(url.query)
                 before = int(params['before'][0]) if 'before' in params else None
-                limit = int(params.get('limit', ['200'])[0])
+                limit = int(params.get('limit', [str(UI_MESSAGE_LIMIT)])[0])
                 self.json(200, page(self.db_path, before, limit))
             elif url.path.startswith('/api/messages/'):
                 message_id = url.path.removeprefix('/api/messages/')
@@ -415,7 +413,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     coord = Coordinator(self.db_path)
                     coord.session = None
                     try:
-                        result = dispatch(coord, data)
+                        result = dispatch(coord, data, bridge_manager=self.bridge_manager)
                     finally:
                         coord.close()
                 else:
@@ -453,20 +451,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+        content_type = self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower()
+        if content_type not in ('application/json', 'multipart/form-data'):
             self.json(415, {'error': 'Expected a JSON message'})
             return
         try:
+            if content_type == 'multipart/form-data':
+                if len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_all('Transfer-Encoding', []):
+                    raise ValueError('Multipart uploads require one Content-Length and no Transfer-Encoding')
             size = int(self.headers.get('Content-Length', '0'))
-            if not 1 <= size <= 65536:
-                self.json(413, {'error': 'Message must fit within 64 KiB'})
-                return
-            data = json.loads(self.rfile.read(size))
+            if content_type == 'application/json':
+                if not 1 <= size <= 65536:
+                    self.json(413, {'error': 'Message must fit within 64 KiB'})
+                    return
+                data = json.loads(self.rfile.read(size))
+                attachments = None
+            else:
+                if not 1 <= size <= MAX_MULTIPART_BYTES:
+                    self.json(413, {'error': 'Images must fit within 40 MiB plus 64 KiB of metadata'})
+                    return
+                data, attachments = self.read_multipart_message(size)
             if not isinstance(data, dict) or set(data) not in ({'to', 'body'}, {'to', 'body', 'reply_to'}):
                 raise ValueError('Choose a recipient and write a message')
             recipient, body = data['to'], data['body']
             is_many = isinstance(recipient, list)
-            if (not isinstance(recipient, (str, list)) or not isinstance(body, str) or not body.strip() or
+            if (not isinstance(recipient, (str, list)) or not isinstance(body, str) or
+                    (content_type == 'application/json' and not body.strip()) or
+                    (content_type == 'multipart/form-data' and not body.strip() and not attachments) or
                     (is_many and (not recipient or any(not isinstance(item, str) or not item for item in recipient)))):
                 raise ValueError('Choose a recipient and write a nonempty message')
             reply_to = data.get('reply_to')
@@ -478,14 +489,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         raise ValueError('Recipient is not a registered agent session')
                 elif any(not db.execute('SELECT 1 FROM sessions WHERE id=?', (item,)).fetchone() for item in recipient):
                     raise ValueError('Recipient is not a registered agent session')
-            coord = Coordinator(self.db_path, self.sender_session)
-            try:
-                sent = coord.send_many(recipient, body.strip(), reply_to=reply_to) if is_many else coord.send(recipient, body.strip(), reply_to=reply_to)
-            finally:
-                coord.close()
+            with tempfile.TemporaryDirectory(prefix='agent-chat-upload-') as directory:
+                upload_paths = self.write_uploads(directory, attachments or [])
+                coord = Coordinator(self.db_path, self.sender_session)
+                try:
+                    sent = (coord.send_many(recipient, body.strip(), reply_to=reply_to, attachments=upload_paths)
+                            if is_many else coord.send(recipient, body.strip(), attachments=upload_paths, reply_to=reply_to))
+                finally:
+                    coord.close()
             self.json(200, {'messages': sent} if is_many else sent)
         except (CoordError, ValueError, sqlite3.Error, RuntimeError, OSError) as error:
             self.json(400, {'error': str(error)})
+
+    def read_multipart_message(self, size):
+        """Decode the deliberately small form shape accepted by browser uploads."""
+        raw = self.rfile.read(size)
+        if len(raw) != size:
+            raise ValueError('Malformed multipart message')
+        content_type = self.headers.get('Content-Type', '')
+        try:
+            header = content_type.encode('ascii', 'strict')
+        except UnicodeEncodeError as error:
+            raise ValueError('Malformed multipart message') from error
+        message = BytesParser(policy=email_policy).parsebytes(b'Content-Type: ' + header + b'\r\n\r\n' + raw)
+        if not message.is_multipart() or message.defects:
+            raise ValueError('Malformed multipart message')
+        data = None
+        has_message = False
+        images = []
+        for part in message.iter_parts():
+            if part.defects or part.get_content_disposition() != 'form-data':
+                raise ValueError('Malformed multipart message')
+            name = part.get_param('name', header='content-disposition')
+            if name == 'message':
+                if has_message or part.get_filename() is not None:
+                    raise ValueError('Multipart message must contain one message field')
+                has_message = True
+                try:
+                    payload = part.get_payload(decode=True)
+                    if payload is None:
+                        raise ValueError('Multipart message field must be UTF-8 JSON')
+                    if len(payload) > 64 * 1024:
+                        raise ValueError('Multipart message metadata must fit within 64 KiB')
+                    data = json.loads(payload.decode('utf-8'))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ValueError('Multipart message field must be UTF-8 JSON') from error
+            elif name == 'images':
+                filename = part.get_filename()
+                if not filename:
+                    raise ValueError('Image filename is required')
+                content = part.get_payload(decode=True)
+                if content is None:
+                    raise ValueError('Malformed image upload')
+                images.append((self.sanitize_upload_name(filename), content))
+            else:
+                raise ValueError('Multipart message contains an unsupported field')
+        if not has_message:
+            raise ValueError('Multipart message must contain one message field')
+        return data, images
+
+    @staticmethod
+    def sanitize_upload_name(name):
+        name = Path(name.replace('\\', '/')).name
+        name = ''.join(char if char.isprintable() and char not in '/\\' else '_' for char in name).strip(' .')
+        return name[:255] or 'image'
+
+    @staticmethod
+    def write_uploads(directory, uploads):
+        if len(uploads) > 4:
+            raise CoordError('at most 4 image attachments are allowed')
+        if any(len(content) > 10 * 1024 * 1024 for _, content in uploads):
+            raise CoordError('attachment exceeds 10 MiB')
+        paths = []
+        for index, (name, content) in enumerate(uploads):
+            child = Path(directory) / str(index)
+            child.mkdir()
+            path = child / name
+            path.write_bytes(content)
+            paths.append(path)
+        return paths
 
     def project_action(self, data):
         op = data.get('op')
@@ -529,42 +611,3 @@ def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_to
     with reader(db_path):
         pass
     return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url)
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--db', default=os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or str(default_db()))
-    parser.add_argument('--port', type=int, default=8765)
-    parser.add_argument('--host', default='127.0.0.1',
-                        help='Bind address (use 0.0.0.0 for remote access)')
-    parser.add_argument('--api-token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
-    parser.add_argument('--public-url', help='External HTTP(S) origin, e.g. https://chat.example.com')
-    args = parser.parse_args(argv)
-    if not 0 <= args.port <= 65535:
-        parser.error('port must be between 0 and 65535')
-    try:
-        # The standalone web command owns first-run initialization; the lower
-        # level server factory remains read-only for callers that require an
-        # already-existing database.
-        Coordinator(args.db).close()
-        server = create_server(args.db, args.port, host=args.host, api_token=args.api_token, public_url=args.public_url)
-    except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
-        print(f'agent-chat-web: {error}', file=sys.stderr)
-        return 2
-    print(server.origin + '/', flush=True)
-
-    def stop(signum, frame):
-        threading.Thread(target=server.shutdown, daemon=True).start()
-
-    signal.signal(signal.SIGINT, stop)
-    signal.signal(signal.SIGTERM, stop)
-    try:
-        server.serve_forever(poll_interval=.2)
-    finally:
-        server.stop_event.set()
-        server.server_close()
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())

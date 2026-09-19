@@ -1,5 +1,6 @@
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,12 @@ class FakeRpc:
         self.drop_add = False
         self.drop_start = False
         self.busy_start = False
+
+    def connect(self):
+        return self
+
+    def close(self):
+        pass
 
     def request(self, method, params):
         self.calls.append((method, params))
@@ -206,6 +213,136 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.job()['status'], 'dispatched')
         self.assertEqual(self.count('thread/queue/start'), 1)
 
+    def test_reconciles_paginated_summaries_without_loading_tool_outputs(self):
+        self.send()
+        self.rpc.drop_start = True
+        with self.assertRaises(TransportError):
+            self.bridge.tick()
+        job = self.job()
+        original = self.rpc.request
+        history_pages = []
+        def request(method, params):
+            if method != 'thread/turns/list':
+                return original(method, params)
+            # Full history for these turns contains oversized tool output.
+            if params.get('itemsView') != 'summary':
+                raise TransportError('WebSocket frame exceeds size limit')
+            history_pages.append(params)
+            page = int(params.get('cursor', '0'))
+            item = {'type': 'userMessage', 'clientId': job['id'] if page == 3 else 'unrelated'}
+            return {'data': [{'items': [item]}], 'nextCursor': str(page + 1)}
+        with mock.patch.object(self.rpc, 'request', side_effect=request):
+            self.bridge.tick()
+        self.assertEqual(self.state.job(job['id'])['status'], 'dispatched')
+        self.assertEqual([page.get('cursor') for page in history_pages], [None, '1', '2', '3'])
+        self.assertEqual(self.count('thread/queue/add'), 1)
+        self.assertEqual(self.count('thread/queue/start'), 1)
+
+    def test_missing_summary_marker_remains_uncertain_with_bounded_history(self):
+        self.send()
+        self.rpc.drop_start = True
+        with self.assertRaises(TransportError):
+            self.bridge.tick()
+        original = self.rpc.request
+        history_pages = []
+        def request(method, params):
+            if method != 'thread/turns/list':
+                return original(method, params)
+            history_pages.append(params)
+            return {'data': [{'items': [{'type': 'userMessage', 'clientId': None}]}],
+                    'nextCursor': str(len(history_pages))}
+        with mock.patch.object(self.rpc, 'request', side_effect=request):
+            self.bridge.tick()
+        self.assertEqual(self.job()['status'], 'uncertain')
+        self.assertEqual(len(history_pages), 4)
+        self.assertEqual(self.count('thread/queue/add'), 1)
+        self.assertEqual(self.count('thread/queue/start'), 1)
+
+    def assert_oversized_history_does_not_starve_other_thread(self, prepare_other):
+        from test_rpc import FakeServer, _initialize, _frame, _send
+        from agent_chat.rpc import _MAX_MESSAGE
+        message = self.send()
+        broken = self.state.prepare(self.thread, [{'id': message, 'recipient_session': 'worker'}], 'payload')
+        self.state.update(broken['id'], 'queued', queue_id='gone')
+        other = self.coord('other', 'other')
+        tid = str(uuid.uuid4())
+        BridgeState(other).bind(thread_id=tid)
+        other_message = self.send('other')
+        if prepare_other:
+            self.state.prepare(tid, [{'id': other_message, 'recipient_session': 'other'}], 'payload')
+        connections = []
+        def handler(sock):
+            connections.append(True)
+            _initialize(sock)
+            while True:
+                opcode, _, body = _frame(sock)
+                if opcode == 8:
+                    return
+                request = json.loads(body)
+                if request['method'] == 'thread/turns/list':
+                    # Leave unread body bytes on the rejected connection.
+                    sock.sendall(b'\x81\x7f' + struct.pack('!Q', _MAX_MESSAGE + 1) + b'{"id":')
+                    self.assertEqual(_frame(sock)[0], 8)
+                    return
+                result = self.rpc.request(request['method'], request['params'])
+                _send(sock, 1, json.dumps({'id': request['id'], 'result': result}).encode())
+        server = FakeServer(handler, connections=2)
+        try:
+            with RpcClient(server.endpoint) as client:
+                with self.assertRaisesRegex(TransportError, 'frame exceeds size limit'):
+                    Bridge(self.state, client).tick()
+        finally:
+            server.join()
+        self.assertEqual(len(connections), 2)
+        self.assertEqual(self.state.job(broken['id'])['status'], 'queued')
+        other_job = self.agent.db.execute('SELECT status FROM bridge_jobs WHERE thread_id=?', (tid,)).fetchone()
+        self.assertEqual(other_job['status'], 'dispatched')
+        for method in ('thread/queue/add', 'thread/queue/start'):
+            self.assertEqual([p['threadId'] for m, p in self.rpc.calls if m == method], [tid])
+
+    def test_oversized_history_reconnects_before_other_persisted_job(self):
+        self.assert_oversized_history_does_not_starve_other_thread(prepare_other=True)
+
+    def test_oversized_history_reconnects_before_new_wake(self):
+        self.assert_oversized_history_does_not_starve_other_thread(prepare_other=False)
+
+    def test_lost_new_enqueue_does_not_starve_or_repeat(self):
+        self.send()
+        other = self.coord('other', 'other')
+        tid = str(uuid.uuid4())
+        BridgeState(other).bind(thread_id=tid)
+        self.send('other')
+        original = self.rpc.request
+        def request(method, params):
+            result = original(method, params)
+            if method == 'thread/queue/add' and params['threadId'] == self.thread:
+                # Isolate the other thread's queue in this single-thread fake.
+                self.rpc.entries.clear()
+                raise TransportError('lost add response')
+            return result
+        with mock.patch.object(self.rpc, 'request', side_effect=request), \
+                mock.patch.object(self.rpc, 'close') as close, \
+                mock.patch.object(self.rpc, 'connect') as connect:
+            with self.assertRaisesRegex(TransportError, 'lost add response'):
+                self.bridge.tick()
+        close.assert_called_once_with()
+        connect.assert_called_once_with()
+        jobs = dict(self.agent.db.execute('SELECT thread_id, status FROM bridge_jobs'))
+        self.assertEqual(jobs, {self.thread: 'uncertain', tid: 'dispatched'})
+        self.assertEqual([p['threadId'] for m, p in self.rpc.calls if m == 'thread/queue/add'], [self.thread, tid])
+        self.assertEqual([p['threadId'] for m, p in self.rpc.calls if m == 'thread/queue/start'], [tid])
+
+    def test_failed_reconnect_stops_pass_for_normal_backoff(self):
+        self.send()
+        self.rpc.drop_add = True
+        with mock.patch.object(self.rpc, 'connect', side_effect=TransportError('connection refused')) as connect:
+            with self.assertRaisesRegex(TransportError, 'connection refused'):
+                self.bridge.tick()
+        connect.assert_called_once_with()
+        self.assertEqual(self.job()['status'], 'uncertain')
+        self.assertEqual(self.count('thread/queue/add'), 1)
+        self.assertEqual(self.count('thread/queue/start'), 0)
+
     def test_no_evidence_is_uncertain_never_automatic_retry(self):
         self.send()
         self.rpc.drop_start = True
@@ -309,14 +446,6 @@ class BridgeTests(unittest.TestCase):
                     self.fail('second bridge admitted')
         with exclusive_bridge(self.db):
             pass
-
-    def test_cli_binding_and_status_do_not_read_inbox(self):
-        self.send()
-        root = Path(__file__).resolve().parents[1]
-        result = subprocess.run([sys.executable, str(root / 'bin/agent-chat'), '--db', str(self.db), '--session', 'worker', 'bind', '--thread', self.thread], text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)['session_id'], 'worker')
-        self.assertEqual(self.agent.db.execute("SELECT inbox_read_seq FROM sessions WHERE id='worker'").fetchone()[0], 0)
 
     def test_end_to_end_websocket_dispatch(self):
         from test_rpc import FakeServer, _initialize, _frame, _send

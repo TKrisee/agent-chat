@@ -104,6 +104,12 @@ async function run() {
     assert.equal(await input.inputValue(), '');
     assert.equal(await page.evaluate(() => window.injected), undefined);
 
+    const toMe = page.getByRole('button', { name: 'To me', exact: true });
+    await toMe.click();
+    assert.equal(await toMe.getAttribute('aria-pressed'), 'true');
+    assert.equal(await page.locator('.message').count(), 0, 'To me excludes outgoing and agent-to-agent messages');
+    assert.equal(await page.locator('#empty-title').textContent(), 'No matching messages');
+
     const action = `
 import base64, json, sys
 from pathlib import Path
@@ -122,7 +128,6 @@ picture.unlink()
 c.close()
 `;
     const agentReply = JSON.parse(execFileSync(python, ['-c', action, fixtureInfo.db, sent.id], { cwd: root, encoding: 'utf8' }));
-    await page.locator(`[data-message-id="${sent.id}"] .acknowledged`).waitFor();
     await page.locator('.message-body').filter({ hasText: 'Received. The next validation window is queued.' }).waitFor();
     const preview = page.locator('.attachment-preview');
     await preview.scrollIntoViewIfNeeded();
@@ -134,10 +139,33 @@ c.close()
     assert.match(imagePage.url(), /\/api\/attachments\/attachment_[A-Za-z0-9_-]+$/);
     await imagePage.close();
     const agentReplyCard = page.locator(`[data-message-id="${agentReply.id}"]`);
+    assert.equal(await page.locator('.message').count(), 1, 'Incoming messages appear live while To me is active');
+    assert.equal(await agentReplyCard.count(), 1);
+    await page.locator('#ack-filter').selectOption('acknowledged');
+    assert.equal(await page.locator('.message').count(), 0, 'An acknowledged outgoing request does not count as an acknowledged incoming reply');
+    await page.locator('#ack-filter').selectOption('pending');
+    assert.equal(await agentReplyCard.count(), 1);
+    await page.locator('#ack-filter').selectOption('all');
+    await page.getByRole('button', { name: 'Show conversations with beta', exact: true }).click();
+    assert.equal(await page.locator('.message').count(), 0);
+    await page.getByRole('button', { name: 'Show conversations with alpha', exact: true }).click();
+    assert.equal(await agentReplyCard.count(), 1);
+    await page.locator('#all-conversations').click();
+    await input.fill('');
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'to-me-desktop.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await toMe.isVisible(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'to-me-mobile.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 320, height: 700 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    await page.setViewportSize({ width: 1440, height: 1000 });
     assert.equal(await agentReplyCard.locator('.reply-quote').textContent(), '↩ You' + message);
     await page.locator('#search').fill('next validation window');
     await agentReplyCard.locator('.reply-quote').click();
     assert.equal(await page.locator('#search').inputValue(), '');
+    assert.equal(await toMe.getAttribute('aria-pressed'), 'false', 'Opening a quoted original clears To me');
+    await page.locator(`[data-message-id="${sent.id}"] .acknowledged`).waitFor();
     await page.locator(`[data-message-id="${sent.id}"].highlighted`).waitFor();
     const colors = await page.locator(`[data-message-id="${sent.id}"]`).evaluate(article => ({
       background: getComputedStyle(article.querySelector('.message-card')).backgroundColor,
@@ -191,7 +219,8 @@ c.close()
     await page.keyboard.press('Escape');
     await page.locator('#agents-toggle').click();
     await page.locator('#all-conversations').click();
-    await page.locator('.attachment-preview').scrollIntoViewIfNeeded();
+    // A live snapshot may replace the card while Playwright waits for stability.
+    await page.locator('.attachment-preview').evaluate(image => image.scrollIntoView({ block: 'nearest' }));
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'mobile.png'), animations: 'disabled' });
     await page.setViewportSize({ width: 1440, height: 1000 });
@@ -408,7 +437,7 @@ for sid in ['fixture-alpha', 'fixture-beta', 'fixture-nested']:
     await page.locator(`[data-message-id="${plainReply.id}"]`).waitFor();
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'broadcast.png'), animations: 'disabled' });
 
-    // Quoted originals outside the latest500 must not corrupt the history cursor.
+    // History stays bounded; long bodies are parsed fully only on demand.
     const backlog = `
 import sys
 from pathlib import Path
@@ -417,6 +446,7 @@ from agent_chat.core import Coordinator
 c = Coordinator(sys.argv[1], 'fixture-alpha')
 for index in range(505):
     c.send('fixture-beta', 'History filler ' + str(index))
+c.send('fixture-beta', 'Large history detail\\n\\n| Row | Detail |\\n| --- | --- |\\n' + '\\n'.join('| %s | detail |' % index for index in range(1000)))
 parent = c.db.execute('SELECT sender_session FROM messages WHERE id=?', (sys.argv[2],)).fetchone()
 c.send(parent['sender_session'], 'Reply to the older operator request.', reply_to=sys.argv[2])
 c.close()
@@ -425,14 +455,73 @@ c.close()
     await page.reload();
     const oldReply = page.locator('.message').filter({ has: page.locator('.message-body').filter({ hasText: 'Reply to the older operator request.' }) });
     await oldReply.waitFor();
+    assert.equal(await page.locator('.message').count(), 50);
+    const longHistory = page.locator('.message').filter({ has: page.locator('.message-body').filter({ hasText: 'Large history detail' }) });
+    assert.ok(await longHistory.locator('tbody tr').count() < 150);
+    await longHistory.locator('.expand-message').click();
+    assert.equal(await longHistory.locator('tbody tr').count(), 1000);
+    await longHistory.locator('.expand-message').click();
+    assert.ok(await longHistory.locator('tbody tr').count() < 150);
+    assert.equal(await page.evaluate(() => {
+      const card = document.querySelector('.message');
+      applySnapshot({ ...state.snapshot, server_time: state.snapshot.server_time + 1 });
+      return document.querySelector('.message') === card;
+    }), true, 'Unchanged snapshots retain the existing message DOM');
     assert.equal(await page.locator(`[data-message-id="${sent.id}"]`).count(), 0);
     const originalFetched = page.waitForResponse(response => response.url().endsWith('/api/messages/' + sent.id));
     await oldReply.locator('.reply-quote').click();
     assert.equal((await originalFetched).status(), 200);
     await page.locator(`[data-message-id="${sent.id}"].highlighted`).waitFor();
+    await page.evaluate(id => jumpToMessage(id), userReply.id);
+    await page.evaluate(id => jumpToMessage(id), sent.id);
+    assert.equal(await page.evaluate(() => state.originals.size), 1, 'Original lookups do not accumulate history');
     const olderFetched = page.waitForRequest(request => request.url().includes('/api/messages?before='));
     await page.locator('#load-older').click();
     assert.ok(Number(new URL((await olderFetched).url()).searchParams.get('before')) > 2, 'Original lookup must not skip the remaining history');
+    await page.waitForFunction(() => state.pageBefore !== null && !state.loadingHistory);
+    const firstHistoryIds = await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId));
+    assert.equal(firstHistoryIds.length, 50);
+    assert.equal(await page.locator(`[data-message-id="${sent.id}"]`).count(), 0, 'Paging releases fetched originals');
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'history-desktop.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 320, height: 700 });
+    assert.equal(await page.locator('#show-latest').isVisible(), true);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'history-mobile.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('#load-older').click();
+    await page.waitForFunction(() => state.pageCursors.length === 2 && !state.loadingHistory);
+    assert.equal(await page.locator('.message').count(), 50);
+    await page.locator('#load-newer').click();
+    await page.waitForFunction(() => state.pageCursors.length === 1 && !state.loadingHistory);
+    assert.deepEqual(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId)), firstHistoryIds);
+    const liveBurst = `
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / 'src'))
+from agent_chat.core import Coordinator
+c = Coordinator(sys.argv[1], 'fixture-alpha')
+for index in range(60):
+    c.send('fixture-beta', 'Live window burst ' + str(index))
+c.close()
+`;
+    execFileSync(python, ['-c', liveBurst, fixtureInfo.db], { cwd: root });
+    await page.waitForFunction(() => state.snapshot.messages.at(-1)?.body === 'Live window burst 59');
+    assert.deepEqual(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId)), firstHistoryIds, 'Live messages do not displace the history page');
+    assert.equal(await page.evaluate(() => state.messages.size), 50);
+    assert.equal(await page.evaluate(() => state.snapshot.messages.length), 50);
+    await page.locator('#new-messages').click();
+    await page.locator('.message-body').filter({ hasText: 'Live window burst 59' }).waitFor();
+    assert.equal(await page.locator('.message').count(), 50);
+    assert.equal(await page.evaluate(() => state.expanded.size), 0, 'Evicted expansion state is released');
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'bounded-history.png'), animations: 'disabled' });
+    const historyDuringReconnect = new Promise(resolve => page.route('**/api/messages?before=*', route => resolve(route)));
+    await page.locator('#load-older').click();
+    const interruptedHistory = await historyDuringReconnect;
+    await page.evaluate(() => connect());
+    await interruptedHistory.fulfill({ response: await interruptedHistory.fetch() });
+    await page.unroute('**/api/messages?before=*');
+    assert.equal(await page.locator('#load-older').isEnabled(), true, 'Reconnect releases obsolete history requests');
+    assert.equal(await page.evaluate(() => state.pageBefore), null);
 
     // Session removal uses sibling controls, preserves history, and only succeeds after holds close.
     const removalSetup = `
@@ -483,11 +572,13 @@ print(json.dumps({'history': history['id']}))
     // Project creation, drafts, reply clearing, scoping and live events.
     await page.setViewportSize({ width: 1440, height: 1000 });
     await input.fill('Default project draft');
+    await toMe.click();
     await page.locator('#new-project').click();
     await page.locator('#project-name').fill('Second project');
     await page.locator('#save-project').click();
     await page.waitForFunction(() => !document.querySelector('#message-input').disabled && document.querySelector('#project-select').value !== 'default');
     const projectId = await page.locator('#project-select').inputValue();
+    assert.equal(await toMe.getAttribute('aria-pressed'), 'false', 'Project switches reset recipient filtering');
     assert.equal(await page.locator('.message').count(), 0);
     assert.equal(await page.locator('#agent-count').textContent(), '0');
     assert.equal(await input.inputValue(), '');
@@ -505,11 +596,14 @@ c.close()
 `;
     const secondMessage = JSON.parse(execFileSync(python, ['-c', secondCode, fixtureInfo.db, projectId], { cwd: root, encoding: 'utf8' }));
     await page.locator(`[data-message-id="${secondMessage.id}"]`).waitFor();
+    await toMe.click();
+    assert.equal(await page.locator(`[data-message-id="${secondMessage.id}"]`).count(), 1, 'To me uses the current project operator identity');
     await page.locator(`[data-message-id="${secondMessage.id}"] .reply-message`).click();
     await input.fill('Second project draft');
     await page.locator('#project-select').selectOption('default');
     await page.waitForFunction(() => !document.querySelector('#message-input').disabled && document.querySelectorAll('.message').length > 0);
     assert.equal(await input.inputValue(), 'Default project draft');
+    assert.equal(await toMe.getAttribute('aria-pressed'), 'false');
     assert.equal(await page.locator('#composer-reply').isVisible(), false);
     assert.equal(await page.locator(`[data-message-id="${secondMessage.id}"]`).count(), 0);
     await page.locator('#project-select').selectOption(projectId);
@@ -549,6 +643,100 @@ c.close()
     await page.setViewportSize({width:1440,height:1000});
     await page.keyboard.press('Escape');
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'projects-desktop.png'), animations: 'disabled' });
+
+    // Image drafts use local previews; only Send uploads them to this project.
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    async function dropFiles(files) {
+      const transfer = await page.evaluateHandle(items => {
+        const data = new DataTransfer();
+        for (const item of items) data.items.add(new File([new Uint8Array(item.bytes)], item.name, { type: item.type }));
+        return data;
+      }, files);
+      try {
+        await page.locator('#message-input').dispatchEvent('dragenter', { dataTransfer: transfer });
+        assert.equal(await page.locator('#composer').evaluate(form => form.classList.contains('drag-over')), true);
+        await page.locator('#message-input').dispatchEvent('drop', { dataTransfer: transfer });
+        assert.equal(await page.locator('#composer').evaluate(form => form.classList.contains('drag-over')), false);
+      } finally { await transfer.dispose(); }
+    }
+    const draftImages = page.locator('#composer-images .draft-image');
+    await dropFiles([{ name: 'notes.txt', type: 'text/plain', bytes: [65] }]);
+    assert.equal(await draftImages.count(), 0);
+    await page.locator('#composer-status').filter({ hasText: 'Choose PNG' }).waitFor();
+    const beforeImageDraft = await (await page.request.get(fixtureInfo.url + '/api/snapshot?project=' + projectId)).json();
+    await dropFiles([{ name: 'drag.png', type: 'image/png', bytes: [...png] }]);
+    await page.waitForFunction(() => document.querySelector('#composer-images img')?.naturalWidth === 1);
+    const afterImageDraft = await (await page.request.get(fixtureInfo.url + '/api/snapshot?project=' + projectId)).json();
+    assert.equal(afterImageDraft.total_messages, beforeImageDraft.total_messages, 'Dropping images does not send messages');
+    const chooseFiles = page.waitForEvent('filechooser');
+    await page.getByRole('button', { name: 'Attach images', exact: true }).click();
+    await (await chooseFiles).setFiles({ name: 'picker.png', mimeType: 'image/png', buffer: png });
+    assert.equal(await draftImages.count(), 2);
+    await page.getByRole('button', { name: 'Remove picker.png', exact: true }).click();
+    assert.equal(await draftImages.count(), 1);
+    await page.locator('#image-input').setInputFiles(Array.from({ length: 4 }, (_, index) => ({ name: `extra-${index}.png`, mimeType: 'image/png', buffer: png })));
+    await page.locator('#composer-status').filter({ hasText: 'up to 4' }).waitFor();
+    assert.equal(await draftImages.count(), 1, 'Over-limit drops leave the current draft intact');
+    await page.locator('#image-input').setInputFiles({ name: 'too-big.png', mimeType: 'image/png', buffer: Buffer.alloc(10 * 1024 * 1024 + 1) });
+    await page.locator('#composer-status').filter({ hasText: '10 MiB' }).waitFor();
+    assert.equal(await draftImages.count(), 1);
+    await input.fill('Keep this image draft');
+    await page.locator('#project-select').selectOption('default');
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    assert.equal(await draftImages.count(), 0);
+    await page.locator('#project-select').selectOption(projectId);
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    assert.equal(await draftImages.count(), 1);
+    assert.equal(await input.inputValue(), 'Keep this image draft');
+    await input.fill('');
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'image-draft-desktop.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 320, height: 700 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'image-draft-mobile.png'), animations: 'disabled' });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.route('**/api/messages?project=*', route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'Upload unavailable' }) }));
+    await input.press('Control+Enter');
+    await page.locator('#composer-status').filter({ hasText: 'Upload unavailable' }).waitFor();
+    assert.equal(await draftImages.count(), 1, 'A failed upload keeps images available for retry');
+    await page.unroute('**/api/messages?project=*');
+    const imagePosted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages' && response.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    const imageResponse = await imagePosted;
+    assert.equal(imageResponse.status(), 200);
+    assert.match(imageResponse.request().headers()['content-type'], /^multipart\/form-data;/);
+    const imageSent = await imageResponse.json();
+    assert.equal(imageSent.attachments[0].name, 'drag.png');
+    await page.waitForFunction(() => document.querySelectorAll('#composer-images .draft-image').length === 0);
+    const imageCard = page.locator(`[data-message-id="${imageSent.id}"]`);
+    await imageCard.locator('.attachment-preview').waitFor();
+    const storedImage = await page.request.get(fixtureInfo.url + imageSent.attachments[0].url);
+    assert.deepEqual(await storedImage.body(), png);
+    assert.equal((await page.request.get(fixtureInfo.url + '/api/attachments/' + imageSent.attachments[0].id)).status(), 404, 'Upload stays in the selected project');
+    await imageCard.locator('.reply-message').click();
+    await dropFiles([{ name: 'reply.png', type: 'image/png', bytes: [...png] }]);
+    await input.fill('Image follow-up');
+    const imageReplyPosted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages' && response.request().method() === 'POST');
+    await input.press('Control+Enter');
+    const imageReply = await (await imageReplyPosted).json();
+    assert.equal(imageReply.reply_to, imageSent.id);
+    assert.equal(imageReply.attachments.length, 1);
+    await page.waitForFunction(() => !document.querySelector('#send-button').disabled);
+    await page.locator('#project-select').selectOption('default');
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    await dropFiles([{ name: 'group.png', type: 'image/png', bytes: [...png] }]);
+    await input.fill('@alpha @beta Image group delivery');
+    const imageGroupPosted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages' && response.request().method() === 'POST');
+    await input.press('Control+Enter');
+    const imageGroupResponse = await imageGroupPosted;
+    assert.equal(imageGroupResponse.status(), 200);
+    const imageGroup = await imageGroupResponse.json();
+    assert.equal(imageGroup.messages.length, 2);
+    assert.ok(imageGroup.messages.every(message => message.attachments.length === 1));
+    const imageGroupCard = page.locator(`[data-batch-id="${imageGroup.messages[0].batch_id}"]`);
+    await imageGroupCard.locator('.attachment-preview').waitFor();
+    assert.equal(await imageGroupCard.count(), 1);
+    assert.equal(await imageGroupCard.locator('.attachment-preview').count(), 1);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'image-group.png'), animations: 'disabled' });
     assert.deepEqual(errors, []);
     console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow', 'retired history attribution', 'project creation and rename', 'project live events', 'per-project drafts and reply reset', 'scoped project broadcasts', 'late cross-project response isolation', 'project reload persistence', 'mobile project selector'] }));
   } finally {

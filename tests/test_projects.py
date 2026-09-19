@@ -28,13 +28,13 @@ class ProjectStoreTests(unittest.TestCase):
 
     def test_legacy_default_rename_stable_id_and_strict_selection(self):
         old = Coordinator(self.base, 'old'); old.register('legacy'); old.close()
-        self.projects.rename('default', 'Into The Rot')
-        self.assertEqual(Projects(self.base).list()[0]['name'], 'Into The Rot')
+        self.projects.rename('default', 'Example Project')
+        self.assertEqual(Projects(self.base).list()[0]['name'], 'Example Project')
         self.assertEqual(self.projects.db_path(), self.base)
         with self.assertRaises(CoordError): self.projects.db_path('../bad')
         for bad in ('', 'x\nname', 'x'*81, None):
             with self.assertRaises(CoordError): self.projects.create(bad)
-        with self.assertRaises(CoordError): self.projects.create(' INTO THE ROT ')
+        with self.assertRaises(CoordError): self.projects.create(' EXAMPLE PROJECT ')
         c = Coordinator(self.base, 'old'); self.addCleanup(c.close)
         self.assertEqual(c.require_session(), 'old')
 
@@ -63,22 +63,6 @@ class ProjectStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordError, 'missing'): resolve_database(self.base, item['id'])
         self.assertFalse(path.exists())
 
-    def test_cli_project_selection_and_deregister(self):
-        root = Path(__file__).resolve().parents[1]
-        env = {k:v for k,v in os.environ.items() if not k.startswith(('AGENT_CHAT_', 'ITR_COORD_'))}
-        def cli(*args):
-            p = subprocess.run([sys.executable, str(root/'bin/agent-chat'), '--db', str(self.base), *args], capture_output=True, text=True, env=env)
-            self.assertEqual(p.returncode, 0, p.stderr)
-            return json.loads(p.stdout)
-        item = cli('project', 'create', '--name', 'CLI')['project']
-        cli('--project', item['id'], '--session', 'cli-worker', 'register', '--agent', 'backend')
-        self.assertEqual(len(cli('--project', item['id'], '--session', 'cli-worker', 'status')['sessions']), 1)
-        with self.projects.connection() as registry:
-            self.assertEqual(registry.execute('SELECT COUNT(*) FROM projects').fetchone()[0], 2)
-        cli('--project', item['id'], '--session', 'cli-worker', 'deregister')
-        c = Coordinator(self.projects.db_path(item['id']))
-        try: self.assertEqual(c.db.execute('SELECT COUNT(*) FROM sessions').fetchone()[0], 0)
-        finally: c.close()
 
 
 class ProjectHttpTests(RemoteWebFixture):

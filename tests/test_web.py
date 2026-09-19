@@ -117,6 +117,26 @@ class WebApiTests(unittest.TestCase):
         body = data if isinstance(data, (bytes, str)) else json.dumps(data)
         return self.request("POST", "/api/messages", body, post_headers)
 
+    def post_multipart(self, message, images=(), headers=None, extra_fields=()):
+        boundary = 'agent-chat-' + uuid.uuid4().hex
+        chunks = []
+        def field(headers, value):
+            chunks.extend((b'--' + boundary.encode(), headers, b'', value))
+        field(b'Content-Disposition: form-data; name="message"', json.dumps(message).encode())
+        for name, content in images:
+            field(('Content-Disposition: form-data; name="images"; filename="%s"' % name).encode(), content)
+        for name, content in extra_fields:
+            field(('Content-Disposition: form-data; name="%s"' % name).encode(), content)
+        chunks.extend((b'--' + boundary.encode() + b'--', b''))
+        config = self.config()
+        post_headers = {
+            'Content-Type': 'multipart/form-data; boundary=' + boundary,
+            'Origin': 'http://127.0.0.1:' + str(self.port),
+            'X-Agent-Chat-CSRF': config['csrf_token'],
+        }
+        post_headers.update(headers or {})
+        return self.request('POST', '/api/messages', b'\r\n'.join(chunks), post_headers)
+
     def read_event(self, response):
         while True:
             line = response.fp.readline().decode().strip()
@@ -160,6 +180,40 @@ class WebApiTests(unittest.TestCase):
         connection.commit()
         connection.close()
         self.assertEqual(self.request("GET", "/api/snapshot")[0], 200)
+
+    def test_default_snapshot_events_and_history_load_only_fifty_messages(self):
+        coordinator = self.coordinator(self.alpha)
+        try:
+            for index in range(80):
+                coordinator.send(self.beta, 'history %s' % index)
+        finally:
+            coordinator.close()
+        status, _, raw = self.request('GET', '/api/snapshot')
+        latest = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(latest['messages']), 50)
+        self.assertEqual(latest['total_messages'], 82)
+        self.assertTrue(latest['history_truncated'])
+        self.assertEqual(latest['messages'][0]['body'], 'history 30')
+        connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=6)
+        try:
+            connection.request('GET', '/api/events')
+            response = connection.getresponse()
+            self.assertEqual(len(self.read_event(response)['messages']), 50)
+            response.close()
+        finally:
+            connection.close()
+        status, _, raw = self.request('GET', '/api/messages')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(raw)['messages'], latest['messages'])
+        before = latest['messages'][0]['seq']
+        status, _, raw = self.request('GET', '/api/messages?before=%s' % before)
+        older = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(older['messages']), 32)
+        self.assertFalse(older['has_more'])
+        self.assertLess(older['messages'][-1]['seq'], before)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM messages'), 82)
         self.assertEqual(self.value("SELECT stale FROM resources WHERE name='web-test-resource'"), 0)
 
     def test_sse_initial_message_and_ack_updates(self):
@@ -211,6 +265,48 @@ class WebApiTests(unittest.TestCase):
         status, headers, body = self.request('GET', attachment['url'])
         self.assertEqual((status, headers['Content-Type'], body), (200, 'image/png', payload))
         self.assertEqual(self.request('GET', '/api/attachments/not-an-id')[0], 404)
+
+    def test_multipart_image_only_send_preserves_sanitized_name(self):
+        image = b'\x89PNG\r\n\x1a\nweb-upload'
+        status, _, raw = self.post_multipart({'to': self.beta, 'body': ''}, [('../proof.png', image)])
+        self.assertEqual(status, 200)
+        sent = json.loads(raw)
+        self.assertEqual((sent['recipient_session'], sent['attachments'][0]['name']), (self.beta, 'proof.png'))
+        self.assertEqual(self.value('SELECT body FROM messages WHERE id=?', (sent['id'],)), '')
+        status, _, stored = self.request('GET', sent['attachments'][0]['url'])
+        self.assertEqual((status, stored), (200, image))
+
+    def test_multipart_group_reply_attaches_each_delivery_atomically(self):
+        status, _, raw = self.post({'to': [self.beta, self.gamma], 'body': 'group parent'})
+        self.assertEqual(status, 200)
+        parent = json.loads(raw)['messages']
+        status, _, raw = self.post_multipart(
+            {'to': [self.gamma, self.beta], 'body': '', 'reply_to': parent[0]['id']},
+            [('group.gif', b'GIF89agroup-upload')],
+        )
+        self.assertEqual(status, 200)
+        sent = json.loads(raw)['messages']
+        parent_for = {item['recipient_session']: item['id'] for item in parent}
+        self.assertEqual({item['recipient_session']: item['reply_to'] for item in sent}, parent_for)
+        self.assertEqual({item['recipient_session'] for item in sent}, {self.beta, self.gamma})
+        self.assertTrue(all(item['attachments'][0]['mime'] == 'image/gif' for item in sent))
+        self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 2)
+
+    def test_invalid_multipart_uploads_do_not_insert_messages(self):
+        before = self.value('SELECT COUNT(*) FROM messages')
+        image = b'\x89PNG\r\n\x1a\nimage'
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)] * 5)[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('bad.txt', b'not an image')])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('large.png', b'\x89PNG\r\n\x1a\n' + b'x' * (10 * 1024 * 1024))])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)], extra_fields=[('message', b'{}')])[0], 400)
+        self.assertEqual(self.post_multipart(None, [('a.png', image)],
+                         extra_fields=[('message', json.dumps({'to': self.beta, 'body': ''}).encode())])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)], extra_fields=[('unexpected', b'x')])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': 'x' * (64 * 1024 + 1)}, [('a.png', image)])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)],
+                                             {'Content-Type': 'multipart/form-data; boundary=wrong'})[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)], {'X-Agent-Chat-CSRF': 'wrong'})[0], 403)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM messages'), before)
 
     def test_operator_persistence_parent_identity_isolation_and_valid_post(self):
         first = self.config()

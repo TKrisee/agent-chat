@@ -1,13 +1,19 @@
 'use strict';
 
 const $ = (id) => document.getElementById(id);
+const MESSAGE_LIMIT = 50;
+const MESSAGE_PREVIEW_LENGTH = 2000;
+const MAX_IMAGES = 4;
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const state = {
-  snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all',
+  snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all', toMe: false,
   expanded: new Set(), paused: false, pending: null, connected: false,
   hasOlder: false, source: null, newCount: 0, config: null, sending: false,
   mentionOptions: [], mentionIndex: 0, reply: null, originals: new Map(), highlighted: null,
   project: new URL(location.href).searchParams.get('project') || 'default', epoch: 0,
   projects: [], drafts: new Map(), busy: false,
+  pageBefore: null, pageCursors: [], loadingHistory: false,
+  attachments: [],
 };
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 const dateFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -244,6 +250,61 @@ function clearReply() {
   $('composer-reply').hidden = true;
 }
 
+function renderDraftImages() {
+  const fragment = document.createDocumentFragment();
+  for (const attachment of state.attachments) {
+    const item = node('div', 'draft-image');
+    item.setAttribute('role', 'listitem');
+    const preview = node('img');
+    preview.src = attachment.url;
+    preview.alt = attachment.file.name;
+    preview.decoding = 'async';
+    const name = node('span', 'draft-image-name', attachment.file.name);
+    name.title = attachment.file.name;
+    const remove = node('button', 'remove-image', '×');
+    remove.type = 'button';
+    remove.setAttribute('aria-label', `Remove ${attachment.file.name}`);
+    remove.disabled = state.sending || state.busy;
+    remove.addEventListener('click', () => {
+      if (state.sending || state.busy) return;
+      URL.revokeObjectURL(attachment.url);
+      state.attachments = state.attachments.filter(item => item !== attachment);
+      renderDraftImages();
+    });
+    item.append(preview, name, remove);
+    fragment.append(item);
+  }
+  $('composer-images').replaceChildren(fragment);
+  $('composer-images').hidden = !state.attachments.length;
+  $('message-input').required = !state.attachments.length;
+}
+
+function addImages(files) {
+  if (state.sending || state.busy || !state.config) return;
+  if (state.attachments.length + files.length > MAX_IMAGES) {
+    composerStatus('Attach up to 4 images per message.', true); return;
+  }
+  for (const file of files) {
+    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type) &&
+        (file.type || !/\.(png|jpe?g|gif|webp)$/i.test(file.name))) {
+      composerStatus('Choose PNG, JPEG, GIF or WebP images.', true); return;
+    }
+    if (!file.size || file.size > MAX_IMAGE_BYTES) {
+      composerStatus('Each image must be nonempty and no larger than 10 MiB.', true); return;
+    }
+  }
+  state.attachments.push(...files.map(file => ({ file, url: URL.createObjectURL(file) })));
+  renderDraftImages();
+  composerStatus('');
+  $('message-input').focus();
+}
+
+function clearImages() {
+  for (const attachment of state.attachments) URL.revokeObjectURL(attachment.url);
+  state.attachments = [];
+  renderDraftImages();
+}
+
 function startReply(message) {
   if (state.sending) return;
   const recipients = replyRecipients(message);
@@ -261,11 +322,14 @@ async function jumpToMessage(id) {
     if (!state.messages.has(id) && !state.originals.has(id)) {
       const original = await fetchJSON(`/api/messages/${encodeURIComponent(id)}`);
       // Keep fetched originals separate so loading one never skips intervening history.
+      state.originals.clear();
       state.originals.set(original.id, original);
+      pruneExpanded();
     }
     state.selected = null;
     state.query = '';
     state.ack = 'all';
+    state.toMe = false;
     state.highlighted = id;
     $('search').value = '';
     $('ack-filter').value = 'all';
@@ -319,7 +383,12 @@ function messageCard(message) {
   const long = message.body.length > 900 || message.body.split('\n').length > 8;
   const expanded = state.expanded.has(message.id);
   const body = node('div', `message-body markdown${long && !expanded ? ' collapsed' : ''}`);
-  body.append(CoordMarkdown.render(message.body));
+  const renderBody = (open) => {
+    const text = !open && message.body.length > MESSAGE_PREVIEW_LENGTH
+      ? message.body.slice(0, MESSAGE_PREVIEW_LENGTH) + '\n…' : message.body;
+    body.replaceChildren(CoordMarkdown.render(text));
+  };
+  renderBody(expanded);
   card.append(body);
   if (long) {
     const toggle = node('button', 'expand-message', expanded ? 'Show less' : 'Read full message');
@@ -328,6 +397,7 @@ function messageCard(message) {
     toggle.addEventListener('click', () => {
       const open = !state.expanded.has(message.id);
       if (open) state.expanded.add(message.id); else state.expanded.delete(message.id);
+      renderBody(open);
       body.classList.toggle('collapsed', !open);
       toggle.textContent = open ? 'Show less' : 'Read full message';
       toggle.setAttribute('aria-expanded', String(open));
@@ -384,11 +454,15 @@ function renderMessages(forceBottom = false) {
   const feed = $('feed');
   const oldTop = feed.scrollTop;
   const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
-  const label = state.selected ? agentLabel(state.selected) : 'All conversations';
+  const label = state.toMe
+    ? (state.selected ? `${agentLabel(state.selected)} → You` : 'Messages to you')
+    : (state.selected ? agentLabel(state.selected) : 'All conversations');
   $('conversation-title').textContent = label;
+  $('to-me-filter').setAttribute('aria-pressed', String(state.toMe));
   const batches = new Set();
   const rows = [...new Map([...state.originals, ...state.messages]).values()].sort((a, b) => a.seq - b.seq).filter((message) => {
     let deliveries = messageDeliveries(message);
+    if (state.toMe) deliveries = deliveries.filter((delivery) => delivery.recipient_session === state.config?.sender.id);
     if (state.selected && message.sender_session !== state.selected) deliveries = deliveries.filter((delivery) => delivery.recipient_session === state.selected);
     if (!deliveries.length) return false;
     if (state.ack === 'pending' && !deliveries.some((delivery) => delivery.acked_at == null)) return false;
@@ -407,9 +481,21 @@ function renderMessages(forceBottom = false) {
   }
   $('messages').replaceChildren(fragment);
   $('empty-state').hidden = rows.length > 0;
-  $('empty-title').textContent = state.query || state.ack !== 'all' ? 'No matching messages' : 'The room is quiet';
-  $('empty-description').textContent = state.query || state.ack !== 'all' ? 'Try a different search or message filter.' : 'New agent messages will appear here automatically. You can start a conversation below.';
+  const filtered = state.query || state.ack !== 'all' || state.toMe;
+  $('empty-title').textContent = filtered ? 'No matching messages' : 'The room is quiet';
+  $('empty-description').textContent = filtered ? 'Try a different search or message filter.' : 'New agent messages will appear here automatically. You can start a conversation below.';
   $('load-older').hidden = !state.hasOlder;
+  $('load-newer').hidden = !state.pageCursors.length;
+  $('show-latest').hidden = state.pageBefore === null && !state.originals.size;
+  $('message-window').textContent = state.pageBefore !== null
+    ? `Earlier messages · ${state.messages.size} loaded`
+    : state.hasOlder ? `Latest ${state.messages.size} messages` : '';
+  if (state.pageBefore !== null) {
+    feed.scrollTop = oldTop;
+    $('new-messages').hidden = state.newCount === 0;
+    $('new-messages').textContent = `${state.newCount} new · Back to latest`;
+    return;
+  }
   if (forceBottom || nearBottom) {
     feed.scrollTop = feed.scrollHeight;
     state.newCount = 0;
@@ -472,26 +558,90 @@ function renderResources() {
 
 function applySnapshot(data) {
   if (data.project && data.project.id !== state.project) return;
+  // Keep a bounded latest window, even while connected to an older server.
+  data = { ...data, messages: data.messages.slice(-MESSAGE_LIMIT),
+    history_truncated: data.history_truncated || data.messages.length > MESSAGE_LIMIT };
   renderProjects(data);
   const bridge = data.bridge;
-  $('bridge-caption').textContent = bridge?.recent && !bridge.error ? 'Wake bridge connected' : 'Wake bridge offline';
-  $('bridge-caption').title = bridge?.error || 'Only loaded, idle, bound Codex agents can be woken.';
+  const clients = bridge?.clients || [];
+  const connected = clients.filter(client => client.recent && !client.error).length;
+  $('bridge-caption').textContent = clients.length > 1
+    ? `Wake bridges: ${connected}/${clients.length} connected`
+    : bridge?.recent && !bridge.error ? 'Wake bridge connected' : 'Wake bridge offline';
+  $('bridge-caption').title = clients.length
+    ? clients.map(client => `${client.host_id}: ${client.error || (client.recent ? 'connected' : 'offline')}`).join('\n')
+    : bridge?.error || 'Only loaded, idle, bound Codex agents can be woken.';
   if (state.paused) { state.pending = data; return; }
   const initial = !state.snapshot;
-  const oldMax = Math.max(0, ...[...state.messages.values()].map((item) => item.seq));
+  const previous = state.snapshot?.messages || [];
+  const oldMax = Math.max(0, ...previous.map((item) => item.seq));
+  const oldVisible = JSON.stringify([...state.messages.values()]);
+  const labels = (sessions) => JSON.stringify((sessions || []).map(({ id, agent }) => [id, agent]));
+  const labelsChanged = labels(data.sessions) !== labels(state.snapshot?.sessions);
   state.snapshot = data;
-  const seen = new Set([...state.messages.values()].map((message) => message.batch_id || message.id));
+  const seen = new Set(previous.map((message) => message.batch_id || message.id));
   for (const message of data.messages) {
     const key = message.batch_id || message.id;
     if (!initial && message.seq > oldMax && !seen.has(key)) state.newCount += 1;
     seen.add(key);
-    state.messages.set(message.id, message);
+    if (state.pageBefore !== null && state.messages.has(message.id)) state.messages.set(message.id, message);
   }
-  state.hasOlder = data.total_messages > state.messages.size;
+  if (state.pageBefore === null) {
+    state.messages = new Map(data.messages.map((message) => [message.id, message]));
+    state.hasOlder = data.history_truncated;
+    pruneExpanded();
+  }
   renderAgents();
-  renderMessages(initial);
+  if (initial || labelsChanged || oldVisible !== JSON.stringify([...state.messages.values()])) renderMessages(initial);
+  else if (state.pageBefore !== null) {
+    $('new-messages').hidden = state.newCount === 0;
+    $('new-messages').textContent = `${state.newCount} new · Back to latest`;
+  }
   renderResources();
   if (state.newCount) $('announcement').textContent = `${state.newCount} new messages received`;
+}
+
+function pruneExpanded() {
+  for (const id of state.expanded) {
+    if (!state.messages.has(id) && !state.originals.has(id)) state.expanded.delete(id);
+  }
+}
+
+function showLatest() {
+  if (state.loadingHistory || !state.snapshot) return;
+  state.pageBefore = null; state.pageCursors = [];
+  state.originals.clear(); state.highlighted = null;
+  state.messages = new Map(state.snapshot.messages.map((message) => [message.id, message]));
+  state.hasOlder = state.snapshot.history_truncated;
+  pruneExpanded();
+  renderMessages(true);
+}
+
+async function loadMessagePage(newer = false) {
+  if (state.loadingHistory || (newer && !state.pageCursors.length) || (!newer && !state.messages.size)) return;
+  const before = newer ? state.pageCursors.at(-1) : Math.min(...[...state.messages.values()].map(message => message.seq));
+  if (before === null) { showLatest(); return; }
+  const epoch = state.epoch;
+  state.loadingHistory = true;
+  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = true;
+  try {
+    const result = await fetchJSON(`/api/messages?before=${before}&limit=${MESSAGE_LIMIT}`);
+    if (newer) state.pageCursors.pop(); else state.pageCursors.push(state.pageBefore);
+    state.pageBefore = before;
+    state.messages = new Map(result.messages.slice(-MESSAGE_LIMIT).map(message => [message.id, message]));
+    state.originals.clear(); state.highlighted = null;
+    state.hasOlder = result.has_more;
+    pruneExpanded();
+    renderMessages();
+    $('feed').scrollTop = 0;
+  } catch (error) {
+    if (error.name !== 'AbortError') composerStatus(`Could not load history: ${error.message}`, true);
+  } finally {
+    if (epoch === state.epoch) {
+      state.loadingHistory = false;
+      for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
+    }
+  }
 }
 
 async function fetchJSON(url, options = {}) {
@@ -514,6 +664,9 @@ function projectControls() {
   $('project-select').disabled = disabled;
   $('new-project').disabled = disabled || !state.config;
   $('rename-project').disabled = disabled || !state.config;
+  $('attach-button').disabled = disabled || !state.config;
+  $('image-input').disabled = disabled || !state.config;
+  for (const button of $('composer-images').querySelectorAll('button')) button.disabled = disabled;
 }
 
 function renderProjects(data) {
@@ -529,6 +682,8 @@ function renderProjects(data) {
 
 async function connect() {
   const epoch = ++state.epoch;
+  state.loadingHistory = false;
+  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
   state.source?.close();
   state.config = null;
   $('message-input').disabled = true;
@@ -559,24 +714,29 @@ async function connect() {
 
 function switchProject(id) {
   if (state.busy || state.sending || id === state.project) return;
-  state.drafts.set(state.project, $('message-input').value);
+  state.drafts.set(state.project, { body: $('message-input').value, attachments: state.attachments });
   state.project = id;
   const url = new URL(location.href);
   if (id === 'default') url.searchParams.delete('project'); else url.searchParams.set('project', id);
   history.replaceState(null, '', url);
   state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
-  state.selected = null; state.query = ''; state.ack = 'all'; state.highlighted = null;
+  state.selected = null; state.query = ''; state.ack = 'all'; state.toMe = false; state.highlighted = null;
   state.pending = null; state.paused = false; state.hasOlder = false; state.newCount = 0;
+  state.pageBefore = null; state.pageCursors = []; state.loadingHistory = false;
   $('pause-button').setAttribute('aria-pressed', 'false'); $('pause-label').textContent = 'Pause feed'; $('pause-icon').textContent = 'Ⅱ';
   $('search').value = ''; $('ack-filter').value = 'all';
-  $('message-input').value = state.drafts.get(id) || '';
+  const draft = state.drafts.get(id);
+  state.drafts.delete(id);
+  $('message-input').value = draft?.body || '';
+  state.attachments = draft?.attachments || [];
+  renderDraftImages();
   clearReply(); hideMentions(); closePanels();
   $('agent-list').replaceChildren(); $('resource-list').replaceChildren();
   $('available-list').replaceChildren(); $('available-resources').hidden = true;
   $('agent-count').textContent = '0'; $('all-count').textContent = '0';
   $('held-count').textContent = '0'; $('mobile-resource-count').textContent = '0';
   $('waiting-count').textContent = ''; $('bridge-caption').textContent = 'Connecting…';
-  $('load-older').disabled = false;
+  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
   renderMessages(true);
   connect();
 }
@@ -611,6 +771,7 @@ $('project-form').addEventListener('submit', async event => {
 $('all-conversations').addEventListener('click', () => selectAgent(null));
 $('search').addEventListener('input', (event) => { state.query = event.target.value.toLowerCase(); renderMessages(true); });
 $('ack-filter').addEventListener('change', (event) => { state.ack = event.target.value; renderMessages(true); });
+$('to-me-filter').addEventListener('click', () => { state.toMe = !state.toMe; renderMessages(true); });
 $('retry-button').addEventListener('click', connect);
 $('pause-button').addEventListener('click', () => {
   state.paused = !state.paused;
@@ -620,22 +781,10 @@ $('pause-button').addEventListener('click', () => {
   if (!state.paused && state.pending) { applySnapshot(state.pending); state.pending = null; }
   setConnection(state.connected);
 });
-$('new-messages').addEventListener('click', () => { $('feed').scrollTop = $('feed').scrollHeight; state.newCount = 0; $('new-messages').hidden = true; });
-$('load-older').addEventListener('click', async () => {
-  const epoch = state.epoch;
-  const button = $('load-older');
-  button.disabled = true;
-  const feed = $('feed'), oldHeight = feed.scrollHeight, oldTop = feed.scrollTop;
-  const before = Math.min(...[...state.messages.values()].map((message) => message.seq));
-  try {
-    const result = await fetchJSON(`/api/messages?before=${before}&limit=200`);
-    for (const message of result.messages) state.messages.set(message.id, message);
-    state.hasOlder = result.has_more;
-    renderMessages();
-    feed.scrollTop = oldTop + feed.scrollHeight - oldHeight;
-  } catch (error) { if (error.name !== 'AbortError') button.textContent = 'Could not load history · try again'; }
-  finally { if (epoch === state.epoch) button.disabled = false; }
-});
+$('new-messages').addEventListener('click', showLatest);
+$('show-latest').addEventListener('click', showLatest);
+$('load-older').addEventListener('click', () => loadMessagePage());
+$('load-newer').addEventListener('click', () => loadMessagePage(true));
 for (const [id, panel] of [['agents-toggle', 'sidebar'], ['resources-toggle', 'resources']]) {
   $(id).addEventListener('click', () => {
     const open = !document.body.classList.contains(`show-${panel}`);
@@ -671,6 +820,34 @@ $('message-input').addEventListener('keydown', (event) => {
 });
 $('message-input').addEventListener('input', () => { composerStatus(''); showMentions(); });
 $('message-input').addEventListener('click', showMentions);
+$('attach-button').addEventListener('click', () => $('image-input').click());
+$('image-input').addEventListener('change', (event) => {
+  addImages([...event.target.files]);
+  event.target.value = '';
+});
+let imageDragDepth = 0;
+const draggingFiles = (event) => [...(event.dataTransfer?.types || [])].includes('Files');
+$('composer').addEventListener('dragenter', (event) => {
+  if (!draggingFiles(event)) return;
+  event.preventDefault();
+  imageDragDepth += 1;
+  if (!state.sending && !state.busy && state.config) $('composer').classList.add('drag-over');
+});
+$('composer').addEventListener('dragleave', (event) => {
+  if (!draggingFiles(event)) return;
+  imageDragDepth = Math.max(0, imageDragDepth - 1);
+  if (!imageDragDepth) $('composer').classList.remove('drag-over');
+});
+document.addEventListener('dragover', (event) => {
+  if (draggingFiles(event)) event.preventDefault();
+});
+document.addEventListener('drop', (event) => {
+  if (!draggingFiles(event)) return;
+  event.preventDefault();
+  imageDragDepth = 0;
+  $('composer').classList.remove('drag-over');
+  if ($('composer').contains(event.target)) addImages([...event.dataTransfer.files]);
+});
 document.addEventListener('click', (event) => { if (!$('composer').contains(event.target)) hideMentions(); });
 $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -687,7 +864,7 @@ $('composer').addEventListener('submit', async (event) => {
   const broadcast = !parsed.tags.length && !state.reply;
   if (!parsed.tags.length) recipients.push(...(state.reply ? replyRecipients(state.reply) : sessions.map((session) => session.id)));
   const body = draft.slice(parsed.bodyStart).trim();
-  if (!body) { composerStatus('Write a message.', true); return; }
+  if (!body && !state.attachments.length) { composerStatus('Write a message or attach an image.', true); return; }
   if (!recipients.length) { composerStatus('No agents are registered yet.', true); return; }
   if (state.reply && recipients.some((id) => !replyRecipients(state.reply).includes(id))) {
     composerStatus('An @agent differs from this reply. Cancel the reply to start a new conversation.', true);
@@ -701,8 +878,20 @@ $('composer').addEventListener('submit', async (event) => {
   $('message-input').disabled = true;
   composerStatus('Sending…');
   try {
-    await fetchJSON('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token }, body: JSON.stringify({ to, body, ...(state.reply ? { reply_to: state.reply.id } : {}) }) });
+    const message = { to, body, ...(state.reply ? { reply_to: state.reply.id } : {}) };
+    const headers = { 'X-Agent-Chat-CSRF': state.config.csrf_token };
+    let payload;
+    if (state.attachments.length) {
+      payload = new FormData();
+      payload.append('message', JSON.stringify(message));
+      for (const attachment of state.attachments) payload.append('images', attachment.file, attachment.file.name);
+    } else {
+      headers['Content-Type'] = 'application/json';
+      payload = JSON.stringify(message);
+    }
+    await fetchJSON('/api/messages', { method: 'POST', headers, body: payload });
     $('message-input').value = '';
+    clearImages();
     clearReply();
     composerStatus(broadcast ? `Sent to all ${recipients.length} agents` : `Sent to ${recipients.map((id) => agentLabel(id)).join(', ')}`);
     try {

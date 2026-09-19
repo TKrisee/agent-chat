@@ -16,7 +16,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / 'bin' / 'agent-chat'
+# Keep coordinator regression coverage independent of the public HTTP client.
+CLI = [sys.executable, str(ROOT / 'src' / 'agent_chat' / 'core.py')]
 sys.path.insert(0, str(ROOT / 'src'))
 import agent_chat.core
 
@@ -38,7 +39,7 @@ class CoordTests(unittest.TestCase):
         if token is not None:
             env['AGENT_CHAT_TOKEN'] = token
         result = subprocess.run(
-            [str(CLI), *args], cwd=ROOT, env=env, text=True,
+            [*CLI, *args], cwd=ROOT, env=env, text=True,
             capture_output=True, timeout=20,
         )
         if check:
@@ -89,7 +90,7 @@ class CoordTests(unittest.TestCase):
     def launch(self, claim, code):
         env = dict(self.env, AGENT_CHAT_TOKEN=claim['token'])
         process = subprocess.Popen(
-            [str(CLI), 'run', claim['resource'], '--', sys.executable, '-c', code],
+            [*CLI, 'run', claim['resource'], '--', sys.executable, '-c', code],
             env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
         )
@@ -252,11 +253,9 @@ class CoordTests(unittest.TestCase):
 
     def test_run_preserves_stdout_exit_status_and_effective_environment(self):
         claim = self.request()
-        self.env.update(AGENT_CHAT_ROOT=str(ROOT), ITR_COORD_DB='stale-db', ITR_COORD_SESSION='stale-session',
-                        ITR_COORD_TOKEN='stale-token', ITR_COORD_ROOT='stale-root')
+        self.env.update(AGENT_CHAT_ROOT=str(ROOT))
         code = ('import json,os; print(json.dumps({name: os.environ[name] for name in '
-                '("AGENT_CHAT_DB", "AGENT_CHAT_SESSION", "AGENT_CHAT_TOKEN", "AGENT_CHAT_ROOT", '
-                '"ITR_COORD_DB", "ITR_COORD_SESSION", "ITR_COORD_TOKEN", "ITR_COORD_ROOT")})); '
+                '("AGENT_CHAT_DB", "AGENT_CHAT_SESSION", "AGENT_CHAT_TOKEN", "AGENT_CHAT_ROOT")})); '
                 'raise SystemExit(7)')
         result, _ = self.cli('run', 'shared', '--token', claim['token'], '--',
                              sys.executable, '-c', code, check=False)
@@ -266,10 +265,6 @@ class CoordTests(unittest.TestCase):
         self.assertEqual(environment['AGENT_CHAT_TOKEN'], claim['token'])
         self.assertEqual(environment['AGENT_CHAT_DB'], str(self.db.resolve()))
         self.assertEqual(environment['AGENT_CHAT_ROOT'], str(ROOT.resolve()))
-        self.assertEqual(environment['ITR_COORD_DB'], environment['AGENT_CHAT_DB'])
-        self.assertEqual(environment['ITR_COORD_SESSION'], environment['AGENT_CHAT_SESSION'])
-        self.assertEqual(environment['ITR_COORD_TOKEN'], environment['AGENT_CHAT_TOKEN'])
-        self.assertEqual(environment['ITR_COORD_ROOT'], environment['AGENT_CHAT_ROOT'])
         self.release(claim)
 
     def test_live_run_prevents_release_and_signal_closes_child(self):
@@ -355,7 +350,7 @@ class CoordTests(unittest.TestCase):
 
     def test_default_database_uses_the_callers_project_root(self):
         prior = {name: os.environ.pop(name, None) for name in (
-            'AGENT_CHAT_DB', 'ITR_COORD_DB', 'AGENT_CHAT_ROOT', 'ITR_COORD_ROOT',
+            'AGENT_CHAT_DB', 'AGENT_CHAT_ROOT',
         )}
         cwd = Path.cwd()
         try:

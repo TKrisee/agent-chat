@@ -27,7 +27,6 @@ def _project_root() -> pathlib.Path:
     """Resolve the caller's project root, never this installed package."""
     return pathlib.Path(
         os.environ.get("AGENT_CHAT_ROOT")
-        or os.environ.get("ITR_COORD_ROOT")
         or os.getcwd()
     ).expanduser().resolve()
 
@@ -67,8 +66,8 @@ def agent_labels(db):
 class Coordinator:
     def __init__(self, db_path: str | os.PathLike[str] | None = None,
                  session: str | None = None):
-        self.path = pathlib.Path(db_path or os.environ.get("AGENT_CHAT_DB") or os.environ.get("ITR_COORD_DB") or default_db())
-        self.session = session or os.environ.get("AGENT_CHAT_SESSION") or os.environ.get("ITR_COORD_SESSION")
+        self.path = pathlib.Path(db_path or os.environ.get("AGENT_CHAT_DB") or default_db())
+        self.session = session or os.environ.get("AGENT_CHAT_SESSION")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), timeout=10, isolation_level=None)
         self.db.row_factory = sqlite3.Row
@@ -420,11 +419,13 @@ class Coordinator:
                 recipients.append(recipient)
         return recipients
 
-    def send_many(self, targets: list[str], body: str, reply_to: str | None = None) -> list[dict[str, Any]]:
+    def send_many(self, targets: list[str], body: str, reply_to: str | None = None,
+                  attachments: list[str | os.PathLike[str]] | None = None) -> list[dict[str, Any]]:
         """Atomically create one delivery per distinct resolved recipient."""
         sid = self.require_session()
         if not isinstance(targets, list):
             raise CoordError("recipients must be a list")
+        prepared = self._prepare_attachments(attachments)
         with self.tx() as db:
             recipients = self._resolve_targets(db, targets)
             parents: dict[str, sqlite3.Row | None] = {recipient: None for recipient in recipients}
@@ -454,8 +455,15 @@ class Coordinator:
                 parent = parents[recipient]
                 if parent is not None:
                     db.execute("INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)", (message_id, parent["id"]))
+                metadata = []
+                for name, mime, content in prepared:
+                    attachment_id = _id("attachment")
+                    db.execute("INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)",
+                               (attachment_id, message_id, name, mime, len(content), content))
+                    metadata.append({"id": attachment_id, "name": name, "mime": mime,
+                                     "size": len(content), "url": "/api/attachments/" + attachment_id})
                 results.append({"id": message_id, "sender_session": sid, "recipient_session": recipient,
-                                "attachments": [], "reply_to": None if parent is None else parent["id"],
+                                "attachments": metadata, "reply_to": None if parent is None else parent["id"],
                                 "reply_preview": None if parent is None else {"id": parent["id"], "seq": parent["seq"],
                                     "sender_session": parent["sender_session"], "recipient_session": parent["recipient_session"],
                                     "sender_agent": None, "body": parent["body"][:240]}})
@@ -668,12 +676,12 @@ class Coordinator:
 class ValidationGuard:
     """Guard an active reservation and make release wait for normal cleanup."""
     def __init__(self,resource:str="validation-clone", token:str|None=None, db_path: str|None=None, session:str|None=None):
-        if os.environ.get("AGENT_CHAT_SERVER") or os.environ.get("ITR_COORD_SERVER"):
+        if os.environ.get("AGENT_CHAT_SERVER"):
             raise CoordError("ValidationGuard cannot use remote coordination; use agent-chat --server run")
         if db_path is None and os.environ.get('AGENT_CHAT_PROJECT'):
             from .projects import resolve_database
-            db_path = str(resolve_database(os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or default_db(), os.environ['AGENT_CHAT_PROJECT']))
-        self.coord=Coordinator(db_path,session);self.resource=resource;self.token=token or os.environ.get("AGENT_CHAT_TOKEN") or os.environ.get("ITR_COORD_TOKEN","");self.run_id: str|None=None;self.seen:set[str]=set();self.safe_to_close=True
+            db_path = str(resolve_database(os.environ.get('AGENT_CHAT_DB') or default_db(), os.environ['AGENT_CHAT_PROJECT']))
+        self.coord=Coordinator(db_path,session);self.resource=resource;self.token=token or os.environ.get("AGENT_CHAT_TOKEN","");self.run_id: str|None=None;self.seen:set[str]=set();self.safe_to_close=True
     def _emit_inbox(self)->None:
         messages=self.coord.inbox()["messages"]; new=[m for m in messages if m["id"] not in self.seen]
         self.seen.update(m["id"] for m in messages)
@@ -699,7 +707,7 @@ def validation_guard(resource:str="validation-clone") -> ValidationGuard:
 
 
 def _json_ok(value:dict[str,Any])->int: print(json.dumps(value,sort_keys=True));return 0
-def _token(a:argparse.Namespace)->str:return a.token or os.environ.get("AGENT_CHAT_TOKEN") or os.environ.get("ITR_COORD_TOKEN","")
+def _token(a:argparse.Namespace)->str:return a.token or os.environ.get("AGENT_CHAT_TOKEN","")
 
 def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
     command = list(a.command)
@@ -718,10 +726,6 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
             AGENT_CHAT_SESSION=resolved_session,
             AGENT_CHAT_TOKEN=resolved_token,
             AGENT_CHAT_ROOT=resolved_root,
-            ITR_COORD_DB=resolved_db,
-            ITR_COORD_SESSION=resolved_session,
-            ITR_COORD_TOKEN=resolved_token,
-            ITR_COORD_ROOT=resolved_root,
         )
         proc = None
         interrupted = False

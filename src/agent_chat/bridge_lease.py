@@ -1,4 +1,5 @@
-"""One durable remote dispatcher per database; disconnections never transfer it."""
+"""One durable dispatcher per client host and project."""
+import contextlib
 import hashlib
 import secrets
 import threading
@@ -16,10 +17,17 @@ class BridgeManager:
         c = Coordinator(db_path)
         try:
             BridgeState(c)
-            c.db.execute('''CREATE TABLE IF NOT EXISTS bridge_dispatcher (
-                singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                owner TEXT NOT NULL, secret_hash TEXT NOT NULL,
-                host_id TEXT NOT NULL, acquired_at REAL NOT NULL)''')
+            with c.tx():
+                legacy = any(row['name'] == 'singleton' for row in c.db.execute('PRAGMA table_info(bridge_dispatcher)'))
+                if legacy:
+                    c.db.execute('ALTER TABLE bridge_dispatcher RENAME TO bridge_dispatcher_legacy')
+                c.db.execute('''CREATE TABLE IF NOT EXISTS bridge_dispatcher (
+                    host_id TEXT PRIMARY KEY, owner TEXT NOT NULL,
+                    secret_hash TEXT NOT NULL, acquired_at REAL NOT NULL)''')
+                if legacy:
+                    c.db.execute('''INSERT INTO bridge_dispatcher
+                        SELECT host_id,owner,secret_hash,acquired_at FROM bridge_dispatcher_legacy''')
+                    c.db.execute('DROP TABLE bridge_dispatcher_legacy')
             if c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
                 self._hold_lock()
         finally:
@@ -51,31 +59,56 @@ class BridgeManager:
             finally:
                 c.close()
 
+    @contextlib.contextmanager
+    def recovery(self, route):
+        """Pause acquisition while recovering one stopped host's wake job."""
+        if not route:
+            raise CoordError('bind this session before recovering a wake job')
+        with self.mutex:
+            c = Coordinator(self.db_path)
+            try:
+                row = c.db.execute('''SELECT d.host_id FROM bridge_dispatcher d
+                    JOIN remote_session_hosts h ON h.host_id=d.host_id
+                    WHERE h.session_id=?''', (route['route'][0]['session_id'],)).fetchone()
+                if row:
+                    raise CoordError('stop the bridge on this route\'s client machine before recovering its wake job')
+                # Other client hosts may keep dispatching. When none owns the
+                # database, also exclude a legacy direct-database dispatcher.
+                from .bridge import exclusive_bridge
+                with contextlib.nullcontext() if self.lock else exclusive_bridge(self.db_path):
+                    yield
+            finally:
+                c.close()
+
     def _dispatch(self, c, op, body, params):
-        existing = c.db.execute('SELECT * FROM bridge_dispatcher WHERE singleton=1').fetchone()
-        if op == 'reset':
-            if params != {'confirm_stopped': True}:
-                raise CoordError('verify the previous bridge client is stopped before confirming recovery')
-            c.db.execute('DELETE FROM bridge_dispatcher')
-            self.close()
-            return {'released': True}
         owner, secret, host = body.get('owner'), body.get('secret'), body.get('host_id')
         if not all(isinstance(x, str) and x.isascii() and 1 <= len(x) <= 256 for x in (owner, secret, host)) or len(secret) < 32:
             raise CoordError('invalid dispatcher identity')
+        existing = c.db.execute('SELECT * FROM bridge_dispatcher WHERE host_id=?', (host,)).fetchone()
+        if op == 'reset':
+            if params != {'confirm_stopped': True}:
+                raise CoordError('verify the previous bridge client is stopped before confirming recovery')
+            c.db.execute('DELETE FROM bridge_dispatcher WHERE host_id=?', (host,))
+            c.db.execute('DELETE FROM bridge_client_runtime WHERE host_id=?', (host,))
+            if not c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
+                self.close()
+            return {'released': True}
         digest = hashlib.sha256(secret.encode()).hexdigest()
         same = existing and existing['owner'] == owner and existing['host_id'] == host and secrets.compare_digest(existing['secret_hash'], digest)
         if op == 'acquire':
             if existing and not same:
-                raise CoordError('another remote dispatcher owns this database; offline ownership does not expire')
+                raise CoordError('another bridge owns this host in this project; restart it with its saved identity')
             self._hold_lock()
-            c.db.execute('INSERT OR IGNORE INTO bridge_dispatcher VALUES(1,?,?,?,?)',
-                         (owner, digest, host, time.time()))
+            c.db.execute('INSERT OR IGNORE INTO bridge_dispatcher VALUES(?,?,?,?)',
+                         (host, owner, digest, time.time()))
             return {'owner': owner, 'host_id': host, 'acquired': True}
         if not same:
             raise CoordError('dispatcher ownership is absent or has changed; reacquire before dispatch')
         if op == 'release':
-            c.db.execute('DELETE FROM bridge_dispatcher')
-            self.close()
+            c.db.execute('DELETE FROM bridge_dispatcher WHERE host_id=?', (host,))
+            c.db.execute('UPDATE bridge_client_runtime SET pid=0,error=? WHERE host_id=?', ('bridge stopped', host))
+            if not c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
+                self.close()
             return {'released': True}
         state = BridgeState(c)
 
@@ -160,6 +193,6 @@ class BridgeManager:
             error = params.get('error')
             if error is not None and not isinstance(error, str):
                 raise CoordError('invalid heartbeat error')
-            state.heartbeat(params['server'], params['pid'], error)
+            state.heartbeat(params['server'], params['pid'], error, host_id=host)
             return {'heartbeat': True}
         raise CoordError('unsupported bridge operation')

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import subprocess
 import sys
 import threading
 import uuid
@@ -73,12 +74,64 @@ def client_identity(server_url, state_file=None):
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def _project_ids(client):
+    projects = client.call('/api/projects/rpc', {'op': 'list'}).get('projects')
+    if not isinstance(projects, list):
+        raise CoordError('remote project list is invalid')
+    ids = []
+    for project in projects:
+        project_id = project.get('id') if isinstance(project, dict) else None
+        if not isinstance(project_id, str) or not project_id:
+            raise CoordError('remote project list is invalid')
+        ids.append(project_id)
+    return ids
+
+
+def _identity_key(server_url, project):
+    return server_url.rstrip('/') + ('#project=' + project if project != 'default' else '')
+
+
+def _stop_codex(process):
+    if process is None or process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=5)
+        except ProcessLookupError:
+            return
+
+
+def _codex_environment(args, api_token):
+    environment = os.environ.copy()
+    environment['AGENT_CHAT_SERVER'] = args.server
+    environment['AGENT_CHAT_API_TOKEN'] = api_token
+    if args.project:
+        environment['AGENT_CHAT_PROJECT'] = args.project
+    else:
+        environment.pop('AGENT_CHAT_PROJECT', None)
+    for name in ('AGENT_CHAT_SESSION', 'AGENT_CHAT_TOKEN'):
+        environment.pop(name, None)
+    return environment
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, prog='agent-chat-bridge-client')
+    parser = argparse.ArgumentParser(description=__doc__, prog='agent-chat-client bridge')
     parser.add_argument('--server', default=os.environ.get('AGENT_CHAT_SERVER'))
     parser.add_argument('--api-token', '--token', dest='api_token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
-    parser.add_argument('--codex-server', default='ws://127.0.0.1:4500')
-    parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT', 'default'))
+    parser.add_argument('--codex-server', default=os.environ.get('AGENT_CHAT_CODEX_SERVER', 'ws://127.0.0.1:4500'))
+    parser.add_argument('--codex-bin', default='codex')
+    parser.add_argument('--connect-only', action='store_true', help='attach to an existing local Codex app-server')
+    parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT'))
     parser.add_argument('--state-file', help='private persistent worker identity; do not share between machines')
     parser.add_argument('--interval', type=float, default=2)
     parser.add_argument('--once', action='store_true')
@@ -91,66 +144,131 @@ def main(argv=None):
         parser.error('--interval must be finite and at least 0.2 seconds')
     if args.recover != args.confirm_stopped:
         parser.error('--recover requires --confirm-stopped, and vice versa')
-    previous, stop = {}, threading.Event()
-    rpc = None
+    if args.state_file and not args.project and not args.recover:
+        parser.error('--state-file requires --project when bridging all projects')
+    previous, stop, stack = {}, threading.Event(), contextlib.ExitStack()
+    rpc, codex = None, None
+    records = {}
     try:
-        client = HttpClient(args.server, args.api_token, project=args.project)
-        with client_identity(args.server.rstrip('/') + ('#project=' + args.project if args.project != 'default' else ''), args.state_file) as identity:
+        registry = HttpClient(args.server, args.api_token, project='default')
+        if not isinstance(registry.token, str) or not registry.token.strip():
+            raise CoordError('an API token is required to run the bridge client')
+        if args.recover:
+            project = args.project or 'default'
+            client = HttpClient(args.server, args.api_token, project=project)
+            with client_identity(_identity_key(args.server, project), args.state_file) as identity:
+                RemoteBridgeState(client, args.server.rstrip('/'), identity).call('reset', confirm_stopped=True)
+            print(json.dumps({'dispatcher': 'released', 'project': project}))
+            return 0
+        rpc = RpcClient(args.codex_server)
+        if not args.connect_only:
+            codex = subprocess.Popen(
+                [args.codex_bin, 'app-server', '--listen', args.codex_server],
+                cwd=os.getcwd(), env=_codex_environment(args, registry.token), stdout=sys.stderr, stderr=sys.stderr)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, lambda *_: stop.set())
+        command = 'codex --remote ' + args.codex_server
+        print(json.dumps({'bridge': 'starting', 'server': args.server, 'codex': args.codex_server,
+                          'connect': 'Connect Codex with ' + command}), flush=True)
+
+        def add_project(project):
+            if project in records:
+                return
+            client = HttpClient(args.server, args.api_token, project=project)
+            identity = stack.enter_context(client_identity(_identity_key(args.server, project), args.state_file))
             state = RemoteBridgeState(client, args.server.rstrip('/'), identity)
-            if args.recover:
-                state.call('reset', confirm_stopped=True)
-                print(json.dumps({'dispatcher': 'released'}))
-                return 0
-            rpc = RpcClient(args.codex_server)
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                previous[sig] = signal.signal(sig, lambda *_: stop.set())
-            bridge = Bridge(state, rpc)
-            connected, acquired, last_error = False, False, None
-            print(json.dumps({'bridge': 'started', 'server': args.server, 'codex': args.codex_server}), flush=True)
+            records[project] = {'state': state, 'bridge': Bridge(state, rpc), 'acquired': False,
+                                'last_error': None, 'ready': False}
+
+        while not stop.is_set():
+            if codex is not None and codex.poll() is not None:
+                raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
             try:
-                while not stop.is_set():
-                    try:
-                        # Reacquiring the same durable identity is idempotent and
-                        # verifies the server still recognizes this dispatcher.
-                        state.call('acquire')
-                        acquired = True
-                        if not connected:
-                            rpc.connect()
-                            connected = True
-                        bridge.tick()
-                        state.heartbeat(args.codex_server, os.getpid())
-                        last_error = None
-                    except (CoordError, RpcError, TransportError, OSError, ValueError, KeyError, TypeError) as error:
-                        rpc.close()
-                        connected = False
-                        if str(error) != last_error:
-                            print(json.dumps({'bridge': 'waiting', 'error': str(error)}), file=sys.stderr, flush=True)
-                        last_error = str(error)
-                        if acquired:
-                            try:
-                                state.heartbeat(args.codex_server, os.getpid(), last_error)
-                            except (CoordError, OSError, ValueError):
-                                pass  # keep original outage visible; never crash while reporting it
-                    if args.once:
-                        return 2 if last_error else 0
-                    stop.wait(args.interval)
-            finally:
-                rpc.close()
-                if acquired:
-                    try:
-                        state.heartbeat(args.codex_server, 0, 'bridge stopped')
-                        state.call('release')
-                    except (CoordError, OSError, ValueError) as error:
-                        print(json.dumps({'bridge': 'lease_retained', 'error': str(error),
-                                          'action': 'Restart with the same identity to reconcile; no automatic takeover.'}), file=sys.stderr)
+                projects = [args.project] if args.project else _project_ids(registry)
+            except (CoordError, OSError, ValueError, KeyError, TypeError) as error:
+                print(json.dumps({'bridge': 'waiting', 'error': str(error)}), file=sys.stderr, flush=True)
+                if args.once:
+                    return 2
+                stop.wait(args.interval)
+                continue
+            for project in projects:
+                try:
+                    add_project(project)
+                except (CoordError, OSError, ValueError) as error:
+                    print(json.dumps({'bridge': 'waiting', 'project': project, 'error': str(error)}),
+                          file=sys.stderr, flush=True)
+            any_error = False
+            for project in projects:
+                if stop.is_set():
+                    break
+                if codex is not None and codex.poll() is not None:
+                    raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
+                record = records.get(project)
+                if record is None:
+                    any_error = True
+                    continue
+                state = record['state']
+                try:
+                    # Reacquiring the same identity is idempotent and confirms
+                    # that a recovered server still recognizes this dispatcher.
+                    state.call('acquire')
+                    record['acquired'] = True
+                    rpc.connect()
+                    record['bridge'].tick()
+                    state.heartbeat(args.codex_server, os.getpid())
+                    if codex is not None and codex.poll() is not None:
+                        raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
+                    if not record['ready']:
+                        print(json.dumps({'bridge': 'ready', 'project': project,
+                                          'server': args.server, 'codex': args.codex_server}), flush=True)
+                    record['ready'] = True
+                    record['last_error'] = None
+                except (CoordError, RpcError, TransportError, OSError, ValueError, KeyError, TypeError) as error:
+                    rpc.close()
+                    any_error = True
+                    record['ready'] = False
+                    text = str(error)
+                    if text != record['last_error']:
+                        print(json.dumps({'bridge': 'waiting', 'project': project, 'error': text}),
+                              file=sys.stderr, flush=True)
+                    record['last_error'] = text
+                    if record['acquired']:
+                        try:
+                            state.heartbeat(args.codex_server, os.getpid(), text)
+                        except (CoordError, OSError, ValueError):
+                            pass
+            if args.once:
+                return 2 if any_error else 0
+            stop.wait(args.interval)
     except (CoordError, OSError, ValueError) as error:
         print(json.dumps({'error': str(error)}), file=sys.stderr)
         return 2
     finally:
-        if rpc:
-            rpc.close()
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        try:
+            if rpc:
+                rpc.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            for project, record in records.items():
+                if record['acquired']:
+                    try:
+                        record['state'].heartbeat(args.codex_server, 0, 'bridge stopped')
+                        record['state'].call('release')
+                    except (CoordError, OSError, ValueError) as error:
+                        print(json.dumps({'bridge': 'lease_retained', 'project': project, 'error': str(error),
+                                          'action': 'Restart with the same identity to reconcile; no automatic takeover.'}), file=sys.stderr)
+        finally:
+            try:
+                stack.close()
+            except Exception as error:
+                print(json.dumps({'bridge': 'identity_cleanup_failed', 'error': str(error)}), file=sys.stderr)
+            finally:
+                try:
+                    _stop_codex(codex)
+                finally:
+                    for sig, handler in previous.items():
+                        signal.signal(sig, handler)
     return 0
 
 

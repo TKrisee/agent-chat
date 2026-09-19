@@ -1,21 +1,14 @@
 """Wake loaded, idle Codex threads for operator messages, without model polling."""
 from __future__ import annotations
 
-import argparse
 import contextlib
 import fcntl
 import json
-import math
-import os
-import signal
 import sqlite3
-import sys
-import threading
 from pathlib import Path
 
-from .core import CoordError, Coordinator
-from .bridge_state import BridgeState
-from .rpc import RpcClient, RpcError, TransportError
+from .core import CoordError
+from .rpc import RpcError, TransportError
 
 
 @contextlib.contextmanager
@@ -67,8 +60,10 @@ class Bridge:
         cursor = None
         # Positive evidence is sufficient. Absence is never treated as proof
         # that a lost request failed, even beyond this bounded history window.
+        # Summaries retain user-message client IDs without full tool outputs,
+        # which can exceed the WebSocket limit even for a short conversation.
         for _ in range(4):
-            params = {'threadId': job['thread_id'], 'limit': 25, 'itemsView': 'full', 'sortDirection': 'desc'}
+            params = {'threadId': job['thread_id'], 'limit': 25, 'itemsView': 'summary', 'sortDirection': 'desc'}
             if cursor:
                 params['cursor'] = cursor
             page = self.rpc.request('thread/turns/list', params)
@@ -158,9 +153,9 @@ class Bridge:
         return (
             'New user messages are waiting in agent-chat. Read your own coordination inbox now, '
             'explicitly acknowledge each message you consume, and carry out the user instructions within your authorized scope. '
-            'Reply through agent-chat send with --reply-to using your own inbox message ID. '
+            'Reply through agent-chat-client send with --reply-to using your own inbox message ID. '
             'A notification or acknowledgement grants no resource ownership; retain reservation/token/closure rules. '
-            'Use your own registered session with agent-chat --session YOUR_SESSION inbox, selecting --server SERVER --project PROJECT for hosted chat or --db DATABASE for local chat from the metadata below. Preserve your API token in your configured environment; never put it in chat. '
+            'Use your own registered session with agent-chat-client --session YOUR_SESSION inbox. Use your configured AGENT_CHAT_SERVER and the project from the metadata below. Preserve your API token in your configured environment; never put it in chat. '
             'For descendant routes, first verify the path is your existing child, then wake/resume that EXISTING subagent through your native subagent follow-up tool '
             'and pass its message IDs and this protocol. Forward along the listed parent chain when nested. '
             'Do not impersonate a child, read/ack its inbox as it, share tokens, or create a duplicate worker. '
@@ -176,10 +171,16 @@ class Bridge:
             if thread_id:
                 try: self.state.observe(thread_id, 'error', str(error))
                 except (CoordError, sqlite3.Error): pass
+            if isinstance(error, TransportError):
+                # A rejected frame may leave unread payload on the socket.
+                # Reconnect for independent jobs, never replay the failed RPC.
+                # If Codex is unavailable, let reconnect fail into poll backoff.
+                self.rpc.close()
+                self.rpc.connect()
         jobs = self.state.jobs()
         for job in jobs:
             try: self.advance(job)
-            except (CoordError, sqlite3.Error) as error: record(error, job['thread_id'])
+            except (CoordError, sqlite3.Error, TransportError) as error: record(error, job['thread_id'])
         blocked = {job['thread_id'] for job in self.state.jobs()}
         groups = {}
         for message in self.state.pending():
@@ -202,74 +203,7 @@ class Bridge:
             except RpcError as error:
                 self.state.observe(thread_id, 'error', str(error))
                 continue  # e.g. binding not yet resumed on this server
-            except (CoordError, sqlite3.Error) as error: record(error, thread_id)
-        # Reconnect/report the error after giving independent conversations a
+            except (CoordError, sqlite3.Error, TransportError) as error: record(error, thread_id)
+        # Report the error after giving independent conversations a
         # chance to dispatch. Never clear or retry ambiguous durable intentions.
         if errors: raise errors[0]
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--db')
-    parser.add_argument('--server', default='ws://127.0.0.1:4500')
-    parser.add_argument('--interval', type=float, default=2)
-    parser.add_argument('--once', action='store_true', help='run one dispatch pass and exit')
-    parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT'))
-    args = parser.parse_args(argv)
-    if not math.isfinite(args.interval) or args.interval < .2:
-        parser.error('--interval must be a finite number at least 0.2 seconds')
-    coord, rpc, state = None, None, None
-    stop = threading.Event()
-    previous = {}
-    try:
-        if args.project:
-            from .projects import resolve_database
-            from .core import default_db
-            args.db = str(resolve_database(args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or default_db(), args.project))
-        coord = Coordinator(args.db)
-        with exclusive_bridge(coord.path):
-            state = BridgeState(coord)
-            state.operator()
-            # Endpoint validation happens even when there are no pending messages.
-            rpc = RpcClient(args.server)
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                previous[sig] = signal.signal(sig, lambda *_: stop.set())
-            print(json.dumps({'bridge': 'started', 'db': str(coord.path.resolve()), 'server': args.server}), flush=True)
-            connected, last_error = False, None
-            while not stop.is_set():
-                try:
-                    if not connected:
-                        rpc.connect()
-                        connected = True
-                    Bridge(state, rpc).tick()
-                    state.heartbeat(args.server, os.getpid())
-                    if last_error:
-                        print(json.dumps({'bridge': 'connected'}), flush=True)
-                    last_error = None
-                except (TransportError, RpcError, OSError, CoordError, ValueError, KeyError, TypeError) as error:
-                    rpc.close()
-                    connected = False
-                    state.heartbeat(args.server, os.getpid(), str(error))
-                    if str(error) != last_error:
-                        print(json.dumps({'bridge': 'waiting', 'error': str(error)}), file=sys.stderr, flush=True)
-                    last_error = str(error)
-                if args.once:
-                    return 2 if last_error else 0
-                stop.wait(args.interval)
-    except (CoordError, TransportError, OSError, ValueError, sqlite3.Error) as error:
-        print(json.dumps({'error': str(error)}), file=sys.stderr)
-        return 2
-    finally:
-        if rpc:
-            rpc.close()
-        if state:
-            state.heartbeat(args.server, 0, 'bridge stopped')
-        if coord:
-            coord.close()
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
-    return 0
-
-
-if __name__ == '__main__':
-    sys.exit(main())

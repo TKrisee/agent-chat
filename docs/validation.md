@@ -1,3 +1,131 @@
+# Bounded message history and image uploads — 2026-09-19
+
+The UI keeps 50 messages per page and receives 50-message snapshots. Older and
+newer navigation replaces the page rather than accumulating messages; a
+separate latest window remains bounded while reading history. Only one fetched
+reply original is retained, and evicted expansion state is discarded. Unchanged
+message snapshots keep their DOM, and long collapsed messages render only the
+first 2,000 characters until explicitly expanded. Stored messages remain intact. Search
+and filters apply to the loaded page.
+
+The composer accepts image drops and an accessible Attach button, with local
+object-URL previews, removal, per-project drafts and retry preservation. It
+sends multipart uploads only on Send, supporting optional captions, replies
+and atomic delivery to multiple recipients. PNG/JPEG/GIF/WebP validation, four
+images per message, 10 MiB per image, a bounded request body, authentication,
+CSRF and project isolation are enforced server-side. Temporary files are
+cleaned up; image bytes persist in SQLite. Drafts are not persisted across reload.
+
+Validation: 62 relevant Python tests passed (web/core/attachments/replies/
+projects/remote HTTP), plus the full browser integration suite. New browser
+checks cover a 500+ message backlog, 50-message history navigation, live bursts,
+bounded reply lookups, on-demand rendering of a 1,000-row Markdown table,
+reconnect recovery, image drops and chooser selection, previews/removal,
+client limits, image-only sends, retries, project isolation, replies and grouped
+image delivery. Desktop and 320 px mobile screenshots were inspected. Tests
+used isolated databases and services; live conversations were untouched.
+All 19 web tests passed again after the final duplicate-metadata validation fix.
+Artifacts are under `.agent-chat/validation/bounded-ui/` and
+`.agent-chat/validation/image-drop/`.
+
+Restart the chat server and reload the browser to load the backend upload and
+snapshot changes. Existing Codex clients do not need a restart for these UI
+changes.
+
+## Earlier validation
+
+# Messages directed at the operator — 2026-09-19
+
+Added a keyboard-accessible **To me** toggle beside search. It matches the
+current project's operator session ID against message deliveries and combines
+with agent, search and acknowledgement filters. Live incoming messages remain
+visible; outgoing and agent-to-agent messages are excluded. Opening a quoted
+original or changing projects clears the filter. Mobile controls wrap below
+search without horizontal overflow.
+
+The browser integration suite passed, including new checks for incoming versus
+outgoing messages, live replies, combined filters, original-message navigation,
+project reset and distinct project operator identities. Desktop and mobile
+screenshots were inspected; 390 px and 320 px widths passed overflow checks.
+JavaScript syntax and diff whitespace checks passed. The suite uses a temporary
+server/database and does not touch live conversations. Screenshots and the
+successful run log are under `.agent-chat/validation/to-me-ui/`.
+
+## Earlier validation
+
+# WebSocket history recovery — 2026-09-19
+
+History reconciliation now requests turn summaries, retaining user-message
+client IDs while excluding full tool outputs. A read-only check against the
+affected local conversation found the exact delivery marker in a 14,391-byte
+serialized response; its full-history response had exceeded the 16 MiB
+WebSocket limit at 22.44 MiB. The existing 100-turn search bound and conservative
+handling of missing markers remain intact.
+
+A per-job transport failure now closes and reconnects the WebSocket before
+independent persisted jobs or new wakes proceed. Failed requests are never
+replayed; ambiguous enqueue/start outcomes remain subject to reconciliation.
+A failed reconnect exits the pass for normal polling backoff.
+
+All 64 focused bridge, WebSocket, remote-state and client tests passed in
+10.3 seconds. New regressions cover paginated summary matching, missing markers,
+oversized real socket frames followed by fresh connections, independent wake
+progress, lost enqueue responses and failed reconnects. Validation used isolated
+test services plus the read-only live history check; no real model turn was
+started. Existing running clients must restart to load this code. They were
+not restarted during validation because the default client owns its local
+Codex app-server.
+
+## Earlier validation
+
+# Bridge readiness reporting — 2026-09-19
+
+The client reports `starting` before connections are established and `ready`
+for each project after the dispatcher, Codex connection, dispatch pass and
+heartbeat succeed. A failed pass clears readiness, so recovery is announced
+without logging every healthy poll. Existing automatic retries remain intact.
+
+All 29 focused bridge/client tests passed, including a refused first connection
+followed by successful retry and exactly one readiness announcement. The checks
+used simulated Codex services and started no real model turns.
+
+## Earlier validation
+
+# Client startup flags — 2026-09-19
+
+The default client launcher now forwards bridge flags without requiring the
+`bridge` subcommand. Both `--token VALUE` and `--token=VALUE` authenticate bridge
+startup; `--api-token` and `--connect-only` remain supported. Resource commands
+retain their separate reservation-token meaning for `--token`.
+
+All 24 focused bridge, client and guarded-run tests passed. The executable help
+smoke also accepts `--token=example --help` without requiring an agent operation.
+Tests used isolated services and simulated Codex processes; no real model turn
+or persistent bridge was started.
+
+## Earlier validation
+
+# Standalone configuration — 2026-09-19
+
+Version 0.4.0. All 142 Python tests passed in 57.5 seconds after the configuration
+cleanup. The suite includes HTTP authentication, resource/process supervision,
+project isolation, host routing, bridge lifecycle and executable startup.
+
+The checkout server launcher defaults to its own `.agent-chat/` directory even
+when started from another working directory with stale database environment
+settings. An explicit `--db` still overrides the location; both cases passed
+real subprocess startup/shutdown tests. Database symlinks use the canonical
+token sidecar. Client configuration uses only the documented `AGENT_CHAT_*`
+variables and flags.
+
+Source, documentation and test fixtures contain no consumer-project names,
+machine-specific paths or project-specific environment aliases. Per-project
+connection instructions belong in the consuming workspace. Historical migration
+archives are stored outside the app checkout. Existing live data and credentials
+were preserved. No real model turn was started by these checks.
+
+## Earlier validation
+
 # Projects and wake fixes — 2026-09-19
 
 Version 0.3.0, macOS, Python 3.14.7, headless Chrome, Codex 0.154.0.

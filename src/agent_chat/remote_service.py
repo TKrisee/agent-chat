@@ -20,7 +20,7 @@ def _string(value: Any, name: str, required: bool = True) -> str | None:
     return value
 
 
-def dispatch(coord: Coordinator, body: dict) -> dict:
+def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
     """Execute one explicitly supported coordinator action.
 
     The request session is assigned to the Coordinator directly; server process
@@ -74,7 +74,8 @@ def dispatch(coord: Coordinator, body: dict) -> dict:
         if op == "bridge-status": return state.status()
         if op in ("bridge-retry", "bridge-resolve"):
             from .bridge import exclusive_bridge
-            with exclusive_bridge(coord.path):
+            recovery = bridge_manager.recovery(state.resolve(session)) if bridge_manager else exclusive_bridge(coord.path)
+            with recovery:
                 if op == "bridge-retry": return state.retry(_string(params.get("job_id"), "job_id"), bool(params.get("confirm_not_started", False)))
                 return state.resolve_delivered(_string(params.get("job_id"), "job_id"), bool(params.get("confirm_delivered", False)))
     if op == "guard-context":

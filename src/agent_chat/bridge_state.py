@@ -11,6 +11,26 @@ from .core import CoordError, Coordinator
 TERMINAL = ('dispatched', 'cancelled')
 
 
+def runtime_snapshot(db, now=None):
+    """Read bridge health without creating tables (also used by the web UI)."""
+    now = time.time() if now is None else now
+    def recent(row):
+        item = dict(row)
+        item['recent'] = item['pid'] != 0 and now - item['heartbeat'] < 30
+        return item
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_client_runtime'").fetchone():
+        clients = [recent(row) for row in db.execute('SELECT * FROM bridge_client_runtime ORDER BY host_id')]
+        if clients:
+            healthy = [item for item in clients if item['recent'] and not item['error']]
+            latest = max(healthy or clients, key=lambda item: item['heartbeat'])
+            return dict(latest, recent=any(item['recent'] for item in clients), clients=clients)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_runtime'").fetchone():
+        row = db.execute('SELECT * FROM bridge_runtime WHERE singleton=1').fetchone()
+        if row:
+            return recent(row)
+    return None
+
+
 class BridgeState:
     def __init__(self, coord: Coordinator):
         self.coord = coord
@@ -28,6 +48,9 @@ class BridgeState:
             CREATE TABLE IF NOT EXISTS bridge_runtime (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
                 server TEXT NOT NULL, pid INTEGER NOT NULL,
+                heartbeat REAL NOT NULL, error TEXT);
+            CREATE TABLE IF NOT EXISTS bridge_client_runtime (
+                host_id TEXT PRIMARY KEY, server TEXT NOT NULL, pid INTEGER NOT NULL,
                 heartbeat REAL NOT NULL, error TEXT);
             CREATE TABLE IF NOT EXISTS bridge_observations (
                 thread_id TEXT PRIMARY KEY, state TEXT NOT NULL,
@@ -101,7 +124,7 @@ class BridgeState:
         try:
             value = json.loads(sidecar.read_text())['id']
         except (OSError, ValueError, KeyError, TypeError):
-            raise CoordError('start agent-chat-web for this database first (operator identity is missing)')
+            raise CoordError('start agent-chat-server for this database first (operator identity is missing)')
         if not isinstance(value, str) or not self.db.execute('SELECT 1 FROM sessions WHERE id=?', (value,)).fetchone():
             raise CoordError('web operator identity is not registered in this database')
         return value
@@ -166,8 +189,12 @@ class BridgeState:
             self.db.execute("UPDATE bridge_jobs SET status='prepared',queue_id=NULL,error=NULL,updated_at=? WHERE id=?", (time.time(), job_id))
         return self.job(job_id)
 
-    def heartbeat(self, server, pid, error=None):
-        self.db.execute('INSERT OR REPLACE INTO bridge_runtime VALUES(1,?,?,?,?)', (server, pid, time.time(), error))
+    def heartbeat(self, server, pid, error=None, *, host_id=None):
+        if host_id is None:
+            self.db.execute('INSERT OR REPLACE INTO bridge_runtime VALUES(1,?,?,?,?)', (server, pid, time.time(), error))
+        else:
+            self.db.execute('INSERT OR REPLACE INTO bridge_client_runtime VALUES(?,?,?,?,?)',
+                            (host_id, server, pid, time.time(), error))
 
     def observe(self, thread_id, state, error=None):
         self.db.execute('INSERT OR REPLACE INTO bridge_observations VALUES(?,?,?,?)',
@@ -187,11 +214,7 @@ class BridgeState:
         return self.job(job_id)
 
     def status(self):
-        runtime = self.db.execute('SELECT * FROM bridge_runtime WHERE singleton=1').fetchone()
-        runtime = dict(runtime) if runtime else None
-        if runtime:
-            runtime['recent'] = runtime['pid'] != 0 and time.time() - runtime['heartbeat'] < 30
-        return {'runtime': runtime,
+        return {'runtime': runtime_snapshot(self.db),
                 'bindings': [dict(r) for r in self.db.execute('SELECT * FROM bridge_bindings ORDER BY updated_at')],
                 'threads': [dict(r) for r in self.db.execute('SELECT * FROM bridge_observations ORDER BY checked_at DESC')],
                 'jobs': [dict(r) for r in self.db.execute('SELECT id,thread_id,status,queue_id,error,created_at,updated_at FROM bridge_jobs ORDER BY created_at DESC LIMIT 100')]}

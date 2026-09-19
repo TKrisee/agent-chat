@@ -31,11 +31,10 @@ def client_host_id() -> str:
 
     Tests and ephemeral runners should set AGENT_CHAT_HOST_ID explicitly.
     """
-    explicit = os.environ.get("AGENT_CHAT_HOST_ID") or os.environ.get("ITR_COORD_HOST_ID")
+    explicit = os.environ.get("AGENT_CHAT_HOST_ID")
     if explicit:
         return explicit
-    root = Path(os.environ.get("AGENT_CHAT_STATE_DIR") or os.environ.get("ITR_COORD_STATE_DIR")
-                or (Path.home() / ".local" / "state" / "agent-chat"))
+    root = Path(os.environ.get("AGENT_CHAT_STATE_DIR") or (Path.home() / ".local" / "state" / "agent-chat"))
     path = root / "client-host.json"
     root.mkdir(parents=True, exist_ok=True)
     # A lock plus fsync/replace prevents a concurrent client from reading a
@@ -86,7 +85,7 @@ class HttpClient:
         if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0 or timeout > 120:
             raise RemoteCoordError("timeout must be between 0 and 120 seconds")
         self.server_url = server_url.rstrip("/")
-        self.token = api_token if api_token is not None else (os.environ.get("AGENT_CHAT_API_TOKEN") or os.environ.get("ITR_COORD_API_TOKEN"))
+        self.token = api_token if api_token is not None else os.environ.get("AGENT_CHAT_API_TOKEN")
         self.timeout = float(timeout)
         self.project = project or os.environ.get("AGENT_CHAT_PROJECT") or "default"
         self._opener = urllib.request.build_opener(_NoRedirect)
@@ -126,6 +125,6 @@ class HttpClient:
             raise RemoteCoordError("remote coordinator returned invalid JSON") from error
         if not isinstance(result, dict):
             raise RemoteCoordError("remote coordinator returned an invalid response")
-        if "error" in result:
-            raise RemoteCoordError(str(result["error"]))
+        # HTTP errors are handled above. Successful wake-job responses also
+        # contain an "error" field (including recovery/audit information).
         return result

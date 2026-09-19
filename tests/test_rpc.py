@@ -50,7 +50,7 @@ def _send(sock, opcode, payload, fin=True, split=False):
 
 
 class FakeServer:
-    def __init__(self, handler):
+    def __init__(self, handler, connections=1):
         self.listener = socket.socket()
         try:
             self.listener.bind(("127.0.0.1", 0))
@@ -62,20 +62,21 @@ class FakeServer:
         self.listener.listen(1)
         self.endpoint = "ws://127.0.0.1:%d" % self.listener.getsockname()[1]
         self.failure = None
-        self.thread = threading.Thread(target=self._run, args=(handler,), daemon=True)
+        self.thread = threading.Thread(target=self._run, args=(handler, connections), daemon=True)
         self.thread.start()
 
-    def _run(self, handler):
+    def _run(self, handler, connections):
         try:
-            sock, _ = self.listener.accept()
-            request = bytearray()
-            while b"\r\n\r\n" not in request:
-                request.extend(sock.recv(1))
-            key = next(line.split(":", 1)[1].strip() for line in request.decode().split("\r\n") if line.lower().startswith("sec-websocket-key:"))
-            accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
-            sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % accept).encode())
-            handler(sock)
-            sock.close()
+            for _ in range(connections):
+                sock, _ = self.listener.accept()
+                with sock:
+                    request = bytearray()
+                    while b"\r\n\r\n" not in request:
+                        request.extend(sock.recv(1))
+                    key = next(line.split(":", 1)[1].strip() for line in request.decode().split("\r\n") if line.lower().startswith("sec-websocket-key:"))
+                    accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+                    sock.sendall(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n" % accept).encode())
+                    handler(sock)
         except Exception as exc:  # reported by join
             self.failure = exc
         finally:

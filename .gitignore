@@ -1,6 +1,5 @@
 # Local chat data: SQLite, attachments, operator identity, logs and backups.
 .agent-chat/
-.itr-coord/
 .venv/
 __pycache__/
 *.py[cod]
@@ -15,3 +14,4 @@ node_modules/
 *.web-session.json
 *.bridge.lock
 *.sqlite3-journal
+*.api-token

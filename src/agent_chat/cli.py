@@ -1,4 +1,4 @@
-"""Command dispatcher; legacy coordination commands retain their exact semantics."""
+"""HTTP client commands and the local Codex wake bridge."""
 import argparse
 import base64
 import hashlib
@@ -13,87 +13,39 @@ import sys
 
 from . import core
 
-BRIDGE_COMMANDS = ('bind', 'unbind', 'bridge-status', 'bridge-retry', 'bridge-resolve')
-
-
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
-    # Remote mode is intentionally selected before local dispatch.  A remote
-    # command never constructs Coordinator, so a typo/outage cannot make a new
-    # local SQLite database and split a team's coordination state.
     globals_parser = argparse.ArgumentParser(add_help=False)
-    globals_parser.add_argument('--db')
     globals_parser.add_argument('--session')
-    globals_parser.add_argument('--server')
-    globals_parser.add_argument('--api-token')
-    globals_parser.add_argument('--project')
+    globals_parser.add_argument('--server', default=os.environ.get('AGENT_CHAT_SERVER') or 'http://127.0.0.1:8765')
+    globals_parser.add_argument('--api-token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
+    globals_parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT'))
     global_raw = raw[:raw.index('--')] if '--' in raw else raw
-    global_args, remainder = globals_parser.parse_known_args(global_raw)
+    args, remainder = globals_parser.parse_known_args(global_raw)
     if '--' in raw:
         remainder += raw[raw.index('--'):]
-    server = global_args.server or os.environ.get('AGENT_CHAT_SERVER') or os.environ.get('ITR_COORD_SERVER')
-    selected_project = global_args.project or os.environ.get('AGENT_CHAT_PROJECT')
-    if remainder and remainder[0] == 'project':
-        return _project_main(remainder[1:], global_args, server)
-    global_args.project = selected_project
-    if server:
-        if global_args.db:
-            raise core.CoordError('--db and --server are mutually exclusive')
-        return _remote_main(remainder, global_args, server)
-    if selected_project:
-        from .projects import resolve_database
-        base = global_args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or core.default_db()
-        raw = ['--db', str(resolve_database(base, selected_project))]
-        if global_args.session: raw += ['--session', global_args.session]
-        raw += remainder
-    # Find the command after known global options, never words in a body/path.
-    pos = 0
-    while pos < len(raw) and (raw[pos] in ('--db', '--session') or raw[pos].startswith(('--db=', '--session='))):
-        pos += 1 if '=' in raw[pos] else 2
-    if pos >= len(raw) or raw[pos] not in BRIDGE_COMMANDS:
-        if raw in (['--help'], ['-h']):
-            print('Wake bridge commands: bind, unbind, bridge-status, bridge-retry, bridge-resolve\n')
-        return core.main(raw)
-    parser = argparse.ArgumentParser(prog='agent-chat')
-    parser.add_argument('--db')
-    parser.add_argument('--session')
-    sub = parser.add_subparsers(dest='op', required=True)
-    bind = sub.add_parser('bind', help='opt this coordination session into Codex wake-ups')
-    group = bind.add_mutually_exclusive_group(required=True)
-    group.add_argument('--thread')
-    group.add_argument('--parent-session')
-    bind.add_argument('--agent-path')
-    sub.add_parser('unbind')
-    sub.add_parser('bridge-status')
-    retry = sub.add_parser('bridge-retry')
-    retry.add_argument('job_id')
-    retry.add_argument('--confirm-not-started', action='store_true')
-    resolve = sub.add_parser('bridge-resolve')
-    resolve.add_argument('job_id')
-    resolve.add_argument('--confirm-delivered', action='store_true')
-    args = parser.parse_args(raw)
-    from .bridge_state import BridgeState
-    coord = core.Coordinator(args.db, args.session)
-    try:
-        state = BridgeState(coord)
-        if args.op == 'bind':
-            result = state.bind(args.thread, args.parent_session, args.agent_path)
-        elif args.op == 'unbind':
-            result = state.unbind()
-        elif args.op == 'bridge-retry':
-            from .bridge import exclusive_bridge
-            with exclusive_bridge(coord.path):
-                result = state.retry(args.job_id, args.confirm_not_started)
-        elif args.op == 'bridge-resolve':
-            from .bridge import exclusive_bridge
-            with exclusive_bridge(coord.path):
-                result = state.resolve_delivered(args.job_id, args.confirm_delivered)
-        else:
-            result = state.status()
-        print(json.dumps(result, sort_keys=True))
-        return 0
-    finally:
-        coord.close()
+    # Every public client command uses HTTP. No local database fallback.
+    # Flags without a command belong to the default bridge launcher. Keep
+    # command-specific flags (including reservation --token) with their command.
+    default_bridge = not remainder or (remainder[0].startswith('-') and remainder[0] not in ('-h', '--help'))
+    if default_bridge or remainder[0] == 'bridge':
+        from .bridge_client import main as bridge_main
+        bridge_args = ['--server', args.server]
+        if args.api_token is not None:
+            bridge_args += ['--api-token', args.api_token]
+        if args.project is not None:
+            bridge_args += ['--project', args.project]
+        if args.session is not None:
+            raise core.CoordError('--session applies to agent commands, not the bridge')
+        return bridge_main(bridge_args + (remainder if default_bridge else remainder[1:]))
+    if remainder[0] == 'project':
+        return _project_main(remainder[1:], args, args.server)
+    if remainder in (['--help'], ['-h']):
+        globals_parser.prog = 'agent-chat-client'
+        globals_parser.print_help()
+        print('\nRun without a command (or use bridge) to start the local Codex app-server and wake bridge.\n'
+              'Use bridge --help for startup options; project --help for project commands.\n')
+    return _remote_main(remainder, args, args.server)
 
 
 def entrypoint():
@@ -105,23 +57,15 @@ def entrypoint():
 
 
 def _project_main(raw, args, server):
-    parser = argparse.ArgumentParser(prog='agent-chat project')
+    parser = argparse.ArgumentParser(prog='agent-chat-client project')
     sub = parser.add_subparsers(dest='op', required=True)
     sub.add_parser('list')
     create = sub.add_parser('create'); create.add_argument('--name', required=True)
     rename = sub.add_parser('rename'); rename.add_argument('id'); rename.add_argument('--name', required=True)
     values = vars(parser.parse_args(raw))
-    if server:
-        if args.db: raise core.CoordError('--db and --server are mutually exclusive')
-        from .remote import HttpClient
-        # Registry actions must work even if a user's previously selected ID is invalid.
-        result = HttpClient(server, args.api_token, project='default').call('/api/projects/rpc', values)
-    else:
-        from .projects import Projects
-        registry = Projects(args.db or os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or core.default_db())
-        if values['op'] == 'list': result = {'projects': registry.list()}
-        elif values['op'] == 'create': result = {'project': registry.create(values['name'])}
-        else: result = {'project': registry.rename(values['id'], values['name'])}
+    from .remote import HttpClient
+    # Registry actions work even when a previously selected project no longer exists.
+    result = HttpClient(server, args.api_token, project='default').call('/api/projects/rpc', values)
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -129,7 +73,7 @@ def _project_main(raw, args, server):
 def _remote_main(raw, global_args, server):
     """Client CLI for operations whose state lives exclusively on the server."""
     from .remote import HttpClient, client_host_id
-    p = argparse.ArgumentParser(prog='agent-chat --server ' + server)
+    p = argparse.ArgumentParser(prog='agent-chat-client')
     sub = p.add_subparsers(dest='op', required=True)
     x = sub.add_parser('register'); x.add_argument('--agent', required=True)
     x = sub.add_parser('inbox'); x.add_argument('--all', action='store_true'); x.add_argument('--agent')
@@ -153,7 +97,7 @@ def _remote_main(raw, global_args, server):
     child_args = raw[raw.index('--') + 1:] if raw and raw[0] == 'run' and '--' in raw else None
     a = p.parse_args(raw[:raw.index('--')] if child_args is not None else raw)
     if child_args is not None: a.command = child_args
-    session = global_args.session or os.environ.get('AGENT_CHAT_SESSION') or os.environ.get('ITR_COORD_SESSION')
+    session = global_args.session or os.environ.get('AGENT_CHAT_SESSION')
     if not session and a.op == 'register':
         import secrets
         session = 'session_' + secrets.token_urlsafe(24)
@@ -161,7 +105,7 @@ def _remote_main(raw, global_args, server):
         raise core.CoordError('AGENT_CHAT_SESSION or --session is required in remote mode')
     params = vars(a).copy(); op = params.pop('op')
     if 'token' in params and not params['token']:
-        params['token'] = os.environ.get('AGENT_CHAT_TOKEN') or os.environ.get('ITR_COORD_TOKEN')
+        params['token'] = os.environ.get('AGENT_CHAT_TOKEN')
     if op == 'inbox' and params.pop('agent') is not None:
         raise core.CoordError('--agent cannot read another agent inbox in remote mode')
     if op == 'send':
@@ -241,15 +185,14 @@ def _remote_main(raw, global_args, server):
             stop_group()
         try:
             for sig in (signal.SIGINT, signal.SIGTERM): old_handlers[sig] = signal.signal(sig, forward)
-            env = dict(os.environ, AGENT_CHAT_SERVER=server, ITR_COORD_SERVER=server,
+            env = dict(os.environ, AGENT_CHAT_SERVER=server,
                        AGENT_CHAT_PROJECT=client.project,
-                       AGENT_CHAT_SESSION=session, ITR_COORD_SESSION=session,
-                       AGENT_CHAT_TOKEN=params.get('token') or '', ITR_COORD_TOKEN=params.get('token') or '',
-                       AGENT_CHAT_API_TOKEN=client.token or '', ITR_COORD_API_TOKEN=client.token or '',
-                       AGENT_CHAT_HOST_ID=host, ITR_COORD_HOST_ID=host,
-                       AGENT_CHAT_ROOT=os.environ.get('AGENT_CHAT_ROOT') or os.environ.get('ITR_COORD_ROOT') or os.getcwd(),
-                       ITR_COORD_ROOT=os.environ.get('AGENT_CHAT_ROOT') or os.environ.get('ITR_COORD_ROOT') or os.getcwd())
-            env.pop('AGENT_CHAT_DB', None); env.pop('ITR_COORD_DB', None)
+                       AGENT_CHAT_SESSION=session,
+                       AGENT_CHAT_TOKEN=params.get('token') or '',
+                       AGENT_CHAT_API_TOKEN=client.token or '',
+                       AGENT_CHAT_HOST_ID=host,
+                       AGENT_CHAT_ROOT=os.environ.get('AGENT_CHAT_ROOT') or os.getcwd())
+            env.pop('AGENT_CHAT_DB', None)
             # The requested command cannot execute until its process group is
             # recorded remotely. EOF closes the inert launcher if this client dies.
             gate_read, gate_write = os.pipe()

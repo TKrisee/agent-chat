@@ -41,12 +41,18 @@
       </div>
       <div class="toolbar">
         <label class="search"><span aria-hidden="true">⌕</span><input type="search" id="search" placeholder="Search messages or agents…" aria-label="Search messages or agents"><kbd aria-hidden="true">/</kbd></label>
+        <button class="quiet-button recipient-filter" id="to-me-filter" type="button" aria-pressed="false" aria-controls="messages" title="Show messages directed at you">To me</button>
         <label class="status-filter"><span class="sr-only">Acknowledgement filter</span><select id="ack-filter"><option value="all">All messages</option><option value="pending">Awaiting acknowledgement</option><option value="acknowledged">Acknowledged</option></select></label>
       </div>
       <div class="connection-notice" id="connection-notice" hidden>Connection interrupted. Reconnecting automatically… <button id="retry-button">Retry now</button></div>
       <div class="feed-wrap">
         <section class="feed" id="feed" aria-label="Agent messages" tabindex="0">
-          <div class="history-row"><button id="load-older" class="quiet-button" hidden>Load earlier messages</button></div>
+          <div class="history-row">
+            <span id="message-window" class="message-window"></span>
+            <button id="load-older" class="quiet-button" hidden>Older messages</button>
+            <button id="load-newer" class="quiet-button" hidden>Newer messages</button>
+            <button id="show-latest" class="quiet-button" hidden>Back to latest</button>
+          </div>
           <div id="messages"></div>
           <div class="empty-state" id="empty-state"><div class="empty-icon" aria-hidden="true">···</div><h3 id="empty-title">Connecting to your agents</h3><p id="empty-description">Their conversation will appear here.</p></div>
         </section>
@@ -57,10 +63,13 @@
           <button class="reply-context" id="reply-context" type="button"><strong id="reply-label"></strong><span id="reply-excerpt"></span></button>
           <button class="cancel-reply" id="cancel-reply" type="button" aria-label="Cancel reply">×</button>
         </div>
+        <div class="composer-images" id="composer-images" role="list" aria-label="Image attachments" hidden></div>
+        <input id="image-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
         <label class="sr-only" for="message-input">Your message</label>
         <div class="mention-list" id="mention-list" role="listbox" aria-label="Agent mentions" hidden></div>
         <div class="composer-input-row">
-          <textarea id="message-input" placeholder="Message all agents, or @tag recipients…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
+          <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach images" title="Attach up to 4 PNG, JPEG, GIF or WebP images, 10 MiB each" disabled>Attach</button>
+          <textarea id="message-input" placeholder="Message all agents, @tag recipients, or drop images…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
           <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
         </div>
         <span class="composer-status" id="composer-status" role="status" hidden></span>
