@@ -368,5 +368,58 @@ class CoordTests(unittest.TestCase):
                 if value is not None:
                     os.environ[name] = value
 
+    def test_remove_session_basic(self):
+        """A registered session can be removed."""
+        _, result = self.cli('remove-session', 'b')
+        self.assertEqual(result['removed'], 'b')
+        self.assertEqual(result['agent'], 'beta')
+        # Session should no longer exist
+        failed, _ = self.cli('inbox', session='b', check=False)
+        self.assertNotEqual(failed.returncode, 0)
+
+    def test_remove_session_unknown(self):
+        """Removing an unknown session fails."""
+        failed, _ = self.cli('remove-session', 'nonexistent', check=False)
+        self.assertNotEqual(failed.returncode, 0)
+
+    def test_remove_session_blocks_active_reservation(self):
+        """Cannot remove a session that holds an active resource."""
+        claim = self.request()  # alpha owns "shared"
+        self.assertEqual(claim['state'], 'owned')
+        failed, _ = self.cli('remove-session', 'a', check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn('active resource', (failed.stderr + failed.stdout).lower())
+        # Release it first, then removal should succeed
+        self.release(claim)
+        _, result = self.cli('remove-session', 'a')
+        self.assertEqual(result['removed'], 'a')
+
+    def test_remove_session_preserves_messages(self):
+        """Messages involving a removed session are kept."""
+        msg_id = self.send()  # b -> a
+        self.cli('acknowledge', msg_id, session='a')
+        self.cli('remove-session', 'b')
+        # Messages involving the removed session are preserved in the DB
+        conn = sqlite3.connect(str(self.db))
+        conn.row_factory = sqlite3.Row
+        try:
+            ids = [r['id'] for r in conn.execute(
+                "SELECT id FROM messages WHERE sender_session=? OR recipient_session=?",
+                ('b', 'b')).fetchall()]
+        finally:
+            conn.close()
+        self.assertIn(msg_id, ids)
+
+    def test_remove_session_clears_queue(self):
+        """Removing a session clears its resource queue entries."""
+        # alpha requests "shared", beta queues behind
+        self.request()
+        self.cli('request', 'shared', '--minutes', '5', session='b')
+        self.cli('remove-session', 'b')
+        status = self.cli('status')[1]
+        shared = next(r for r in status['resources'] if r['resource'] == 'shared')
+        self.assertEqual(shared['queue'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

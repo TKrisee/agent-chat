@@ -1,8 +1,9 @@
 # Codex wake bridge
 
-The chat stores messages immediately. A separate `agent-chat-bridge` process
-checks SQLite every two seconds and asks a local Codex app-server about bound
-threads. Sending does not depend on either the bridge or Codex being available.
+The chat stores messages immediately. The bridge checks pending messages every
+two seconds and asks a local Codex app-server about bound threads. It can run
+inside `agent-chat-server`, as a separate local `agent-chat-bridge`, or on the
+agents' machine as `agent-chat-bridge-client` against a hosted HTTP coordinator. Sending does not depend on either the bridge or Codex being available.
 The browser and CLI also work with agents that do not use Codex; only automatic
 wake-ups depend on Codex.
 
@@ -19,7 +20,8 @@ Keep the chat, bridge and Codex server running in their terminals. Ctrl+C stops
 the bridge without interrupting a Codex turn or stopping the app server. Starting
 the bridge before Codex is available is fine; it reports the connection problem
 and retries. Bindings persist. Only one bridge can dispatch for a database; an
-OS process lock is released automatically when the bridge exits.
+OS process lock protects local dispatch. Remote dispatch also uses a persistent
+lease; it never expires or transfers merely because a client disconnects.
 
 Bindings are opt-in and use exact identities. A conversation UUID can belong to
 only one coordination session. `agent-chat unbind` removes the caller's route.
@@ -111,3 +113,31 @@ report RPC errors; there is no fallback to a turn API with different admission
 semantics. See the [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 for transport and lifecycle details. Revalidate queue and thread capabilities
 when upgrading Codex. Automated tests use a fake app server and never run models.
+
+## Hosted coordinator
+
+Follow the [remote setup and migration instructions](../README.md#remote-hosting).
+Use `agent-chat-server --no-bridge` on the database host and one
+`agent-chat-bridge-client` beside Codex on the agents' machine. The client uses
+`AGENT_CHAT_SERVER` and the privately supplied `AGENT_CHAT_API_TOKEN`; it dispatches
+through the same queue/reconciliation engine as local mode. HTTP response loss
+therefore retains durable intent and the existing uncertain-outcome policy.
+
+Remote wake metadata includes the server URL instead of the host's SQLite path.
+Agents retain their API configuration separately. All main/child bindings and
+messages remain in the hosted database. Only routes rooted in a session pinned
+to the client's machine are eligible. This version supports one active Codex
+execution host per project database; it does not multiplex multiple app servers.
+
+A private persistent client identity and a local file lock prevent duplicate
+workers. The server holds both a database lease and the local dispatch lock, so
+local and remote bridges cannot overlap. A restart of the same client reclaims
+its existing lease. Normal shutdown releases it; a lost connection during shutdown
+leaves it reserved. The server never assumes an offline client has stopped.
+
+For a lost identity, stop the previous client and verify its pending RPCs have
+ended before `agent-chat-bridge-client --recover --confirm-stopped`. This explicit
+operator confirmation only removes the dispatch lease. Job retry/resolution still
+requires checking the Codex queue and conversation as described above. If a client
+cannot release its lease because the server is offline, restore connectivity and
+restart/stop that same client before manual job recovery.

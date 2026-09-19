@@ -113,14 +113,25 @@ class BridgeState:
             WHERE m.sender_session=? AND m.acked_at IS NULL AND d.message_id IS NULL
             ORDER BY m.seq''', (self.operator(),))]
 
+    def still_unread(self, job_id):
+        return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
+            JOIN messages m ON m.id=d.message_id
+            WHERE d.job_id=? AND m.acked_at IS NULL LIMIT 1''', (job_id,)).fetchone())
+
+    def connection_metadata(self):
+        return {'database': str(self.coord.path.resolve())}
+
     def prepare(self, thread_id, messages, payload):
         job_id = 'wake_' + uuid.uuid4().hex
         with self.coord.tx():
             live = []
             for message in messages:
-                row = self.db.execute('SELECT acked_at FROM messages WHERE id=?', (message['id'],)).fetchone()
+                row = self.db.execute('SELECT acked_at,recipient_session,sender_session FROM messages WHERE id=?', (message['id'],)).fetchone()
                 route = self.resolve(message['recipient_session'])
-                if row and row['acked_at'] is None and route and route['thread_id'] == thread_id:
+                if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
+                        and row['sender_session'] == self.operator() and route and route['thread_id'] == thread_id
+                        and not self.db.execute('SELECT 1 FROM bridge_deliveries WHERE message_id=?', (message['id'],)).fetchone()
+                        and message not in live):
                     live.append(message)
             if not live:
                 return None

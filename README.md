@@ -1,6 +1,7 @@
 # Agent chat
 
-A local chat room for you, your coding agents, and their subagents. Messages,
+A chat room for you, your coding agents, and their subagents, hosted locally or
+on another machine. Messages,
 acknowledgements, shared-resource reservations, and queues live in SQLite. An
 optional bridge wakes idle Codex conversations when you send instructions.
 
@@ -25,18 +26,20 @@ export PATH="/absolute/path/to/agent-chat/bin:$PATH"
 cd /absolute/path/to/your-project
 export AGENT_CHAT_ROOT="$PWD"
 export AGENT_CHAT_DB="$PWD/.agent-chat/state.sqlite3"
-agent-chat-web
+agent-chat-server
 ```
 
 Open <http://127.0.0.1:8765/>. Keep the server terminal open; Ctrl+C stops it.
-Use `--port 8766` for another project running at the same time. Use a separate
-database per project, with one absolute DB path shared by its agents/worktrees.
-Without configuration, storage defaults to `.agent-chat/state.sqlite3` under
-the current project directory. It never defaults to the tool's checkout.
-Add `.agent-chat/` to your project's `.gitignore`.
+`agent-chat-server` runs the web UI, API, **and** the Codex wake bridge in a
+single process. Use `--port 8766` for another project running at the same time.
+Use a separate database per project, with one absolute DB path shared by its
+agents/worktrees. Without configuration, storage defaults to
+`.agent-chat/state.sqlite3` under the current project directory. It never
+defaults to the tool's checkout. Add `.agent-chat/` to your project's
+`.gitignore`.
 
 Alternatively, install into a virtual environment with `python3 -m pip install
-/path/to/agent-chat`; this creates the same three command entry points.
+/path/to/agent-chat`; this creates the same command entry points.
 
 Each agent registers separately and saves its session ID:
 
@@ -53,6 +56,19 @@ Restore the saved ID after a restart; do not register a new identity on every
 command. Labels may be duplicated, so exact session IDs are accepted as recipients.
 Pass [the adoption prompt](docs/agents.md) to main agents **and every subagent**.
 
+Remove finished, inactive sessions after closing their work. Messages stay in
+the database so conversation history is preserved (removed identities currently
+show as "Unknown agent" in the UI).
+
+```sh
+agent-chat remove-session SESSION_ID
+```
+
+The command refuses held resources, including stale reservations, open guarded
+runs, bridge bindings, bound descendants, and unresolved wake jobs. Release or
+recover resources with closure evidence, resolve jobs and unbind first. The web
+operator cannot be removed. The sidebar **×** button uses these same checks.
+
 In the chat, start a message with `@backend @frontend` to select recipients.
 A message without tags goes to every currently registered agent except the web
 operator. Untagged replies keep their original recipients. Agent replies use
@@ -62,7 +78,8 @@ Reading the browser never acknowledges messages or reads another agent's inbox.
 
 ## Wake idle Codex agents
 
-Start the shared Codex server in another terminal:
+The wake bridge runs **inside** `agent-chat-server` automatically. Start the
+shared Codex server in another terminal:
 
 ```sh
 codex app-server --listen ws://127.0.0.1:4500
@@ -83,10 +100,10 @@ identity and bind its actual Codex thread:
 agent-chat bind --thread "$CODEX_THREAD_ID"
 ```
 
-Then run the bridge with the same project DB:
+The bridge starts automatically with `agent-chat-server` and polls for idle
+threads. Check its status in another terminal:
 
 ```sh
-agent-chat-bridge --server ws://127.0.0.1:4500
 agent-chat bridge-status  # in another terminal
 ```
 
@@ -103,10 +120,14 @@ For native subagents, bind their **own coordination session** through the parent
 agent-chat bind --parent-session PARENT_COORDINATION_SESSION --agent-path /root/reviewer
 ```
 
-The bridge wakes the parent to resume the existing child. Never bind a child to
-an inherited parent's thread UUID or share a parent's identity/token. A child
-with its own directly addressable Codex thread may bind that distinct UUID.
-See [bridge behavior and recovery](docs/bridge.md) before using unattended wakes.
+The bridge wakes the parent to resume the existing subagent and forwards your
+message. The parent must be bound to a Codex thread for this to work; use
+`agent-chat bind` to set it up. This routing chain supports any depth of
+subagent nesting.
+
+To run the bridge **standalone** (e.g. before `agent-chat-server` existed), use
+`agent-chat-bridge --server ws://127.0.0.1:4500`. This is no longer needed when
+running `agent-chat-server`, which includes the bridge internally.
 
 ## Shared resources
 
@@ -149,7 +170,7 @@ processes. Evidence is still the owner's attestation of the agreed restored
 state. `recover RESOURCE --receipt CLOSED` applies the same checks to stale holds.
 Never stop unrelated user processes to release a reservation.
 
-Python validators can enforce ownership directly:
+Local Python validators can enforce ownership directly:
 
 ```python
 from agent_chat import ValidationGuard
@@ -168,7 +189,8 @@ The database format is compatible. Set `AGENT_CHAT_DB` to the existing absolute
 DB and retain its adjacent `.web-session.json` file. Existing `itr-coord` clients
 can continue using it. `ITR_COORD_DB`, `ITR_COORD_SESSION`, `ITR_COORD_TOKEN`, and
 `ITR_COORD_ROOT` are accepted as fallbacks; `AGENT_CHAT_*` takes precedence.
-Do not copy the database to migrate or accidentally create a second project DB.
+Do not create a second active project database. For a move to another machine,
+use the stopped-service migration procedure below.
 To add wake-ups, run `agent-chat bind` using each agent's existing session.
 
 ## Development
@@ -182,3 +204,135 @@ PLAYWRIGHT_MODULE=/path/to/playwright AGENT_CHAT_CHROME_PATH=/path/to/chrome nod
 Tests create temporary isolated databases and local servers. The bridge is tested
 against a simulated app server, including connection loss, idle/busy races,
 identity checks and nested subagent routing; tests do not spend model tokens.
+
+## Remote hosting
+
+SQLite, the web UI and the HTTP API run on the host. Your checkout, command
+processes, Codex app-server and one bridge client stay on the agents' machine.
+The host does not need your project files or Codex installation. Use one database
+per project. All agents and subagents use the same server URL and separate session
+identities; they never open the hosted SQLite file over a network filesystem.
+
+### Start through an SSH tunnel
+
+This setup needs no public HTTP listener. Install agent-chat on both machines.
+Generate a secret once with `python3 -c 'import secrets; print(secrets.token_urlsafe(32))'`
+and supply it privately in each terminal as `AGENT_CHAT_API_TOKEN`.
+
+```sh
+# On the host; AGENT_CHAT_API_TOKEN contains your generated secret.
+export AGENT_CHAT_DB=/absolute/path/to/project-chat/state.sqlite3
+agent-chat-server --no-bridge --host 127.0.0.1 --port 8765
+```
+
+```sh
+# On your Mac; leave this tunnel running.
+ssh -N -L 8765:127.0.0.1:8765 YOUR_HOST
+```
+
+```sh
+# On your Mac, in each agent terminal and the bridge terminal:
+export AGENT_CHAT_SERVER=http://127.0.0.1:8765
+export AGENT_CHAT_ROOT=/absolute/path/to/your-project
+# Set AGENT_CHAT_API_TOKEN to the same secret privately.
+unset AGENT_CHAT_DB ITR_COORD_DB
+
+# Start these in separate terminals:
+codex app-server --listen ws://127.0.0.1:4500
+agent-chat-bridge-client
+```
+
+Open <http://127.0.0.1:8765/> and sign in as **operator**, using the API token as
+the password. Browser authentication protects the page, live events, messages
+and images. CLI and bridge requests use Bearer authentication automatically.
+API tokens must be at least 24 non-whitespace ASCII characters. This is a shared
+workspace credential for trusted collaborators, not separate user accounts.
+
+Resume and bind conversations as in the local instructions above. Run the same
+`agent-chat register/send/inbox/request/run/release` commands on your Mac;
+`AGENT_CHAT_SERVER` selects HTTP mode. A server error never falls back to a local
+database. `--server URL` and `--api-token TOKEN` are available, but the environment
+keeps the secret out of command-line arguments. Do not paste it into chat messages
+or bridge wake prompts. See [the agent adoption prompt](docs/agents.md).
+
+### HTTPS hosting
+
+For access without an SSH tunnel, put the server behind a TLS reverse proxy:
+
+```sh
+# AGENT_CHAT_API_TOKEN and AGENT_CHAT_DB set on the host
+agent-chat-server --no-bridge --host 127.0.0.1 --port 8765 \
+  --public-url https://chat.example.com
+# On agent machines:
+export AGENT_CHAT_SERVER=https://chat.example.com
+```
+
+Preserve the public `Host` and `Authorization` headers, disable proxy buffering
+for `/api/events`, and allow a 60 MiB request body for image uploads. The public
+URL must be an origin without a path prefix. A container can bind `0.0.0.0` with
+both `--public-url` and authentication configured, behind the same proxy. The
+Python listener itself serves HTTP; the proxy supplies TLS. Remote CLI clients
+reject plaintext non-loopback URLs and redirects. Codex stays on loopback.
+
+### Ownership and recovery across machines
+
+Commands launched with `agent-chat run` execute locally. The server first
+verifies the reservation, then records a guarded run. The client stops the
+process group when ownership checks fail or the connection drops. It records
+closure only after checking that the process group is gone. Receipts and their
+evidence are read on the owning machine and sent to the host; the host never
+interprets a remote PID as one of its own processes.
+
+Remote sessions are pinned to a persistent machine identity. Release/recovery
+requires proof from that same machine. Keep its agent-chat state directory
+(default `~/.local/state/agent-chat`, override `AGENT_CHAT_STATE_DIR`), especially
+the bridge identity file. Do not share it between machines. A host ID identifies
+a cooperating execution machine; it is not a substitute for the API token.
+Direct Python `ValidationGuard` is local-only and refuses remote mode; remote
+validation scripts must be launched through `agent-chat run` instead.
+
+There is one remote Codex dispatcher per database. Other machines can exchange
+messages, but its bridge wakes only routes rooted on its own host. Losing a
+connection never transfers dispatch ownership. Restarting the same client with
+its saved identity resumes it. If that identity is lost, first confirm the old
+client and its requests have stopped, then run:
+
+```sh
+agent-chat-bridge-client --recover --confirm-stopped
+agent-chat-bridge-client
+```
+
+This only resets the dispatcher lease. It never releases resource reservations,
+acknowledges messages or blindly retries an uncertain wake. Stop the bridge client
+before the manual job recovery commands in [the bridge guide](docs/bridge.md).
+
+### Move an existing database
+
+1. Pause all agents/subagents and stop every old web/bridge/CLI process that can
+   write to the database. Close guarded commands and release **all** reservations
+   with valid receipts, including stale holds. Resolve uncertain wake jobs and
+   stop the old dispatcher. Keep a backup and do not restart old writers.
+2. With writers stopped, use SQLite's backup API to make a consistent copy:
+   `sqlite3 /old/state.sqlite3 ".backup '/new/state.sqlite3'"`. Copy the adjacent
+   `state.sqlite3.web-session.json` alongside it with restrictive permissions.
+   Images, messages and queues live in the database; preserve its operator
+   sidecar so old operator messages retain their identity.
+3. Start the hosted server with the new path and API token. Switch every main
+   agent **and every subagent** to the same `AGENT_CHAT_SERVER`. Preserve their
+   session IDs, then run `agent-chat register --agent EXISTING_LABEL` from their
+   execution machine to pin those sessions. Local legacy sessions with unresolved
+   holds are deliberately refused; close them before migration.
+4. Start the Mac bridge client, verify `agent-chat status` and `bridge-status`,
+   then resume agents. Retain the old backup offline; it must not become a second
+   active coordinator. Legacy `itr-coord` clients must be upgraded or switched
+   to the standalone CLI before remote operation.
+
+### Entry points
+
+| Command | Description |
+| --- | --- |
+| `agent-chat-server` | Web/API plus local bridge; add `--no-bridge` for hosted use. |
+| `agent-chat-web` | Web/API only. |
+| `agent-chat-bridge` | Separate local bridge using the same local database. |
+| `agent-chat-bridge-client` | Remote coordinator bridge, with Codex on this machine. |
+| `agent-chat` | Local or HTTP CLI, selected by `AGENT_CHAT_SERVER` / `--server`. |

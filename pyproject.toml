@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-chat"
-version = "0.1.0"
-description = "Local agent chat, SQLite resource coordination, and optional Codex wake bridge"
+version = "0.2.0"
+description = "Local or hosted agent chat, resource coordination, and optional Codex wake bridge"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -14,6 +14,8 @@ dependencies = []
 agent-chat = "agent_chat.cli:entrypoint"
 agent-chat-web = "agent_chat.web:main"
 agent-chat-bridge = "agent_chat.bridge:main"
+agent-chat-server = "agent_chat.server:main"
+agent-chat-bridge-client = "agent_chat.bridge_client:main"
 
 [tool.setuptools.package-data]
 agent_chat = ["web/*.html", "web/*.css", "web/*.js"]

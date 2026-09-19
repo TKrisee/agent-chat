@@ -1,17 +1,27 @@
 # Prompt for main agents and subagents
 
-Replace the three placeholders, then share the following prompt with every main
+Choose local or hosted configuration, replace its placeholders, then share the following prompt with every main
 agent. Parents must pass it to every subagent with that child's bounded scope.
 
 ---
 
 Use agent-chat for communication with me and the other agents, including every
 subagent you spawn. The tool is installed at `TOOL_CHECKOUT/bin`. This project's
-root is `PROJECT_ROOT` and its one shared local SQLite database is `ABSOLUTE_DB`.
+root is `PROJECT_ROOT`.
 
-Export `PATH="TOOL_CHECKOUT/bin:$PATH"`, `AGENT_CHAT_ROOT="PROJECT_ROOT"`, and
-`AGENT_CHAT_DB="ABSOLUTE_DB"` in each terminal context. Keep the same absolute DB
-across worktrees/clones. If you already have a coordination session, restore its
+Export `PATH="TOOL_CHECKOUT/bin:$PATH"` and `AGENT_CHAT_ROOT="PROJECT_ROOT"` in
+each terminal context. Use exactly one configuration for this project:
+
+- **Local:** `AGENT_CHAT_DB="ABSOLUTE_DB"`; unset `AGENT_CHAT_SERVER` and
+  `ITR_COORD_SERVER`. Keep the same absolute DB across worktrees/clones.
+- **Hosted:** `AGENT_CHAT_SERVER="SERVER_URL"`; unset `AGENT_CHAT_DB` and
+  `ITR_COORD_DB`. The operator provisions `AGENT_CHAT_API_TOKEN` privately.
+  Never include the token in messages, screenshots or saved prompts. Main agents
+  and subagents inherit this server configuration and the machine's private
+  agent-chat state directory, but always clear inherited session/resource tokens.
+  Do not open a remote SQLite file or fall back to a local DB on connection errors.
+
+If you already have a coordination session, restore its
 exact ID as `AGENT_CHAT_SESSION` (legacy `ITR_COORD_SESSION` is also accepted).
 Register only if this is a new session:
 
@@ -64,7 +74,7 @@ A child may bind directly only with its distinct, directly addressable thread.
 The bridge wakes idle loaded main threads for my messages. For child messages,
 the parent verifies the supplied path belongs to its existing child, then uses
 its native follow-up/resume tool to wake that child and
-pass the message IDs, DB and protocol. The child reads/acks/replies under its own
+pass the message IDs, configured DB/server and protocol (never the API secret). The child reads/acks/replies under its own
 identity. Do not impersonate it or create a duplicate worker. If the native
 runtime cannot resume it, report the limitation through chat. Active agents must
 still check their inbox; unbound/closed agents wait until resumed. Agent replies
@@ -76,7 +86,9 @@ Proceed only on `state == "owned"`; retain that reservation ID and token as
 `AGENT_CHAT_TOKEN`. A directory resource does not lock descendants. Queued agents
 keep checking inbox/status and repeat `request` when next. Run shared validation
 through `agent-chat run RESOURCE -- COMMAND ...`; preserve project-specific
-validation flags and restoration guards. A token never expands your task scope.
+validation flags and restoration guards. Direct Python `ValidationGuard` is
+local-only; hosted validation must use the CLI `run` wrapper. A token never expands
+your task scope.
 
 Expiry marks ownership stale and never transfers it. Restore the exact agreed
 state, close every owned process, and retain a nonempty closure report before

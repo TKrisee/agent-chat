@@ -69,6 +69,7 @@ function renderAgents() {
   const fragment = document.createDocumentFragment();
   for (const session of sessions) {
     const isSubagent = session.agent.includes('/');
+    const controls = node('div', 'agent-controls');
     const button = node('button', `agent-button${isSubagent ? ' subagent' : ''}${state.selected === session.id ? ' selected' : ''}`);
     button.type = 'button';
     button.title = `${session.agent}\n${session.id}`;
@@ -80,8 +81,29 @@ function renderAgents() {
       pending.title = 'Has messages awaiting acknowledgement';
       button.append(pending);
     }
+    const removeBtn = node('button', 'agent-remove', '×');
+    removeBtn.type = 'button';
+    removeBtn.title = `Remove inactive session ${session.agent}`;
+    removeBtn.setAttribute('aria-label', `Remove inactive session ${session.agent}`);
+    removeBtn.addEventListener('click', async () => {
+      if (!confirm(`Remove inactive session ${session.agent}? Its history will be retained. Any held reservations must first be closed or released.`)) return;
+      try {
+        await fetchJSON('/api/sessions/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+          body: JSON.stringify({ id: session.id }),
+        });
+        if (state.selected === session.id) state.selected = null;
+        if (state.reply && (state.reply.sender_session === session.id || messageDeliveries(state.reply).some((delivery) => delivery.recipient_session === session.id))) clearReply();
+        applySnapshot(await fetchJSON('/api/snapshot'));
+        composerStatus(`Removed ${session.agent}. Its history is retained.`);
+      } catch (error) {
+        composerStatus(error.message, true);
+      }
+    });
     button.addEventListener('click', () => selectAgent(session.id));
-    fragment.append(button);
+    controls.append(button, removeBtn);
+    fragment.append(controls);
   }
   $('agent-list').replaceChildren(fragment);
 }

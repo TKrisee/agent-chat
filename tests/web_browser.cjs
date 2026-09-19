@@ -433,8 +433,53 @@ c.close()
     const olderFetched = page.waitForRequest(request => request.url().includes('/api/messages?before='));
     await page.locator('#load-older').click();
     assert.ok(Number(new URL((await olderFetched).url()).searchParams.get('before')) > 2, 'Original lookup must not skip the remaining history');
+
+    // Session removal uses sibling controls, preserves history, and only succeeds after holds close.
+    const removalSetup = `
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd() / 'src'))
+from agent_chat.core import Coordinator
+for sid, label in [('fixture-removable', 'removable'), ('fixture-blocked', 'blocked')]:
+    c = Coordinator(sys.argv[1], sid)
+    c.register(label)
+    c.close()
+c = Coordinator(sys.argv[1], 'fixture-removable')
+history = c.send('fixture-beta', 'Removal history stays available.')
+c.close()
+c = Coordinator(sys.argv[1], 'fixture-blocked')
+claim = c.request('browser-removal-hold', minutes=5)
+assert claim['state'] == 'owned'
+c.close()
+print(json.dumps({'history': history['id']}))
+`;
+    const removal = JSON.parse(execFileSync(python, ['-c', removalSetup, fixtureInfo.db], { cwd: root, encoding: 'utf8' }));
+    await page.reload();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.locator('#agents-toggle').click();
+    const blockedRemove = page.getByRole('button', { name: 'Remove inactive session blocked', exact: true });
+    assert.equal(await blockedRemove.isVisible(), true, 'Mobile keeps the removal control visible');
+    assert.equal(await blockedRemove.evaluate(button => button.parentElement.classList.contains('agent-controls') && button.parentElement.querySelectorAll('button').length === 2), true, 'Removal must be a sibling of selection, never a nested button');
+    await input.fill('Keep my removal draft');
+    page.once('dialog', dialog => {
+      assert.match(dialog.message(), /history will be retained\. Any held reservations must first be closed or released\./);
+      dialog.accept();
+    });
+    await blockedRemove.focus();
+    await page.keyboard.press('Enter');
+    await page.locator('#composer-status').filter({ hasText: /held reservation|active resource/i }).waitFor();
+    assert.equal(await page.getByRole('button', { name: 'Show conversations with blocked', exact: true }).count(), 1, 'Refusal leaves the session in the sidebar');
+    assert.equal(await input.inputValue(), 'Keep my removal draft', 'Refusal must not discard the draft');
+    const removableRemove = page.getByRole('button', { name: 'Remove inactive session removable', exact: true });
+    page.once('dialog', dialog => dialog.accept());
+    await removableRemove.click();
+    await page.getByRole('button', { name: 'Show conversations with removable', exact: true }).waitFor({ state: 'detached' });
+    await page.locator('#composer-status').filter({ hasText: 'Removed removable. Its history is retained.' }).waitFor();
+    await page.locator(`[data-message-id="${removal.history}"]`).waitFor();
+    assert.equal((await page.request.get(fixtureInfo.url + '/api/messages/' + removal.history)).status(), 200, 'Removal keeps the recorded history available');
+    assert.equal(await page.evaluate(() => localStorage.getItem('snapshot')), null, 'Removal never relies on a local snapshot');
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'no page errors or horizontal overflow'] }));
+    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow'] }));
   } finally {
     if (browser) await browser.close();
     fixture.kill('SIGTERM');

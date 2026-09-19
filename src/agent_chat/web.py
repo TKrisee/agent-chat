@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import secrets
 import signal
+import socket
 import sqlite3
 import sys
 import threading
@@ -18,6 +19,8 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 from agent_chat.core import CoordError, Coordinator, default_db
+
+from .auth import authorized, validate_config, origin
 
 HERE = Path(__file__).resolve().parent
 STATIC = {
@@ -171,17 +174,35 @@ def operator_session(db_path):
 class WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, db_path, web_root):
+    def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.web_root = Path(web_root).resolve()
         self.stop_event = threading.Event()
         self.csrf_token = secrets.token_urlsafe(32)
+        self.api_token = api_token
+        self.listen_host = address[0]
+        self.address_family = socket.AF_INET6 if ':' in address[0] else socket.AF_INET
+        self.public_url = validate_config(address[0], api_token, public_url)
+        self.bridge_manager = None
         super().__init__(address, handler)
         try:
             self.sender_session = operator_session(self.db_path)
+            if api_token:
+                from .bridge_lease import BridgeManager
+                self.bridge_manager = BridgeManager(self.db_path)
         except BaseException:
             self.server_close()
             raise
+
+    @property
+    def origin(self):
+        host = '[' + self.listen_host + ']' if ':' in self.listen_host else self.listen_host
+        return self.public_url or origin(f'http://{host}:{self.server_port}')
+
+    def server_close(self):
+        if self.bridge_manager:
+            self.bridge_manager.close()
+        super().server_close()
 
     def shutdown(self):
         self.stop_event.set()
@@ -200,8 +221,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
     def trusted(self):
-        allowed = f'127.0.0.1:{self.server.server_port}'
-        return self.headers.get('Host') == allowed and self.headers.get('Origin') in (None, 'http://' + allowed)
+        expected = self.server.origin
+        hosts = self.headers.get_all('Host', [])
+        try:
+            return (len(hosts) == 1 and origin(urlsplit(expected).scheme + '://' + hosts[0]) == expected and
+                    (self.headers.get('Origin') is None or origin(self.headers['Origin']) == expected))
+        except ValueError:
+            return False
+
+    def authenticate(self, bearer_only=False):
+        if authorized(self.headers.get('Authorization', ''), self.server.api_token, bearer_only):
+            return True
+        raw = b'{"error":"Authentication required"}'
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Bearer realm="Agent chat"' if bearer_only else 'Basic realm="Agent chat", charset="UTF-8"')
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(raw)))
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        self.close_connection = True
+        self.wfile.write(raw)
+        return False
+
+    def read_json(self, limit=65536):
+        if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1:
+            raise ValueError('one Content-Length header is required; chunked requests are unsupported')
+        if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
+            raise ValueError('Expected JSON content')
+        size = int(self.headers['Content-Length'])
+        if not 1 <= size <= limit:
+            raise ValueError('request exceeds the allowed size')
+        raw = self.rfile.read(size)
+        if len(raw) != size:
+            raise ValueError('incomplete request')
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError('Expected a JSON object')
+        return value
 
     def respond(self, code, raw, mime):
         self.send_response(code)
@@ -226,6 +283,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(403, {'error': 'Untrusted host or origin'})
             return
         url = urlsplit(self.path)
+        if not self.authenticate():
+            return
         try:
             if url.path == '/api/snapshot':
                 self.json(200, snapshot(self.server.db_path))
@@ -283,12 +342,47 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.trusted():
             self.json(403, {'error': 'Untrusted host or origin'})
             return
-        if urlsplit(self.path).path != '/api/messages':
+        path = urlsplit(self.path).path
+        machine_api = path in ('/api/coord', '/api/bridge/rpc')
+        if not self.authenticate(bearer_only=machine_api):
+            return
+        if machine_api:
+            try:
+                data = self.read_json(60 * 1024 * 1024 if path == '/api/coord' else 1024 * 1024)
+                if path == '/api/coord':
+                    from .remote_service import dispatch
+                    coord = Coordinator(self.server.db_path)
+                    coord.session = None
+                    try:
+                        result = dispatch(coord, data)
+                    finally:
+                        coord.close()
+                else:
+                    result = {'result': self.server.bridge_manager.dispatch(data)}
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
+            return
+        if path not in ('/api/messages', '/api/sessions/remove'):
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
+            return
+        if path == '/api/sessions/remove':
+            try:
+                data = self.read_json()
+                if set(data) != {'id'} or not isinstance(data['id'], str) or not data['id']:
+                    raise ValueError('Session id must be a nonempty string')
+                coord = Coordinator(self.server.db_path, self.server.sender_session)
+                try:
+                    result = coord.remove_session(data['id'])
+                finally:
+                    coord.close()
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
             return
         if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() != 'application/json':
             self.json(415, {'error': 'Expected a JSON message'})
@@ -350,16 +444,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def create_server(db_path, port=8765, web_root=None):
+def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_token=None, public_url=None):
     with reader(db_path):
         pass
-    return WebServer(('127.0.0.1', port), Handler, db_path, web_root or HERE / 'web')
+    return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--db', default=os.environ.get('AGENT_CHAT_DB') or os.environ.get('ITR_COORD_DB') or str(default_db()))
     parser.add_argument('--port', type=int, default=8765)
+    parser.add_argument('--host', default='127.0.0.1',
+                        help='Bind address (use 0.0.0.0 for remote access)')
+    parser.add_argument('--api-token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
+    parser.add_argument('--public-url', help='External HTTP(S) origin, e.g. https://chat.example.com')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('port must be between 0 and 65535')
@@ -368,11 +466,11 @@ def main(argv=None):
         # level server factory remains read-only for callers that require an
         # already-existing database.
         Coordinator(args.db).close()
-        server = create_server(args.db, args.port)
+        server = create_server(args.db, args.port, host=args.host, api_token=args.api_token, public_url=args.public_url)
     except (OSError, ValueError, sqlite3.Error, RuntimeError) as error:
         print(f'agent-chat-web: {error}', file=sys.stderr)
         return 2
-    print(f'http://127.0.0.1:{server.server_port}/', flush=True)
+    print(server.origin + '/', flush=True)
 
     def stop(signum, frame):
         threading.Thread(target=server.shutdown, daemon=True).start()

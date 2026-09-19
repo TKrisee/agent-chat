@@ -148,6 +148,79 @@ class Coordinator:
         self.session = sid
         return {"session": sid, "agent": agent}
 
+    def remove_session(self, session_id: str) -> dict[str, Any]:
+        """Remove a coordination session (e.g. a finished subagent).
+
+        Removes only a fully closed session and deletes its session record.  Messages involving the session are kept
+        so conversation history is preserved (the agent shows as "Unknown
+        agent" thereafter).
+        """
+        caller = self.require_session()
+        if not session_id:
+            raise CoordError("session_id must be nonempty")
+        with self.tx() as db:
+            info = db.execute(
+                "SELECT id,agent FROM sessions WHERE id=?", (session_id,)).fetchone()
+            if info is None:
+                raise CoordError(f"unknown session: {session_id}")
+            agent_name = info["agent"]
+
+            # This is deliberately an authenticated administrative operation,
+            # never a way for an anonymous client to discard a dead identity.
+            # The browser's durable operator identity is part of the audit trail.
+            sidecar = pathlib.Path(str(self.path) + ".web-session.json")
+            try:
+                operator_id = json.loads(sidecar.read_text(encoding="utf-8")).get("id")
+            except (OSError, ValueError, AttributeError):
+                operator_id = None
+            if session_id == operator_id:
+                raise CoordError("the web operator session cannot be removed")
+
+            # Stale ownership remains ownership until a receipt-backed release or
+            # recovery.  Clearing it here used to let a later request jump an
+            # unresolved hold and lose the owner label/audit token.
+            held = db.execute(
+                "SELECT name FROM resources "
+                "WHERE owner_session=? AND owner_session IS NOT NULL", (session_id,)).fetchall()
+            if held:
+                names = ", ".join(r["name"] for r in held)
+                raise CoordError(
+                    f"session {session_id} ({agent_name}) holds active resource(s): "
+                    f"{names}; release or recover them with a receipt first")
+
+            runs = db.execute("SELECT resource FROM guarded_runs WHERE session=? AND closed_at IS NULL", (session_id,)).fetchall()
+            if runs:
+                raise CoordError("session has open guarded run(s): " + ", ".join(r["resource"] for r in runs))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_guarded_runs'").fetchone():
+                remote_runs = db.execute("SELECT resource FROM remote_guarded_runs WHERE session_id=? AND closed_at IS NULL", (session_id,)).fetchall()
+                if remote_runs: raise CoordError("session has open remote guarded run(s): " + ", ".join(r["resource"] for r in remote_runs))
+
+            # Clear resource queue entries.
+            db.execute("DELETE FROM resource_queue WHERE session=?", (session_id,))
+
+            # Remove bridge bindings (may not exist if bridge never started).
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_bindings'").fetchone():
+                descendants = db.execute("SELECT session_id FROM bridge_bindings WHERE parent_session=?", (session_id,)).fetchall()
+                if descendants:
+                    raise CoordError("session has bound bridge descendant(s): " + ", ".join(r["session_id"] for r in descendants))
+                binding = db.execute("SELECT 1 FROM bridge_bindings WHERE session_id=?", (session_id,)).fetchone()
+                pending = False
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_jobs'").fetchone() and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_deliveries'").fetchone():
+                    pending = db.execute(
+                        """SELECT 1 FROM bridge_jobs j JOIN bridge_deliveries d ON d.job_id=j.id
+                           JOIN messages m ON m.id=d.message_id
+                           WHERE j.status NOT IN ('dispatched','cancelled')
+                           AND (m.sender_session=? OR m.recipient_session=?) LIMIT 1""",
+                        (session_id, session_id)).fetchone()
+                if binding or pending:
+                    raise CoordError("session has a bridge binding or unresolved bridge job; unbind and resolve it first")
+                db.execute("DELETE FROM bridge_bindings WHERE session_id=?", (session_id,))
+
+            # Delete the session record.
+            db.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+
+        return {"removed": session_id, "agent": agent_name}
+
     def _fresh(self, db: sqlite3.Connection, session: str) -> None:
         row = db.execute("SELECT inbox_read_seq FROM sessions WHERE id=?", (session,)).fetchone()
         latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (session,)).fetchone()["n"]
@@ -508,6 +581,8 @@ class Coordinator:
         if runs: db.executemany("UPDATE guarded_runs SET closed_at=? WHERE run_id=?",[(attested_closed_at,r["run_id"]) for r in runs])
 
     def _clear_with_receipt(self,db:sqlite3.Connection,r:sqlite3.Row,path:str,action:str)->None:
+        if self._remote_bound(db, r["owner_session"]):
+            raise CoordError("remote reservation requires receipt proof from its owning host via --server")
         canonical,digest,evidence_digest=self._validate_receipt(path,r)
         attested=json.loads(canonical)["closed_at"]
         latest=db.execute("SELECT MAX(closed_at) x FROM guarded_runs WHERE reservation_id=?",(r["reservation_id"],)).fetchone()["x"]
@@ -520,12 +595,14 @@ class Coordinator:
     def release(self,raw:str,token:str,path:str)->dict[str,Any]:
         sid,resource=self.require_session(),self.resource_name(raw)
         with self.tx() as db:
+            if self._remote_bound(db, sid): raise CoordError("remote-bound reservation must be released with agent-chat --server")
             self._fresh(db,sid);r=self._verify_owner(db,resource,sid,token,True);self._clear_with_receipt(db,r,path,"release")
         return {"resource":resource,"released":True}
 
     def recover(self,raw:str,path:str)->dict[str,Any]:
         sid,resource=self.require_session(),self.resource_name(raw)
         with self.tx() as db:
+            if self._remote_bound(db, sid): raise CoordError("remote-bound reservation must be recovered with agent-chat --server")
             self._fresh(db,sid);r=self._row(db,resource)
             if not r or self._state(r)!="stale": raise CoordError("only a stale reservation can be recovered")
             self._clear_with_receipt(db,r,path,"recover")
@@ -545,10 +622,15 @@ class Coordinator:
     def begin_guard(self,resource:str,token:str,pid:int)->tuple[str,sqlite3.Row]:
         sid=self.require_session(); resource=self.resource_name(resource)
         with self.tx() as db:
+            if self._remote_bound(db, sid): raise CoordError("remote-bound reservation must use agent-chat --server run")
             # Reading inbox here is deliberate and satisfies the ownership mutation guard.
             self._fresh(db,sid);r=self._verify_owner(db,resource,sid,token)
             run=_id("run"); db.execute("INSERT INTO guarded_runs(run_id,resource,reservation_id,session,pid,started_at) VALUES(?,?,?,?,?,?)",(run,resource,r["reservation_id"],sid,pid,_now()))
         return run,r
+
+    @staticmethod
+    def _remote_bound(db: sqlite3.Connection, session: str) -> bool:
+        return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_session_hosts'").fetchone() and db.execute("SELECT 1 FROM remote_session_hosts WHERE session_id=?", (session,)).fetchone())
 
     def attach_group(self,run:str,pgid:int)->None:
         with self.tx() as db: db.execute("UPDATE guarded_runs SET pgid=? WHERE run_id=? AND closed_at IS NULL",(pgid,run))
@@ -560,6 +642,8 @@ class Coordinator:
 class ValidationGuard:
     """Guard an active reservation and make release wait for normal cleanup."""
     def __init__(self,resource:str="validation-clone", token:str|None=None, db_path: str|None=None, session:str|None=None):
+        if os.environ.get("AGENT_CHAT_SERVER") or os.environ.get("ITR_COORD_SERVER"):
+            raise CoordError("ValidationGuard cannot use remote coordination; use agent-chat --server run")
         self.coord=Coordinator(db_path,session);self.resource=resource;self.token=token or os.environ.get("AGENT_CHAT_TOKEN") or os.environ.get("ITR_COORD_TOKEN","");self.run_id: str|None=None;self.seen:set[str]=set();self.safe_to_close=True
     def _emit_inbox(self)->None:
         messages=self.coord.inbox()["messages"]; new=[m for m in messages if m["id"] not in self.seen]
@@ -690,6 +774,7 @@ def main(argv:list[str]|None=None)->int:
     x=sub.add_parser("release");x.add_argument("resource");x.add_argument("--receipt",required=True);x.add_argument("--token")
     x=sub.add_parser("recover");x.add_argument("resource");x.add_argument("--receipt",required=True)
     x=sub.add_parser("block");x.add_argument("resource");x.add_argument("--reason",required=True)
+    x=sub.add_parser("remove-session");x.add_argument("id")
     x=sub.add_parser("run");x.add_argument("resource");x.add_argument("--token");x.add_argument("command",nargs="*")
     a=p.parse_args(raw)
     if a.op=="run": a.command=run_tail or []
@@ -712,6 +797,7 @@ def main(argv:list[str]|None=None)->int:
         elif a.op=="release":out=c.release(a.resource,_token(a),a.receipt)
         elif a.op=="recover":out=c.recover(a.resource,a.receipt)
         elif a.op=="block":out=c.block(a.resource,a.reason)
+        elif a.op=="remove-session":out=c.remove_session(a.id)
         else:
             out=run_command(c,a)
             return int(out["exit_code"])

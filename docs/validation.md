@@ -1,3 +1,25 @@
+# Validation — 2026-09-19
+
+Version 0.2.0, macOS, Python 3.14.7, headless Chrome.
+
+| Check | Result |
+| --- | --- |
+| Full Python suite | 106 tests passed (49.3 s). After the final SQLite connection-lifetime fix, all 28 bridge/server regression tests passed again. |
+| Browser integration | 36 scenario groups passed: existing live chat, replies, images, Markdown, multi-tags/broadcasts, mobile layout and safe session removal. |
+| HTTP hosting | All UI/data/image/event routes require authentication when configured. Basic browser and Bearer machine access, exact Host/Origin checks, proxy default ports, malformed requests, large image uploads and explicit ACK semantics passed. |
+| Remote validation | Real temporary processes and HTTP server verified authorization before execution, preserved child arguments/environment, descendant cleanup, connection loss, lost PID-attachment responses, receipt-bound recovery, live-group rejection and refusal of local recovery for remote ownership. |
+| Remote bridge | Authenticated HTTP state with simulated Codex verified root/child routing, host isolation, exclusive durable dispatcher ownership, server restart, and reconciliation after lost HTTP/Codex responses without duplicate starts. |
+| Packaging | Built and installed wheel 0.2.0 in a disposable venv. All five command entry points worked; installed HTML/JS/Markdown/CSS/config loaded with authentication; remote CLI registration/status and SIGTERM shutdown passed. |
+
+Test databases, HTTP servers, process groups and browsers were isolated and closed.
+No live project database was moved, real agent resumed, or model turn started.
+The Codex protocol remains the previously tested queue interface below. A real
+second-machine deployment, external TLS reverse proxy and live model wake were
+not exercised here. Direct Python ValidationGuard remains local-only; hosted
+validation uses the CLI wrapper. One Codex execution host is supported per DB.
+
+## Previous release evidence
+
 # Validation — 2026-09-13
 
 Version 0.1.0, macOS, Python 3.14, Codex CLI 0.154.0.
