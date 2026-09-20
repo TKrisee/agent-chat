@@ -10,8 +10,9 @@ from .bridge_state import BridgeState
 
 
 class BridgeManager:
-    def __init__(self, db_path):
+    def __init__(self, db_path, usage_store=None):
         self.db_path = db_path
+        self.usage_store = usage_store
         self.mutex = threading.RLock()
         self.lock = None
         c = Coordinator(db_path)
@@ -110,6 +111,7 @@ class BridgeManager:
             if not c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
                 self.close()
             return {'released': True}
+        usage = self.usage_store.status(host) if self.usage_store else None
         state = BridgeState(c)
 
         def route_for(session_id):
@@ -136,6 +138,8 @@ class BridgeManager:
             return job
 
         if op == 'pending':
+            if usage and usage['blocked']:
+                return []
             return [m for m in state.pending() if route_for(m['recipient_session'])]
         if op == 'resolve':
             sid = params.get('session_id')
@@ -160,12 +164,16 @@ class BridgeManager:
             status = params.get('status')
             if status not in ('prepared', 'adding', 'queued', 'starting', 'uncertain', 'dispatched', 'cancelled', 'failed'):
                 raise CoordError('invalid job status')
+            if usage and usage['blocked'] and status in ('adding', 'starting'):
+                raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             queue_id, error = params.get('queue_id'), params.get('error')
             if any(v is not None and (not isinstance(v, str) or len(v) > 8192) for v in (queue_id, error)):
                 raise CoordError('invalid queue/error metadata')
             state.update(job['id'], status, queue_id, error)
             return {'updated': True}
         if op == 'prepare':
+            if usage and usage['blocked']:
+                raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             thread_id, messages, payload = params.get('thread_id'), params.get('messages'), params.get('payload')
             thread_allowed(thread_id)
             if not isinstance(messages, list) or not 1 <= len(messages) <= 100 or not isinstance(payload, str) or len(payload) > 262144:

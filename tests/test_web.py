@@ -163,16 +163,30 @@ class WebApiTests(unittest.TestCase):
 
     def test_pagination_boundaries_and_expired_resource_read(self):
         self.send(self.alpha, self.beta, "third")
+        self.send(self.alpha, self.beta, "fourth")
         status, _, raw = self.request("GET", "/api/messages?limit=2")
         page = json.loads(raw)
         self.assertEqual(status, 200)
-        self.assertEqual([item["body"] for item in page["messages"]], ["second", "third"])
+        self.assertEqual([item["body"] for item in page["messages"]], ["third", "fourth"])
         self.assertTrue(page["has_more"])
         before = page["messages"][0]["seq"]
         status, _, raw = self.request("GET", "/api/messages?before=%s&limit=2" % before)
         self.assertEqual(status, 200)
-        self.assertEqual([item["body"] for item in json.loads(raw)["messages"]], ["first"])
+        self.assertEqual([item["body"] for item in json.loads(raw)["messages"]], ["first", "second"])
         self.assertFalse(json.loads(raw)["has_more"])
+        first = json.loads(raw)['messages'][0]['seq']
+        status, _, raw = self.request("GET", "/api/messages?after=%s&limit=2&project=default" % first)
+        forward = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual([item['body'] for item in forward['messages']], ['second', 'third'])
+        self.assertEqual([item['seq'] for item in forward['messages']], sorted(item['seq'] for item in forward['messages']))
+        self.assertTrue(forward['has_more'])
+        status, _, raw = self.request("GET", "/api/messages?after=%s&limit=2&project=default" % forward['messages'][-1]['seq'])
+        next_page = json.loads(raw)
+        self.assertEqual(status, 200)
+        self.assertEqual([item['body'] for item in next_page['messages']], ['fourth'])
+        self.assertFalse(next_page['has_more'])
+        self.assertFalse({item['id'] for item in forward['messages']} & {item['id'] for item in next_page['messages']})
         self.assertEqual(self.request("GET", "/api/messages?limit=0")[0], 400)
         self.assertEqual(self.request("GET", "/api/messages?limit=201")[0], 400)
         connection = sqlite3.connect(self.db)
@@ -180,6 +194,26 @@ class WebApiTests(unittest.TestCase):
         connection.commit()
         connection.close()
         self.assertEqual(self.request("GET", "/api/snapshot")[0], 200)
+
+    def test_pagination_rejects_invalid_or_ambiguous_cursors_without_side_effects(self):
+        first = self.value('SELECT MIN(seq) FROM messages')
+        before_read = self.value('SELECT inbox_read_seq FROM sessions WHERE id=?', (self.beta,))
+        messages = self.value('SELECT COUNT(*) FROM messages')
+        resources = self.value('SELECT COUNT(*) FROM resources')
+        for query in (
+            'before=%s&after=%s' % (first, first),
+            'before=%s&before=%s' % (first, first),
+            'after=%s&after=%s' % (first, first),
+            'after=0',
+            'after=',
+            'after=not-a-sequence',
+            'after=9223372036854775808',
+            'before=-1',
+        ):
+            self.assertEqual(self.request('GET', '/api/messages?' + query)[0], 400)
+        self.assertEqual(self.value('SELECT inbox_read_seq FROM sessions WHERE id=?', (self.beta,)), before_read)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM messages'), messages)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM resources'), resources)
 
     def test_default_snapshot_events_and_history_load_only_fifty_messages(self):
         coordinator = self.coordinator(self.alpha)

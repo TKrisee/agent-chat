@@ -52,9 +52,12 @@ async function run() {
     const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
     const errors = [];
     let postCount = 0;
+    let historyFetchCount = 0;
     page.on('pageerror', error => errors.push(error.message));
     page.on('request', request => {
       if (request.url().endsWith('/api/messages') && request.method() === 'POST') postCount += 1;
+      const url = new URL(request.url());
+      if (url.pathname === '/api/messages' && request.method() === 'GET' && (url.searchParams.has('before') || url.searchParams.has('after'))) historyFetchCount += 1;
     });
     await page.goto(fixtureInfo.url);
     await page.waitForFunction(() => document.querySelectorAll('.message').length > 0 && !document.querySelector('#message-input').disabled);
@@ -452,10 +455,14 @@ c.send(parent['sender_session'], 'Reply to the older operator request.', reply_t
 c.close()
 `;
     execFileSync(python, ['-c', backlog, fixtureInfo.db, sent.id], { cwd: root });
+    const historyFetchesBeforeReload = historyFetchCount;
     await page.reload();
     const oldReply = page.locator('.message').filter({ has: page.locator('.message-body').filter({ hasText: 'Reply to the older operator request.' }) });
     await oldReply.waitFor();
     assert.equal(await page.locator('.message').count(), 50);
+    assert.equal(await page.evaluate(() => state.snapshot.messages.length), 50, 'Reload keeps a 50-message latest snapshot');
+    await page.waitForTimeout(100);
+    assert.equal(historyFetchCount, historyFetchesBeforeReload, 'Reload starts with one snapshot and does not drain history');
     const longHistory = page.locator('.message').filter({ has: page.locator('.message-body').filter({ hasText: 'Large history detail' }) });
     assert.ok(await longHistory.locator('tbody tr').count() < 150);
     await longHistory.locator('.expand-message').click();
@@ -472,28 +479,98 @@ c.close()
     await oldReply.locator('.reply-quote').click();
     assert.equal((await originalFetched).status(), 200);
     await page.locator(`[data-message-id="${sent.id}"].highlighted`).waitFor();
+    assert.ok(await page.locator('.message').count() <= 151, 'An original lookup may add one card but never expands the bounded cache');
     await page.evaluate(id => jumpToMessage(id), userReply.id);
     await page.evaluate(id => jumpToMessage(id), sent.id);
     assert.equal(await page.evaluate(() => state.originals.size), 1, 'Original lookups do not accumulate history');
-    const olderFetched = page.waitForRequest(request => request.url().includes('/api/messages?before='));
-    await page.locator('#load-older').click();
+    assert.equal(await page.locator('#load-older, #load-newer').count(), 0, 'History uses scrolling, not paging controls');
+    async function scrollHistory(edge) {
+      await page.locator('#feed').evaluate((feed, edge) => {
+        feed.scrollTop = edge === 'top' ? 0 : feed.scrollHeight;
+      }, edge);
+      await page.locator('#feed').evaluate((feed, edge) => {
+        feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: edge === 'top' ? -120 : 120 }));
+      }, edge);
+    }
+    async function renderedSequences() {
+      return page.locator('.message').evaluateAll(cards => cards.map(card => state.messages.get(card.dataset.messageId).seq));
+    }
+    const initialHistoryIds = await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId));
+    assert.ok(initialHistoryIds.length <= 51, 'The latest snapshot has 50 cards plus at most one fetched original');
+    const olderFetched = page.waitForRequest(request => new URL(request.url()).pathname === '/api/messages' && new URL(request.url()).searchParams.has('before'));
+    const prependAnchor = await page.locator('#feed').evaluate((feed, originalId) => {
+      feed.scrollTop = 0;
+      const card = [...feed.querySelectorAll('.message')].find(item => item.dataset.messageId !== originalId);
+      return { id: card.dataset.messageId, top: card.getBoundingClientRect().top };
+    }, sent.id);
+    await page.locator('#feed').evaluate(feed => feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 })));
     assert.ok(Number(new URL((await olderFetched).url()).searchParams.get('before')) > 2, 'Original lookup must not skip the remaining history');
-    await page.waitForFunction(() => state.pageBefore !== null && !state.loadingHistory);
-    const firstHistoryIds = await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId));
-    assert.equal(firstHistoryIds.length, 50);
-    assert.equal(await page.locator(`[data-message-id="${sent.id}"]`).count(), 0, 'Paging releases fetched originals');
+    await page.waitForFunction(() => state.historyLoaded && !state.loadingHistory && state.messages.size === 100);
+    assert.ok(Math.abs((await page.locator(`[data-message-id="${prependAnchor.id}"]`).evaluate(card => card.getBoundingClientRect().top)) - prependAnchor.top) < 3, 'Prepending preserves the visible anchor');
+    assert.equal(await page.locator(`[data-message-id="${sent.id}"]`).count(), 0, 'History fetch releases fetched originals');
+    assert.deepEqual((await renderedSequences()).slice().sort((a, b) => a - b), await renderedSequences(), 'Older fetches retain chronological order');
+    const historyFetchesBeforeSecondReload = historyFetchCount;
+    await page.reload();
+    await oldReply.waitFor();
+    assert.equal(await page.locator('.message').count(), 50, 'Refreshing after history loading returns to the latest snapshot');
+    assert.equal(await page.evaluate(() => state.snapshot.messages.length), 50);
+    await page.waitForTimeout(100);
+    assert.equal(historyFetchCount, historyFetchesBeforeSecondReload, 'Refresh does not automatically reload prior history');
+    for (let batches = 0; batches < 2; batches += 1) {
+      const request = page.waitForRequest(candidate => new URL(candidate.url()).pathname === '/api/messages' && new URL(candidate.url()).searchParams.has('before'));
+      await scrollHistory('top');
+      await request;
+      await page.waitForFunction(() => !state.loadingHistory);
+    }
+    assert.equal(await page.locator('.message').count(), 150);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'history-desktop.png'), animations: 'disabled' });
     await page.setViewportSize({ width: 320, height: 700 });
     assert.equal(await page.locator('#show-latest').isVisible(), true);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'history-mobile.png'), animations: 'disabled' });
     await page.setViewportSize({ width: 1440, height: 1000 });
-    await page.locator('#load-older').click();
-    await page.waitForFunction(() => state.pageCursors.length === 2 && !state.loadingHistory);
-    assert.equal(await page.locator('.message').count(), 50);
-    await page.locator('#load-newer').click();
-    await page.waitForFunction(() => state.pageCursors.length === 1 && !state.loadingHistory);
-    assert.deepEqual(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId)), firstHistoryIds);
+    const trimOlder = page.waitForRequest(candidate => new URL(candidate.url()).pathname === '/api/messages' && new URL(candidate.url()).searchParams.has('before'));
+    const trimAnchor = await page.locator('#feed').evaluate(feed => {
+      feed.scrollTop = 0;
+      const card = feed.querySelector('.message');
+      return { id: card.dataset.messageId, top: card.getBoundingClientRect().top };
+    });
+    await page.locator('#feed').evaluate(feed => feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: -120 })));
+    await trimOlder;
+    await page.waitForFunction(() => !state.loadingHistory && state.messages.size === 150 && state.hasNewer);
+    assert.equal(await page.locator('.message').count(), 150, 'Repeated history fetches keep only a bounded window');
+    assert.equal(new Set(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId))).size, 150, 'The bounded window has no duplicates');
+    assert.ok(Math.abs((await page.locator(`[data-message-id="${trimAnchor.id}"]`).evaluate(card => card.getBoundingClientRect().top)) - trimAnchor.top) < 3, 'Trimming after prepend preserves an existing anchor');
+    const newerFetched = page.waitForRequest(candidate => new URL(candidate.url()).pathname === '/api/messages' && new URL(candidate.url()).searchParams.has('after'));
+    const appendAnchor = await page.locator('#feed').evaluate(feed => {
+      feed.scrollTop = feed.scrollHeight;
+      const cards = feed.querySelectorAll('.message');
+      const card = cards[cards.length - 1];
+      return { id: card.dataset.messageId, top: card.getBoundingClientRect().top };
+    });
+    await page.locator('#feed').evaluate(feed => feed.dispatchEvent(new WheelEvent('wheel', { bubbles: true, deltaY: 120 })));
+    await newerFetched;
+    await page.waitForFunction(() => !state.loadingHistory && state.messages.size === 150);
+    assert.ok(Math.abs((await page.locator(`[data-message-id="${appendAnchor.id}"]`).evaluate(card => card.getBoundingClientRect().top)) - appendAnchor.top) < 3, 'Appending and trimming preserve an existing anchor');
+    const forwardSequences = await renderedSequences();
+    assert.deepEqual(forwardSequences.slice().sort((a, b) => a - b), forwardSequences, 'Forward fetches restore contiguous chronological rows');
+    assert.ok(forwardSequences.every((seq, index) => index === 0 || seq === forwardSequences[index - 1] + 1), 'Before and after pages have no skipped rows');
+    const failedHistory = page.waitForResponse(response => new URL(response.url()).pathname === '/api/messages' && new URL(response.url()).searchParams.has('before'));
+    await page.route('**/api/messages?before=*', route => route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'History unavailable' }) }));
+    await scrollHistory('top');
+    assert.equal((await failedHistory).status(), 503);
+    await page.waitForFunction(() => !state.loadingHistory);
+    await page.unroute('**/api/messages?before=*');
+    const retriedHistory = page.waitForRequest(request => new URL(request.url()).pathname === '/api/messages' && new URL(request.url()).searchParams.has('before'));
+    await scrollHistory('top');
+    await retriedHistory;
+    await page.waitForFunction(() => !state.loadingHistory, null);
+    const historyFetchesBeforeFilter = historyFetchCount;
+    await page.locator('#search').fill('History filler');
+    await page.waitForTimeout(100);
+    assert.equal(historyFetchCount, historyFetchesBeforeFilter, 'Filters do not automatically fetch every matching history page');
+    await page.locator('#search').fill('');
+    const frozenHistoryIds = await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId));
     const liveBurst = `
 import sys
 from pathlib import Path
@@ -506,22 +583,26 @@ c.close()
 `;
     execFileSync(python, ['-c', liveBurst, fixtureInfo.db], { cwd: root });
     await page.waitForFunction(() => state.snapshot.messages.at(-1)?.body === 'Live window burst 59');
-    assert.deepEqual(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId)), firstHistoryIds, 'Live messages do not displace the history page');
-    assert.equal(await page.evaluate(() => state.messages.size), 50);
+    assert.deepEqual(await page.locator('.message').evaluateAll(cards => cards.map(card => card.dataset.messageId)), frozenHistoryIds, 'Live messages do not displace the history window');
+    assert.equal(await page.evaluate(() => state.messages.size), 150);
     assert.equal(await page.evaluate(() => state.snapshot.messages.length), 50);
     await page.locator('#new-messages').click();
     await page.locator('.message-body').filter({ hasText: 'Live window burst 59' }).waitFor();
     assert.equal(await page.locator('.message').count(), 50);
     assert.equal(await page.evaluate(() => state.expanded.size), 0, 'Evicted expansion state is released');
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'bounded-history.png'), animations: 'disabled' });
-    const historyDuringReconnect = new Promise(resolve => page.route('**/api/messages?before=*', route => resolve(route)));
-    await page.locator('#load-older').click();
+    let captureReconnect;
+    const historyDuringReconnect = new Promise(resolve => { captureReconnect = resolve; });
+    await page.route('**/api/messages?before=*', captureReconnect);
+    const reconnectRequest = page.waitForRequest(request => new URL(request.url()).searchParams.has('before'), { timeout: 5000 });
+    await scrollHistory('top');
+    await reconnectRequest;
     const interruptedHistory = await historyDuringReconnect;
     await page.evaluate(() => connect());
     await interruptedHistory.fulfill({ response: await interruptedHistory.fetch() });
     await page.unroute('**/api/messages?before=*');
-    assert.equal(await page.locator('#load-older').isEnabled(), true, 'Reconnect releases obsolete history requests');
-    assert.equal(await page.evaluate(() => state.pageBefore), null);
+    await page.waitForFunction(() => !state.loadingHistory && state.messages.size === 50 && !state.historyLoaded);
+    assert.equal(await page.locator('.message').count(), 50, 'Reconnect resets to the latest bounded snapshot');
 
     // Session removal uses sibling controls, preserves history, and only succeeds after holds close.
     const removalSetup = `
@@ -620,9 +701,13 @@ c.close()
     assert.equal(scopedMessages.length, 1);
     assert.equal(scopedMessages[0].recipient_session, 'second-agent');
     await page.locator('#project-select').selectOption('default');
-    await page.locator('#load-older').waitFor();
-    const delayed = new Promise(resolve => page.route('**/api/messages?before=*', route => resolve(route)));
-    await page.locator('#load-older').click();
+    await page.waitForFunction(() => state.project === 'default' && !document.querySelector('#message-input').disabled && state.hasOlder);
+    let captureOldProject;
+    const delayed = new Promise(resolve => { captureOldProject = resolve; });
+    await page.route('**/api/messages?before=*', captureOldProject);
+    const oldProjectRequest = page.waitForRequest(request => new URL(request.url()).searchParams.has('before'), { timeout: 5000 });
+    await scrollHistory('top');
+    await oldProjectRequest;
     const oldRequest = await delayed;
     await page.locator('#project-select').selectOption(projectId);
     await page.locator(`[data-message-id="${secondMessage.id}"]`).waitFor();

@@ -20,6 +20,7 @@ from .bridge import Bridge
 from .core import CoordError
 from .remote import HttpClient, host_id
 from .rpc import RpcClient, RpcError, TransportError
+from .usage_guard import UsageGuard
 
 
 class RemoteBridgeState:
@@ -149,6 +150,7 @@ def main(argv=None):
     previous, stop, stack = {}, threading.Event(), contextlib.ExitStack()
     rpc, codex = None, None
     records = {}
+    usage_notice = None
     try:
         registry = HttpClient(args.server, args.api_token, project='default')
         if not isinstance(registry.token, str) or not registry.token.strip():
@@ -161,6 +163,7 @@ def main(argv=None):
             print(json.dumps({'dispatcher': 'released', 'project': project}))
             return 0
         rpc = RpcClient(args.codex_server)
+        usage_guard = UsageGuard(registry, host_id())
         if not args.connect_only:
             codex = subprocess.Popen(
                 [args.codex_bin, 'app-server', '--listen', args.codex_server],
@@ -183,6 +186,25 @@ def main(argv=None):
         while not stop.is_set():
             if codex is not None and codex.poll() is not None:
                 raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
+            usage = usage_guard.check(rpc)
+            if usage['blocked']:
+                notice = (usage.get('reason'), usage.get('enforcement_error'))
+                if notice != usage_notice:
+                    print(json.dumps({'bridge': 'usage_paused', 'reason': notice[0],
+                                      'error': notice[1]}), file=sys.stderr, flush=True)
+                    usage_notice = notice
+                for record in records.values():
+                    record['ready'] = False
+                    if record['acquired']:
+                        try:
+                            record['state'].heartbeat(args.codex_server, os.getpid(), usage.get('reason'))
+                        except (CoordError, OSError, ValueError):
+                            pass
+                if args.once:
+                    return 2
+                stop.wait(args.interval)
+                continue
+            usage_notice = None
             try:
                 projects = [args.project] if args.project else _project_ids(registry)
             except (CoordError, OSError, ValueError, KeyError, TypeError) as error:

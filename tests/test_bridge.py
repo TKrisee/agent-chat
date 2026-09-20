@@ -101,6 +101,24 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.count('thread/queue/start'), 1)
         self.assertIn(first, self.job()['payload'])
         self.assertIn(second, self.job()['payload'])
+        payload = next(p for method, p in self.rpc.calls if method == 'thread/queue/add')['input'][0]['text']
+        instructions, metadata = payload.split('\n')
+        self.assertIn('Keep established communication style.', instructions)
+        self.assertNotIn('caveman', instructions.lower())
+        self.assertIn('Chat only via agent-chat-client', instructions)
+        self.assertIn('no duplicate terminal commentary or final replies', instructions)
+        self.assertIn('--reply-to INBOX_MESSAGE_ID', instructions)
+        self.assertIn('do not send ACK-only messages', instructions)
+        self.assertNotIn('child', instructions)
+        self.assertLessEqual(len(instructions.split()), 65)
+        self.assertEqual(json.loads(metadata), {
+            'database': str(self.db.resolve()), 'thread_id': self.thread,
+            'deliveries': [
+                {'message_id': message, 'recipient_session': 'worker',
+                 'route': [{'session': 'worker', 'agent_path': None}]}
+                for message in (first, second)
+            ],
+        })
         self.assertEqual(self.job()['status'], 'dispatched')
         self.assertEqual(before, dict(self.agent.db.execute("SELECT * FROM sessions WHERE id='worker'").fetchone()))
         self.assertEqual(self.agent.db.execute('SELECT COUNT(*) FROM messages WHERE acked_at IS NOT NULL').fetchone()[0], 0)
@@ -108,12 +126,47 @@ class BridgeTests(unittest.TestCase):
         self.bridge.tick()
         self.assertEqual(self.count('thread/queue/start'), 1)
 
-    def test_acknowledged_and_agent_messages_do_not_wake(self):
+    def test_acknowledged_and_self_messages_do_not_wake(self):
         self.agent.acknowledge(self.send())
         other = self.coord('other', 'other')
-        self.send(sender=other)
+        self.agent.acknowledge(self.send(sender=other))
+        self_message = self.send(sender=self.agent)
+        self.assertEqual(self.state.pending(), [])
+        self.assertIsNone(self.state.prepare(
+            self.thread, [{'id': self_message, 'recipient_session': 'worker'}], 'ignored'))
         self.bridge.tick()
         self.assertEqual(self.count('thread/queue/add'), 0)
+        self.assertIsNone(self.agent.db.execute(
+            'SELECT acked_at FROM messages WHERE id=?', (self_message,)).fetchone()[0])
+
+    def test_peer_and_operator_messages_coalesce_without_automatic_ack_or_repeats(self):
+        other = self.coord('other', 'other')
+        first = self.send(sender=other)
+        second = self.send()
+        self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/start'), 1)
+        metadata = json.loads(self.job()['payload'].split('\n')[-1])
+        self.assertEqual([item['message_id'] for item in metadata['deliveries']], [first, second])
+        self.assertEqual(self.agent.db.execute(
+            'SELECT COUNT(*) FROM messages WHERE acked_at IS NOT NULL').fetchone()[0], 0)
+        self.rpc.status = 'idle'
+        self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/start'), 1)
+        self.agent.acknowledge(first)
+        self.agent.acknowledge(second)
+        self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/start'), 1)
+
+    def test_prepare_rechecks_peer_acknowledgement_and_recipient(self):
+        other = self.coord('other', 'other')
+        message = self.send(sender=other)
+        pending = self.state.pending()
+        self.assertEqual(pending, [{'id': message, 'recipient_session': 'worker'}])
+        self.assertIsNone(self.state.prepare(
+            self.thread, [{'id': message, 'recipient_session': 'other'}], 'wrong recipient'))
+        self.agent.acknowledge(message)
+        self.assertIsNone(self.state.prepare(self.thread, pending, 'already acknowledged'))
+        self.assertEqual(self.state.jobs(), [])
 
     def test_busy_unloaded_and_noninput_threads_wait_then_wake(self):
         self.send()
@@ -396,12 +449,28 @@ class BridgeTests(unittest.TestCase):
         BridgeState(grandchild).bind(parent_session='child', agent_path='/root/reviewer/check')
         child_message = self.send('child')
         grand_message = self.send('grandchild')
-        self.send()
+        root_message = self.send()
         self.bridge.tick()
         self.assertEqual(self.count('thread/queue/start'), 1)
         self.assertIn(child_message, self.job()['payload'])
         self.assertIn(grand_message, self.job()['payload'])
         self.assertIn('/root/reviewer/check', self.job()['payload'])
+        instructions, metadata = self.job()['payload'].split('\n')
+        self.assertIn('Keep established communication style.', instructions)
+        self.assertNotIn('caveman', instructions.lower())
+        self.assertEqual(instructions.count('For child routes'), 1)
+        self.assertIn('native follow-up', instructions)
+        self.assertIn('Never impersonate a child, read/ack its inbox', instructions)
+        self.assertIn('routing metadata and these instructions', instructions)
+        self.assertIn('Report unavailable children in chat', instructions)
+        root_route = [{'session': 'worker', 'agent_path': None}]
+        child_route = root_route + [{'session': 'child', 'agent_path': '/root/reviewer'}]
+        self.assertEqual(json.loads(metadata)['deliveries'], [
+            {'message_id': child_message, 'recipient_session': 'child', 'route': child_route},
+            {'message_id': grand_message, 'recipient_session': 'grandchild',
+             'route': child_route + [{'session': 'grandchild', 'agent_path': '/root/reviewer/check'}]},
+            {'message_id': root_message, 'recipient_session': 'worker', 'route': root_route},
+        ])
         self.assertEqual(child.db.execute("SELECT inbox_read_seq FROM sessions WHERE id='child'").fetchone()[0], 0)
 
     def test_binding_rejects_inherited_non_uuid_and_missing_parent_path(self):
@@ -430,14 +499,13 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.rpc.entries, [])
         self.assertEqual(self.count('thread/queue/start'), 1)  # first attempt was rejected busy
 
-    def test_operator_identity_is_exact_not_label_or_prefix(self):
-        impostor = self.coord('web_operator_impostor', 'operator')
-        self.send(sender=impostor)
-        self.bridge.tick()
-        self.assertEqual(self.count('thread/queue/add'), 0)
+    def test_peer_wake_does_not_depend_on_sender_label_or_web_identity(self):
+        peer = self.coord('web_operator_peer', 'operator')
+        self.send(sender=peer)
         Path(str(self.db) + '.web-session.json').unlink()
-        with self.assertRaises(CoordError):
-            self.state.pending()
+        self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/start'), 1)
+        self.assertEqual(self.state.pending(), [])
 
     def test_single_bridge_lock_is_released_on_exception(self):
         with exclusive_bridge(self.db):

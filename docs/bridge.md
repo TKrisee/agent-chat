@@ -70,13 +70,26 @@ wake jobs before changing bindings so queued input cannot reach an old route.
 
 ## Dispatch behavior
 
-- Only unacknowledged messages from the exact persistent web operator session
-  are eligible. Agent messages, replies and acknowledgements do not wake peers.
-  A newly bound agent may be woken for old messages it has not acknowledged.
+- Unacknowledged incoming messages from the operator or another agent are
+  eligible, including replies and subagent messages. Self-addressed messages
+  are inbox-only. Acknowledgement operations do not wake agents. A newly bound
+  agent may be woken for old messages it has neither acknowledged nor received
+  a wake for.
 - Messages for one root thread are coalesced (up to 100 per wake). The wake
   includes routing metadata and message IDs; agents read message bodies from
   their inbox. The bridge does not read inboxes, acknowledge messages, alter
   tokens or change resource queues.
+- Wake instructions retain the established communication style and request
+  chat-only communication, with no duplicate terminal commentary or final
+  replies. They do not mention or invoke the style skill: repeating an explicit
+  skill reference causes Codex to inject its full instructions into each wake.
+  The [adoption prompt](agents.md) activates `$caveman` full mode once during
+  setup for each agent, including new subagents.
+  Agents should acknowledge receipt through the acknowledgement command and
+  reply only when needed, avoiding exchanges of ACK-only chat messages.
+  Child-routing instructions appear only when the wake includes a descendant.
+  These are agent instructions, not runtime enforcement; install the skill on
+  each execution machine and use the [adoption prompt](agents.md) during setup.
 - A thread must be loaded, idle and accept direct input. Active,
   approval-waiting, unloaded and non-input child threads wait. The bridge never
   resumes a thread, starts or steers a turn directly, or answers approvals.
@@ -87,12 +100,70 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   If all those messages are acknowledged before dispatch, the bridge cancels
   its own pending input if present. New messages can trigger another wake.
 
+Restart the chat server to load message-eligibility changes and each running
+client bridge to load wake-prompt changes. The default client launcher also
+stops its owned Codex app-server when stopped; `--connect-only` leaves an
+independently running app-server available. Existing persisted wake jobs retain
+their original text. After upgrading from operator-only wakes, old unread peer
+messages become eligible; completed wakes are not replayed. No database
+migration is needed.
+
 The app-server endpoint must be a loopback WebSocket URL such as
 `ws://127.0.0.1:4500`, `ws://localhost:4500` or `ws://[::1]:4500`. Keep it
 private to trusted local clients. The bridge does not change model settings,
 credentials, sandbox or approval policy. Codex retains control of approvals.
 See the [official app-server documentation](https://learn.chatgpt.com/docs/app-server)
 for transport and lifecycle details.
+
+## Weekly usage guard
+
+The UI's **Weekly guard** setting is global and stored in the base chat database,
+even when a different project is selected. It starts disabled with a 30%
+remaining threshold. Each client reads `account/rateLimits/read` from its own
+local app-server roughly every ten seconds and reports the weekly window to
+the chat server. The window is identified by its seven-day duration, whether
+Codex returns it as primary or secondary. If several weekly buckets exist, the
+lowest remaining allowance is used. The policy uses the lowest fresh allowance
+across connected hosts.
+
+Each bridge checks the shared policy before dispatching, normally every two
+seconds (`--interval`). A report at or below the threshold latches a persistent
+pause for all projects. Raising the threshold above a current allowance also
+triggers it. Lowering it or reaching a weekly reset does not clear a latched
+pause. **Allow work** requires fresh reports strictly above the configured
+threshold from all recently connected hosts. Explicitly disabling protection
+clears the pause as well.
+
+While blocked, clients enumerate all loaded threads on their local app-server,
+including native children and threads outside the bridge's selected project.
+They read only the latest turn summary, interrupt active turns, and clean
+Codex-tracked background terminals. Repeated checks also stop new manually
+started turns while the reserve is active. They do not resume unloaded threads,
+send model prompts, acknowledge chat, delete queued input, release resource
+holds, or fabricate closure receipts. Interrupted tasks require continuation
+after manual release; pending chat wakes can then dispatch normally. Inspect
+unfinished resource cleanup before continuing shared work.
+
+The server also refuses bridge preparation, enqueue intent and start intent
+while protection blocks work. Old clients can therefore be prevented from
+starting chat wakes, but every client must be upgraded for active-turn stopping.
+Stop failures appear in the Usage reserve dialog and the client stderr log and
+are retried. Keep the local app-server and bridge running during a reserve pause.
+
+Reports expire after 60 seconds. An online host with missing, failed or stale
+quota blocks an enabled policy until data recovers; unknown data is never shown
+as zero. A disconnected host drops out of fresh-report comparisons, but a
+threshold pause remains latched. A bridge that already knows protection is
+enabled stops local work if it loses contact with the chat server. Before the
+first policy read succeeds, it withholds wakes without interrupting existing
+work. Unsupported account quota data cannot enable protected work.
+
+There is no exact spending guarantee: reporting delays, polling and in-flight
+operations can overshoot the reserve. Other Codex instances, an offline bridge,
+and detached processes outside Codex's tracked terminals cannot be controlled.
+Use a margin above the allowance you need to preserve. The implementation was
+checked against Codex CLI 0.155.1's generated schema and the
+[official app-server quota and interruption APIs](https://learn.chatgpt.com/docs/app-server).
 
 ## Status and recovery
 

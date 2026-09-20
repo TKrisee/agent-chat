@@ -2,6 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 const MESSAGE_LIMIT = 50;
+const MESSAGE_WINDOW_LIMIT = 150;
 const MESSAGE_PREVIEW_LENGTH = 2000;
 const MAX_IMAGES = 4;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -12,8 +13,10 @@ const state = {
   mentionOptions: [], mentionIndex: 0, reply: null, originals: new Map(), highlighted: null,
   project: new URL(location.href).searchParams.get('project') || 'default', epoch: 0,
   projects: [], drafts: new Map(), busy: false,
-  pageBefore: null, pageCursors: [], loadingHistory: false,
+  hasNewer: false, historyLoaded: false, loadingHistory: false,
+  historyDirection: null, historyError: null, scrollTop: 0,
   attachments: [],
+  usage: null, usageDialogDirty: false, usageSaving: false,
 };
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 const dateFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -45,6 +48,85 @@ function setConnection(connected) {
   if (!connected && !state.snapshot) {
     $('empty-title').textContent = 'Waiting for the connection';
     $('empty-description').textContent = 'The conversation will appear when the local server is available.';
+  }
+}
+
+function usageStatus(usage = state.usage) {
+  if (!usage) return 'Usage unavailable';
+  if (!usage?.enabled) return 'Weekly guard off';
+  if (usage.paused) return usage.remaining_percent == null ? 'Usage unknown · work paused' : 'Weekly reserve reached · work paused';
+  if (usage.blocked || usage.remaining_percent == null) return 'Usage unknown · work paused';
+  return `${Math.round(usage.remaining_percent)}% weekly left`;
+}
+
+function usageReset(usage = state.usage) {
+  if (!usage?.resets_at) return 'Reset time unavailable';
+  const date = new Date(usage.resets_at * 1000);
+  if (Number.isNaN(date.getTime())) return 'Reset time unavailable';
+  return `Resets ${new Intl.DateTimeFormat(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit' }).format(date)}`;
+}
+
+function renderUsage(usage) {
+  state.usage = usage || null;
+  const label = usageStatus();
+  $('usage-label').textContent = label;
+  $('usage-button').classList.toggle('paused', Boolean(usage?.enabled && (usage.paused || usage.blocked || usage.remaining_percent == null)));
+  $('usage-button').classList.toggle('enabled', Boolean(usage?.enabled && !(usage.paused || usage.blocked || usage.remaining_percent == null)));
+  $('usage-button').title = usage?.reason || (usage?.enabled ? usageReset() : 'Configure a global weekly usage reserve');
+  const remaining = usage?.remaining_percent == null ? 'Remaining usage is unknown' : `${Math.round(usage.remaining_percent)}% remaining this week`;
+  $('usage-current').textContent = usage?.enabled
+    ? `${remaining}. ${label}. ${usageReset()}${usage.reason ? ` ${usage.reason}` : ''}`
+    : `${remaining}. ${usageReset()}. The weekly usage reserve is off.`;
+  const failures = (usage?.hosts || []).filter(host => host.recent && host.enforcement_error);
+  $('usage-enforcement').textContent = failures.map(host => `${host.host_id}: ${host.enforcement_error}`).join('\n');
+  $('usage-enforcement').hidden = !failures.length;
+  $('resume-usage').hidden = !(usage?.enabled && usage.paused);
+  if (!$('usage-dialog').open || !state.usageDialogDirty) syncUsageForm();
+}
+
+function syncUsageForm() {
+  const usage = state.usage;
+  $('usage-enabled').checked = Boolean(usage?.enabled);
+  $('usage-threshold').value = String(usage?.threshold_percent ?? 30);
+  usageFormControls();
+}
+
+function usageFormControls() {
+  $('usage-enabled').disabled = state.usageSaving;
+  $('usage-threshold').disabled = !$('usage-enabled').checked || state.usageSaving;
+  $('save-usage').disabled = state.usageSaving;
+  $('resume-usage').disabled = state.usageSaving;
+}
+
+function usageError(message = '') {
+  $('usage-error').textContent = message;
+  $('usage-error').hidden = !message;
+}
+
+async function saveUsage(operation) {
+  if (!state.config || state.usageSaving) return;
+  const enabled = $('usage-enabled').checked;
+  const threshold = Number($('usage-threshold').value);
+  if (operation === 'configure' && (!Number.isInteger(threshold) || threshold < 0 || threshold > 100)) {
+    usageError('Choose a whole percentage from 0 to 100.');
+    return;
+  }
+  state.usageSaving = true;
+  usageError();
+  usageFormControls();
+  try {
+    const usage = await fetchUsage('/api/usage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify(operation === 'resume' ? { op: 'resume' } : { op: 'configure', enabled, threshold_percent: threshold }),
+    });
+    state.usageDialogDirty = false;
+    renderUsage(usage);
+  } catch (error) {
+    usageError(error.message);
+  } finally {
+    state.usageSaving = false;
+    usageFormControls();
   }
 }
 
@@ -340,6 +422,7 @@ async function jumpToMessage(id) {
     const original = $(`chat-${id}`) || (batch && [...document.querySelectorAll('.message')].find((article) => article.dataset.batchId === batch));
     original?.focus({ preventScroll: true });
     original?.scrollIntoView({ block: 'center' });
+    state.scrollTop = $('feed').scrollTop;
   } catch (error) {
     if (error.name === 'AbortError') return;
     composerStatus(`Could not open the original message: ${error.message}`, true);
@@ -450,10 +533,36 @@ function messageCard(message) {
   return article;
 }
 
-function renderMessages(forceBottom = false) {
+function feedAnchor() {
   const feed = $('feed');
-  const oldTop = feed.scrollTop;
-  const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
+  const top = feed.getBoundingClientRect().top;
+  const card = [...$('messages').querySelectorAll('.message')].find(card =>
+    state.messages.has(card.dataset.messageId) && card.getBoundingClientRect().bottom > top
+    && card.getBoundingClientRect().top < top + feed.clientHeight);
+  return { id: card?.id, batch: card?.dataset.batchId,
+    offset: card ? card.getBoundingClientRect().top - top : 0, top: feed.scrollTop };
+}
+
+function renderHistoryStatus() {
+  $('feed').setAttribute('aria-busy', String(state.loadingHistory));
+  $('show-latest').disabled = state.loadingHistory;
+  $('show-latest').hidden = !state.historyLoaded && !state.originals.size && !state.hasNewer;
+  $('message-window').textContent = state.historyLoaded ? `${state.messages.size} messages loaded` : state.hasOlder ? `Latest ${state.messages.size} messages` : '';
+  for (const direction of ['older', 'newer']) {
+    const edge = $('history-' + direction);
+    const available = direction === 'older' ? state.hasOlder : state.hasNewer;
+    edge.hidden = !available;
+    edge.textContent = state.loadingHistory && state.historyDirection === direction
+      ? `Loading ${direction} messages…`
+      : state.historyError === direction ? `Could not load ${direction} messages. Scroll to retry.`
+        : `Scroll ${direction === 'older' ? 'up' : 'down'} for ${direction} messages`;
+  }
+  $('new-messages').hidden = state.newCount === 0;
+  $('new-messages').textContent = `${state.newCount} new · Back to latest`;
+}
+
+function renderMessages(forceBottom = false, anchor = feedAnchor()) {
+  const feed = $('feed');
   const label = state.toMe
     ? (state.selected ? `${agentLabel(state.selected)} → You` : 'Messages to you')
     : (state.selected ? agentLabel(state.selected) : 'All conversations');
@@ -484,27 +593,19 @@ function renderMessages(forceBottom = false) {
   const filtered = state.query || state.ack !== 'all' || state.toMe;
   $('empty-title').textContent = filtered ? 'No matching messages' : 'The room is quiet';
   $('empty-description').textContent = filtered ? 'Try a different search or message filter.' : 'New agent messages will appear here automatically. You can start a conversation below.';
-  $('load-older').hidden = !state.hasOlder;
-  $('load-newer').hidden = !state.pageCursors.length;
-  $('show-latest').hidden = state.pageBefore === null && !state.originals.size;
-  $('message-window').textContent = state.pageBefore !== null
-    ? `Earlier messages · ${state.messages.size} loaded`
-    : state.hasOlder ? `Latest ${state.messages.size} messages` : '';
-  if (state.pageBefore !== null) {
-    feed.scrollTop = oldTop;
-    $('new-messages').hidden = state.newCount === 0;
-    $('new-messages').textContent = `${state.newCount} new · Back to latest`;
-    return;
-  }
-  if (forceBottom || nearBottom) {
+  renderHistoryStatus();
+  if (forceBottom) {
     feed.scrollTop = feed.scrollHeight;
-    state.newCount = 0;
-    $('new-messages').hidden = true;
+    if (!state.hasNewer) {
+      state.newCount = 0;
+      $('new-messages').hidden = true;
+    }
   } else {
-    feed.scrollTop = oldTop;
-    $('new-messages').hidden = state.newCount === 0;
-    $('new-messages').textContent = `${state.newCount} new ${state.newCount === 1 ? 'message' : 'messages'} ↓`;
+    const card = (anchor.id && document.getElementById(anchor.id))
+      || (anchor.batch && [...$('messages').querySelectorAll('.message')].find(card => card.dataset.batchId === anchor.batch));
+    feed.scrollTop = card ? feed.scrollTop + card.getBoundingClientRect().top - feed.getBoundingClientRect().top - anchor.offset : anchor.top;
   }
+  state.scrollTop = feed.scrollTop;
 }
 
 function prettyResource(value) {
@@ -571,10 +672,16 @@ function applySnapshot(data) {
   $('bridge-caption').title = clients.length
     ? clients.map(client => `${client.host_id}: ${client.error || (client.recent ? 'connected' : 'offline')}`).join('\n')
     : bridge?.error || 'Only loaded, idle, bound Codex agents can be woken.';
+  renderUsage(data.usage);
   if (state.paused) { state.pending = data; return; }
   const initial = !state.snapshot;
   const previous = state.snapshot?.messages || [];
   const oldMax = Math.max(0, ...previous.map((item) => item.seq));
+  const visibleMax = Math.max(0, ...[...state.messages.values()].map(message => message.seq));
+  const feed = $('feed');
+  const following = !state.loadingHistory && !state.hasNewer && !state.originals.size
+    && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
+  const overlap = data.messages.some(message => state.messages.has(message.id));
   const oldVisible = JSON.stringify([...state.messages.values()]);
   const labels = (sessions) => JSON.stringify((sessions || []).map(({ id, agent }) => [id, agent]));
   const labelsChanged = labels(data.sessions) !== labels(state.snapshot?.sessions);
@@ -584,19 +691,32 @@ function applySnapshot(data) {
     const key = message.batch_id || message.id;
     if (!initial && message.seq > oldMax && !seen.has(key)) state.newCount += 1;
     seen.add(key);
-    if (state.pageBefore !== null && state.messages.has(message.id)) state.messages.set(message.id, message);
+    if (state.messages.has(message.id)) state.messages.set(message.id, message);
   }
-  if (state.pageBefore === null) {
+  if (initial || (!state.historyLoaded && following && (overlap || !state.messages.size))) {
     state.messages = new Map(data.messages.map((message) => [message.id, message]));
     state.hasOlder = data.history_truncated;
-    pruneExpanded();
+    state.hasNewer = false;
+  } else if (overlap && (following || (!state.historyLoaded && !state.loadingHistory && !state.hasNewer))) {
+    const messages = new Map([...state.messages, ...data.messages.map(message => [message.id, message])]);
+    const rows = [...messages.values()].sort((a, b) => a.seq - b.seq);
+    if (!following && rows.length > MESSAGE_WINDOW_LIMIT) {
+      state.historyLoaded = true;
+      state.hasNewer = true;
+    } else {
+      if (rows.length > MESSAGE_WINDOW_LIMIT) state.hasOlder = true;
+      state.messages = new Map(rows.slice(-MESSAGE_WINDOW_LIMIT).map(message => [message.id, message]));
+    }
+  } else if (data.messages.some(message => message.seq > visibleMax)) {
+    // Keep a contiguous window while reading history, even if live traffic
+    // moves beyond the server's latest 50-message snapshot.
+    state.historyLoaded = true;
+    state.hasNewer = true;
   }
+  pruneExpanded();
   renderAgents();
-  if (initial || labelsChanged || oldVisible !== JSON.stringify([...state.messages.values()])) renderMessages(initial);
-  else if (state.pageBefore !== null) {
-    $('new-messages').hidden = state.newCount === 0;
-    $('new-messages').textContent = `${state.newCount} new · Back to latest`;
-  }
+  if (initial || labelsChanged || oldVisible !== JSON.stringify([...state.messages.values()])) renderMessages(initial || (following && !state.hasNewer));
+  else renderHistoryStatus();
   renderResources();
   if (state.newCount) $('announcement').textContent = `${state.newCount} new messages received`;
 }
@@ -609,7 +729,7 @@ function pruneExpanded() {
 
 function showLatest() {
   if (state.loadingHistory || !state.snapshot) return;
-  state.pageBefore = null; state.pageCursors = [];
+  state.historyLoaded = false; state.hasNewer = false; state.historyError = null;
   state.originals.clear(); state.highlighted = null;
   state.messages = new Map(state.snapshot.messages.map((message) => [message.id, message]));
   state.hasOlder = state.snapshot.history_truncated;
@@ -618,30 +738,54 @@ function showLatest() {
 }
 
 async function loadMessagePage(newer = false) {
-  if (state.loadingHistory || (newer && !state.pageCursors.length) || (!newer && !state.messages.size)) return;
-  const before = newer ? state.pageCursors.at(-1) : Math.min(...[...state.messages.values()].map(message => message.seq));
-  if (before === null) { showLatest(); return; }
+  if (state.loadingHistory || !state.messages.size || (newer ? !state.hasNewer : !state.hasOlder)) return;
+  const sequences = [...state.messages.values()].map(message => message.seq);
+  const cursor = newer ? Math.max(...sequences) : Math.min(...sequences);
   const epoch = state.epoch;
   state.loadingHistory = true;
-  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = true;
+  state.historyDirection = newer ? 'newer' : 'older';
+  state.historyError = null;
+  renderHistoryStatus();
   try {
-    const result = await fetchJSON(`/api/messages?before=${before}&limit=${MESSAGE_LIMIT}`);
-    if (newer) state.pageCursors.pop(); else state.pageCursors.push(state.pageBefore);
-    state.pageBefore = before;
-    state.messages = new Map(result.messages.slice(-MESSAGE_LIMIT).map(message => [message.id, message]));
+    const result = await fetchJSON(`/api/messages?${newer ? 'after' : 'before'}=${cursor}&limit=${MESSAGE_LIMIT}`);
+    const anchor = feedAnchor();
+    const messages = new Map([...state.messages, ...result.messages.slice(0, MESSAGE_LIMIT).map(message => [message.id, message])]);
+    const rows = [...messages.values()].sort((a, b) => a.seq - b.seq);
+    const trimmed = rows.length > MESSAGE_WINDOW_LIMIT;
+    const retained = newer ? rows.slice(-MESSAGE_WINDOW_LIMIT) : rows.slice(0, MESSAGE_WINDOW_LIMIT);
+    // If the user moved to the opposite end during the request, avoid evicting
+    // the message they are now reading. The next edge scroll can retry.
+    if (anchor.id && !retained.some(message => `chat-${message.id}` === anchor.id || (anchor.batch && message.batch_id === anchor.batch))) return;
+    state.messages = new Map(retained.map(message => [message.id, message]));
+    state.historyLoaded = true;
     state.originals.clear(); state.highlighted = null;
-    state.hasOlder = result.has_more;
+    if (newer) {
+      state.hasNewer = result.has_more || state.snapshot.messages.some(message => message.seq > (retained.at(-1)?.seq || 0));
+      if (trimmed) state.hasOlder = true;
+      if (!state.hasNewer) state.newCount = 0;
+    } else {
+      state.hasOlder = result.has_more;
+      if (trimmed) state.hasNewer = true;
+    }
     pruneExpanded();
-    renderMessages();
-    $('feed').scrollTop = 0;
+    renderMessages(false, anchor);
   } catch (error) {
-    if (error.name !== 'AbortError') composerStatus(`Could not load history: ${error.message}`, true);
+    if (error.name !== 'AbortError') state.historyError = newer ? 'newer' : 'older';
   } finally {
     if (epoch === state.epoch) {
       state.loadingHistory = false;
-      for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
+      state.historyDirection = null;
+      renderHistoryStatus();
+      state.scrollTop = $('feed').scrollTop;
     }
   }
+}
+
+function loadAtScrollEdge(direction) {
+  if (state.loadingHistory || !state.config) return;
+  const feed = $('feed');
+  if (direction < 0 && feed.scrollTop < 180) loadMessagePage();
+  else if (direction > 0 && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 180) loadMessagePage(true);
 }
 
 async function fetchJSON(url, options = {}) {
@@ -649,6 +793,13 @@ async function fetchJSON(url, options = {}) {
   const response = await fetch(projectURL(url), { cache: 'no-store', ...options });
   const data = await response.json();
   if (epoch !== state.epoch) throw new DOMException('Project changed', 'AbortError');
+  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  return data;
+}
+
+async function fetchUsage(url, options = {}) {
+  const response = await fetch(url, { cache: 'no-store', ...options });
+  const data = await response.json();
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
   return data;
 }
@@ -683,7 +834,12 @@ function renderProjects(data) {
 async function connect() {
   const epoch = ++state.epoch;
   state.loadingHistory = false;
-  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
+  state.historyDirection = null; state.historyError = null;
+  state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
+  state.historyLoaded = false; state.hasNewer = false; state.hasOlder = false;
+  state.pending = null; state.paused = false; state.newCount = 0;
+  $('pause-button').setAttribute('aria-pressed', 'false'); $('pause-label').textContent = 'Pause feed'; $('pause-icon').textContent = 'Ⅱ';
+  renderMessages(true);
   state.source?.close();
   state.config = null;
   $('message-input').disabled = true;
@@ -722,7 +878,8 @@ function switchProject(id) {
   state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
   state.selected = null; state.query = ''; state.ack = 'all'; state.toMe = false; state.highlighted = null;
   state.pending = null; state.paused = false; state.hasOlder = false; state.newCount = 0;
-  state.pageBefore = null; state.pageCursors = []; state.loadingHistory = false;
+  state.historyLoaded = false; state.hasNewer = false; state.loadingHistory = false;
+  state.historyDirection = null; state.historyError = null;
   $('pause-button').setAttribute('aria-pressed', 'false'); $('pause-label').textContent = 'Pause feed'; $('pause-icon').textContent = 'Ⅱ';
   $('search').value = ''; $('ack-filter').value = 'all';
   const draft = state.drafts.get(id);
@@ -736,12 +893,26 @@ function switchProject(id) {
   $('agent-count').textContent = '0'; $('all-count').textContent = '0';
   $('held-count').textContent = '0'; $('mobile-resource-count').textContent = '0';
   $('waiting-count').textContent = ''; $('bridge-caption').textContent = 'Connecting…';
-  for (const id of ['load-older', 'load-newer', 'show-latest']) $(id).disabled = false;
   renderMessages(true);
   connect();
 }
 
 $('project-select').addEventListener('change', event => switchProject(event.target.value));
+$('usage-button').addEventListener('click', () => {
+  state.usageDialogDirty = false;
+  usageError();
+  renderUsage(state.usage);
+  $('usage-dialog').showModal();
+  $('usage-enabled').focus();
+});
+$('cancel-usage').addEventListener('click', () => $('usage-dialog').close());
+$('usage-enabled').addEventListener('change', () => {
+  state.usageDialogDirty = true;
+  usageFormControls();
+});
+$('usage-threshold').addEventListener('input', () => { state.usageDialogDirty = true; usageError(); });
+$('usage-form').addEventListener('submit', (event) => { event.preventDefault(); saveUsage('configure'); });
+$('resume-usage').addEventListener('click', () => saveUsage('resume'));
 for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
   $(id).addEventListener('click', () => {
     $('project-form').dataset.rename = String(rename);
@@ -783,8 +954,27 @@ $('pause-button').addEventListener('click', () => {
 });
 $('new-messages').addEventListener('click', showLatest);
 $('show-latest').addEventListener('click', showLatest);
-$('load-older').addEventListener('click', () => loadMessagePage());
-$('load-newer').addEventListener('click', () => loadMessagePage(true));
+$('feed').addEventListener('scroll', () => {
+  const top = $('feed').scrollTop;
+  const direction = top - state.scrollTop;
+  state.scrollTop = top;
+  loadAtScrollEdge(direction);
+}, { passive: true });
+$('feed').addEventListener('wheel', event => loadAtScrollEdge(event.deltaY), { passive: true });
+$('feed').addEventListener('keydown', event => {
+  if (event.target !== $('feed')) return;
+  if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) loadAtScrollEdge(-1);
+  if (['ArrowDown', 'PageDown', 'End'].includes(event.key)) loadAtScrollEdge(1);
+});
+let feedTouchY = null;
+$('feed').addEventListener('touchstart', event => { feedTouchY = event.touches[0]?.clientY; }, { passive: true });
+$('feed').addEventListener('touchmove', event => {
+  const y = event.touches[0]?.clientY;
+  if (feedTouchY != null && y != null && Math.abs(feedTouchY - y) > 30) {
+    loadAtScrollEdge(feedTouchY - y);
+    feedTouchY = y;
+  }
+}, { passive: true });
 for (const [id, panel] of [['agents-toggle', 'sidebar'], ['resources-toggle', 'resources']]) {
   $(id).addEventListener('click', () => {
     const open = !document.body.classList.contains(`show-${panel}`);
@@ -896,7 +1086,7 @@ $('composer').addEventListener('submit', async (event) => {
     composerStatus(broadcast ? `Sent to all ${recipients.length} agents` : `Sent to ${recipients.map((id) => agentLabel(id)).join(', ')}`);
     try {
       applySnapshot(await fetchJSON('/api/snapshot'));
-      $('feed').scrollTop = $('feed').scrollHeight;
+      showLatest();
     } catch { setConnection(false); }
   } catch (error) {
     composerStatus(error.message, true);

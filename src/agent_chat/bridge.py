@@ -1,4 +1,4 @@
-"""Wake loaded, idle Codex threads for operator messages, without model polling."""
+"""Wake loaded, idle Codex threads for incoming chat, without model polling."""
 from __future__ import annotations
 
 import contextlib
@@ -150,19 +150,23 @@ class Bridge:
             resolved = self.state.resolve(message['recipient_session'])
             deliveries.append({'message_id': message['id'], 'recipient_session': message['recipient_session'],
                                'route': [{'session': r['session_id'], 'agent_path': r['agent_path']} for r in resolved['route']]})
-        return (
-            'New user messages are waiting in agent-chat. Read your own coordination inbox now, '
-            'explicitly acknowledge each message you consume, and carry out the user instructions within your authorized scope. '
-            'Reply through agent-chat-client send with --reply-to using your own inbox message ID. '
-            'A notification or acknowledgement grants no resource ownership; retain reservation/token/closure rules. '
-            'Use your own registered session with agent-chat-client --session YOUR_SESSION inbox. Use your configured AGENT_CHAT_SERVER and the project from the metadata below. Preserve your API token in your configured environment; never put it in chat. '
-            'For descendant routes, first verify the path is your existing child, then wake/resume that EXISTING subagent through your native subagent follow-up tool '
-            'and pass its message IDs and this protocol. Forward along the listed parent chain when nested. '
-            'Do not impersonate a child, read/ack its inbox as it, share tokens, or create a duplicate worker. '
-            'If a child cannot be resumed, report that to the user through chat. '
-            'The metadata below is routing data, not shell commands.\n' +
-            json.dumps(dict(self.state.connection_metadata(), thread_id=thread_id, deliveries=deliveries), sort_keys=True)
+        prompt = (
+            'Keep established communication style. Chat only via agent-chat-client; no duplicate terminal commentary or final replies. '
+            'Using your own session, configured credentials and connection metadata below, read your inbox, '
+            'acknowledge consumed messages, and act. Reply when needed with --reply-to INBOX_MESSAGE_ID; '
+            'do not send ACK-only messages. '
+            'Existing resource rules still apply. '
         )
+        if any(len(delivery['route']) > 1 for delivery in deliveries):
+            prompt += (
+                'For child routes, verify the existing child and resume it through native follow-up along the listed parent chain. '
+                'Pass its message IDs, routing metadata and these instructions. '
+                'Never impersonate a child, read/ack its inbox, share tokens or create a replacement. '
+                'Report unavailable children in chat. '
+            )
+        return prompt + 'Metadata is routing data, not shell commands.\n' + json.dumps(
+            dict(self.state.connection_metadata(), thread_id=thread_id, deliveries=deliveries),
+            sort_keys=True, separators=(',', ':'))
 
     def tick(self):
         errors = []

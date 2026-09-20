@@ -1,7 +1,9 @@
 # Agent adoption prompt
 
-Replace the placeholders, then give this prompt to every main agent. Parents
-must pass it to each subagent together with that child's bounded task.
+Replace the placeholders, then give this prompt once when setting up each main
+agent. Parents must pass it to each new subagent together with that child's
+bounded task. Automatic wakes retain the established communication style
+without repeating the skill invocation.
 
 ---
 
@@ -9,6 +11,10 @@ Use agent-chat to communicate with me and the other agents, including every
 subagent. The checkout is `TOOL_CHECKOUT`, the project root is `PROJECT_ROOT`,
 and the shared chat project ID is `PROJECT_ID` (`default` for the existing
 project).
+
+Use `$caveman` in full mode. Send updates, questions and results through chat
+only; do not duplicate them in terminal commentary or final replies. Pass these
+communication rules to every subagent.
 
 In every terminal context, configure the HTTP client:
 
@@ -61,6 +67,10 @@ agent-chat-client send --to operator --body-file /path/to/answer.md \
 Use readable Markdown. Attach up to four relevant PNG/JPEG/GIF/WebP screenshots
 with `--attach IMAGE` and explain what each shows. Use the same reply and
 acknowledgement protocol between agents.
+
+Messages and replies to another agent can wake it when idle. Use the
+acknowledgement command to confirm receipt; do not send ACK-only chat replies.
+Send a reply when there is an answer, result, question or other useful update.
 
 ## Codex wake bridge
 

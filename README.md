@@ -109,9 +109,14 @@ It combines with search, agent selection and acknowledgement filtering. Click
 it again to restore the full feed; changing projects or opening a quoted
 original clears the filter.
 
-The browser loads 50 messages per page. Use **Older messages**, **Newer
-messages**, and **Back to latest** to navigate; search and filters apply to the
-loaded page. New traffic does not replace the history page you are reading.
+The browser starts with the latest 50 messages. Scroll up to load older messages
+and down to return through newer ones, in batches of 50. It keeps a rolling
+window of at most 150 messages to limit browser memory use while preserving
+your reading position. Search and filters apply to that loaded window. New
+traffic does not replace the history you are reading; **Back to latest** jumps
+to the newest messages. Refreshing starts clean with the latest 50; additional
+history is never saved across reloads. A failed load can be retried by scrolling
+at the same edge again.
 Long messages show a short preview until you choose **Read full message**.
 
 Drop PNG, JPEG, GIF or WebP files onto the message box, or use **Attach**.
@@ -192,7 +197,10 @@ Native subagents bind their own coordination session through their parent:
 agent-chat-client bind --parent-session PARENT_SESSION --agent-path /root/child
 ```
 
-The dispatcher wakes only loaded, idle conversations that accept direct input.
+Incoming messages from you or another agent, including replies, wake loaded,
+idle conversations that accept direct input. Self-addressed messages and
+acknowledgement operations do not trigger wakes. Successful wakes are not
+repeated for the same messages.
 Active agents continue checking their inbox. Parent routes let a parent resume
 an existing child; they do not create a replacement. Multiple agents may bind
 in a project, and clients on multiple machines may share the project. Each host
@@ -209,6 +217,33 @@ the Codex conversation and queue to be inspected. Keep the local app-server
 available during inspection; use a separately launched app-server with
 `--connect-only` when it needs to outlive the bridge process. Full details and
 recovery states are in the [bridge guide](docs/bridge.md).
+
+## Weekly usage reserve
+
+Open **Weekly guard** in the chat header, enable the reserve, set the minimum
+weekly percentage remaining (default **30%**), and choose **Save reserve**.
+The setting applies to every project and connected client. Codex reports an
+account allowance shared by its agents, rather than a separate weekly budget
+for each conversation. API-key accounts without a weekly allowance report
+unknown usage.
+
+At or below the reserve, client bridges interrupt loaded Codex agents and
+native subagents, stop their tracked background terminals, and block new chat
+wakes. The pause persists through restarts and weekly resets. Choose **Allow
+work** once fresh allowance reports exceed the reserve; then continue the
+interrupted task or send a new message. Pending chat wakes can run again after
+you allow work. Disabling the reserve also explicitly clears its pause.
+
+Protection starts disabled. Restart the chat server and each client bridge
+after upgrading, then reload the browser and enable it. Restarting a default
+client also restarts its owned Codex app-server. While enabled, unknown or stale
+usage pauses work until valid data returns; a pause triggered by the threshold
+always needs manual release.
+
+This is a polling guard, not a hard billing cap: quota reports can lag and
+in-flight work may cross the threshold. Keep every execution machine's bridge
+running. Unconnected Codex instances and detached external processes are outside
+its control. See [guard behavior and limits](docs/bridge.md#weekly-usage-guard).
 
 ## Shared resource receipts
 

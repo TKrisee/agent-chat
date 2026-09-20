@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 from agent_chat.core import CoordError, Coordinator, agent_labels
 from .projects import Projects
 from .bridge_state import runtime_snapshot
+from .usage import UsageStore
 
 from .auth import authorized, validate_config, origin
 
@@ -110,7 +111,7 @@ def message_rows(rows, agents, db):
     return items
 
 
-def snapshot(db_path, limit=UI_MESSAGE_LIMIT):
+def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None):
     """Read a consistent view without advancing inboxes or changing ownership."""
     with reader(db_path) as db:
         now = time.time()
@@ -135,20 +136,34 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT):
                                   reservation_id=row['reservation_id'], state=state,
                                   deadline=row['deadline'], reason=row['reason'], queue=queue))
         bridge = runtime_snapshot(db, now)
-        return dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
+        data = dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
                     resources=resources, total_messages=total,
                     history_truncated=total > len(messages))
+    if usage_store is not None:
+        data['usage'] = usage_store.status()
+    return data
 
 
-def page(db_path, before=None, limit=UI_MESSAGE_LIMIT):
-    if not 1 <= limit <= 200 or (before is not None and before < 1):
+def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None):
+    def valid_cursor(value):
+        return value is None or (type(value) is int and 1 <= value <= 2**63 - 1)
+    if ((before is not None and after is not None) or type(limit) is not int
+            or not 1 <= limit <= 200 or not valid_cursor(before) or not valid_cursor(after)):
         raise ValueError('History requires a positive cursor and a limit from 1 to 200')
     with reader(db_path) as db:
         agents = agent_labels(db)
-        where = 'WHERE seq<?' if before is not None else ''
-        args = (before, limit + 1) if before is not None else (limit + 1,)
-        rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages {where} ORDER BY seq DESC LIMIT ?', args).fetchall()
-        return dict(messages=message_rows(list(reversed(rows[:limit])), agents, db), has_more=len(rows) > limit)
+        if after is not None:
+            rows = db.execute(
+                f'SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq>? ORDER BY seq ASC LIMIT ?',
+                (after, limit + 1)).fetchall()
+            messages = rows[:limit]
+        else:
+            where = 'WHERE seq<?' if before is not None else ''
+            args = (before, limit + 1) if before is not None else (limit + 1,)
+            rows = db.execute(
+                f'SELECT {MESSAGE_COLUMNS} FROM messages {where} ORDER BY seq DESC LIMIT ?', args).fetchall()
+            messages = list(reversed(rows[:limit]))
+        return dict(messages=message_rows(messages, agents, db), has_more=len(rows) > limit)
 
 
 def operator_session(db_path):
@@ -189,6 +204,7 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.address_family = socket.AF_INET6 if ':' in address[0] else socket.AF_INET
         self.public_url = validate_config(address[0], api_token, public_url)
         self.bridge_manager = None
+        self.usage = UsageStore(self.db_path)
         self.projects = Projects(self.db_path)
         self.project_contexts = {}
         self.project_lock = threading.RLock()
@@ -197,7 +213,7 @@ class WebServer(http.server.ThreadingHTTPServer):
             self.sender_session = operator_session(self.db_path)
             if api_token:
                 from .bridge_lease import BridgeManager
-                self.bridge_manager = BridgeManager(self.db_path)
+                self.bridge_manager = BridgeManager(self.db_path, usage_store=self.usage)
         except BaseException:
             self.server_close()
             raise
@@ -219,7 +235,7 @@ class WebServer(http.server.ThreadingHTTPServer):
                 manager = None
                 if self.api_token:
                     from .bridge_lease import BridgeManager
-                    manager = BridgeManager(path)
+                    manager = BridgeManager(path, usage_store=self.usage)
                 self.project_contexts[item['id']] = (path, sender, manager)
             return self.project_contexts[item['id']]
 
@@ -319,7 +335,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return data
 
     def project_snapshot(self):
-        return dict(snapshot(self.db_path), project=self.server.projects.get(self.project['id']), projects=self.server.projects.list())
+        return dict(snapshot(self.db_path, usage_store=self.server.usage), project=self.server.projects.get(self.project['id']), projects=self.server.projects.list())
 
     def json(self, code, data):
         self.respond(code, json.dumps(self.scoped(data), separators=(',', ':')).encode(), 'application/json; charset=utf-8')
@@ -332,10 +348,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticate():
             return
         try:
-            if url.path.startswith('/api/'):
+            if url.path.startswith('/api/') and url.path != '/api/usage':
                 self.select_project()
             if url.path == '/api/projects':
                 self.json(200, {'projects': self.server.projects.list(), 'project': self.project})
+            elif url.path == '/api/usage':
+                self.json(200, self.server.usage.status())
             elif url.path == '/api/snapshot':
                 self.json(200, self.project_snapshot())
             elif url.path == '/api/config':
@@ -343,10 +361,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                 'csrf_token': self.server.csrf_token, 'project': self.project,
                                 'projects': self.server.projects.list()})
             elif url.path == '/api/messages':
-                params = parse_qs(url.query)
-                before = int(params['before'][0]) if 'before' in params else None
-                limit = int(params.get('limit', [str(UI_MESSAGE_LIMIT)])[0])
-                self.json(200, page(self.db_path, before, limit))
+                params = parse_qs(url.query, keep_blank_values=True)
+                before_values = params.get('before', [])
+                after_values = params.get('after', [])
+                limit_values = params.get('limit', [str(UI_MESSAGE_LIMIT)])
+                if len(before_values) > 1 or len(after_values) > 1 or len(limit_values) != 1:
+                    raise ValueError('History cursor and limit parameters must appear once')
+                if before_values and after_values:
+                    raise ValueError('Choose either a before or after history cursor')
+
+                def positive_integer(values, name):
+                    if not values:
+                        return None
+                    value = values[0]
+                    if not value.isascii() or not value.isdigit() or int(value) < 1:
+                        raise ValueError(f'{name} must be a positive integer')
+                    return int(value)
+
+                before = positive_integer(before_values, 'before')
+                after = positive_integer(after_values, 'after')
+                limit = positive_integer(limit_values, 'limit')
+                self.json(200, page(self.db_path, before, limit, after))
             elif url.path.startswith('/api/messages/'):
                 message_id = url.path.removeprefix('/api/messages/')
                 if set(parse_qs(url.query)) - {'project'} or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
@@ -394,17 +429,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(403, {'error': 'Untrusted host or origin'})
             return
         path = urlsplit(self.path).path
-        machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc')
+        machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc', '/api/usage/rpc')
         if not self.authenticate(bearer_only=machine_api):
             return
         try:
-            self.select_project()
+            if path not in ('/api/usage', '/api/usage/rpc'):
+                self.select_project()
         except (CoordError, ValueError, sqlite3.Error, OSError) as error:
             self.json(400, {'error': str(error)})
             return
         if machine_api:
             try:
                 data = self.read_json(60 * 1024 * 1024 if path == '/api/coord' else 1024 * 1024)
+                if path == '/api/usage/rpc':
+                    self.json(200, self.usage_action(data, machine=True))
+                    return
                 if path == '/api/projects/rpc':
                     self.json(200, self.project_action(data))
                     return
@@ -422,12 +461,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename'):
+        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename', '/api/usage'):
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
+            return
+        if path == '/api/usage':
+            try:
+                self.json(200, self.usage_action(self.read_json(), machine=False))
+            except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
             return
         if path in ('/api/projects', '/api/projects/rename'):
             try:
@@ -580,6 +625,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if op == 'rename' and set(data) == {'op', 'id', 'name'}:
             return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.projects.list()}
         raise CoordError('invalid project operation')
+
+    def usage_action(self, data, machine):
+        if not isinstance(data, dict) or not isinstance(data.get('op'), str):
+            raise CoordError('invalid usage operation')
+        op = data['op']
+        if machine:
+            if op == 'status' and set(data) == {'op', 'host_id'}:
+                return self.server.usage.status(data['host_id'])
+            fields = {'op', 'host_id', 'remaining_percent', 'resets_at', 'error', 'stopped_threads', 'enforcement_error'}
+            if op == 'report' and set(data) <= fields and {'op', 'host_id', 'remaining_percent', 'resets_at'} <= set(data):
+                return self.server.usage.report(data['host_id'], data['remaining_percent'], data['resets_at'],
+                                                data.get('error'), data.get('stopped_threads', 0), data.get('enforcement_error'))
+            if op == 'enforcement' and set(data) == {'op', 'host_id', 'stopped_threads', 'enforcement_error'}:
+                return self.server.usage.enforcement(data['host_id'], data['stopped_threads'], data['enforcement_error'])
+        else:
+            if op == 'configure' and set(data) == {'op', 'enabled', 'threshold_percent'}:
+                return self.server.usage.configure(data['enabled'], data['threshold_percent'])
+            if op == 'resume' and set(data) == {'op'}:
+                return self.server.usage.resume()
+        raise CoordError('invalid usage operation')
 
     def events(self):
         self.send_response(200)

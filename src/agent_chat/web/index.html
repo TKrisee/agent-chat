@@ -37,7 +37,10 @@
       <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false">Resources <span id="mobile-resource-count">0</span></button></div>
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
-        <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
+        <div class="conversation-actions">
+          <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
+          <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
+        </div>
       </div>
       <div class="toolbar">
         <label class="search"><span aria-hidden="true">⌕</span><input type="search" id="search" placeholder="Search messages or agents…" aria-label="Search messages or agents"><kbd aria-hidden="true">/</kbd></label>
@@ -49,12 +52,12 @@
         <section class="feed" id="feed" aria-label="Agent messages" tabindex="0">
           <div class="history-row">
             <span id="message-window" class="message-window"></span>
-            <button id="load-older" class="quiet-button" hidden>Older messages</button>
-            <button id="load-newer" class="quiet-button" hidden>Newer messages</button>
             <button id="show-latest" class="quiet-button" hidden>Back to latest</button>
           </div>
+          <div id="history-older" class="history-edge" role="status" hidden></div>
           <div id="messages"></div>
           <div class="empty-state" id="empty-state"><div class="empty-icon" aria-hidden="true">···</div><h3 id="empty-title">Connecting to your agents</h3><p id="empty-description">Their conversation will appear here.</p></div>
+          <div id="history-newer" class="history-edge" role="status" hidden></div>
         </section>
         <button class="new-messages" id="new-messages" hidden>New messages ↓</button>
       </div>
@@ -90,6 +93,19 @@
       <input id="project-name" name="name" maxlength="80" required autocomplete="off">
       <p id="project-error" class="composer-status error" role="alert" hidden></p>
       <div class="project-dialog-actions"><button type="button" id="cancel-project" class="quiet-button">Cancel</button><button type="submit" id="save-project" class="send-button">Create project</button></div>
+    </form>
+  </dialog>
+  <dialog id="usage-dialog" aria-labelledby="usage-dialog-title">
+    <form id="usage-form">
+      <div class="usage-dialog-heading"><div><p class="usage-kicker">GLOBAL WEEKLY USAGE</p><h2 id="usage-dialog-title">Usage reserve</h2></div><button class="quiet-button usage-close" id="cancel-usage" type="button" aria-label="Close usage settings">×</button></div>
+      <p class="usage-scope">Protects all projects on connected clients. When enabled, unknown usage also pauses work. Quota updates can lag; Allow work needs fresh reports above the reserve.</p>
+      <p class="usage-current" id="usage-current" role="status">Weekly usage has not been reported yet.</p>
+      <p id="usage-enforcement" class="composer-status error" role="alert" hidden></p>
+      <label class="usage-toggle"><input id="usage-enabled" type="checkbox"> <span>Pause all connected agents at or below the reserve</span></label>
+      <label class="usage-threshold" for="usage-threshold">Minimum weekly remaining <span><input id="usage-threshold" type="number" min="0" max="100" step="1" inputmode="numeric" value="30">%</span></label>
+      <p class="usage-scope">Once reached, the reserve stays paused through restarts and weekly resets until you choose Allow work. Then send a message or continue the interrupted task.</p>
+      <p id="usage-error" class="composer-status error" role="alert" hidden></p>
+      <div class="usage-dialog-actions"><button id="resume-usage" type="button" class="quiet-button" hidden>Allow work</button><span class="usage-actions-spacer"></span><button id="save-usage" type="submit" class="send-button">Save reserve</button></div>
     </form>
   </dialog>
   <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>

@@ -1,3 +1,123 @@
+# Infinite message scrolling — 2026-09-20
+
+Replaced Older/Newer paging buttons with scroll-triggered history loading.
+The initial view contains the latest 50 messages; edge scrolling fetches 50
+more in either direction. A rolling 150-message window limits memory use,
+discarding the opposite edge and reloading it when needed. Scroll anchors
+preserve the visible message through prepending and trimming, including grouped
+deliveries. The latest snapshot stays capped at 50 and fetched reply originals
+remain limited to one. Reloads and reconnects start clean; history is not stored
+in browser storage or URL state.
+
+Forward history uses the project-scoped read-only `after` cursor API. Cursors
+are exclusive, bounded and mutually exclusive with `before`. Live traffic
+updates the latest view without displacing older history being read. Filters
+do not automatically scan the backlog. Scroll, wheel, touch and feed keyboard
+navigation trigger edge loading; a failed request can be retried at the same
+edge. Back to latest remains a shortcut.
+
+All 34 web/project/remote HTTP tests passed, followed by both cursor tests after
+adding oversized-cursor rejection. The full browser suite and usage-settings
+browser suite passed. New browser checks cover a 500+ message backlog,
+bidirectional ordering without gaps or duplicates, anchor preservation,
+150-message bounds, failed-load retry, reload reset after additional fetches,
+live updates, filters, and late requests during reconnect/project switches.
+Desktop and 320px screenshots were inspected. Syntax and diff whitespace
+checks passed. Tests used temporary databases and services; artifacts are in
+`.agent-chat/validation/infinite-scroll/`.
+
+Restart the chat server and refresh the browser to load the new cursor API and
+scroll behavior. Client bridges do not need restarting for this change.
+
+## Earlier validation
+
+# Weekly usage reserve — 2026-09-20
+
+Added a global, persistent reserve policy and browser settings, plus local
+Codex quota monitoring and interruption. Protection starts disabled with a 30%
+remaining default. At or below the threshold, it blocks chat wakes, interrupts
+loaded root and child turns, and cleans tracked background terminals. Threshold
+pauses survive restarts and weekly resets until manual release with fresh
+reports above the configured reserve. Missing or stale quota blocks enabled
+protection without inventing an allowance value.
+
+Verified Codex CLI 0.155.1's generated protocol and made read-only quota and
+turn-summary requests to confirm response shapes. No live agent was interrupted
+or prompted, and no live policy was enabled. The guard uses polling and cannot
+guarantee an exact spending floor or control disconnected runtimes.
+
+Validation: the full 187-test Python run exposed one incorrect new test
+expectation about an already assigned wake. After correcting that expectation,
+all 60 focused usage, bridge, client and project tests passed. Both the existing
+browser regression suite and the new isolated usage suite passed. Coverage
+includes inclusive cutoff, persistent manual release, below-threshold resume
+refusal, multi-host/global-project behavior, unknown quota, connection failures,
+child interruption, stop retries, preserved queued messages, authentication,
+CSRF, live form edits and failed-save retention. Desktop and 320px screenshots
+were inspected. Syntax and diff whitespace checks passed. Logs and screenshots
+are in `.agent-chat/validation/usage-guard/`.
+
+Restart the server and each bridge client, reload the UI, and enable the reserve
+from **Weekly guard**. A default client restart also restarts its owned Codex
+app-server. **Allow work** clears the latch; interrupted tasks need continuation,
+while pending chat wakes become eligible again.
+
+## Earlier validation
+
+# Agent-to-agent wake-ups — 2026-09-20
+
+Unread incoming messages and replies from agents now use the same idle-wake
+path as operator messages. Eligibility is rechecked when preparing each job;
+self-addressed messages, acknowledged messages and already assigned deliveries
+are excluded. Existing idle/direct-input checks, coalescing, host/project
+isolation, descendant routes and durable recovery remain in place. Pending
+peer replies survive sender deregistration. The bridge no longer needs the
+web operator sidecar to identify eligible senders.
+
+The compact wake prompt keeps `$caveman` and chat-only instructions, and asks
+agents to reply only when needed rather than exchange ACK-only messages.
+Acknowledgement operations remain separate from chat replies and cannot
+trigger another wake. This instruction discourages chat loops; it does not
+enforce message semantics in the runtime.
+
+All 67 bridge, remote bridge, client, project and deregistration tests passed
+in 10.6 seconds. Coverage includes peer requests/replies, busy deferral, mixed
+operator/peer coalescing, acknowledgement races, self-message exclusion at
+selection and dispatch, no repeated wakes, retired senders, descendant routing
+and cross-host isolation. Tests used temporary databases and local test servers;
+no live agent was prompted or restarted. Diff whitespace checks passed.
+
+Restart `agent-chat-server` to load peer-message eligibility for HTTP clients.
+Restart each client bridge to load the updated prompt; stopping the default
+launcher also stops its owned Codex app-server. Old unread peer messages become
+eligible without a migration. Existing persisted jobs retain their prompt and
+delivery state.
+
+## Earlier validation
+
+# Compact wake prompts — 2026-09-20
+
+Direct wake instructions now use 48 words instead of 163, explicitly requesting
+`$caveman` full mode and chat-only communication without duplicate terminal
+commentary or final replies. Child-routing guidance is included only for wakes
+with descendant deliveries and tells parents to pass the same instructions
+along the existing child chain. Routing metadata retains its schema and uses
+compact JSON. The adoption prompt documents the same communication rules.
+Skill use remains an agent instruction, not runtime enforcement.
+
+All 51 bridge, remote bridge and client tests passed. Extended dispatch checks
+cover direct-only, child-only, nested and mixed deliveries, the instruction
+length bound, exact metadata, and unchanged read/acknowledgement behavior.
+Tests used isolated temporary databases and local test services. No live agent
+was prompted or restarted. Diff whitespace checks passed.
+
+Restart the running client bridge to load these changes; the chat server does
+not need a restart. The default client owns its Codex app-server, so restarting
+that launcher also restarts the app-server. Previously persisted wake jobs
+retain their original prompt.
+
+## Earlier validation
+
 # Bounded message history and image uploads — 2026-09-19
 
 The UI keeps 50 messages per page and receives 50-message snapshots. Older and

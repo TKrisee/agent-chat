@@ -1,10 +1,8 @@
 """Durable, opt-in wake routes. Inbox and reservation state remain untouched."""
 from __future__ import annotations
 
-import json
 import time
 import uuid
-from pathlib import Path
 
 from .core import CoordError, Coordinator
 
@@ -119,22 +117,13 @@ class BridgeState:
             self.db.execute('DELETE FROM bridge_bindings WHERE session_id=?', (self.coord.require_session(),))
         return {'unbound': True}
 
-    def operator(self):
-        sidecar = Path(str(self.coord.path) + '.web-session.json')
-        try:
-            value = json.loads(sidecar.read_text())['id']
-        except (OSError, ValueError, KeyError, TypeError):
-            raise CoordError('start agent-chat-server for this database first (operator identity is missing)')
-        if not isinstance(value, str) or not self.db.execute('SELECT 1 FROM sessions WHERE id=?', (value,)).fetchone():
-            raise CoordError('web operator identity is not registered in this database')
-        return value
-
     def pending(self):
         return [dict(r) for r in self.db.execute('''
             SELECT m.id,m.recipient_session FROM messages m
             LEFT JOIN bridge_deliveries d ON d.message_id=m.id
-            WHERE m.sender_session=? AND m.acked_at IS NULL AND d.message_id IS NULL
-            ORDER BY m.seq''', (self.operator(),))]
+            WHERE m.sender_session<>m.recipient_session
+              AND m.acked_at IS NULL AND d.message_id IS NULL
+            ORDER BY m.seq''')]
 
     def still_unread(self, job_id):
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
@@ -152,7 +141,7 @@ class BridgeState:
                 row = self.db.execute('SELECT acked_at,recipient_session,sender_session FROM messages WHERE id=?', (message['id'],)).fetchone()
                 route = self.resolve(message['recipient_session'])
                 if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
-                        and row['sender_session'] == self.operator() and route and route['thread_id'] == thread_id
+                        and row['sender_session'] != row['recipient_session'] and route and route['thread_id'] == thread_id
                         and not self.db.execute('SELECT 1 FROM bridge_deliveries WHERE message_id=?', (message['id'],)).fetchone()
                         and message not in live):
                     live.append(message)

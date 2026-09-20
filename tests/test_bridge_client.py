@@ -78,6 +78,8 @@ class BridgeClientTests(unittest.TestCase):
             value.clear()
         _Bridge.fail_default = False
         self.patches = [
+            mock.patch.object(bridge_client, 'host_id', return_value='h'),
+            mock.patch.object(bridge_client, 'UsageGuard', return_value=mock.Mock(check=mock.Mock(return_value={'blocked': False}))),
             mock.patch.object(bridge_client, 'HttpClient', _Http),
             mock.patch.object(bridge_client, 'RpcClient', _Rpc),
             mock.patch.object(bridge_client, 'RemoteBridgeState', _State),
@@ -95,6 +97,29 @@ class BridgeClientTests(unittest.TestCase):
         self.assertEqual(_Bridge.ticks, ['default', 'other'])
         self.assertEqual([state.client.project for state in _State.instances], ['default', 'other'])
         self.assertEqual(_Rpc.instances[0].endpoint, 'ws://127.0.0.1:4500')
+
+    def test_usage_pause_skips_project_discovery_and_all_wakes(self):
+        bridge_client.UsageGuard.return_value.check.return_value = {'blocked': True, 'reason': 'reserve reached'}
+        with mock.patch.object(bridge_client, '_project_ids') as discover:
+            result = bridge_client.main(['--server', 'https://chat.example', '--connect-only', '--once'])
+        self.assertEqual(result, 2)
+        discover.assert_not_called()
+        self.assertEqual(_Bridge.ticks, [])
+
+    def test_usage_pause_checks_again_and_dispatches_after_manual_clear(self):
+        class TwoPassEvent:
+            def __init__(self): self.waits = 0
+            def is_set(self): return self.waits >= 2
+            def wait(self, _): self.waits += 1
+            def set(self): self.waits = 2
+
+        bridge_client.UsageGuard.return_value.check.side_effect = [
+            {'blocked': True, 'reason': 'reserve reached'}, {'blocked': False},
+        ]
+        with mock.patch.object(bridge_client.threading, 'Event', TwoPassEvent):
+            result = bridge_client.main(['--server', 'https://chat.example', '--connect-only'])
+        self.assertEqual(result, 0)
+        self.assertEqual(_Bridge.ticks, ['default', 'other'])
 
     def test_client_launcher_accepts_token_flags_without_a_command(self):
         for flags in (['--token=flag-token'], ['--token', 'flag-token'],

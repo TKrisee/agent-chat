@@ -45,7 +45,65 @@ class RemoteBridgeTests(RemoteWebFixture):
         payload = next(p for m,p in self.rpc.calls if m == 'thread/queue/add')['input'][0]['text']
         self.assertIn(self.url, payload)
         self.assertIn(message, payload)
-        self.assertNotIn('database', json.loads(payload.split('\n')[-1]))
+        instructions, metadata = payload.split('\n')
+        self.assertIn('Keep established communication style.', instructions)
+        self.assertNotIn('caveman', instructions.lower())
+        self.assertNotIn('child', instructions)
+        self.assertEqual(json.loads(metadata), {
+            'server': self.url, 'project': 'default', 'thread_id': self.tid,
+            'deliveries': [{'message_id': message, 'recipient_session': 'a',
+                            'route': [{'session': 'a', 'agent_path': None}]}],
+        })
+
+    def test_unread_peer_request_wakes_idle_recipient_once(self):
+        self.call('register', session='b', agent='beta')
+        message = self.call('send', session='b', to='a', body='Please review this.')['id']
+
+        self.bridge.tick()
+
+        self.assertEqual([m for m, _ in self.rpc.calls].count('thread/queue/start'), 1)
+        payload = next(p for m, p in self.rpc.calls if m == 'thread/queue/add')['input'][0]['text']
+        self.assertIn(message, payload)
+        self.assertEqual(self.call('bridge-status')['jobs'][0]['status'], 'dispatched')
+
+        self.rpc.status = 'idle'
+        self.bridge.tick()
+        self.assertEqual([m for m, _ in self.rpc.calls].count('thread/queue/start'), 1)
+
+    def test_unread_peer_request_waits_for_busy_recipient(self):
+        self.call('register', session='b', agent='beta')
+        self.call('send', session='b', to='a', body='Please review this.')
+        self.rpc.status = 'active'
+
+        self.bridge.tick()
+
+        self.assertFalse(any(m == 'thread/queue/add' for m, _ in self.rpc.calls))
+        self.assertEqual(self.call('bridge-status')['jobs'], [])
+
+        self.rpc.status = 'idle'
+        self.bridge.tick()
+        self.assertEqual([m for m, _ in self.rpc.calls].count('thread/queue/start'), 1)
+
+    def test_unread_peer_reply_wakes_but_acknowledged_and_self_messages_do_not(self):
+        self.call('register', session='b', agent='beta')
+        question = self.call('send', to='b', body='Can you check this?')['id']
+        reply = self.call('send', session='b', to='a', body='Done.', reply_to=question)['id']
+        acknowledged = self.call('send', session='b', to='a', body='Already handled.')['id']
+        self.call('acknowledge', id=acknowledged)
+        self.call('deregister', session='b')
+        own_message = self.call('send', to='a', body='Do not wake myself.')['id']
+
+        self.assertNotIn(acknowledged, [m['id'] for m in self.state.pending()])
+        self.assertNotIn(own_message, [m['id'] for m in self.state.pending()])
+        with self.assertRaises(RemoteCoordError):
+            self.state.prepare(self.tid, [{'id': own_message, 'recipient_session': 'a'}], 'self wake')
+
+        self.bridge.tick()
+
+        payload = next(p for m, p in self.rpc.calls if m == 'thread/queue/add')['input'][0]['text']
+        self.assertIn(reply, payload)
+        self.assertNotIn(acknowledged, payload)
+        self.assertNotIn(own_message, payload)
 
     def test_two_workers_local_dispatch_and_recovery_cannot_overlap(self):
         other = RemoteBridgeState(self.client, self.url, dict(self.identity, owner='another', secret='z'*40))
@@ -90,10 +148,21 @@ class RemoteBridgeTests(RemoteWebFixture):
     def test_child_routes_keep_parent_chain_and_other_host_cannot_dispatch(self):
         self.call('register', session='child', agent='alpha/child')
         self.call('bind', session='child', parent_session='a', agent_path='/root/child')
-        self.send_operator('child')
+        self.call('register', session='peer', agent='beta')
+        message = self.call('send', session='peer', to='child', body='Please help.')['id']
         self.bridge.tick()
         payload = next(p for m,p in self.rpc.calls if m == 'thread/queue/add')['input'][0]['text']
         self.assertIn('/root/child', payload)
+        instructions, metadata = payload.split('\n')
+        self.assertIn('For child routes', instructions)
+        self.assertIn('Keep established communication style.', instructions)
+        self.assertNotIn('caveman', instructions.lower())
+        self.assertEqual(json.loads(metadata)['deliveries'], [
+            {'message_id': message, 'recipient_session': 'child', 'route': [
+                {'session': 'a', 'agent_path': None},
+                {'session': 'child', 'agent_path': '/root/child'},
+            ]},
+        ])
         self.state.call('release')
         wrong = RemoteBridgeState(self.client, self.url, dict(self.identity, owner='other', host_id='other-mac'))
         wrong.call('acquire')
@@ -119,7 +188,8 @@ class RemoteBridgeTests(RemoteWebFixture):
 
     def test_two_client_machines_wake_only_their_own_threads(self):
         other, thread_id = self.second_host()
-        self.send_operator('a'); self.send_operator('b')
+        self.call('send', session='b', host='linux', to='a', body='Please review this.')
+        self.call('send', to='b', body='Please review this.')
         other_rpc = FakeRpc()
         self.bridge.tick()
         Bridge(other, other_rpc).tick()
