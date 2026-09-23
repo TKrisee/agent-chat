@@ -35,6 +35,8 @@ class RemoteBridgeState:
     def job(self, job_id): return self.call('job', job_id=job_id)
     def resolve(self, session_id): return self.call('resolve', session_id=session_id)
     def still_unread(self, job_id): return self.call('still_unread', job_id=job_id)
+    def wake_messages(self, thread_id, message_ids):
+        return self.call('wake-messages', thread_id=thread_id, message_ids=message_ids)
     def connection_metadata(self): return {'server': self.server_url, 'project': self.client.project}
     def prepare(self, thread_id, messages, payload):
         return self.call('prepare', thread_id=thread_id, messages=messages, payload=payload)

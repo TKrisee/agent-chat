@@ -49,7 +49,7 @@ class RemoteBridgeTests(RemoteWebFixture):
         self.assertIn('Keep established communication style.', instructions)
         self.assertNotIn('caveman', instructions.lower())
         self.assertNotIn('child', instructions)
-        self.assertEqual(json.loads(metadata), {
+        self.assertEqual({k: v for k, v in json.loads(metadata).items() if k != 'messages'}, {
             'server': self.url, 'project': 'default', 'thread_id': self.tid,
             'deliveries': [{'message_id': message, 'recipient_session': 'a',
                             'route': [{'session': 'a', 'agent_path': None}]}],

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import uuid
+import json
 
 from .core import CoordError, Coordinator
 
@@ -129,6 +130,28 @@ class BridgeState:
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
             JOIN messages m ON m.id=d.message_id
             WHERE d.job_id=? AND m.acked_at IS NULL LIMIT 1''', (job_id,)).fetchone())
+
+    def wake_messages(self, thread_id, message_ids):
+        """Bound direct-recipient content without reading or acknowledging inboxes.
+
+        Child messages belong to the child, even when a parent dispatches its wake.
+        Large bodies/metadata stay retrievable through the recipient's message API.
+        """
+        result = []
+        for message_id in message_ids:
+            row = self.db.execute('SELECT * FROM messages WHERE id=? AND acked_at IS NULL',
+                                  (message_id,)).fetchone()
+            route = self.resolve(row['recipient_session']) if row else None
+            if not route or route['thread_id'] != thread_id or len(route['route']) != 1:
+                continue
+            item = {'id': message_id, 'complete': False}
+            if len(row['body']) <= 4096:
+                full = self.coord._message_dicts(self.db, [row])[0]
+                candidate = dict(full, complete=True)
+                if len(json.dumps(candidate, ensure_ascii=False).encode('utf-8')) <= 4096:
+                    item = candidate
+            result.append(item)
+        return result
 
     def connection_metadata(self):
         return {'database': str(self.coord.path.resolve())}

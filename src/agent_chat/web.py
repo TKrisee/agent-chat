@@ -338,7 +338,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return dict(snapshot(self.db_path, usage_store=self.server.usage), project=self.server.projects.get(self.project['id']), projects=self.server.projects.list())
 
     def json(self, code, data):
-        self.respond(code, json.dumps(self.scoped(data), separators=(',', ':')).encode(), 'application/json; charset=utf-8')
+        self.respond(code, json.dumps(self.scoped(data), ensure_ascii=False, separators=(',', ':')).encode('utf-8'), 'application/json; charset=utf-8')
 
     def do_GET(self):
         if not self.trusted():
@@ -451,6 +451,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     from .remote_service import dispatch
                     coord = Coordinator(self.db_path)
                     coord.session = None
+                    coord.context_size = lambda value: len(json.dumps(
+                        self.scoped(value), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
                     try:
                         result = dispatch(coord, data, bridge_manager=self.bridge_manager)
                     finally:

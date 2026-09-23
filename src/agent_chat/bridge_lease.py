@@ -146,6 +146,13 @@ class BridgeManager:
             if not isinstance(sid, str):
                 raise CoordError('invalid session id')
             return route_for(sid)
+        if op == 'wake-messages':
+            thread_id, message_ids = params.get('thread_id'), params.get('message_ids')
+            thread_allowed(thread_id)
+            if (not isinstance(message_ids, list) or not 1 <= len(message_ids) <= 20
+                    or not all(isinstance(mid, str) for mid in message_ids)):
+                raise CoordError('wake messages require 1 to 20 message IDs')
+            return state.wake_messages(thread_id, message_ids)
         if op == 'jobs':
             jobs = []
             for job in state.jobs():

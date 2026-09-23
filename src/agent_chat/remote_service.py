@@ -46,8 +46,12 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         _bind_host(coord, session, host_id, op)
     # Keep this list auditable.  Do not replace it with getattr.
     if op == "register": return coord.register(_string(params.get("agent"), "agent"))
-    if op == "status": return coord.status()
+    if op == "status": return coord.status(params.get("mine", False), params.get("resources"))
     if op == "inbox": return coord.inbox(bool(params.get("all", False)))
+    if op == "context": return coord.context(params.get("limit", 20), params.get("max_bytes", 12288),
+                                               params.get("cursor"), params.get("message_ids"), params.get("resources"),
+                                               params.get("resource_cursor"))
+    if op == "message": return coord.message(_string(params.get("id"), "id"))
     if op == "acknowledge": return coord.acknowledge(_string(params.get("id"), "id"))
     if op == "request": return coord.request(_string(params.get("resource"), "resource"), params.get("minutes"))
     if op == "cancel": return coord.cancel(_string(params.get("resource"), "resource"))
@@ -58,7 +62,9 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         attachments = params.get("attachments", [])
         body = params.get("body", "")
         if not isinstance(body, str): raise CoordError("body must be a string")
-        return _send(coord, _string(params.get("to"), "to"), body, attachments, params.get("reply_to"))
+        ack_reply = params.get("ack_reply", False)
+        if not isinstance(ack_reply, bool): raise CoordError("ack_reply must be a boolean")
+        return _send(coord, _string(params.get("to"), "to"), body, attachments, params.get("reply_to"), ack_reply)
     if op == "send-many":
         targets = params.get("to")
         if not isinstance(targets, list) or not all(isinstance(x, str) for x in targets):
@@ -109,7 +115,8 @@ def resource_name(raw):
     return raw
 
 
-def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to: Any) -> dict:
+def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to: Any,
+          ack_reply: bool = False) -> dict:
     if not isinstance(attachments, list) or len(attachments) > 4:
         raise CoordError("attachments must contain at most four images")
     prepared = []
@@ -121,20 +128,7 @@ def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to
         if not content or len(content) > 10 * 1024 * 1024 or coord._image_mime(content) is None:
             raise CoordError("remote attachment must be a supported image no larger than 10 MiB")
         prepared.append((item["name"], coord._image_mime(content), content))
-    sid = coord.require_session()
-    with coord.tx() as db:
-        recipients = coord._resolve_targets(db, [target])
-        parent = coord._reply_parent(db, reply_to, sid, recipients[0]) if reply_to is not None else None
-        mid = "message_" + secrets.token_urlsafe(24)
-        db.execute("INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)", (mid, sid, recipients[0], body, time.time()))
-        if parent: db.execute("INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)", (mid, reply_to))
-        metadata = []
-        for name, mime, content in prepared:
-            aid = "attachment_" + hashlib.sha256((mid + name + str(len(metadata))).encode()).hexdigest()[:32]
-            db.execute("INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)", (aid, mid, name, mime, len(content), content))
-            metadata.append({"id": aid, "name": name, "mime": mime, "size": len(content), "url": "/api/attachments/" + aid})
-    return {"id": mid, "sender_session": sid, "recipient_session": recipients[0], "attachments": metadata,
-            "reply_to": reply_to, "reply_preview": (None if parent is None else dict(parent, sender_agent=None))}
+    return coord._send_prepared(target, body, prepared, reply_to, ack_reply)
 
 
 def _schema(coord: Coordinator) -> None:

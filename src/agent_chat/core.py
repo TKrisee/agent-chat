@@ -107,6 +107,14 @@ class Coordinator:
           FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE INDEX IF NOT EXISTS message_batches_batch_id ON message_batches(batch_id);
         CREATE INDEX IF NOT EXISTS attachments_message_id ON attachments(message_id);
+        CREATE TABLE IF NOT EXISTS reply_ack_idempotency (
+          sender_session TEXT NOT NULL, reply_to TEXT NOT NULL,
+          fingerprint TEXT NOT NULL, message_id TEXT NOT NULL,
+          PRIMARY KEY(sender_session, reply_to),
+          FOREIGN KEY(message_id) REFERENCES messages(id));
+        CREATE TABLE IF NOT EXISTS message_reads (
+          message_id TEXT PRIMARY KEY, reader_session TEXT NOT NULL, read_at REAL NOT NULL,
+          FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE TABLE IF NOT EXISTS resources (
           name TEXT PRIMARY KEY, owner_session TEXT, reservation_id TEXT UNIQUE,
           token TEXT, granted_at REAL, deadline REAL, stale INTEGER NOT NULL DEFAULT 0, reason TEXT);
@@ -247,7 +255,14 @@ class Coordinator:
         row = db.execute("SELECT inbox_read_seq FROM sessions WHERE id=?", (session,)).fetchone()
         latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (session,)).fetchone()["n"]
         if row is None: raise CoordError("unknown session")
-        if row["inbox_read_seq"] < latest: raise CoordError("read your inbox after the newest message before changing ownership")
+        unseen = db.execute(
+            "SELECT 1 FROM messages m WHERE m.recipient_session=? AND m.seq>? "
+            "AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id AND r.reader_session=?) LIMIT 1",
+            (session, row["inbox_read_seq"], session)).fetchone()
+        if unseen:
+            raise CoordError("read your inbox after the newest message before changing ownership")
+        if row["inbox_read_seq"] < latest:
+            db.execute("UPDATE sessions SET inbox_read_seq=? WHERE id=?", (latest, session))
 
     def _has_attachments(self, db: sqlite3.Connection) -> bool:
         return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attachments'").fetchone())
@@ -328,6 +343,159 @@ class Coordinator:
         return {"messages": messages}
 
     @staticmethod
+    def _canonical_bytes(value: Any) -> bytes:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False).encode("utf-8")
+
+    def context_size(self, value: Any) -> int:
+        return len(self._canonical_bytes(value))
+
+    @staticmethod
+    def _context_message(message: dict[str, Any], body: str) -> dict[str, Any]:
+        return {"id": message["id"], "sender_session": message["sender_session"],
+                "sender_agent": message["sender_agent"], "created_at": message["created_at"],
+                "body": body, "body_truncated": body != message["body"],
+                "attachments": message["attachments"], "reply_to": message["reply_to"]}
+
+    def context(self, limit: int = 20, max_bytes: int = 12288, cursor: int | None = None,
+                message_ids: list[str] | None = None, resources: list[str] | None = None,
+                resource_cursor: str | None = None) -> dict[str, Any]:
+        """Return a bounded, session-scoped context snapshot.
+
+        Message bodies are previews; :meth:`message` is the only full-body read.
+        A cursor is the last returned message sequence and advances in sequence order.
+        """
+        sid = self.require_session()
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise CoordError("limit must be an integer from 1 through 100")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 256:
+            raise CoordError("max_bytes must be an integer of at least 256")
+        if cursor is not None and (not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0):
+            raise CoordError("cursor must be a nonnegative integer")
+        if resource_cursor is not None and (not isinstance(resource_cursor, str) or not resource_cursor):
+            raise CoordError("resource_cursor must be a nonempty string")
+        if message_ids is not None and (not isinstance(message_ids, list) or
+                                        any(not isinstance(value, str) or not value for value in message_ids)):
+            raise CoordError("message_ids must be a list of nonempty strings")
+        if resources is not None and (not isinstance(resources, list) or
+                                      any(not isinstance(value, str) or not value for value in resources)):
+            raise CoordError("resources must be a list of nonempty strings")
+        named_resources = [] if resources is None else list(dict.fromkeys(self.resource_name(value) for value in resources))
+        with self.tx() as db:
+            clauses = ["recipient_session=?", "acked_at IS NULL"]
+            args: list[Any] = [sid]
+            if cursor is not None:
+                clauses.append("seq>?")
+                args.append(cursor)
+            if message_ids is not None:
+                if not message_ids:
+                    clauses.append("0")
+                else:
+                    clauses.append("id IN (" + ",".join("?" for _ in message_ids) + ")")
+                    args.extend(message_ids)
+            rows = db.execute("SELECT id,sender_session,body,created_at,acked_at,seq FROM messages WHERE " +
+                              " AND ".join(clauses) + " ORDER BY seq LIMIT ?", (*args, limit + 1)).fetchall()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            resource_terms = ["owner_session=?", "name IN (SELECT resource FROM resource_queue WHERE session=?)"]
+            resource_args: list[Any] = [sid, sid]
+            if named_resources:
+                resource_terms.append("name IN (" + ",".join("?" for _ in named_resources) + ")")
+                resource_args.extend(named_resources)
+            resource_where = "(" + " OR ".join(resource_terms) + ")"
+            if resource_cursor is not None:
+                resource_where += " AND name>?"
+                resource_args.append(resource_cursor)
+            resource_rows = db.execute("SELECT * FROM resources WHERE " + resource_where + " ORDER BY name LIMIT 101",
+                                       resource_args).fetchall()
+            resources_has_more = len(resource_rows) > 100
+            resource_rows = resource_rows[:100]
+            result: dict[str, Any] = {"messages": [], "resources": [], "cursor": cursor,
+                                      "has_more": has_more, "truncated": False,
+                                      "resources_cursor": resource_cursor,
+                                      "resources_has_more": resources_has_more}
+            if self.context_size(result) > max_bytes:
+                raise CoordError("max_bytes is too small for context metadata")
+            resource_budget = max_bytes // 3
+            for row in resource_rows:
+                full_resource = self._resource_status(db, row)
+                candidates = [full_resource, {"resource": row["name"], "state": self._state(row),
+                                               "detail_truncated": True}]
+                selected = None
+                for candidate_resource in candidates:
+                    trial = {**result, "resources": [*result["resources"], candidate_resource],
+                             "resources_cursor": row["name"], "resources_has_more": False}
+                    if (self.context_size(trial) <= max_bytes and
+                            self.context_size(trial["resources"]) <= resource_budget):
+                        selected = candidate_resource
+                        break
+                if selected is None:
+                    if not result["resources"]:
+                        raise CoordError("max_bytes is too small for a resource context stub")
+                    result["resources_has_more"] = True
+                    break
+                result["resources"].append(selected)
+                result["resources_cursor"] = row["name"]
+            if len(result["resources"]) < len(resource_rows):
+                result["resources_has_more"] = True
+            for row, full in zip(rows, self._message_dicts(db, rows)):
+                candidate = self._context_message(full, full["body"])
+                trial = {**result, "messages": [*result["messages"], candidate], "cursor": row["seq"],
+                         "has_more": False, "truncated": result["truncated"] or candidate["body_truncated"]}
+                if self.context_size(trial) > max_bytes:
+                    # Keep the message metadata and shrink its Unicode body until its
+                    # canonical UTF-8 representation fits the requested budget.
+                    low, high, best = 0, len(full["body"]), None
+                    while low <= high:
+                        middle = (low + high) // 2
+                        shortened = self._context_message(full, full["body"][:middle])
+                        shortened_trial = {**result, "messages": [*result["messages"], shortened], "cursor": row["seq"],
+                                           "has_more": False,
+                                           "truncated": result["truncated"] or shortened["body_truncated"]}
+                        if self.context_size(shortened_trial) <= max_bytes:
+                            best = shortened
+                            low = middle + 1
+                        else:
+                            high = middle - 1
+                    if best is None:
+                        stub = {"id": row["id"], "body": "", "body_truncated": True,
+                                "metadata_truncated": True}
+                        stub_trial = {**result, "messages": [*result["messages"], stub], "cursor": row["seq"],
+                                      "has_more": False, "truncated": True}
+                        if self.context_size(stub_trial) > max_bytes:
+                            if not result["messages"]:
+                                raise CoordError("max_bytes is too small for a message context stub")
+                            result["has_more"] = True
+                            result["truncated"] = True
+                            break
+                        candidate = stub
+                    else:
+                        candidate = best
+                result["messages"].append(candidate)
+                result["cursor"] = row["seq"]
+                result["truncated"] = result["truncated"] or candidate["body_truncated"]
+                if not candidate["body_truncated"]:
+                    db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
+                               (row["id"], sid, _now()))
+            if len(result["messages"]) < len(rows):
+                result["has_more"] = True
+            return result
+
+    def message(self, message_id: str) -> dict[str, Any]:
+        """Read one complete message only when it belongs to this session's inbox."""
+        sid = self.require_session()
+        if not isinstance(message_id, str) or not message_id:
+            raise CoordError("id must be a nonempty string")
+        with self.tx() as db:
+            row = db.execute("SELECT id,sender_session,body,created_at,acked_at,seq FROM messages "
+                             "WHERE id=? AND recipient_session=?", (message_id, sid)).fetchone()
+            if row is None:
+                raise CoordError("message is not in caller inbox")
+            db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
+                       (message_id, sid, _now()))
+            return {"message": self._message_dicts(db, [row])[0]}
+
+    @staticmethod
     def _image_mime(content: bytes) -> str | None:
         for signature, mime in IMAGE_SIGNATURES:
             if content.startswith(signature):
@@ -372,10 +540,30 @@ class Coordinator:
         return parent
 
     def send(self, target: str, body: str, attachments: list[str | os.PathLike[str]] | None = None,
-             reply_to: str | None = None) -> dict[str, Any]:
+             reply_to: str | None = None, ack_reply: bool = False) -> dict[str, Any]:
+        return self._send_prepared(target, body, self._prepare_attachments(attachments), reply_to, ack_reply)
+
+    def _send_result(self, db: sqlite3.Connection, message_id: str, acknowledged_reply: bool = False) -> dict[str, Any]:
+        row = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages WHERE id=?",
+                         (message_id,)).fetchone()
+        if row is None:
+            raise CoordError("idempotent reply message is unavailable")
+        attachments = self._attachment_metadata(db, [message_id])[message_id]
+        reply = self._reply_metadata(db, [message_id])[message_id]
+        result = {"id": row["id"], "sender_session": row["sender_session"],
+                  "recipient_session": row["recipient_session"], "attachments": attachments, **reply}
+        if acknowledged_reply:
+            result["acknowledged_reply"] = True
+        return result
+
+    def _send_prepared(self, target: str, body: str, prepared: list[tuple[str, str, bytes]],
+                       reply_to: str | None = None, ack_reply: bool = False) -> dict[str, Any]:
         sid = self.require_session()
         if not target: raise CoordError("recipient is required")
-        prepared = self._prepare_attachments(attachments)
+        if not isinstance(body, str): raise CoordError("body must be a string")
+        if not isinstance(ack_reply, bool): raise CoordError("ack_reply must be a boolean")
+        if ack_reply and not isinstance(reply_to, str):
+            raise CoordError("ack_reply requires reply_to")
         with self.tx() as db:
             exact = db.execute("SELECT id FROM sessions WHERE id=?", (target,)).fetchone()
             if exact: recipients = [exact["id"]]
@@ -383,8 +571,24 @@ class Coordinator:
                 recipients = [r["id"] for r in db.execute("SELECT id FROM sessions WHERE agent=?", (target,))]
                 if len(recipients) != 1:
                     raise CoordError("recipient label is unknown or ambiguous; use an exact session id")
+            fingerprint = None
+            if ack_reply:
+                fingerprint = hashlib.sha256(self._canonical_bytes({
+                    "recipient_session": recipients[0], "body": body,
+                    "attachments": [{"name": name, "mime": mime,
+                                     "sha256": hashlib.sha256(content).hexdigest()}
+                                    for name, mime, content in prepared],
+                })).hexdigest()
+                prior = db.execute("SELECT fingerprint,message_id FROM reply_ack_idempotency WHERE sender_session=? AND reply_to=?",
+                                   (sid, reply_to)).fetchone()
+                if prior is not None:
+                    if not secrets.compare_digest(prior["fingerprint"], fingerprint):
+                        raise CoordError("reply retry payload differs from the original")
+                    return self._send_result(db, prior["message_id"], True)
             mid = _id("message")
             parent = self._reply_parent(db, reply_to, sid, recipients[0]) if reply_to is not None else None
+            if ack_reply and parent is not None and parent["recipient_session"] != sid:
+                raise CoordError("ack_reply parent must be in caller inbox")
             db.execute("INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)", (mid,sid,recipients[0],body,_now()))
             if parent is not None:
                 db.execute("INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)", (mid,reply_to))
@@ -393,12 +597,21 @@ class Coordinator:
                 attachment_id = _id("attachment")
                 db.execute("INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)", (attachment_id, mid, name, mime, len(content), content))
                 metadata.append({"id": attachment_id, "name": name, "mime": mime, "size": len(content), "url": "/api/attachments/" + attachment_id})
+            if ack_reply:
+                db.execute("UPDATE messages SET acked_at=COALESCE(acked_at,?) WHERE id=?", (_now(), reply_to))
+                db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
+                           (reply_to, sid, _now()))
+                db.execute("INSERT INTO reply_ack_idempotency(sender_session,reply_to,fingerprint,message_id) VALUES(?,?,?,?)",
+                           (sid, reply_to, fingerprint, mid))
         preview = None if parent is None else {"id": parent["id"], "seq": parent["seq"],
                                                "sender_session": parent["sender_session"],
                                                "recipient_session": parent["recipient_session"],
                                                "sender_agent": None, "body": parent["body"][:240]}
-        return {"id":mid,"sender_session":sid,"recipient_session":recipients[0],"attachments":metadata,
-                "reply_to": reply_to, "reply_preview": preview}
+        result = {"id":mid,"sender_session":sid,"recipient_session":recipients[0],"attachments":metadata,
+                  "reply_to": reply_to, "reply_preview": preview}
+        if ack_reply:
+            result["acknowledged_reply"] = True
+        return result
 
     def _resolve_targets(self, db: sqlite3.Connection, targets: list[str]) -> list[str]:
         if not targets:
@@ -547,19 +760,42 @@ class Coordinator:
     def _reservation_result(self,r: sqlite3.Row,state:str,pos:int)->dict[str,Any]:
         return {"state":state,"resource":r["name"],"reservation_id":r["reservation_id"],"token":r["token"],"deadline":r["deadline"],"queue_position":pos}
 
-    def status(self) -> dict[str, Any]:
+    def _resource_status(self, db: sqlite3.Connection, r: sqlite3.Row) -> dict[str, Any]:
+        owner = None
+        if r["owner_session"]:
+            s = db.execute("SELECT agent FROM sessions WHERE id=?", (r["owner_session"],)).fetchone()
+            owner = s["agent"] if s else None
+        q = [dict(session=x["session"], agent=x["agent"], position=i + 1) for i, x in enumerate(
+            db.execute("SELECT q.session,s.agent FROM resource_queue q JOIN sessions s ON s.id=q.session "
+                       "WHERE q.resource=? ORDER BY q.seq", (r["name"],)).fetchall())]
+        return {"resource": r["name"], "owner_session": r["owner_session"], "owner_agent": owner,
+                "state": self._state(r), "reservation_id": r["reservation_id"], "deadline": r["deadline"],
+                "reason": r["reason"], "queue": q}
+
+    def status(self, mine: bool = False, resources: list[str] | None = None) -> dict[str, Any]:
         self.require_session()
+        if not isinstance(mine, bool): raise CoordError("mine must be a boolean")
+        if resources is not None and (not isinstance(resources, list) or
+                                      any(not isinstance(value, str) or not value for value in resources)):
+            raise CoordError("resources must be a list of nonempty strings")
+        named = [] if resources is None else list(dict.fromkeys(self.resource_name(value) for value in resources))
         with self.tx() as db:
-          rows=db.execute("SELECT * FROM resources ORDER BY name").fetchall(); out=[]
-          for r in rows:
-            owner=None
-            if r["owner_session"]:
-                s=db.execute("SELECT agent FROM sessions WHERE id=?",(r["owner_session"],)).fetchone()
-                owner=s["agent"] if s else None
-            q=[dict(session=x["session"],agent=x["agent"],position=i+1) for i,x in enumerate(db.execute("SELECT q.session,s.agent FROM resource_queue q JOIN sessions s ON s.id=q.session WHERE q.resource=? ORDER BY q.seq",(r["name"],)).fetchall())]
-            out.append({"resource":r["name"],"owner_session":r["owner_session"],"owner_agent":owner,"state":self._state(r),"reservation_id":r["reservation_id"],"deadline":r["deadline"],"reason":r["reason"],"queue":q})
-          sessions=[dict(session=x["id"],agent=x["agent"],registered_at=x["registered_at"]) for x in db.execute("SELECT id,agent,registered_at FROM sessions ORDER BY registered_at,id")]
-        return {"resources":out,"sessions":sessions}
+            where, args = "", []
+            if mine:
+                where = " WHERE (owner_session=? OR name IN (SELECT resource FROM resource_queue WHERE session=?))"
+                args.extend([self.session, self.session])
+            if resources is not None and not named:
+                where += (" AND " if where else " WHERE ") + "0"
+            elif named:
+                where += (" AND " if where else " WHERE ") + "name IN (" + ",".join("?" for _ in named) + ")"
+                args.extend(named)
+            rows = db.execute("SELECT * FROM resources" + where + " ORDER BY name", args).fetchall()
+            out = [self._resource_status(db, r) for r in rows]
+            if mine or resources is not None:
+                return {"resources": out}
+            sessions = [dict(session=x["id"], agent=x["agent"], registered_at=x["registered_at"])
+                        for x in db.execute("SELECT id,agent,registered_at FROM sessions ORDER BY registered_at,id")]
+        return {"resources": out, "sessions": sessions}
 
     def cancel(self, raw:str)->dict[str,Any]:
         sid,resource=self.require_session(),self.resource_name(raw)

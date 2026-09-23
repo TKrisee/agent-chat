@@ -77,10 +77,16 @@ def _remote_main(raw, global_args, server):
     sub = p.add_subparsers(dest='op', required=True)
     x = sub.add_parser('register'); x.add_argument('--agent', required=True)
     x = sub.add_parser('inbox'); x.add_argument('--all', action='store_true'); x.add_argument('--agent')
+    x = sub.add_parser('context', help='bounded unread messages and relevant resources')
+    x.add_argument('--limit', type=int, default=20); x.add_argument('--max-bytes', type=int, default=12288)
+    x.add_argument('--cursor', type=int); x.add_argument('--resource-cursor')
+    x.add_argument('--message-id', action='append', dest='message_ids')
+    x.add_argument('--resource', action='append', dest='resources')
+    x = sub.add_parser('message', help='read one complete message from your own inbox'); x.add_argument('id')
     x = sub.add_parser('acknowledge'); x.add_argument('id')
-    x = sub.add_parser('send'); x.add_argument('--to', required=True); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to')
+    x = sub.add_parser('send'); x.add_argument('--to', required=True); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to'); x.add_argument('--ack-reply', action='store_true')
     x = sub.add_parser('request'); x.add_argument('resource'); x.add_argument('--minutes', required=True, type=float)
-    sub.add_parser('status')
+    x = sub.add_parser('status'); x.add_argument('--mine', action='store_true'); x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('cancel'); x.add_argument('resource')
     x = sub.add_parser('check'); x.add_argument('resource'); x.add_argument('--token')
     x = sub.add_parser('release'); x.add_argument('resource'); x.add_argument('--receipt', required=True); x.add_argument('--token')
@@ -109,6 +115,8 @@ def _remote_main(raw, global_args, server):
     if op == 'inbox' and params.pop('agent') is not None:
         raise core.CoordError('--agent cannot read another agent inbox in remote mode')
     if op == 'send':
+        if params['ack_reply'] and not params['reply_to']:
+            raise core.CoordError('--ack-reply requires --reply-to')
         params['body'] = Path(params.pop('body_file')).read_text(encoding='utf-8')
         attachments = []
         for raw_path in params.pop('attach'):
@@ -230,7 +238,10 @@ def _remote_main(raw, global_args, server):
         result = {'exit_code': proc.returncode, 'run_id': None if run is None else run['run_id']}
     else:
         result = call(op, params)
-    print(json.dumps(result, sort_keys=True))
+    if op == 'context':
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')))
+    else:
+        print(json.dumps(result, sort_keys=True))
     return int(result.get('exit_code', 0))
 
 

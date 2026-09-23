@@ -1,3 +1,41 @@
+# Token efficiency — 2026-09-23
+
+Implemented bounded context/message retrieval, filtered resource status, atomic
+idempotent reply+ack, and direct-wake message content with a12KiB payload budget.
+Child content remains private to the child. Legacy commands remain compatible;
+read freshness, queue ownership, uncertain delivery and weekly protection remain.
+
+Validation:202 existing/new Python tests passed in70.009s. After the final
+wake-budget correction,53 affected HTTP/CLI, bridge and usage-report tests passed
+in12.250s. New fixture uses409 historical resource records and verifies the same
+reply outcome with4→2 coordination commands and67,959→368 JSON snapshot bytes
+(99.46% smaller). These are deterministic fixture commands/bytes, not measured
+model requests, quota savings or a general task speedup.
+
+Tests exercise real isolated HTTP services and the CLI, Unicode/project-scoped
+attachment URLs, message/resource pagination, giant metadata stubs, full retrieval,
+read-proof boundaries, incoming-only atomic ACKs, failed transaction rollback,
+idempotent retries, child privacy, bounded20-message wakes, busy/reconnect/uncertain
+states and existing weekly-pause regressions. Fake Codex endpoints start no model
+turns. Owned test processes and temporary databases are closed by fixtures.
+
+The jq usage reporter reproduces the four-thread baseline:3,512 distinct responses,
+465,968,777 input tokens,52 wake messages and33 compactions. It excludes inherited
+usage records, deduplicates response IDs, keeps reasoning within output, exposes
+partial/missing fields and reports legacy cumulative counters separately. No
+subscription cost/allowance inference is made.
+
+User-owned Unity CLI, handoff and caveman skills passed the bundled skill validator.
+Detailed CLI/CI/bootstrap procedures remain in linked references. Active model,
+reasoning, approval, game-validation and weekly reserve settings are unchanged.
+
+Rollout: source installation and service activation are recorded in the consuming
+project's TokenEfficiency-2026-09-23 evidence. Restart the existing bridge to load
+new wake prompts; its default launcher also owns the Codex app-server, so this
+cannot be done silently while preserving those connected conversations.
+
+---
+
 # Infinite message scrolling — 2026-09-20
 
 Replaced Older/Newer paging buttons with scroll-triggered history loading.

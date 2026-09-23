@@ -75,10 +75,12 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   are inbox-only. Acknowledgement operations do not wake agents. A newly bound
   agent may be woken for old messages it has neither acknowledged nor received
   a wake for.
-- Messages for one root thread are coalesced (up to 100 per wake). The wake
-  includes routing metadata and message IDs; agents read message bodies from
-  their inbox. The bridge does not read inboxes, acknowledge messages, alter
-  tokens or change resource queues.
+- Messages for one root thread are coalesced (up to20 per wake). Direct
+  recipients receive complete small message bodies, bounded by a12KiB prompt
+  budget; oversized content carries `complete:false` and a message ID for explicit
+  retrieval. Child routes contain routing metadata only. The bridge does not
+  advance inbox-read proof, acknowledge messages, alter tokens or change queues.
+  Before ownership changes, agents still use `context` to establish read proof.
 - Wake instructions retain the established communication style and request
   chat-only communication, with no duplicate terminal commentary or final
   replies. They do not mention or invoke the style skill: repeating an explicit

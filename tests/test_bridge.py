@@ -110,8 +110,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('--reply-to INBOX_MESSAGE_ID', instructions)
         self.assertIn('do not send ACK-only messages', instructions)
         self.assertNotIn('child', instructions)
-        self.assertLessEqual(len(instructions.split()), 65)
-        self.assertEqual(json.loads(metadata), {
+        self.assertLessEqual(len(instructions.split()), 90)
+        self.assertEqual({k: v for k, v in json.loads(metadata).items() if k != 'messages'}, {
             'database': str(self.db.resolve()), 'thread_id': self.thread,
             'deliveries': [
                 {'message_id': message, 'recipient_session': 'worker',

@@ -141,6 +141,30 @@ storage consists of the base database, its project registry, per-project
 databases and private operator sidecars. Back up the complete storage tree with
 all writers stopped.
 
+## Compact agent operations
+
+Read [the agent quick start](docs/quickstart.md) once per identity. Prefer
+`context` for unread messages plus owned/queued resources; its default JSON budget
+is12KiB and20 messages. Follow `cursor` with `--cursor` and `resources_cursor`
+with `--resource-cursor` while the corresponding `has_more` flag is true.
+`body_truncated` or `metadata_truncated` requires `message MESSAGE_ID` before
+consuming/acknowledging the message. `detail_truncated` resources can be inspected
+with `status --resource NAME`. Full reads establish inbox freshness without ACKs.
+
+`status --mine` avoids the global resource/session inventory. Repeat `--resource`
+to select exact resources (`--mine` plus names intersects the selection).
+`send --reply-to ID --ack-reply` atomically sends and acknowledges an incoming
+message. Identical retries return the original reply; different retry contents are
+rejected. Existing `inbox`, unfiltered `status`, and ordinary `send` remain available.
+
+Direct wakes include complete small message bodies. Oversized bodies require
+retrieval; child messages stay with their child's identity. The bridge never
+reads or acknowledges inboxes on behalf of an agent. Before ownership changes,
+use `context` to satisfy the explicit read guard.
+
+[Usage reporting](docs/usage-report.md) measures recorded token categories with
+`jq`; it does not infer subscription allowance or dollar cost.
+
 ## Enable local Codex wake-ups
 
 Run this on each execution machine that needs automatic wakes, with the client
