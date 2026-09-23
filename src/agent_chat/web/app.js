@@ -954,6 +954,7 @@ function projectURL(path) {
 
 function projectControls() {
   const disabled = state.busy || state.sending;
+  $('measurement-button').disabled = disabled || !state.config;
   $('project-select').disabled = disabled;
   $('new-project').disabled = disabled || !state.config;
   $('rename-project').disabled = disabled || !state.config;
@@ -1010,10 +1011,12 @@ async function connect() {
   }
 }
 
-  $('measurement-button').disabled = disabled || !state.config;
 function switchProject(id) {
   if (state.busy || state.sending || id === state.project) return;
   state.drafts.set(state.project, { body: $('message-input').value, attachments: state.attachments });
+  closeMeasurement();
+  state.measurement = null;
+  state.measurementSaving = false;
   state.project = id;
   const url = new URL(location.href);
   if (id === 'default') url.searchParams.delete('project'); else url.searchParams.set('project', id);
@@ -1048,6 +1051,21 @@ $('usage-button').addEventListener('click', () => {
   $('usage-dialog').showModal();
   $('usage-enabled').focus();
 });
+$('measurement-button').addEventListener('click', () => { measurementError(); $('measurement-dialog').showModal(); $('measurement-duration').focus(); loadMeasurement(); });
+$('cancel-measurement').addEventListener('click', closeMeasurement);
+$('measurement-dialog').addEventListener('close', () => {
+  clearMeasurementPolling();
+  state.measurementRequest++;
+  state.measurementLoading = false;
+  state.measurementSaving = false;
+  state.measurement = null;
+  $('measurement-pause-at-end').checked = false;
+  $('measurement-report').hidden = true;
+  $('measurement-status').textContent = 'Loading measurement status…';
+  measurementControls();
+});
+$('start-measurement').addEventListener('click', () => saveMeasurement('start'));
+$('stop-measurement').addEventListener('click', () => saveMeasurement('stop'));
 $('cancel-usage').addEventListener('click', () => $('usage-dialog').close());
 $('usage-enabled').addEventListener('change', () => {
   state.usageDialogDirty = true;
@@ -1070,9 +1088,6 @@ $('project-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.busy) return;
   const rename = event.currentTarget.dataset.rename === 'true';
-  closeMeasurement();
-  state.measurement = null;
-  state.measurementSaving = false;
   state.busy = true; projectControls(); $('save-project').disabled = true;
   try {
     const result = await fetchJSON(rename ? '/api/projects/rename' : '/api/projects', {
@@ -1107,21 +1122,6 @@ $('feed').addEventListener('scroll', () => {
   loadAtScrollEdge(direction);
 }, { passive: true });
 $('feed').addEventListener('wheel', event => loadAtScrollEdge(event.deltaY), { passive: true });
-$('measurement-button').addEventListener('click', () => { measurementError(); $('measurement-dialog').showModal(); $('measurement-duration').focus(); loadMeasurement(); });
-$('cancel-measurement').addEventListener('click', closeMeasurement);
-$('measurement-dialog').addEventListener('close', () => {
-  clearMeasurementPolling();
-  state.measurementRequest++;
-  state.measurementLoading = false;
-  state.measurementSaving = false;
-  state.measurement = null;
-  $('measurement-pause-at-end').checked = false;
-  $('measurement-report').hidden = true;
-  $('measurement-status').textContent = 'Loading measurement status…';
-  measurementControls();
-});
-$('start-measurement').addEventListener('click', () => saveMeasurement('start'));
-$('stop-measurement').addEventListener('click', () => saveMeasurement('stop'));
 $('feed').addEventListener('keydown', event => {
   if (event.target !== $('feed')) return;
   if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) loadAtScrollEdge(-1);
