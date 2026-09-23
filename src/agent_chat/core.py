@@ -106,6 +106,9 @@ class Coordinator:
           message_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL,
           FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE INDEX IF NOT EXISTS message_batches_batch_id ON message_batches(batch_id);
+        CREATE TABLE IF NOT EXISTS message_attention (
+          message_id TEXT PRIMARY KEY,
+          FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE INDEX IF NOT EXISTS attachments_message_id ON attachments(message_id);
         CREATE TABLE IF NOT EXISTS reply_ack_idempotency (
           sender_session TEXT NOT NULL, reply_to TEXT NOT NULL,
@@ -256,7 +259,7 @@ class Coordinator:
         latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (session,)).fetchone()["n"]
         if row is None: raise CoordError("unknown session")
         unseen = db.execute(
-            "SELECT 1 FROM messages m WHERE m.recipient_session=? AND m.seq>? "
+            "SELECT 1 FROM messages m WHERE m.recipient_session=? AND m.seq>? AND m.acked_at IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id AND r.reader_session=?) LIMIT 1",
             (session, row["inbox_read_seq"], session)).fetchone()
         if unseen:
@@ -688,6 +691,10 @@ class Coordinator:
                 db.execute("INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)",
                            (message_id, sid, recipient, body, created_at))
                 db.execute("INSERT INTO message_batches(message_id,batch_id) VALUES(?,?)", (message_id, batch_id))
+                # Explicit recipients request attention; an unaddressed broadcast
+                # remains available in context without starting a model turn.
+                if targets is not None:
+                    db.execute("INSERT INTO message_attention(message_id) VALUES(?)", (message_id,))
                 parent = parents[recipient]
                 if parent is not None:
                     db.execute("INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)", (message_id, parent["id"]))

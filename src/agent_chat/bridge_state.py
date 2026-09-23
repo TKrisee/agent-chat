@@ -124,14 +124,16 @@ class BridgeState:
             LEFT JOIN bridge_deliveries d ON d.message_id=m.id
             WHERE m.sender_session<>m.recipient_session
               AND m.acked_at IS NULL AND d.message_id IS NULL
-              AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
+              AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
+                   OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))
             ORDER BY m.seq''')]
 
     def still_unread(self, job_id):
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
             JOIN messages m ON m.id=d.message_id
             WHERE d.job_id=? AND m.acked_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id) LIMIT 1''', (job_id,)).fetchone())
+              AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
+                   OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id)) LIMIT 1''', (job_id,)).fetchone())
 
     def wake_messages(self, thread_id, message_ids):
         """Bound direct-recipient content without reading or acknowledging inboxes.
@@ -142,7 +144,8 @@ class BridgeState:
         result = []
         for message_id in message_ids:
             row = self.db.execute('''SELECT * FROM messages WHERE id=? AND acked_at IS NULL
-                AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=messages.id)''',
+                AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=messages.id)
+                     OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=messages.id))''',
                                   (message_id,)).fetchone()
             route = self.resolve(row['recipient_session']) if row else None
             if not route or route['thread_id'] != thread_id or len(route['route']) != 1:
@@ -169,7 +172,8 @@ class BridgeState:
                 if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
                         and row['sender_session'] != row['recipient_session'] and route and route['thread_id'] == thread_id
                         and not self.db.execute('SELECT 1 FROM bridge_deliveries WHERE message_id=?', (message['id'],)).fetchone()
-                        and not self.db.execute('SELECT 1 FROM message_batches WHERE message_id=?', (message['id'],)).fetchone()
+                        and (not self.db.execute('SELECT 1 FROM message_batches WHERE message_id=?', (message['id'],)).fetchone()
+                             or self.db.execute('SELECT 1 FROM message_attention WHERE message_id=?', (message['id'],)).fetchone())
                         and message not in live):
                     live.append(message)
             if not live:

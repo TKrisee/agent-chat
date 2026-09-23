@@ -28,7 +28,7 @@ class GroupDeliveryTests(RemoteWebFixture):
         self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
 
     def test_group_read_and_ack_are_independent_and_only_direct_wakes(self):
-        copies = self.operator.send_many(['a', 'b'], 'Shared progress')
+        copies = self.operator.send_group_prepared(None, 'Shared progress', [])
         self.bridge.tick()
         self.assertEqual(self.rpc.calls, [])
         self.assertEqual(self.state.pending(), [])
@@ -48,7 +48,8 @@ class GroupDeliveryTests(RemoteWebFixture):
         self.assertNotIn(second['id'], payload)
 
     def test_single_recipient_group_is_quiet_and_cannot_be_prepared(self):
-        copy = self.operator.send_many(['a'], 'Group intent with one member')[0]
+        self.call('deregister', session='b')
+        copy = self.operator.send_group_prepared(None, 'Group intent with one member', [])[0]
         self.assertIsNone(self.state.prepare(self.thread_id,
                                             [{'id': copy['id'], 'recipient_session': 'a'}], 'must not dispatch'))
         self.bridge.tick()
@@ -59,6 +60,7 @@ class GroupDeliveryTests(RemoteWebFixture):
         for status in ('prepared', 'queued'):
             with self.subTest(status=status):
                 copy = self.operator.send_many(['a'], 'Older group delivery')[0]
+                self.operator.db.execute('DELETE FROM message_attention WHERE message_id=?', (copy['id'],))
                 job_id = 'old-group-' + status
                 queue_id = 'queue-' + status if status == 'queued' else None
                 with self.operator.tx() as db:
@@ -77,10 +79,10 @@ class GroupDeliveryTests(RemoteWebFixture):
                                    {'owner': 'group-test', 'secret': 'x' * 40, 'host_id': 'mac'})
         remote.call('acquire')
         bridge = Bridge(remote, self.rpc)
-        self.operator.send_many(['a', 'b'], 'Quiet remote group')
+        self.operator.send_group_prepared(None, 'Quiet remote group', [])
         bridge.tick()
         self.assertFalse(any(name == 'thread/queue/start' for name, _ in self.rpc.calls))
-        self.operator.send('a', 'Direct remote request')
+        self.operator.send_many(['a', 'b'], 'Addressed remote request')
         bridge.tick()
         self.assertEqual(sum(name == 'thread/queue/start' for name, _ in self.rpc.calls), 1)
 
@@ -94,6 +96,38 @@ class GroupDeliveryTests(RemoteWebFixture):
         self.assert_json(raw, '([.messages[].batch_id]|unique|length==1) and all(.messages[];(.deliveries|length)==2)')
         self.bridge.tick()
         self.assertEqual(self.rpc.calls, [])
+
+    def test_explicit_tags_wake_each_addressed_agent_once(self):
+        self.call('bind', session='b', thread=str(uuid.uuid4()))
+        self.call('register', session='c', agent='untagged')
+        self.call('bind', session='c', thread=str(uuid.uuid4()))
+        status, raw, _ = self.request('POST', '/api/messages',
+                                      {'to': ['a', 'b', 'a'], 'body': 'Please review'},
+                                      headers={'X-Agent-Chat-CSRF': self.server.csrf_token})
+        self.assertEqual(status, 200, raw)
+        self.assert_json(raw, '(.messages|length==2) and ([.messages[].batch_id]|unique|length==1)')
+        pending = self.state.pending()
+        self.assertEqual({m['recipient_session'] for m in pending}, {'a', 'b'})
+        self.assertEqual(len(self.state.wake_messages(self.thread_id, [m['id'] for m in pending])), 1)
+        self.bridge.tick()
+        # FakeRpc models one global active flag, so make the next thread idle.
+        self.rpc.status = 'idle'
+        self.bridge.tick()
+        self.assertEqual(sum(name == 'thread/queue/start' for name, _ in self.rpc.calls), 2)
+        self.assertEqual(len({params['threadId'] for name, params in self.rpc.calls
+                              if name == 'thread/queue/start'}), 2)
+        self.rpc.status = 'idle'
+        self.bridge.tick()
+        self.assertEqual(sum(name == 'thread/queue/start' for name, _ in self.rpc.calls), 2)
+        status, raw, _ = self.request('GET', '/api/messages')
+        self.assertEqual(status, 200)
+        self.assert_json(raw, 'all(.messages[].deliveries[]; .wake_requested==true)')
+
+    def test_explicit_single_member_batch_wakes(self):
+        copies = self.operator.send_many(['a'], 'Explicit attention')
+        self.assertEqual(self.state.pending()[0]['id'], copies[0]['id'])
+        self.bridge.tick()
+        self.assertEqual(sum(name == 'thread/queue/start' for name, _ in self.rpc.calls), 1)
 
     def test_ui_invalid_recipient_and_implicit_reply_do_not_broadcast(self):
         original = self.operator.send('a', 'Original direct')

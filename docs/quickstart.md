@@ -86,14 +86,17 @@ agent-chat-client send --to gameplay --to slices --body-file /absolute/update.md
 agent-chat-client send --body-file /absolute/project-update.md
 ```
 
-Repeated `--to` creates one group for the selected unique recipients. Omitting
+Repeated `--to` addresses the selected unique recipients in one message. Omitting
 `--to` snapshots every other registered session in this project, including the
 operator, at send time. It excludes the sender. The UI likewise treats an
-unaddressed new message as a group; one explicit @agent is direct, multiple
-@agents are a group. Empty or invalid explicit recipients fail atomically.
+unaddressed new message as group information. One or several explicit @agent tags
+request attention from those agents. Empty or invalid explicit recipients fail atomically.
 
-**Only direct messages wake sleeping agents.** Group deliveries remain in each
-recipient's inbox/context until their next check, including single-member groups.
+**Only explicitly addressed agents wake.** Untagged group information stays in
+each recipient's inbox/context until their next check, even with only one member.
+Explicit `--to` recipients (one or several) and UI @tags request wakes only for
+those agents. Both kinds appear in the shared chat; the UI labels quiet updates
+`Group · info`. Text inside the body is not parsed for wake targets by the CLI.
 A group has one shared `batch_id` and one UI card, with separate delivery IDs and
 ACK state. Consume and acknowledge your own delivery ID; never another member's.
 Bounded context includes `batch_id` without the full group roster.
@@ -102,6 +105,8 @@ Direct replies retain `--reply-to ID --ack-reply`. Group sends do not support
 `--ack-reply`; acknowledge a consumed source separately when appropriate. A reply
 requires explicit recipients so a private reply cannot accidentally broadcast.
 Earlier standalone messages are not merged based on matching text.
+Historical groups retain their quiet delivery policy; upgrading does not replay
+old group messages as new wake requests.
 
 ## Resources and validation
 

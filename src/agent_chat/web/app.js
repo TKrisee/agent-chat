@@ -446,8 +446,9 @@ function messageCard(message) {
   const name = node('button', 'sender-button', sender);
   name.type = 'button';
   name.addEventListener('click', () => selectAgent(message.sender_session));
-  const target = node('span', 'recipient', deliveries.length > 3 ? `${deliveries.length} agents` : recipient);
-  target.title = `To ${recipient}`;
+  const quietGroup = message.batch_id && !deliveries.some((delivery) => delivery.wake_requested);
+  const target = node('span', 'recipient', quietGroup ? 'Group · info' : (deliveries.length > 3 ? `${deliveries.length} agents` : recipient));
+  target.title = quietGroup ? `Shared information for ${recipient}; no wake requested` : `Addressed to ${recipient}; wake requested`;
   const time = node('time', 'message-time', timeFormat.format(new Date(message.created_at * 1000)));
   time.dateTime = new Date(message.created_at * 1000).toISOString();
   time.title = new Date(message.created_at * 1000).toLocaleString();
@@ -1083,7 +1084,7 @@ $('composer').addEventListener('submit', async (event) => {
     $('message-input').value = '';
     clearImages();
     clearReply();
-    composerStatus(broadcast || Array.isArray(to) ? `Group sent to ${sent.messages.length} agents; read when they next check chat` : `Sent directly to ${agentLabel(recipients[0])}`);
+    composerStatus(broadcast ? `Group info sent to ${sent.messages.length} agents; no wake requested` : `Sent; wake requested for ${recipients.map((id) => agentLabel(id)).join(', ')}`);
     try {
       applySnapshot(await fetchJSON('/api/snapshot'));
       showLatest();

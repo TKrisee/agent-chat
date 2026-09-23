@@ -66,6 +66,7 @@ async function main() {
     await group.waitFor();
     assert.equal(await group.count(), 1);
     assert.ok(await group.getAttribute('data-batch-id'));
+    assert.equal(await group.locator('.recipient').innerText(), 'Group · info');
     assert.equal(await group.locator('.delivery-statuses .pending').count(), 2);
     await command('ack-alpha');
     await page.waitForFunction(() => [...document.querySelectorAll('.message')].some(card => card.textContent.includes('Shared group update') && card.querySelectorAll('.delivery-statuses .acknowledged').length === 1));
@@ -76,9 +77,17 @@ async function main() {
     const direct = page.locator('.message', {hasText: 'Direct action request'});
     await direct.waitFor();
     assert.equal(await direct.getAttribute('data-batch-id'), null);
+    await page.fill('#message-input', '@alpha @beta Tagged shared request');
+    await page.click('#send-button');
+    const tagged = page.locator('.message', {hasText: 'Tagged shared request'});
+    await tagged.waitFor();
+    assert.equal(await tagged.count(), 1);
+    assert.ok(await tagged.getAttribute('data-batch-id'));
+    assert.match(await tagged.locator('.recipient').getAttribute('title'), /wake requested/);
+    assert.match(await tagged.locator('.recipient').innerText(), /alpha, beta/);
     assert.deepEqual(errors, []);
     if (process.env.GROUP_SCREENSHOT) await page.screenshot({path: process.env.GROUP_SCREENSHOT, fullPage: true});
-    console.log('PASS: one group card, independent receipts, quiet single-member group and direct message identity');
+    console.log('PASS: quiet group label, independent receipts, one tagged group card and direct message identity');
   } finally {
     if (browser) await browser.close();
     const exited = once(fixture, 'exit');

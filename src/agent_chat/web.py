@@ -97,14 +97,18 @@ def message_rows(rows, agents, db):
         batch_ids = sorted({row['batch_id'] for row in memberships})
         if batch_ids:
             batch_marks = ','.join('?' for _ in batch_ids)
+            attention = ('EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id)'
+                         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attention'").fetchone()
+                         else '0')
             deliveries = {batch_id: [] for batch_id in batch_ids}
             for row in db.execute(
-                f'''SELECT b.batch_id,m.id,m.recipient_session,m.acked_at
+                f'''SELECT b.batch_id,m.id,m.recipient_session,m.acked_at,{attention} AS wake_requested
                      FROM message_batches b JOIN messages m ON m.id=b.message_id
                      WHERE b.batch_id IN ({batch_marks}) ORDER BY m.seq''', batch_ids):
                 deliveries[row['batch_id']].append({
                     'id': row['id'], 'recipient_session': row['recipient_session'],
                     'recipient_agent': agents.get(row['recipient_session']), 'acked_at': row['acked_at'],
+                    'wake_requested': bool(row['wake_requested']),
                 })
             for row in memberships:
                 by_message[row['message_id']].update(batch_id=row['batch_id'], deliveries=deliveries[row['batch_id']])
