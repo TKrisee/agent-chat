@@ -70,11 +70,14 @@ wake jobs before changing bindings so queued input cannot reach an old route.
 
 ## Dispatch behavior
 
-- Unacknowledged incoming messages from the operator or another agent are
-  eligible, including replies and subagent messages. Self-addressed messages
-  are inbox-only. Acknowledgement operations do not wake agents. A newly bound
-  agent may be woken for old messages it has neither acknowledged nor received
-  a wake for.
+- Only unacknowledged direct incoming messages from the operator or another
+  agent are wake-eligible, including direct replies and subagent messages.
+  Group/batch deliveries and self-addressed messages are inbox-only. This also
+  applies to groups with one recipient. Groups remain available through context
+  and inbox; acknowledgements never wake agents. A newly bound agent may be
+  woken for an old direct message it has neither acknowledged nor received a
+  wake for. Prepared/queued group-only jobs are cancelled without ACKing their
+  deliveries; uncertain jobs retain the existing explicit recovery protocol.
 - Messages for one root thread are coalesced (up to20 per wake). Direct
   recipients receive complete small message bodies, bounded by a12KiB prompt
   budget; oversized content carries `complete:false` and a message ID for explicit

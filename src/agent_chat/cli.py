@@ -84,7 +84,7 @@ def _remote_main(raw, global_args, server):
     x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('message', help='read one complete message from your own inbox'); x.add_argument('id')
     x = sub.add_parser('acknowledge'); x.add_argument('id')
-    x = sub.add_parser('send'); x.add_argument('--to', required=True); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to'); x.add_argument('--ack-reply', action='store_true')
+    x = sub.add_parser('send'); x.add_argument('--to', action='append'); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to'); x.add_argument('--ack-reply', action='store_true')
     x = sub.add_parser('request'); x.add_argument('resource'); x.add_argument('--minutes', required=True, type=float)
     x = sub.add_parser('status'); x.add_argument('--mine', action='store_true'); x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('cancel'); x.add_argument('resource')
@@ -121,8 +121,14 @@ def _remote_main(raw, global_args, server):
     if op == 'inbox' and params.pop('agent') is not None:
         raise core.CoordError('--agent cannot read another agent inbox in remote mode')
     if op == 'send':
+        targets = params['to']
         if params['ack_reply'] and not params['reply_to']:
             raise core.CoordError('--ack-reply requires --reply-to')
+        if params['ack_reply'] and (not targets or len(targets) != 1):
+            raise core.CoordError('--ack-reply is only supported with one --to recipient')
+        if not targets and params['reply_to']:
+            raise core.CoordError('--reply-to requires an explicit --to recipient')
+        params['to'] = targets[0] if targets and len(targets) == 1 else targets
         params['body'] = Path(params.pop('body_file')).read_text(encoding='utf-8')
         attachments = []
         for raw_path in params.pop('attach'):

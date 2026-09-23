@@ -64,7 +64,17 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         if not isinstance(body, str): raise CoordError("body must be a string")
         ack_reply = params.get("ack_reply", False)
         if not isinstance(ack_reply, bool): raise CoordError("ack_reply must be a boolean")
-        return _send(coord, _string(params.get("to"), "to"), body, attachments, params.get("reply_to"), ack_reply)
+        targets = params.get("to")
+        if isinstance(targets, str):
+            return _send(coord, _string(targets, "to"), body, attachments, params.get("reply_to"), ack_reply)
+        if targets is not None and (not isinstance(targets, list) or not all(isinstance(item, str) for item in targets)):
+            raise CoordError("to must be a recipient string or a list of recipient strings")
+        if ack_reply:
+            raise CoordError("ack_reply is only supported for a direct recipient")
+        if targets is None and params.get("reply_to") is not None:
+            raise CoordError("reply_to requires an explicit recipient group")
+        results = coord.send_group_prepared(targets, body, _prepare_attachments(coord, attachments), params.get("reply_to"))
+        return _group_result(results)
     if op == "send-many":
         targets = params.get("to")
         if not isinstance(targets, list) or not all(isinstance(x, str) for x in targets):
@@ -119,8 +129,7 @@ def resource_name(raw):
     return raw
 
 
-def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to: Any,
-          ack_reply: bool = False) -> dict:
+def _prepare_attachments(coord: Coordinator, attachments: Any) -> list[tuple[str, str, bytes]]:
     if not isinstance(attachments, list) or len(attachments) > 4:
         raise CoordError("attachments must contain at most four images")
     prepared = []
@@ -132,7 +141,20 @@ def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to
         if not content or len(content) > 10 * 1024 * 1024 or coord._image_mime(content) is None:
             raise CoordError("remote attachment must be a supported image no larger than 10 MiB")
         prepared.append((item["name"], coord._image_mime(content), content))
-    return coord._send_prepared(target, body, prepared, reply_to, ack_reply)
+    return prepared
+
+
+def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to: Any,
+          ack_reply: bool = False) -> dict:
+    return coord._send_prepared(target, body, _prepare_attachments(coord, attachments), reply_to, ack_reply)
+
+
+def _group_result(results: list[dict]) -> dict:
+    return {"batch_id": results[0]["batch_id"], "deliveries": [
+        {"id": delivery["id"], "recipient_session": delivery["recipient_session"],
+         "recipient_agent": delivery["recipient_agent"]}
+        for delivery in results[0]["deliveries"]
+    ]}
 
 
 def _schema(coord: Coordinator) -> None:

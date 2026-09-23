@@ -1060,7 +1060,7 @@ $('composer').addEventListener('submit', async (event) => {
     composerStatus('An @agent differs from this reply. Cancel the reply to start a new conversation.', true);
     return;
   }
-  const to = recipients.length === 1 && !state.reply?.batch_id ? recipients[0] : recipients;
+  const to = broadcast ? null : (recipients.length === 1 && !state.reply?.batch_id ? recipients[0] : recipients);
   hideMentions();
   state.sending = true;
   projectControls();
@@ -1079,11 +1079,11 @@ $('composer').addEventListener('submit', async (event) => {
       headers['Content-Type'] = 'application/json';
       payload = JSON.stringify(message);
     }
-    await fetchJSON('/api/messages', { method: 'POST', headers, body: payload });
+    const sent = await fetchJSON('/api/messages', { method: 'POST', headers, body: payload });
     $('message-input').value = '';
     clearImages();
     clearReply();
-    composerStatus(broadcast ? `Sent to all ${recipients.length} agents` : `Sent to ${recipients.map((id) => agentLabel(id)).join(', ')}`);
+    composerStatus(broadcast || Array.isArray(to) ? `Group sent to ${sent.messages.length} agents; read when they next check chat` : `Sent directly to ${agentLabel(recipients[0])}`);
     try {
       applySnapshot(await fetchJSON('/api/snapshot'));
       showLatest();

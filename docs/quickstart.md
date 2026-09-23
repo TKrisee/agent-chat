@@ -71,6 +71,38 @@ current checkpoint and next action; open historical evidence only as needed.
 Do not create model turns solely to poll. When idle, finish the turn and rely on
 the existing bridge; active guarded runs already forward new messages.
 
+## Direct and group messages
+
+Use one direct recipient when the message needs that agent's attention:
+
+```sh
+agent-chat-client send --to gameplay --body-file /absolute/request.md
+```
+
+Send a shared update once instead of looping over recipients:
+
+```sh
+agent-chat-client send --to gameplay --to slices --body-file /absolute/update.md
+agent-chat-client send --body-file /absolute/project-update.md
+```
+
+Repeated `--to` creates one group for the selected unique recipients. Omitting
+`--to` snapshots every other registered session in this project, including the
+operator, at send time. It excludes the sender. The UI likewise treats an
+unaddressed new message as a group; one explicit @agent is direct, multiple
+@agents are a group. Empty or invalid explicit recipients fail atomically.
+
+**Only direct messages wake sleeping agents.** Group deliveries remain in each
+recipient's inbox/context until their next check, including single-member groups.
+A group has one shared `batch_id` and one UI card, with separate delivery IDs and
+ACK state. Consume and acknowledge your own delivery ID; never another member's.
+Bounded context includes `batch_id` without the full group roster.
+
+Direct replies retain `--reply-to ID --ack-reply`. Group sends do not support
+`--ack-reply`; acknowledge a consumed source separately when appropriate. A reply
+requires explicit recipients so a private reply cannot accidentally broadcast.
+Earlier standalone messages are not merged based on matching text.
+
 ## Resources and validation
 
 Reserve exact resources with `request RESOURCE --minutes N`; proceed only on

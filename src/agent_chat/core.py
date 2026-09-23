@@ -355,7 +355,8 @@ class Coordinator:
         return {"id": message["id"], "sender_session": message["sender_session"],
                 "sender_agent": message["sender_agent"], "created_at": message["created_at"],
                 "body": body, "body_truncated": body != message["body"],
-                "attachments": message["attachments"], "reply_to": message["reply_to"]}
+                "attachments": message["attachments"], "reply_to": message["reply_to"],
+                **({"batch_id": message["batch_id"]} if message.get("batch_id") else {})}
 
     def context(self, limit: int = 20, max_bytes: int = 12288, cursor: int | None = None,
                 message_ids: list[str] | None = None, resources: list[str] | None = None,
@@ -635,12 +636,34 @@ class Coordinator:
     def send_many(self, targets: list[str], body: str, reply_to: str | None = None,
                   attachments: list[str | os.PathLike[str]] | None = None) -> list[dict[str, Any]]:
         """Atomically create one delivery per distinct resolved recipient."""
-        sid = self.require_session()
         if not isinstance(targets, list):
             raise CoordError("recipients must be a list")
-        prepared = self._prepare_attachments(attachments)
+        return self._send_many_prepared(targets, body, self._prepare_attachments(attachments), reply_to)
+
+    def send_group_prepared(self, targets: list[str] | None, body: str,
+                            prepared: list[tuple[str, str, bytes]],
+                            reply_to: str | None = None) -> list[dict[str, Any]]:
+        """Create an explicit group, or snapshot every other registered session."""
+        if targets is not None and not isinstance(targets, list):
+            raise CoordError("recipients must be a list")
+        if targets is None and reply_to is not None:
+            raise CoordError("reply_to requires an explicit recipient group")
+        return self._send_many_prepared(targets, body, prepared, reply_to)
+
+    def _send_many_prepared(self, targets: list[str] | None, body: str,
+                            prepared: list[tuple[str, str, bytes]],
+                            reply_to: str | None = None) -> list[dict[str, Any]]:
+        sid = self.require_session()
+        if not isinstance(body, str):
+            raise CoordError("body must be a string")
         with self.tx() as db:
-            recipients = self._resolve_targets(db, targets)
+            if targets is None:
+                recipients = [row["id"] for row in db.execute(
+                    "SELECT id FROM sessions WHERE id<>? ORDER BY registered_at,id", (sid,))]
+                if not recipients:
+                    raise CoordError("no other registered sessions are available")
+            else:
+                recipients = self._resolve_targets(db, targets)
             parents: dict[str, sqlite3.Row | None] = {recipient: None for recipient in recipients}
             if reply_to is not None:
                 parent = db.execute("SELECT id,sender_session FROM messages WHERE id=?", (reply_to,)).fetchone()

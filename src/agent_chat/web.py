@@ -518,14 +518,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(413, {'error': 'Images must fit within 40 MiB plus 64 KiB of metadata'})
                     return
                 data, attachments = self.read_multipart_message(size)
-            if not isinstance(data, dict) or set(data) not in ({'to', 'body'}, {'to', 'body', 'reply_to'}):
-                raise ValueError('Choose a recipient and write a message')
-            recipient, body = data['to'], data['body']
-            is_many = isinstance(recipient, list)
-            if (not isinstance(recipient, (str, list)) or not isinstance(body, str) or
+            if not isinstance(data, dict) or 'body' not in data or set(data) - {'to', 'body', 'reply_to'}:
+                raise ValueError('Write a message with optional recipients')
+            recipient, body = data.get('to'), data['body']
+            is_many = recipient is None or isinstance(recipient, list)
+            if ((recipient is not None and not isinstance(recipient, (str, list))) or not isinstance(body, str) or
                     (content_type == 'application/json' and not body.strip()) or
                     (content_type == 'multipart/form-data' and not body.strip() and not attachments) or
-                    (is_many and (not recipient or any(not isinstance(item, str) or not item for item in recipient)))):
+                    (isinstance(recipient, list) and (not recipient or any(not isinstance(item, str) or not item for item in recipient)))):
                 raise ValueError('Choose a recipient and write a nonempty message')
             reply_to = data.get('reply_to')
             if reply_to is not None and (not isinstance(reply_to, str) or not reply_to):
@@ -534,13 +534,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if isinstance(recipient, str):
                     if not db.execute('SELECT 1 FROM sessions WHERE id=?', (recipient,)).fetchone():
                         raise ValueError('Recipient is not a registered agent session')
-                elif any(not db.execute('SELECT 1 FROM sessions WHERE id=?', (item,)).fetchone() for item in recipient):
+                elif isinstance(recipient, list) and any(not db.execute('SELECT 1 FROM sessions WHERE id=?', (item,)).fetchone() for item in recipient):
                     raise ValueError('Recipient is not a registered agent session')
             with tempfile.TemporaryDirectory(prefix='agent-chat-upload-') as directory:
                 upload_paths = self.write_uploads(directory, attachments or [])
                 coord = Coordinator(self.db_path, self.sender_session)
                 try:
-                    sent = (coord.send_many(recipient, body.strip(), reply_to=reply_to, attachments=upload_paths)
+                    sent = (coord.send_group_prepared(recipient, body.strip(), coord._prepare_attachments(upload_paths), reply_to)
                             if is_many else coord.send(recipient, body.strip(), attachments=upload_paths, reply_to=reply_to))
                 finally:
                     coord.close()
