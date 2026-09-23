@@ -17,6 +17,7 @@ const state = {
   historyDirection: null, historyError: null, scrollTop: 0,
   attachments: [],
   usage: null, usageDialogDirty: false, usageSaving: false,
+  measurement: null, measurementLoading: false, measurementSaving: false, measurementRequest: 0, measurementPoll: null,
 };
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 const dateFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
@@ -101,6 +102,146 @@ function usageFormControls() {
 function usageError(message = '') {
   $('usage-error').textContent = message;
   $('usage-error').hidden = !message;
+}
+
+const measurementValue = value => value == null ? '—' : Number(value).toLocaleString();
+
+function measurementTime(value) {
+  const date = new Date(Number(value) * 1000);
+  return value == null || Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+}
+
+function measurementDuration(report) {
+  if (report?.ended_at != null && report?.started_at != null) {
+    const seconds = Math.max(0, Math.round(Number(report.ended_at) - Number(report.started_at)));
+    if (!seconds) return '<1s';
+    return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  }
+  return report?.duration_seconds == null ? 'duration unavailable' : `${Math.round(report.duration_seconds / 60)} min`;
+}
+
+const measurementActive = report => ['starting', 'running'].includes(report?.state);
+function measurementError(message = '') {
+  $('measurement-error').textContent = message;
+  $('measurement-error').hidden = !message;
+}
+function measurementSummary(metrics) {
+  if (!metrics) return '—';
+  return `responses ${measurementValue(metrics.response_count)} · fresh ${measurementValue(metrics.fresh_input_tokens)} · cached ${measurementValue(metrics.cached_input_tokens)} · output ${measurementValue(metrics.output_tokens)}`;
+}
+function clearMeasurementPolling() {
+  if (state.measurementPoll) clearInterval(state.measurementPoll);
+  state.measurementPoll = null;
+}
+function closeMeasurement() {
+  clearMeasurementPolling();
+  state.measurementRequest++;
+  state.measurementLoading = false;
+  if ($('measurement-dialog').open) $('measurement-dialog').close();
+}
+function syncMeasurementPolling() {
+  clearMeasurementPolling();
+  if ($('measurement-dialog').open && measurementActive(state.measurement?.active)) {
+    state.measurementPoll = setInterval(loadMeasurement, 12000);
+  }
+}
+function measurementControls() {
+  const active = measurementActive(state.measurement?.active);
+  const unavailable = state.measurement?.available === false;
+  $('measurement-duration').disabled = state.measurementSaving || active || unavailable;
+  $('measurement-pause-at-end').disabled = !state.measurement || state.measurementSaving || state.measurementLoading || active || unavailable;
+  $('start-measurement').disabled = !state.measurement || state.measurementSaving || state.measurementLoading || active || unavailable;
+  $('stop-measurement').hidden = !active;
+  $('stop-measurement').disabled = state.measurementSaving || state.measurementLoading;
+}
+function renderMeasurement(data) {
+  state.measurement = data || null;
+  const report = data?.active || data?.latest;
+  const active = measurementActive(data?.active);
+  if (data?.active?.pause_at_end != null) $('measurement-pause-at-end').checked = Boolean(data.active.pause_at_end);
+  $('measurement-status').textContent = data?.available === false ? (data.error || 'Measurements are unavailable for this project.')
+    : active ? `${data.active.state === 'starting' ? 'Starting' : 'Running'} · deadline ${measurementTime(data.active.deadline)} · last sample ${measurementTime(data.active.sampled_at)}`
+      : report ? `${report.state} · ${measurementDuration(report)}`
+        : 'No measurement has been recorded for this project.';
+  $('measurement-report').hidden = !report;
+  if (report) {
+    $('measurement-started').textContent = measurementTime(report.started_at);
+    $('measurement-deadline').textContent = report.ended_at == null ? measurementTime(report.deadline) : `ended ${measurementTime(report.ended_at)}`;
+    $('measurement-sampled').textContent = measurementTime(report.sampled_at);
+    const agents = Array.isArray(report.agents) && report.agents.length ? report.agents : [null];
+    $('measurement-agents').replaceChildren(...agents.map(agent => {
+      const row = document.createElement('tr');
+      const values = agent
+        ? [agent.agent || 'Unnamed agent', measurementValue(agent.response_count), measurementValue(agent.fresh_input_tokens), measurementValue(agent.cached_input_tokens), measurementValue(agent.output_tokens), `${measurementValue(agent.tool_result_text_characters)} / ${measurementValue(agent.wake_message_count)}`]
+        : ['No agent samples', '—', '—', '—', '—', '—'];
+      row.replaceChildren(...values.map(value => node('td', '', value)));
+      return row;
+    }));
+    $('measurement-agent-total').textContent = measurementSummary(report.totals);
+    $('measurement-guardian-total').textContent = measurementSummary(report.guardian);
+    const start = report.quota_start?.remaining_percent;
+    const end = report.quota_end?.remaining_percent;
+    $('measurement-quota').textContent = start == null && end == null ? '—' : `start ${start == null ? '—' : `${Math.round(start)}%`} · end ${end == null ? '—' : `${Math.round(end)}%`}`;
+    $('measurement-coverage').textContent = report.coverage || 'Coverage unavailable.';
+    const errors = Array.isArray(report.errors) ? report.errors : [];
+    $('measurement-errors').replaceChildren(...errors.map(error => node('li', '', error)));
+    $('measurement-errors').hidden = !errors.length;
+  }
+  const pauseReport = data?.active || report;
+  const pauseStatus = pauseReport?.pause_error
+    ? `Safe-pause delivery error: ${pauseReport.pause_error}`
+    : pauseReport?.pause_requested_at != null
+      ? `Safe-pause requested ${measurementTime(pauseReport.pause_requested_at)}. Delivery is not confirmation that agents are paused.`
+      : '';
+  $('measurement-pause-status').textContent = pauseStatus;
+  $('measurement-pause-status').hidden = !pauseStatus;
+  measurementError(data?.error || '');
+  measurementControls();
+  syncMeasurementPolling();
+}
+async function loadMeasurement() {
+  if (state.measurementLoading || state.measurementSaving || !state.config) return;
+  const request = ++state.measurementRequest;
+  const project = state.project;
+  state.measurementLoading = true;
+  measurementControls();
+  try {
+    const data = await fetchJSON('/api/measurements');
+    if (request === state.measurementRequest && project === state.project && $('measurement-dialog').open) renderMeasurement(data);
+  } catch (error) {
+    if (error.name !== 'AbortError' && request === state.measurementRequest && project === state.project && $('measurement-dialog').open) measurementError(error.message);
+  } finally {
+    if (request === state.measurementRequest) {
+      state.measurementLoading = false;
+      measurementControls();
+    }
+  }
+}
+async function saveMeasurement(operation) {
+  if (state.measurementSaving || state.measurementLoading || !state.config || (operation === 'start' && measurementActive(state.measurement?.active))) return;
+  const request = ++state.measurementRequest;
+  const project = state.project;
+  state.measurementSaving = true;
+  measurementError();
+  measurementControls();
+  try {
+    const duration = Number($('measurement-duration').value);
+    const data = await fetchJSON('/api/measurements', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify(operation === 'start'
+        ? { op: 'start', duration_seconds: duration, pause_at_end: $('measurement-pause-at-end').checked }
+        : { op: 'stop' }),
+    });
+    if (request === state.measurementRequest && project === state.project && $('measurement-dialog').open) renderMeasurement(data);
+  } catch (error) {
+    if (error.name !== 'AbortError' && request === state.measurementRequest && project === state.project && $('measurement-dialog').open) measurementError(error.message);
+  } finally {
+    if (request === state.measurementRequest) {
+      state.measurementSaving = false;
+      measurementControls();
+    }
+  }
 }
 
 async function saveUsage(operation) {
@@ -869,6 +1010,7 @@ async function connect() {
   }
 }
 
+  $('measurement-button').disabled = disabled || !state.config;
 function switchProject(id) {
   if (state.busy || state.sending || id === state.project) return;
   state.drafts.set(state.project, { body: $('message-input').value, attachments: state.attachments });
@@ -928,6 +1070,9 @@ $('project-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.busy) return;
   const rename = event.currentTarget.dataset.rename === 'true';
+  closeMeasurement();
+  state.measurement = null;
+  state.measurementSaving = false;
   state.busy = true; projectControls(); $('save-project').disabled = true;
   try {
     const result = await fetchJSON(rename ? '/api/projects/rename' : '/api/projects', {
@@ -962,6 +1107,21 @@ $('feed').addEventListener('scroll', () => {
   loadAtScrollEdge(direction);
 }, { passive: true });
 $('feed').addEventListener('wheel', event => loadAtScrollEdge(event.deltaY), { passive: true });
+$('measurement-button').addEventListener('click', () => { measurementError(); $('measurement-dialog').showModal(); $('measurement-duration').focus(); loadMeasurement(); });
+$('cancel-measurement').addEventListener('click', closeMeasurement);
+$('measurement-dialog').addEventListener('close', () => {
+  clearMeasurementPolling();
+  state.measurementRequest++;
+  state.measurementLoading = false;
+  state.measurementSaving = false;
+  state.measurement = null;
+  $('measurement-pause-at-end').checked = false;
+  $('measurement-report').hidden = true;
+  $('measurement-status').textContent = 'Loading measurement status…';
+  measurementControls();
+});
+$('start-measurement').addEventListener('click', () => saveMeasurement('start'));
+$('stop-measurement').addEventListener('click', () => saveMeasurement('stop'));
 $('feed').addEventListener('keydown', event => {
   if (event.target !== $('feed')) return;
   if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) loadAtScrollEdge(-1);

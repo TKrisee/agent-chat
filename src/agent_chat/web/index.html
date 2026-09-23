@@ -39,6 +39,7 @@
         <h1 id="conversation-title">All conversations</h1>
         <div class="conversation-actions">
           <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
+          <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog">Measure usage</button>
           <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
         </div>
       </div>
@@ -96,6 +97,46 @@
     </form>
   </dialog>
   <dialog id="usage-dialog" aria-labelledby="usage-dialog-title">
+  <dialog id="measurement-dialog" aria-labelledby="measurement-dialog-title">
+    <section class="measurement-dialog">
+      <div class="usage-dialog-heading">
+        <div><p class="usage-kicker">PROJECT MEASUREMENT</p><h2 id="measurement-dialog-title">Measure usage</h2></div>
+        <button class="quiet-button usage-close" id="cancel-measurement" type="button" aria-label="Close measurement">×</button>
+      </div>
+      <p class="usage-scope">Samples this project only. Account-meter changes are shared-account observations and cannot be attributed solely to this project.</p>
+      <div class="measurement-controls">
+        <label for="measurement-duration">Duration <select id="measurement-duration"><option value="60">1 min</option><option value="300" selected>5 min</option><option value="900">15 min</option><option value="3600">60 min</option></select></label>
+        <button id="start-measurement" type="button" class="send-button">Start</button>
+        <button id="stop-measurement" type="button" class="quiet-button" hidden>Stop early &amp; save</button>
+      </div>
+      <label class="usage-toggle"><input id="measurement-pause-at-end" type="checkbox"> <span>Pause agents at end</span></label>
+      <p class="usage-scope">Sends a safe-pause request after the report is saved; agents finish cleanup before confirming.</p>
+      <p id="measurement-status" class="usage-current" role="status">Loading measurement status…</p>
+      <p id="measurement-error" class="composer-status error" role="alert" hidden></p>
+      <p id="measurement-pause-status" class="usage-scope" hidden></p>
+      <section id="measurement-report" hidden aria-live="polite">
+        <dl class="measurement-meta">
+          <div><dt>Started</dt><dd id="measurement-started">—</dd></div>
+          <div><dt>Deadline / ended</dt><dd id="measurement-deadline">—</dd></div>
+          <div><dt>Last sample</dt><dd id="measurement-sampled">—</dd></div>
+        </dl>
+        <div class="measurement-table-wrap">
+          <table>
+            <caption>Agent usage</caption>
+            <thead><tr><th>Agent</th><th>Responses</th><th>Fresh</th><th>Cached</th><th>Output</th><th>Tool chars / wakes</th></tr></thead>
+            <tbody id="measurement-agents"></tbody>
+          </table>
+        </div>
+        <dl class="measurement-totals">
+          <div><dt>Agent total</dt><dd id="measurement-agent-total">—</dd></div>
+          <div><dt>Guardian / approval total</dt><dd id="measurement-guardian-total">—</dd></div>
+          <div><dt>Account meter</dt><dd id="measurement-quota">—</dd></div>
+        </dl>
+        <p id="measurement-coverage" class="usage-scope"></p>
+        <ul id="measurement-errors" class="measurement-errors" hidden></ul>
+      </section>
+    </section>
+  </dialog>
     <form id="usage-form">
       <div class="usage-dialog-heading"><div><p class="usage-kicker">GLOBAL WEEKLY USAGE</p><h2 id="usage-dialog-title">Usage reserve</h2></div><button class="quiet-button usage-close" id="cancel-usage" type="button" aria-label="Close usage settings">×</button></div>
       <p class="usage-scope">Protects all projects on connected clients. When enabled, unknown usage also pauses work. Quota updates can lag; Allow work needs fresh reports above the reserve.</p>

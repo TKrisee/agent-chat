@@ -22,6 +22,8 @@ from agent_chat.core import CoordError, Coordinator, agent_labels
 from .projects import Projects
 from .bridge_state import runtime_snapshot
 from .usage import UsageStore
+from .measurement import MeasurementStore
+from .measurement_pause import request_pauses
 
 from .auth import authorized, validate_config, origin
 
@@ -198,7 +200,7 @@ def operator_session(db_path):
 class WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None):
+    def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None, sessions_root=None):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.web_root = Path(web_root).resolve()
         self.stop_event = threading.Event()
@@ -209,6 +211,7 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.public_url = validate_config(address[0], api_token, public_url)
         self.bridge_manager = None
         self.usage = UsageStore(self.db_path)
+        self.measurements = None
         self.projects = Projects(self.db_path)
         self.project_contexts = {}
         self.project_lock = threading.RLock()
@@ -218,6 +221,8 @@ class WebServer(http.server.ThreadingHTTPServer):
             if api_token:
                 from .bridge_lease import BridgeManager
                 self.bridge_manager = BridgeManager(self.db_path, usage_store=self.usage)
+            self.measurements = MeasurementStore(self.db_path, sessions_root=sessions_root, usage_store=self.usage,
+                                                 pause_callback=self.pause_measured_agents)
         except BaseException:
             self.server_close()
             raise
@@ -226,6 +231,12 @@ class WebServer(http.server.ThreadingHTTPServer):
     def origin(self):
         host = '[' + self.listen_host + ']' if ':' in self.listen_host else self.listen_host
         return self.public_url or origin(f'http://{host}:{self.server_port}')
+
+    def pause_measured_agents(self, project_id, database, measurement_id, recipients):
+        current_path, sender, _ = self.project_context(project_id)
+        if Path(database).resolve() != Path(current_path).resolve():
+            raise CoordError('measurement project database changed')
+        request_pauses(current_path, sender, measurement_id, recipients)
 
     def project_context(self, project):
         item = self.projects.get(project)
@@ -244,6 +255,8 @@ class WebServer(http.server.ThreadingHTTPServer):
             return self.project_contexts[item['id']]
 
     def server_close(self):
+        if self.measurements:
+            self.measurements.close()
         for _, _, manager in self.project_contexts.values():
             if manager: manager.close()
         if self.bridge_manager:
@@ -358,6 +371,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(200, {'projects': self.server.projects.list(), 'project': self.project})
             elif url.path == '/api/usage':
                 self.json(200, self.server.usage.status())
+            elif url.path == '/api/measurements':
+                self.json(200, self.server.measurements.status(self.project['id']))
             elif url.path == '/api/snapshot':
                 self.json(200, self.project_snapshot())
             elif url.path == '/api/config':
@@ -467,12 +482,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename', '/api/usage'):
+        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename', '/api/usage', '/api/measurements'):
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
+            return
+        if path == '/api/measurements':
+            try:
+                data = self.read_json()
+                if (isinstance(data, dict) and {'op', 'duration_seconds'} <= set(data)
+                        and set(data) <= {'op', 'duration_seconds', 'pause_at_end'} and data['op'] == 'start'):
+                    result = self.server.measurements.start(self.project['id'], self.db_path, data['duration_seconds'],
+                                                            pause_at_end=data.get('pause_at_end', False))
+                elif isinstance(data, dict) and data == {'op': 'stop'}:
+                    result = self.server.measurements.stop(self.project['id'])
+                else:
+                    raise CoordError('invalid measurement operation')
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
             return
         if path == '/api/usage':
             try:
@@ -678,7 +708,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_token=None, public_url=None):
+def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_token=None, public_url=None, sessions_root=None):
     with reader(db_path):
         pass
-    return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url)
+    return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url, sessions_root)

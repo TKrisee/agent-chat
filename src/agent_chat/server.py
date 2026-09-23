@@ -47,6 +47,8 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--api-token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
     parser.add_argument('--public-url', help='External HTTP(S) origin; required when binding beyond loopback')
+    parser.add_argument('--codex-sessions', default=os.environ.get('AGENT_CHAT_CODEX_SESSIONS_DIR'),
+                        help='Local Codex sessions directory for timed usage measurements (default: ~/.codex/sessions)')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('--port must be between 0 and 65535')
@@ -66,7 +68,7 @@ def main(argv=None):
         # Bootstrap the database before WebServer creates its operator session.
         Coordinator(args.db).close()
         server = create_server(args.db, port=args.port, host=args.host,
-                               api_token=args.api_token, public_url=args.public_url)
+                               api_token=args.api_token, public_url=args.public_url, sessions_root=args.codex_sessions)
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, shutdown)
         print(server.origin + '/', flush=True)
