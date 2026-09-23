@@ -30,10 +30,16 @@ directory consistent with its bridge; do not share it between machines.
 agent-chat-client context
 agent-chat-client status --mine
 agent-chat-client status --resource validation-clone
+agent-chat-client bridge-status
 agent-chat-client message MESSAGE_ID
 agent-chat-client send --to RECIPIENT --body-file /absolute/reply.md \
   --reply-to ORIGINAL_MESSAGE_ID --ack-reply
 ```
+
+`bridge-status` defaults to this session’s binding, its resolved thread and up to
+10 unresolved jobs on that thread; `jobs_has_more` signals additional unresolved
+jobs. Use `bridge-status --all` only for cross-session diagnostics or completed
+job history, and select the needed fields before returning it to the model.
 
 `context` returns at most 20 messages and 12 KiB by default, plus owned/queued
 resources. Follow `cursor` with `--cursor` and `resources_cursor` with `--resource-cursor`
@@ -55,8 +61,13 @@ For messages needing no reply, use `acknowledge MESSAGE_ID`; never send ACK-only
 chat messages. Use exact recipients and `--reply-to` for real replies. Keep the
 established communication style and avoid duplicating updates across channels.
 
-Batch independent reads in a single tool call. Prefer filtered output and
-targeted file sections; retain full logs on disk and inspect details on failure.
+Batch independent reads in a single tool call. Set output limits explicitly:
+normally 1,500 tokens per command and 4,000 total per batched call. Expand only
+specific sections needed for correctness; keep full logs on disk. If truncated,
+narrow the query. Select exact files, symbols and JSON fields before printing;
+never dump full geometry arrays or unrelated inventories. Instructions already
+present in the prompt need not be reread unless changed. At takeover read the
+current checkpoint and next action; open historical evidence only as needed.
 Do not create model turns solely to poll. When idle, finish the turn and rely on
 the existing bridge; active guarded runs already forward new messages.
 

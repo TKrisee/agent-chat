@@ -77,7 +77,11 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         state = BridgeState(coord)
         if op == "bind": return state.bind(params.get("thread"), params.get("parent_session"), params.get("agent_path"))
         if op == "unbind": return state.unbind()
-        if op == "bridge-status": return state.status()
+        if op == "bridge-status":
+            mine = params.get("mine", False)
+            if not isinstance(mine, bool):
+                raise CoordError("mine must be a boolean")
+            return state.status(mine)
         if op in ("bridge-retry", "bridge-resolve"):
             from .bridge import exclusive_bridge
             recovery = bridge_manager.recovery(state.resolve(session)) if bridge_manager else exclusive_bridge(coord.path)

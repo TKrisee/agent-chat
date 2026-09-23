@@ -96,7 +96,11 @@ def _remote_main(raw, global_args, server):
     x = sub.add_parser('remove-session'); x.add_argument('id')
     sub.add_parser('deregister')
     x = sub.add_parser('bind'); x.add_argument('--thread'); x.add_argument('--parent-session'); x.add_argument('--agent-path')
-    sub.add_parser('unbind'); sub.add_parser('bridge-status')
+    sub.add_parser('unbind')
+    x = sub.add_parser('bridge-status')
+    scope = x.add_mutually_exclusive_group()
+    scope.add_argument('--all', action='store_true', help='show the legacy global bridge diagnostic')
+    scope.add_argument('--mine', action='store_true', help='show this session bridge route (the default)')
     x = sub.add_parser('bridge-retry'); x.add_argument('job_id'); x.add_argument('--confirm-not-started', action='store_true')
     x = sub.add_parser('bridge-resolve'); x.add_argument('job_id'); x.add_argument('--confirm-delivered', action='store_true')
     x = sub.add_parser('run'); x.add_argument('resource'); x.add_argument('--token'); x.add_argument('command', nargs=argparse.REMAINDER)
@@ -110,6 +114,8 @@ def _remote_main(raw, global_args, server):
     if not session:
         raise core.CoordError('AGENT_CHAT_SESSION or --session is required in remote mode')
     params = vars(a).copy(); op = params.pop('op')
+    if op == 'bridge-status':
+        params['mine'] = not params.pop('all')
     if 'token' in params and not params['token']:
         params['token'] = os.environ.get('AGENT_CHAT_TOKEN')
     if op == 'inbox' and params.pop('agent') is not None:

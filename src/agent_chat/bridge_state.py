@@ -225,8 +225,29 @@ class BridgeState:
             self.update(job_id, 'dispatched', error='Delivery explicitly confirmed by ' + self.coord.require_session())
         return self.job(job_id)
 
-    def status(self):
-        return {'runtime': runtime_snapshot(self.db),
-                'bindings': [dict(r) for r in self.db.execute('SELECT * FROM bridge_bindings ORDER BY updated_at')],
-                'threads': [dict(r) for r in self.db.execute('SELECT * FROM bridge_observations ORDER BY checked_at DESC')],
-                'jobs': [dict(r) for r in self.db.execute('SELECT id,thread_id,status,queue_id,error,created_at,updated_at FROM bridge_jobs ORDER BY created_at DESC LIMIT 100')]}
+    def status(self, mine=False):
+        """Return either the legacy diagnostic or the caller's bridge route."""
+        if not mine:
+            return {'runtime': runtime_snapshot(self.db),
+                    'bindings': [dict(r) for r in self.db.execute('SELECT * FROM bridge_bindings ORDER BY updated_at')],
+                    'threads': [dict(r) for r in self.db.execute('SELECT * FROM bridge_observations ORDER BY checked_at DESC')],
+                    'jobs': [dict(r) for r in self.db.execute('SELECT id,thread_id,status,queue_id,error,created_at,updated_at FROM bridge_jobs ORDER BY created_at DESC LIMIT 100')]}
+
+        caller = self.coord.require_session()
+        binding = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (caller,)).fetchone()
+        if not binding:
+            return {'runtime': runtime_snapshot(self.db), 'bindings': [], 'threads': [],
+                    'jobs': [], 'jobs_has_more': False}
+        route = self.resolve(caller)
+        if not route:
+            return {'runtime': runtime_snapshot(self.db), 'bindings': [dict(binding)], 'threads': [],
+                    'jobs': [], 'jobs_has_more': False}
+        thread_id = route['thread_id']
+        jobs = [dict(r) for r in self.db.execute('''
+            SELECT id,thread_id,status,queue_id,error,created_at,updated_at
+            FROM bridge_jobs WHERE thread_id=? AND status NOT IN ('dispatched','cancelled')
+            ORDER BY created_at DESC LIMIT 11''', (thread_id,))]
+        return {'runtime': runtime_snapshot(self.db), 'bindings': [dict(binding)],
+                'threads': [dict(r) for r in self.db.execute(
+                    'SELECT * FROM bridge_observations WHERE thread_id=?', (thread_id,))],
+                'jobs': jobs[:10], 'jobs_has_more': len(jobs) > 10}
