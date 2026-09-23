@@ -21,6 +21,7 @@ def request_pauses(database, sender_session, measurement_id, recipients):
         'end the idle turn without polling.'
     )
     coord = Coordinator(database, sender_session)
+    batch_id = 'batch_measurement_' + hashlib.sha256(measurement_id.encode()).hexdigest()
     try:
         coord.require_session()
         unavailable = []
@@ -36,6 +37,9 @@ def request_pauses(database, sender_session, measurement_id, recipients):
                 db.execute('''INSERT OR IGNORE INTO messages
                     (id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)''',
                            (message_id, sender_session, recipient, body, time.time()))
+                db.execute('INSERT OR IGNORE INTO message_batches(message_id,batch_id) VALUES(?,?)',
+                           (message_id, batch_id))
+                db.execute('INSERT OR IGNORE INTO message_attention(message_id) VALUES(?)', (message_id,))
         if unavailable:
             raise CoordError(f'Pause requested for available agents; {len(unavailable)} measured sessions are no longer registered')
     finally:

@@ -9,7 +9,8 @@ collection; reopening it or refreshing the page retrieves the report.
 
 Collection itself does not create model calls or chat messages. The optional
 **Pause agents at end** checkbox is unchecked by default. When selected, completion
-(including Stop early) sends one direct safe-pause request to each measured agent.
+(including Stop early) sends one shared safe-pause request, explicitly addressing
+each measured agent so only those agents wake. Each has its own delivery and ACK.
 This can wake an idle agent to acknowledge the request. The report distinguishes
 a sent request from confirmed pause: agents must finish cleanup and reply.
 An interrupted measurement does not send pause requests. Retrying delivery after

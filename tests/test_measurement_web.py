@@ -86,8 +86,14 @@ class MeasurementWebTests(RemoteWebFixture):
         self.assertEqual(status, 200, raw)
         self.check_json(raw, '.active==null and .latest.totals.response_count==1 and (.latest.errors|length)==0')
 
-    def test_opt_in_pause_is_direct_and_idempotent(self):
+    def test_opt_in_pause_is_addressed_and_idempotent(self):
         from agent_chat.measurement_pause import request_pauses
+        other = Coordinator(self.db, 'second-measured-agent')
+        try:
+            other.register('Second measured agent')
+            BridgeState(other).bind(thread_id=str(uuid.uuid4()))
+        finally:
+            other.close()
         self.assertEqual(self.measure({'op': 'start', 'duration_seconds': 60, 'pause_at_end': True})[0], 200)
         self.wait_running()
         status, raw, _ = self.measure({'op': 'stop'})
@@ -100,7 +106,9 @@ class MeasurementWebTests(RemoteWebFixture):
             messages = coord.inbox()['messages']
             self.assertEqual(len(messages), 1)
             self.assertIn('Pause at your next safe checkpoint', messages[0]['body'])
-            self.assertIsNone(messages[0]['batch_id'])
+            self.assertIsNotNone(messages[0]['batch_id'])
+            self.assertEqual(len(messages[0]['deliveries']), 2)
+            self.assertEqual(BridgeState(coord).pending()[0]['id'], messages[0]['id'])
         finally:
             coord.close()
 
