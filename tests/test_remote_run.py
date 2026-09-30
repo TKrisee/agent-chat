@@ -64,6 +64,131 @@ class RemoteRunTests(RemoteWebFixture):
         self.assertEqual(self.runs(), [])
         self.assertFalse(Path(self.env['AGENT_CHAT_DB']).exists())
 
+    def restore_args(self, seconds=10):
+        return ['run', '--restore', '--reservation-id', self.claim['reservation_id'],
+                '--max-seconds', str(seconds), 'shared', '--']
+
+    def test_restoration_runs_to_closure_then_recovers_with_real_receipt(self):
+        self.expire()
+        marker = Path(self.tmp.name)/'restored'
+        code = 'import time; from pathlib import Path; time.sleep(.6); Path('+repr(str(marker))+').touch()'
+        self.assertEqual(self.invoke(*self.restore_args(), sys.executable, '-c', code)[0], 0)
+        self.assertTrue(marker.exists())
+        run = self.runs()[0]
+        self.assertIsNotNone(run['closed_at'])
+        self.assert_group_dead(run['local_pid'])
+        status = self.call('status', resources=['shared'])['resources'][0]
+        self.assertEqual(status['state'], 'stale')
+        self.assertEqual(status['reservation_id'], self.claim['reservation_id'])
+        self.assertEqual(self.invoke('recover', 'shared', '--receipt', self.receipt([run['local_pid']]))[0], 0)
+        self.assertEqual(self.call('status', resources=['shared'])['resources'][0]['state'], 'free')
+
+    def test_restoration_expiry_kills_group_without_releasing_hold(self):
+        self.expire()
+        with self.assertRaisesRegex(CoordError, 'restoration deadline has expired'):
+            self.invoke(*self.restore_args(1), sys.executable, '-c', 'import time; time.sleep(60)')
+        run = self.runs()[0]
+        self.assert_group_dead(run['local_pid'])
+        self.assertIsNone(run['closed_at'])
+        self.assertEqual(self.call('status', resources=['shared'])['resources'][0]['state'], 'stale')
+        self.assertEqual(self.invoke('recover', 'shared', '--receipt', self.receipt([run['local_pid']]))[0], 0)
+
+    def test_wrong_restoration_id_does_not_execute_command(self):
+        self.expire()
+        marker = Path(self.tmp.name)/'must-not-execute'
+        args = self.restore_args()
+        args[3] = 'wrong-reservation'
+        with self.assertRaisesRegex(RemoteCoordError, 'does not match'):
+            self.invoke(*args, sys.executable, '-c', 'from pathlib import Path; Path('+repr(str(marker))+').touch()')
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.runs(), [])
+
+    def test_restoration_connection_loss_closes_group_and_preserves_hold(self):
+        self.expire()
+        original = HttpClient.call
+        def outage(client, path, payload):
+            if payload.get('op') == 'guard-pulse': raise RemoteCoordError('injected connection loss')
+            return original(client, path, payload)
+        with mock.patch.object(HttpClient, 'call', outage), self.assertRaisesRegex(RemoteCoordError, 'connection loss'):
+            self.invoke(*self.restore_args(), sys.executable, '-c', 'import time; time.sleep(60)')
+        run = self.runs()[0]
+        self.assert_group_dead(run['local_pid'])
+        self.assertIsNone(run['closed_at'])
+        self.assertEqual(self.call('status')['resources'][0]['reservation_id'], self.claim['reservation_id'])
+
+    def test_restoration_lost_attach_response_never_executes_command(self):
+        self.expire()
+        marker = Path(self.tmp.name)/'must-not-execute'
+        original = HttpClient.call
+        def lose_attach(client, path, payload):
+            result = original(client, path, payload)
+            if payload.get('op') == 'attach-guard-pid': raise RemoteCoordError('lost attach response')
+            return result
+        with mock.patch.object(HttpClient, 'call', lose_attach), self.assertRaisesRegex(RemoteCoordError, 'lost attach'):
+            self.invoke(*self.restore_args(), sys.executable, '-c', 'from pathlib import Path; Path('+repr(str(marker))+').touch()')
+        self.assertFalse(marker.exists())
+        run = self.runs()[0]
+        self.assert_group_dead(run['local_pid'])
+        self.assertIsNone(run['closed_at'])
+
+    def test_restoration_deadline_stops_group_during_blocked_inbox(self):
+        self.expire()
+        marker = Path(self.tmp.name)/'after-budget'
+        original = HttpClient.call
+        def delayed_inbox(client, path, payload):
+            if payload.get('op') == 'inbox': time.sleep(2)
+            return original(client, path, payload)
+        code = 'import time; from pathlib import Path; time.sleep(1.4); Path('+repr(str(marker))+').touch(); time.sleep(60)'
+        with mock.patch.object(HttpClient, 'call', delayed_inbox), self.assertRaisesRegex(CoordError, 'deadline has expired'):
+            self.invoke(*self.restore_args(1), sys.executable, '-c', code)
+        self.assertFalse(marker.exists())
+        run = self.runs()[0]
+        self.assert_group_dead(run['local_pid'])
+        self.assertIsNone(run['closed_at'])
+
+    def test_restoration_delayed_successful_attach_never_opens_command_gate(self):
+        self.expire()
+        marker = Path(self.tmp.name)/'after-attach-budget'
+        original = HttpClient.call
+        def delayed_attach(client, path, payload):
+            result = original(client, path, payload)
+            if payload.get('op') == 'attach-guard-pid': time.sleep(1.5)
+            return result
+        with mock.patch.object(HttpClient, 'call', delayed_attach), self.assertRaisesRegex(CoordError, 'deadline has expired'):
+            self.invoke(*self.restore_args(1), sys.executable, '-c', 'from pathlib import Path; Path('+repr(str(marker))+').touch()')
+        self.assertFalse(marker.exists())
+        run = self.runs()[0]
+        self.assert_group_dead(run['local_pid'])
+        self.assertIsNone(run['closed_at'])
+
+    def test_restoration_watchdog_does_not_signal_reused_group_after_closure(self):
+        self.expire()
+        signals = []
+        replaced = False
+        original = os.killpg
+        class DeadlineAtCancel:
+            def __init__(self, interval, callback): self.callback = callback; self.fired = False
+            def start(self): pass
+            def cancel(self):
+                if not self.fired:
+                    self.fired = True
+                    self.callback()  # expiry races immediately after group closure
+            def join(self): pass
+        def reused_group(pid, sig):
+            nonlocal replaced
+            if replaced:
+                if sig: signals.append((pid, sig))
+                # Replacement is alive to signal0 and accepts TERM/KILL.
+                return
+            try: return original(pid, sig)
+            except ProcessLookupError:
+                replaced = True
+                raise
+        with mock.patch('agent_chat.cli.threading.Timer', DeadlineAtCancel), mock.patch('agent_chat.cli.os.killpg', reused_group):
+            self.assertEqual(self.invoke(*self.restore_args(), sys.executable, '-c', 'pass')[0], 0)
+        self.assertEqual(signals, [])
+        self.assert_group_dead(self.runs()[0]['local_pid'])
+
     def test_run_propagates_remote_identity_preserves_child_flags_and_releases(self):
         marker=Path(self.tmp.name)/'env.json'
         code='import json,os,sys; open('+repr(str(marker))+',"w").write(json.dumps({"env":dict(os.environ),"args":sys.argv[1:]}))'

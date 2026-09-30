@@ -174,6 +174,7 @@ def _schema(coord: Coordinator) -> None:
     # statements therefore retain the BEGIN IMMEDIATE lock established by tx().
     coord.db.execute("CREATE TABLE IF NOT EXISTS remote_session_hosts (session_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, registered_at REAL NOT NULL, last_seen_at REAL NOT NULL)")
     coord.db.execute("CREATE TABLE IF NOT EXISTS remote_guarded_runs (run_id TEXT PRIMARY KEY, resource TEXT NOT NULL, reservation_id TEXT NOT NULL, session_id TEXT NOT NULL, host_id TEXT NOT NULL, local_pid INTEGER NOT NULL, started_at REAL NOT NULL, closed_at REAL, close_evidence_sha256 TEXT)")
+    coord.db.execute("CREATE TABLE IF NOT EXISTS remote_restoration_runs (run_id TEXT PRIMARY KEY, deadline REAL NOT NULL)")
 
 
 def _bind_host(coord: Coordinator, session: str, host: str, op: str) -> None:
@@ -197,13 +198,42 @@ def _bind_host(coord: Coordinator, session: str, host: str, op: str) -> None:
 
 def _begin_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:
     resource, token = _string(p.get("resource"), "resource"), _string(p.get("token"), "token")
+    restore = p.get("restore", False)
+    if not isinstance(restore, bool): raise CoordError("restore must be a boolean")
+    budget = p.get("max_seconds")
+    if restore:
+        reservation_id = _string(p.get("reservation_id"), "reservation_id")
+        budget = 120 if budget is None else budget
+        if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 900:
+            raise CoordError("restoration max_seconds must be an integer from 1 to 900")
+    elif p.get("reservation_id") is not None or budget is not None:
+        raise CoordError("reservation_id and max_seconds require restoration mode")
     with coord.tx() as db:
         coord._fresh(db, session)
-        r = coord._verify_owner(db, coord.resource_name(resource), session, token)
+        r = coord._verify_owner(db, coord.resource_name(resource), session, token, restore)
+        if restore:
+            if coord._state(r) != "stale": raise CoordError("restoration requires a stale reservation")
+            if r["reservation_id"] != reservation_id: raise CoordError("restoration reservation_id does not match")
+            if db.execute("SELECT 1 FROM remote_guarded_runs WHERE reservation_id=? AND closed_at IS NULL", (reservation_id,)).fetchone():
+                raise CoordError("close existing guarded runs before starting restoration")
         run_id = "remote_run_" + hashlib.sha256((host + session + str(time.time())).encode()).hexdigest()[:32]
         db.execute("INSERT INTO remote_guarded_runs VALUES(?,?,?,?,?,?,?,?,?)",
                    (run_id, r["name"], r["reservation_id"], session, host, 0, time.time(), None, None))
+        if restore:
+            db.execute("INSERT INTO remote_restoration_runs VALUES(?,?)", (run_id, time.time() + budget))
     return {"run_id": run_id, "reservation_id": r["reservation_id"], "host_id": host}
+
+
+def _check_guard(coord: Coordinator, db, row, session: str, token: str) -> dict:
+    restoration = db.execute("SELECT deadline FROM remote_restoration_runs WHERE run_id=?", (row["run_id"],)).fetchone()
+    r = coord._verify_owner(db, row["resource"], session, token, restoration is not None)
+    if r["reservation_id"] != row["reservation_id"]: raise CoordError("guarded run reservation has changed")
+    if restoration:
+        if coord._state(r) != "stale": raise CoordError("restoration requires a stale reservation")
+        if time.time() >= restoration["deadline"]: raise CoordError("restoration deadline has expired")
+    result = {"state": coord._state(r), "resource": r["name"], "reservation_id": r["reservation_id"], "deadline": r["deadline"]}
+    if restoration: result.update(restore=True, restoration_deadline=restoration["deadline"])
+    return result
 
 
 def _attach_guard_pid(coord: Coordinator, session: str, host: str, p: dict) -> dict:
@@ -212,17 +242,18 @@ def _attach_guard_pid(coord: Coordinator, session: str, host: str, p: dict) -> d
     with coord.tx() as db:
         row = db.execute("SELECT * FROM remote_guarded_runs WHERE run_id=?", (run_id,)).fetchone()
         if not row or row["session_id"] != session or row["host_id"] != host or row["closed_at"] is not None or row["local_pid"] != 0: raise CoordError("remote guarded run cannot be attached")
-        coord._verify_owner(db, row["resource"], session, token)
+        _check_guard(coord, db, row, session, token)
         db.execute("UPDATE remote_guarded_runs SET local_pid=? WHERE run_id=?", (pid, run_id))
     return {"run_id": run_id, "attached": True}
 
 
 def _guard_pulse(coord: Coordinator, session: str, host: str, p: dict) -> dict:
     run_id, token = _string(p.get("run_id"), "run_id"), _string(p.get("token"), "token")
-    row = coord.db.execute("SELECT * FROM remote_guarded_runs WHERE run_id=?", (run_id,)).fetchone()
-    if not row or row["session_id"] != session or row["host_id"] != host or row["closed_at"] is not None:
-        raise CoordError("remote guarded run is not open on this host")
-    return coord.check(row["resource"], token, require_fresh=False)
+    with coord.tx() as db:
+        row = db.execute("SELECT * FROM remote_guarded_runs WHERE run_id=?", (run_id,)).fetchone()
+        if not row or row["session_id"] != session or row["host_id"] != host or row["closed_at"] is not None:
+            raise CoordError("remote guarded run is not open on this host")
+        return _check_guard(coord, db, row, session, token)
 
 
 def _close_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:

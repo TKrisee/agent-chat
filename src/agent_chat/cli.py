@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import threading
 import time
 import sqlite3
 import sys
@@ -110,7 +111,10 @@ def _remote_main(raw, global_args, server):
     scope.add_argument('--mine', action='store_true', help='show this session bridge route (the default)')
     x = sub.add_parser('bridge-retry'); x.add_argument('job_id'); x.add_argument('--confirm-not-started', action='store_true')
     x = sub.add_parser('bridge-resolve'); x.add_argument('job_id'); x.add_argument('--confirm-delivered', action='store_true')
-    x = sub.add_parser('run'); x.add_argument('resource'); x.add_argument('--token'); x.add_argument('command', nargs=argparse.REMAINDER)
+    x = sub.add_parser('run'); x.add_argument('resource'); x.add_argument('--token')
+    x.add_argument('--restore', action='store_true', help='bounded same-owner stale reservation restoration only')
+    x.add_argument('--reservation-id'); x.add_argument('--max-seconds', type=int)
+    x.add_argument('command', nargs=argparse.REMAINDER)
     child_args = raw[raw.index('--') + 1:] if raw and raw[0] == 'run' and '--' in raw else None
     a = p.parse_args(raw[:raw.index('--')] if child_args is not None else raw)
     if child_args is not None: a.command = child_args
@@ -191,6 +195,13 @@ def _remote_main(raw, global_args, server):
         command = params.pop('command')
         if command and command[0] == '--': command = command[1:]
         if not command: raise core.CoordError('run requires a command after --')
+        restoration_deadline = None
+        if params.get('restore'):
+            budget = params.get('max_seconds')
+            budget = 120 if budget is None else budget
+            if not params.get('reservation_id') or not 1 <= budget <= 900:
+                raise core.CoordError('--restore requires --reservation-id and --max-seconds from 1 to 900')
+            restoration_deadline = time.monotonic() + budget
         # Authorization is established before any child can execute.
         run = call('begin-guard', params)
         proc = None
@@ -198,12 +209,31 @@ def _remote_main(raw, global_args, server):
         interrupted = False
         old_handlers = {}
         gate_read = gate_write = None
+        restoration_timer = None
+        restoration_expired = threading.Event()
+        lifecycle_lock = threading.RLock()
+        group_closed = False
+        def expire_restoration():
+            restoration_expired.set()
+            # Socket reads may block the main thread. Stop only this run's
+            # process group independently, including an inert attach launcher.
+            with lifecycle_lock:
+                if not group_closed:
+                    try: os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError: pass
+        def check_restoration_deadline():
+            if restoration_deadline is not None and (restoration_expired.is_set() or time.monotonic() >= restoration_deadline):
+                raise core.CoordError('restoration deadline has expired')
         def group_alive():
+            nonlocal group_closed
+            if group_closed: return False
             proc.poll()  # reap an exited group leader before probing its group
             try: os.killpg(proc.pid, 0); return True
-            except ProcessLookupError: return False
+            except ProcessLookupError:
+                group_closed = True
+                return False
             except PermissionError: return True
-        def stop_group():
+        def _stop_group():
             if proc is None: return
             if group_alive():
                 try: os.killpg(proc.pid, signal.SIGTERM)
@@ -218,6 +248,19 @@ def _remote_main(raw, global_args, server):
             while group_alive() and time.monotonic() < deadline:
                 proc.poll(); time.sleep(.05)
             if group_alive(): raise core.CoordError('remote guarded process group did not close')
+        def stop_group():
+            nonlocal group_closed
+            with lifecycle_lock:
+                if group_closed: return
+                _stop_group()
+                group_closed = True
+        def poll_group():
+            # Reaping permits PID/PGID reuse. Finish descendant closure and
+            # disable the watchdog atomically with respect to its signaler.
+            with lifecycle_lock:
+                result = proc.poll()
+                if result is not None: stop_group()
+                return result
         def forward(sig, frame=None):
             nonlocal interrupted
             interrupted = True
@@ -236,23 +279,35 @@ def _remote_main(raw, global_args, server):
             # recorded remotely. EOF closes the inert launcher if this client dies.
             gate_read, gate_write = os.pipe()
             launcher = 'import os,sys; fd=int(sys.argv[1]); allowed=os.read(fd,1); os.close(fd); os.execvpe(sys.argv[2],sys.argv[2:],os.environ) if allowed==b"G" else sys.exit(125)'
+            check_restoration_deadline()
             proc = subprocess.Popen([sys.executable, '-c', launcher, str(gate_read), *command],
                                     start_new_session=True, env=env, pass_fds=(gate_read,))
+            if restoration_deadline is not None:
+                restoration_timer = threading.Timer(max(0, restoration_deadline-time.monotonic()), expire_restoration)
+                restoration_timer.daemon = True
+                restoration_timer.start()
             os.close(gate_read); gate_read = None
             call('attach-guard-pid', {'run_id': run['run_id'], 'token': params.get('token'), 'pid': proc.pid})
+            check_restoration_deadline()
             os.write(gate_write, b'G')
             os.close(gate_write); gate_write = None
-            while proc.poll() is None:
+            while poll_group() is None:
                 time.sleep(0.5)
                 if interrupted: raise core.CoordError('command interrupted; process group closed')
+                check_restoration_deadline()
                 messages = call('inbox', {})['messages']
                 fresh = [m for m in messages if m['id'] not in seen]
                 seen.update(m['id'] for m in messages)
                 if fresh: print(json.dumps({'messages': fresh}), file=sys.stderr, flush=True)
+                check_restoration_deadline()
                 call('guard-pulse', {'run_id': run['run_id'], 'token': params.get('token')})
+            check_restoration_deadline()
             # The leader exiting is insufficient: descendants may retain the
             # reservation's process group and must be closed before attestation.
             stop_group()
+            if restoration_timer is not None:
+                restoration_timer.cancel()
+                restoration_timer.join()
             evidence = hashlib.sha256((str(proc.pid) + ':' + str(proc.returncode)).encode()).hexdigest()
             call('close-guard', {'run_id': run['run_id'], 'token': params.get('token'), 'evidence_sha256': evidence})
         except BaseException:
@@ -262,6 +317,9 @@ def _remote_main(raw, global_args, server):
             stop_group()
             raise
         finally:
+            if restoration_timer is not None:
+                restoration_timer.cancel()
+                restoration_timer.join()
             for fd in (gate_read, gate_write):
                 if fd is not None: os.close(fd)
             for sig, handler in old_handlers.items(): signal.signal(sig, handler)

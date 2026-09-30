@@ -80,6 +80,109 @@ class RemoteCoordTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordError, "legacy session"):
             self.call("status", session="legacy", host="remote-host")
 
+    def stale_claim(self):
+        self.call('register', agent='alpha')
+        claim = self.call('request', resource='shared', minutes=5)
+        self.call('register', session='b', agent='beta')
+        self.call('request', session='b', resource='shared', minutes=5)
+        coord = Coordinator(self.db)
+        try: coord.db.execute("UPDATE resources SET deadline=? WHERE name='shared'", (time.time()-1,))
+        finally: coord.close()
+        self.call('status', resources=['shared'])
+        return claim
+
+    def restoration(self, claim, **overrides):
+        params = dict(resource='shared', token=claim['token'], restore=True,
+                      reservation_id=claim['reservation_id'], max_seconds=30)
+        params.update(overrides)
+        return self.call('begin-guard', **params)
+
+    def test_restoration_preserves_hold_queue_and_requires_receipt(self):
+        claim = self.stale_claim()
+        coord = Coordinator(self.db)
+        try:
+            before = dict(coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+            queue = [tuple(r) for r in coord.db.execute('SELECT * FROM resource_queue')]
+        finally: coord.close()
+        run = self.restoration(claim)
+        params = dict(run_id=run['run_id'], token=claim['token'])
+        self.call('attach-guard-pid', pid=123, **params)
+        self.call('send', session='b', to='a', body='New message during restoration.')
+        pulse = self.call('guard-pulse', **params)
+        self.assertEqual(pulse['state'], 'stale')
+        self.assertTrue(pulse['restore'])
+        self.call('close-guard', evidence_sha256='0'*64, **params)
+        coord = Coordinator(self.db)
+        try:
+            self.assertEqual(dict(coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone()), before)
+            self.assertEqual([tuple(r) for r in coord.db.execute('SELECT * FROM resource_queue')], queue)
+            self.assertEqual(coord.db.execute('SELECT COUNT(*) FROM receipts').fetchone()[0], 0)
+        finally: coord.close()
+        with self.assertRaisesRegex(CoordError, 'not open'):
+            self.call('guard-pulse', **params)
+        self.call('context')
+        with self.assertRaisesRegex(CoordError, 'stale'):
+            self.call('check', resource='shared', token=claim['token'])
+
+    def test_restoration_authorization_and_budget_boundaries(self):
+        claim = self.stale_claim()
+        for params, error in [
+            ({'token': 'invalid'}, 'reservation token'),
+            ({'session': 'b'}, 'reservation token'),
+            ({'host': 'other'}, 'different remote host'),
+            ({'reservation_id': 'other'}, 'does not match'),
+            ({'resource': 'free'}, 'reservation token'),
+            ({'max_seconds': 0}, 'integer from'),
+            ({'max_seconds': 901}, 'integer from'),
+            ({'max_seconds': True}, 'integer from'),
+            ({'restore': 'true'}, 'boolean'),
+        ]:
+            with self.subTest(params=params), self.assertRaisesRegex(CoordError, error):
+                self.restoration(claim, **params)
+        with self.assertRaisesRegex(CoordError, 'stale'):
+            self.call('begin-guard', resource='shared', token=claim['token'])
+        self.call('send', session='b', to='a', body='Read before starting restoration.')
+        with self.assertRaisesRegex(CoordError, 'read your inbox'):
+            self.restoration(claim)
+        self.call('context')
+        run = self.restoration(claim)
+        with self.assertRaisesRegex(CoordError, 'close existing'):
+            self.restoration(claim)
+        coord = Coordinator(self.db)
+        try: coord.db.execute('UPDATE remote_restoration_runs SET deadline=? WHERE run_id=?', (time.time()-1, run['run_id']))
+        finally: coord.close()
+        params = dict(run_id=run['run_id'], token=claim['token'])
+        with self.assertRaisesRegex(CoordError, 'deadline has expired'):
+            self.call('attach-guard-pid', pid=123, **params)
+        with self.assertRaisesRegex(CoordError, 'deadline has expired'):
+            self.call('guard-pulse', **params)
+        self.call('close-guard', evidence_sha256='0'*64, **params)
+
+    def test_ordinary_run_cannot_be_upgraded_and_replacement_reservation_rejected(self):
+        self.call('register', agent='alpha')
+        claim = self.call('request', resource='shared', minutes=5)
+        with self.assertRaisesRegex(CoordError, 'requires a stale'):
+            self.restoration(claim)
+        run = self.call('begin-guard', resource='shared', token=claim['token'])
+        coord = Coordinator(self.db)
+        try: coord.db.execute("UPDATE resources SET deadline=? WHERE name='shared'", (time.time()-1,))
+        finally: coord.close()
+        params = dict(run_id=run['run_id'], token=claim['token'], restore=True)
+        with self.assertRaisesRegex(CoordError, 'stale'):
+            self.call('attach-guard-pid', pid=123, **params)
+        with self.assertRaisesRegex(CoordError, 'stale'):
+            self.call('guard-pulse', **params)
+        self.call('close-guard', evidence_sha256='0'*64, **params)
+        restoration = self.restoration(claim)
+        coord = Coordinator(self.db)
+        try: coord.db.execute("UPDATE resources SET reservation_id='replacement' WHERE name='shared'")
+        finally: coord.close()
+        params['run_id'] = restoration['run_id']
+        with self.assertRaisesRegex(CoordError, 'reservation has changed'):
+            self.call('attach-guard-pid', pid=123, **params)
+        with self.assertRaisesRegex(CoordError, 'reservation has changed'):
+            self.call('guard-pulse', **params)
+
     def test_file_resource_keys_do_not_depend_on_host_filesystem(self):
         self.call('register', agent='alpha')
         with mock.patch('pathlib.Path.resolve', side_effect=AssertionError('must not inspect project filesystem')):

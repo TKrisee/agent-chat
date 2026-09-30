@@ -163,6 +163,43 @@ Messages, bindings and resource locks are project-scoped. Reserve a physically
 shared resource in the same project on every machine; locks in different
 projects do not conflict. A queued request is not permission to start work.
 
+An expired owner may need to read back or restore agreed state before it can
+truthfully close its hold. For a reviewed restoration command, the HTTP client
+supports a bounded same-owner exception:
+
+```sh
+agent-chat-client context
+agent-chat-client run --restore --reservation-id EXACT_HELD_RESERVATION \
+  --max-seconds 120 validation-clone -- COMMAND ...
+```
+
+Supply the existing owner's session, host state and private `AGENT_CHAT_TOKEN`.
+The exact reservation must be stale. The server records restoration mode and a
+separate deadline on the new run; attach and pulse recheck owner, token, host,
+reservation identity and deadline. The default budget is 120 seconds; allowed
+budgets are 1–900 seconds. Close existing guarded runs with truthful evidence
+before starting a restoration run. Never mark a live or uncertain run closed.
+The command may perform readback, restore agreed state or close owned processes;
+it must not run feature work, tests, imports or builds. The CLI cannot infer that
+purpose from an arbitrary shell command, so review its scope first.
+
+The hold remains stale with its original deadline, token and queue. Ordinary
+request/check/run still reject stale ownership. Timeout or connection loss stops
+the client-owned process group and leaves the hold for receipt-backed recovery.
+It does not cancel work already dispatched into an external Editor or prove its
+terminal state. Successful restoration execution is not a CLOSED receipt. Verify
+actual restoration and include the new run's PID in the eventual closure proof.
+When a command touches multiple held resources, guard each exact hold separately
+(nested restoration commands may cover distinct resources). For nested guards,
+give the outer guard more time than the inner budget
+and its cleanup, so it cannot kill an inner client before that client closes its
+own process group. Reviewed wrappers which create separate groups must still
+close those groups themselves; timeout is not evidence that detached work ended.
+This mode is remote
+only; local `ValidationGuard` has no stale exception. Reload the existing chat
+server to load server checks, coordinating active guards, measurements and wakes;
+the bridge and its app-server do not need restarting for this feature.
+
 Before release, restore agreed state, close owned processes and retain a
 reservation-bound CLOSED receipt. Expiry never transfers ownership. Read
 [receipt details](#shared-resource-receipts) when closing or recovering
