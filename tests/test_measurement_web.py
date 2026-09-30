@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 import subprocess
+import sqlite3
 import time
 import uuid
 
@@ -65,6 +66,89 @@ class MeasurementWebTests(RemoteWebFixture):
         self.check_json(raw, '.active==null and .latest==null')
         self.measure({'op': 'stop'}, project=other)
         self.assertIsNotNone(self.server.measurements.status('default')['active'])
+
+    def test_project_lists_track_measurement_lifecycle_across_workspaces(self):
+        other = self.server.projects.create('Other measurement workspace')['id']
+        coord = Coordinator(self.server.projects.db_path(other), 'other-measured-agent')
+        try:
+            coord.register('Other measured agent')
+            BridgeState(coord).bind(thread_id=str(uuid.uuid4()))
+        finally:
+            coord.close()
+        paths = ('/api/projects', '/api/config', '/api/snapshot?project=' + other)
+
+        def check_projects(running):
+            for path in paths:
+                status, raw, _ = self.request('GET', path)
+                self.assertEqual(status, 200, raw)
+                self.check_json(raw, '([.projects[] | select(.measurement_running) | .id] | sort) == (' + running + ')')
+
+        check_projects('[]')
+        self.assertEqual(self.measure({'op': 'start', 'duration_seconds': 300})[0], 200)
+        self.wait_running()
+        check_projects('["default"]')
+        self.assertEqual(self.measure({'op': 'start', 'duration_seconds': 300}, project=other)[0], 200)
+        check_projects('["' + other + '", "default"] | sort')
+        self.assertEqual(self.measure({'op': 'stop'})[0], 200)
+        check_projects('["' + other + '"]')
+        self.assertEqual(self.measure({'op': 'stop'}, project=other)[0], 200)
+        check_projects('[]')
+
+    def test_measurement_reports_use_recorded_thread_model_and_leave_unknown_fields_empty(self):
+        self.assertEqual(self.measure({'op': 'start', 'duration_seconds': 300})[0], 200)
+        self.wait_running()
+        status, raw, _ = self.request('GET', '/api/measurements')
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '.active.agents[0].model == null and .active.agents[0].reasoning_effort == null')
+        with self.log.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'model': 'gpt-6.1-sol', 'effort': 'high'}}) + '\n')
+        status, raw, _ = self.request('GET', '/api/measurements')
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '[.active.agents[0].model, .active.agents[0].reasoning_effort] == ["gpt-6.1-sol", "high"]')
+        replacement_thread = str(uuid.uuid4())
+        coord = Coordinator(self.db, 'measurement-agent')
+        try:
+            state = BridgeState(coord)
+            state.unbind()
+            state.bind(thread_id=replacement_thread)
+        finally:
+            coord.close()
+        replacement = self.rollouts / ('rollout-' + replacement_thread + '.jsonl')
+        replacement.write_text(json.dumps({'type': 'session_meta', 'payload': {'id': replacement_thread}}) + '\n'
+                               + json.dumps({'type': 'turn_context', 'payload': {'model': 'gpt-6-luna', 'effort': 'medium'}}) + '\n')
+        status, raw, _ = self.measure({'op': 'stop'})
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '[.latest.agents[0].model, .latest.agents[0].reasoning_effort] == ["gpt-6.1-sol", "high"]')
+
+    def test_snapshot_exposes_latest_bound_session_model(self):
+        with self.log.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'model': 'gpt-6.1-sol', 'effort': 'high'}}) + '\n')
+        status, raw, _ = self.request('GET', '/api/snapshot')
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '[.sessions[] | select(.id=="measurement-agent") | .model, .reasoning_effort] == ["gpt-6.1-sol", "high"]')
+        with self.log.open('a') as stream:
+            stream.write(json.dumps({'type': 'turn_context', 'payload': {
+                'model': 'gpt-6-luna', 'effort': 'medium'}}) + '\n')
+        status, raw, _ = self.request('GET', '/api/snapshot')
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '[.sessions[] | select(.id=="measurement-agent") | .model, .reasoning_effort] == ["gpt-6-luna", "medium"]')
+
+    def test_snapshot_exposes_unique_parent_route_model(self):
+        child = Coordinator(self.db, 'child-model-agent')
+        try:
+            child.register('Child model agent')
+            BridgeState(child).bind(parent_session='measurement-agent', agent_path='/root/reviewer')
+        finally:
+            child.close()
+        with sqlite3.connect(self.rollouts.parent / 'state_5.sqlite') as database:
+            database.execute('CREATE TABLE threads (id TEXT, model TEXT, reasoning_effort TEXT, agent_path TEXT, archived INTEGER)')
+            database.execute('INSERT INTO threads VALUES (?, ?, ?, ?, 0)',
+                             ('child-thread', 'gpt-5.6-terra', 'medium', '/root/reviewer'))
+        status, raw, _ = self.request('GET', '/api/snapshot')
+        self.assertEqual(status, 200, raw)
+        self.check_json(raw, '[.sessions[] | select(.id=="child-model-agent") | .model, .reasoning_effort] == ["gpt-5.6-terra", "medium"]')
 
     def test_stop_reports_only_new_tokens_and_survives_restart(self):
         self.assertEqual(self.measure({'op': 'start', 'duration_seconds': 300})[0], 200)

@@ -366,6 +366,11 @@ class MeasurementStore:
         totals = {key: (None if any(a[key] is None for a in listed) else sum(a[key] for a in listed)) for key in ('response_count', *_FIELDS, 'fresh_input_tokens', 'tool_result_text_characters', 'wake_message_count')}
         return {'id': row['id'], 'project_id': row['project_id'], 'state': row['state'], 'started_at': row['started_at'], 'ended_at': row['ended_at'], 'deadline': row['deadline'], 'duration_seconds': row['duration_seconds'], 'sampled_at': row['sampled_at'], 'agents': listed, 'guardian': item('__guardian__'), 'totals': totals, 'quota_start': None if row['quota_start'] is None else {'remaining_percent': row['quota_start'], 'observed_at': row['quota_start_at']}, 'quota_end': None if row['quota_end'] is None else {'remaining_percent': row['quota_end'], 'observed_at': row['quota_end_at']}, 'pause_at_end': bool(row['pause_at_end']), 'pause_requested_at': row['pause_requested_at'], 'pause_error': row['pause_error'], 'errors': row['errors'].split('\n') if row['errors'] else [], 'coverage': 'Local logs for agents connected when this measurement started. Remote logs and agents connected later are not included. Missing or incomplete data is listed below.'}
 
+    def active_projects(self):
+        with self._db() as db:
+            return {row['project_id'] for row in db.execute(
+                "SELECT project_id FROM usage_measurements WHERE state IN ('starting','running')")}
+
     def status(self, project_id):
         try:
             if shutil.which('jq') is None: return {'available': False, 'error': 'jq is unavailable', 'active': None, 'latest': None}

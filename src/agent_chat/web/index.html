@@ -20,7 +20,9 @@
       </a>
       <div class="project-controls">
         <label class="sr-only" for="project-select">Project</label>
-        <select id="project-select" aria-label="Project" disabled><option value="default">Loading projects…</option></select>
+        <div class="project-selection">
+          <select id="project-select" aria-label="Project" disabled><option value="default">Loading projects…</option></select>
+        </div>
         <button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button>
         <button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button>
       </div>
@@ -38,8 +40,9 @@
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
         <div class="conversation-actions">
+          <span class="weekly-usage" id="weekly-usage" role="status">Weekly usage unavailable</span>
           <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
-          <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog">Measure usage</button>
+          <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog"><span class="measurement-indicator" id="measurement-indicator" aria-hidden="true" hidden></span>Measure usage</button>
           <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
         </div>
       </div>
@@ -50,6 +53,7 @@
       </div>
       <div class="connection-notice" id="connection-notice" hidden>Connection interrupted. Reconnecting automatically… <button id="retry-button">Retry now</button></div>
       <div class="feed-wrap">
+        <div id="copy-status" class="sr-only" role="status"></div>
         <section class="feed" id="feed" aria-label="Agent messages" tabindex="0">
           <div class="history-row">
             <span id="message-window" class="message-window"></span>
@@ -67,13 +71,13 @@
           <button class="reply-context" id="reply-context" type="button"><strong id="reply-label"></strong><span id="reply-excerpt"></span></button>
           <button class="cancel-reply" id="cancel-reply" type="button" aria-label="Cancel reply">×</button>
         </div>
-        <div class="composer-images" id="composer-images" role="list" aria-label="Image attachments" hidden></div>
-        <input id="image-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden>
+        <div class="composer-images" id="composer-images" role="list" aria-label="File attachments" hidden></div>
+        <input id="image-input" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.txt,.md,.markdown,.json,.xml,.csv,.tsv,.log,.yaml,.yml,.toml" multiple hidden>
         <label class="sr-only" for="message-input">Your message</label>
         <div class="mention-list" id="mention-list" role="listbox" aria-label="Agent mentions" hidden></div>
         <div class="composer-input-row">
-          <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach images" title="Attach up to 4 PNG, JPEG, GIF or WebP images, 10 MiB each" disabled>Attach</button>
-          <textarea id="message-input" placeholder="Message all agents, @tag recipients, or drop images…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
+          <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach files" title="Attach up to 4 supported files, 10 MiB each" disabled>Attach</button>
+          <textarea id="message-input" placeholder="Message all agents, @tag recipients, or drop files…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
           <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
         </div>
         <span class="composer-status" id="composer-status" role="status" hidden></span>
@@ -84,7 +88,6 @@
       <div class="resource-summary"><span class="resource-summary-number" id="held-count">0</span><span>resources held<span id="waiting-count">No agents waiting</span></span></div>
       <div class="resource-list" id="resource-list"></div>
       <details class="available-resources" id="available-resources"><summary id="available-summary">Available resources</summary><div id="available-list"></div></details>
-      <div class="coordination-note"><span aria-hidden="true">↗</span><p>A message is a conversation.<br>Resource access needs its own reservation.</p></div>
     </aside>
   </div>
   <dialog id="project-dialog" aria-labelledby="project-dialog-title">

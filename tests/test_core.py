@@ -302,6 +302,38 @@ class CoordTests(unittest.TestCase):
         self.assertIsNone(inbox[0]['acked_at'])
         self.release(claim)
 
+    def test_guard_pulse_survives_message_delivered_after_its_inbox_read(self):
+        claim = self.request()
+        guard = agent_chat.core.ValidationGuard('shared', claim['token'], str(self.db), 'a')
+        sender = agent_chat.core.Coordinator(self.db, 'b')
+        try:
+            with guard:
+                emit = guard._emit_inbox
+
+                def emit_then_deliver():
+                    emit()
+                    return sender.send('a', 'Delivered after the guard inbox read.')
+
+                guard._emit_inbox = emit_then_deliver
+                guard.pulse()
+                with sqlite3.connect(self.db) as db:
+                    message = db.execute("SELECT id,acked_at FROM messages WHERE recipient_session='a'").fetchone()
+                    open_run = db.execute('SELECT 1 FROM guarded_runs WHERE run_id=? AND closed_at IS NULL',
+                                          (guard.run_id,)).fetchone()
+                self.assertIsNotNone(open_run)
+                self.assertIsNone(message[1])
+                checker = agent_chat.core.Coordinator(self.db, 'a')
+                try:
+                    with self.assertRaisesRegex(agent_chat.core.CoordError, 'read your inbox'):
+                        checker.check('shared', claim['token'])
+                    checker.inbox()
+                    self.assertEqual(checker.check('shared', claim['token'])['state'], 'owned')
+                finally:
+                    checker.close()
+        finally:
+            sender.close()
+        self.release(claim)
+
     def test_recovery_of_crashed_guard_requires_dead_processes(self):
         claim = self.request()
         completed = subprocess.Popen([sys.executable, '-c', 'pass'])

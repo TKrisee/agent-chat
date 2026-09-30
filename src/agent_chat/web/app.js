@@ -4,8 +4,11 @@ const $ = (id) => document.getElementById(id);
 const MESSAGE_LIMIT = 50;
 const MESSAGE_WINDOW_LIMIT = 150;
 const MESSAGE_PREVIEW_LENGTH = 2000;
-const MAX_IMAGES = 4;
-const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+const MAX_FILES = 4;
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
+const DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
+const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const state = {
   snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all', toMe: false,
   expanded: new Set(), paused: false, pending: null, connected: false,
@@ -15,6 +18,7 @@ const state = {
   projects: [], drafts: new Map(), busy: false,
   hasNewer: false, historyLoaded: false, loadingHistory: false,
   historyDirection: null, historyError: null, scrollTop: 0,
+  viewGeneration: 0, viewLoading: false,
   attachments: [],
   usage: null, usageDialogDirty: false, usageSaving: false,
   measurement: null, measurementLoading: false, measurementSaving: false, measurementRequest: 0, measurementPoll: null,
@@ -71,6 +75,10 @@ function renderUsage(usage) {
   state.usage = usage || null;
   const label = usageStatus();
   $('usage-label').textContent = label;
+  $('weekly-usage').textContent = usage?.remaining_percent == null
+    ? 'Weekly usage unavailable' : `${Math.round(usage.remaining_percent)}% weekly left`;
+  $('weekly-usage').title = usage?.remaining_percent == null
+    ? 'Remaining weekly usage is unknown' : `${Math.round(usage.remaining_percent)}% remaining. ${usageReset()}`;
   $('usage-button').classList.toggle('paused', Boolean(usage?.enabled && (usage.paused || usage.blocked || usage.remaining_percent == null)));
   $('usage-button').classList.toggle('enabled', Boolean(usage?.enabled && !(usage.paused || usage.blocked || usage.remaining_percent == null)));
   $('usage-button').title = usage?.reason || (usage?.enabled ? usageReset() : 'Configure a global weekly usage reserve');
@@ -175,6 +183,18 @@ function renderMeasurement(data) {
         ? [agent.agent || 'Unnamed agent', measurementValue(agent.response_count), measurementValue(agent.fresh_input_tokens), measurementValue(agent.cached_input_tokens), measurementValue(agent.output_tokens), `${measurementValue(agent.tool_result_text_characters)} / ${measurementValue(agent.wake_message_count)}`]
         : ['No agent samples', '—', '—', '—', '—', '—'];
       row.replaceChildren(...values.map(value => node('td', '', value)));
+      if (agent) {
+        // Existing servers already expose current models in their agent snapshot.
+        // Prefer report-thread metadata when the server supplies the new fields.
+        const metadata = 'model' in agent ? agent
+          : state.snapshot?.sessions.find(session => session.id === agent.session_id) || {};
+        const details = `${metadata.model || 'Model unavailable'} · ${metadata.reasoning_effort ? `${metadata.reasoning_effort} reasoning` : 'reasoning unavailable'}`;
+        row.firstElementChild.classList.add('measurement-agent-name');
+        const model = node('span', 'measurement-agent-model', details);
+        model.title = 'model' in agent ? 'Latest known model and reasoning for the recorded thread'
+          : 'Current model and reasoning for this connected agent';
+        row.firstElementChild.append(model);
+      }
       return row;
     }));
     $('measurement-agent-total').textContent = measurementSummary(report.totals);
@@ -286,7 +306,7 @@ function selectAgent(id) {
   }
   closePanels();
   renderAgents();
-  renderMessages(true);
+  loadConversationView();
 }
 
 function renderAgents() {
@@ -306,7 +326,13 @@ function renderAgents() {
     button.title = `${session.agent}\n${session.id}`;
     button.setAttribute('aria-label', `Show conversations with ${session.agent}`);
     button.setAttribute('aria-pressed', String(state.selected === session.id));
-    button.append(avatar(session.agent), node('span', 'agent-name', isSubagent ? session.agent.slice(session.agent.indexOf('/') + 1) : session.agent));
+    const label = node('span', 'agent-label');
+    label.append(node('span', 'agent-name', isSubagent ? session.agent.slice(session.agent.indexOf('/') + 1) : session.agent));
+    const details = [session.model, session.reasoning_effort && `${session.reasoning_effort} reasoning`].filter(Boolean).join(' · ');
+    const metadata = node('span', 'agent-model', details || 'Model details unavailable');
+    metadata.title = details ? `Latest observed: ${details}` : 'No model or reasoning level has been observed for this session';
+    label.append(metadata);
+    button.append(avatar(session.agent), label);
     if ([...state.messages.values()].some((message) => message.recipient_session === session.id && message.acked_at == null)) {
       const pending = node('span', 'agent-pending');
       pending.title = 'Has messages awaiting acknowledgement';
@@ -464,6 +490,56 @@ function messageDeliveries(message) {
   return message.deliveries?.length ? message.deliveries : [{ id: message.id, recipient_session: message.recipient_session, recipient_agent: message.recipient_agent, acked_at: message.acked_at }];
 }
 
+function directDelivery(message) {
+  return !message.batch_id;
+}
+
+function matchesConversation(message) {
+  if (!state.selected && !state.toMe) return true;
+  const operator = state.config?.sender.id;
+  return messageDeliveries(message).some((delivery) => directDelivery(message) && (
+    (delivery.recipient_session === operator && (!state.selected || message.sender_session === state.selected)) ||
+    (!state.toMe && state.selected && message.sender_session === operator && delivery.recipient_session === state.selected)
+  ));
+}
+
+function conversationQuery() {
+  const params = new URLSearchParams();
+  if (state.selected) params.set('agent', state.selected);
+  if (state.toMe) params.set('to_me', '1');
+  return params;
+}
+
+async function loadConversationView() {
+  const generation = ++state.viewGeneration;
+  const params = conversationQuery();
+  state.originals.clear(); state.highlighted = null;
+  state.hasNewer = false; state.hasOlder = false; state.historyError = null;
+  state.historyLoaded = false; state.newCount = 0;
+  state.loadingHistory = false; state.historyDirection = null;
+  if (!params.size) {
+    state.viewLoading = false;
+    showLatest();
+    return;
+  }
+  state.viewLoading = true;
+  renderMessages(true);
+  try {
+    params.set('limit', String(MESSAGE_LIMIT));
+    const result = await fetchJSON(`/api/messages?${params}`);
+    if (generation !== state.viewGeneration) return;
+    state.messages = new Map(result.messages.map((message) => [message.id, message]));
+    state.hasOlder = result.has_more;
+    state.historyLoaded = true;
+    pruneExpanded();
+    renderMessages(true);
+  } catch (error) {
+    if (generation === state.viewGeneration && error.name !== 'AbortError') composerStatus(`Could not load conversation: ${error.message}`, true);
+  } finally {
+    if (generation === state.viewGeneration) state.viewLoading = false;
+  }
+}
+
 function replyRecipients(message) {
   return message.sender_session === state.config?.sender.id ? messageDeliveries(message).map((delivery) => delivery.recipient_session) : [message.sender_session];
 }
@@ -473,15 +549,34 @@ function clearReply() {
   $('composer-reply').hidden = true;
 }
 
+function fileExtension(name) {
+  const match = /\.([^.]+)$/.exec(name);
+  return match ? match[1].toLowerCase() : '';
+}
+
+function isImageFile(file) {
+  return IMAGE_EXTENSIONS.has(fileExtension(file.name));
+}
+
+function attachmentType(attachment) {
+  return fileExtension(attachment.name).toUpperCase() || 'FILE';
+}
+
 function renderDraftImages() {
   const fragment = document.createDocumentFragment();
   for (const attachment of state.attachments) {
     const item = node('div', 'draft-image');
     item.setAttribute('role', 'listitem');
-    const preview = node('img');
-    preview.src = attachment.url;
-    preview.alt = attachment.file.name;
-    preview.decoding = 'async';
+    let preview;
+    if (attachment.url) {
+      preview = node('img');
+      preview.src = attachment.url;
+      preview.alt = attachment.file.name;
+      preview.decoding = 'async';
+    } else {
+      preview = node('span', 'draft-document-type', fileExtension(attachment.file.name).toUpperCase() || 'FILE');
+      preview.setAttribute('aria-hidden', 'true');
+    }
     const name = node('span', 'draft-image-name', attachment.file.name);
     name.title = attachment.file.name;
     const remove = node('button', 'remove-image', '×');
@@ -490,7 +585,7 @@ function renderDraftImages() {
     remove.disabled = state.sending || state.busy;
     remove.addEventListener('click', () => {
       if (state.sending || state.busy) return;
-      URL.revokeObjectURL(attachment.url);
+      if (attachment.url) URL.revokeObjectURL(attachment.url);
       state.attachments = state.attachments.filter(item => item !== attachment);
       renderDraftImages();
     });
@@ -504,26 +599,26 @@ function renderDraftImages() {
 
 function addImages(files) {
   if (state.sending || state.busy || !state.config) return;
-  if (state.attachments.length + files.length > MAX_IMAGES) {
-    composerStatus('Attach up to 4 images per message.', true); return;
+  if (state.attachments.length + files.length > MAX_FILES) {
+    composerStatus('Attach up to 4 files per message.', true); return;
   }
   for (const file of files) {
-    if (!['image/png', 'image/jpeg', 'image/gif', 'image/webp'].includes(file.type) &&
-        (file.type || !/\.(png|jpe?g|gif|webp)$/i.test(file.name))) {
-      composerStatus('Choose PNG, JPEG, GIF or WebP images.', true); return;
+    const extension = fileExtension(file.name);
+    if (!IMAGE_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
+      composerStatus('Choose a supported image or text file.', true); return;
     }
-    if (!file.size || file.size > MAX_IMAGE_BYTES) {
-      composerStatus('Each image must be nonempty and no larger than 10 MiB.', true); return;
+    if (!file.size || file.size > MAX_FILE_BYTES) {
+      composerStatus('Each file must be nonempty and no larger than 10 MiB.', true); return;
     }
   }
-  state.attachments.push(...files.map(file => ({ file, url: URL.createObjectURL(file) })));
+  state.attachments.push(...files.map(file => ({ file, url: isImageFile(file) ? URL.createObjectURL(file) : null })));
   renderDraftImages();
   composerStatus('');
   $('message-input').focus();
 }
 
 function clearImages() {
-  for (const attachment of state.attachments) URL.revokeObjectURL(attachment.url);
+  for (const attachment of state.attachments) if (attachment.url) URL.revokeObjectURL(attachment.url);
   state.attachments = [];
   renderDraftImages();
 }
@@ -536,7 +631,7 @@ function startReply(message) {
   insertRecipients(sessions);
   state.reply = message;
   $('reply-label').textContent = `Replying to ${agentLabel(message.sender_session, message.sender_agent)}`;
-  $('reply-excerpt').textContent = message.body.slice(0, 240) || 'Image attachment';
+  $('reply-excerpt').textContent = message.body.slice(0, 240) || 'File attachment';
   $('composer-reply').hidden = false;
 }
 
@@ -553,6 +648,8 @@ async function jumpToMessage(id) {
     state.query = '';
     state.ack = 'all';
     state.toMe = false;
+    state.viewGeneration++; state.viewLoading = false;
+    state.loadingHistory = false; state.historyDirection = null;
     state.highlighted = id;
     $('search').value = '';
     $('ack-filter').value = 'all';
@@ -567,6 +664,32 @@ async function jumpToMessage(id) {
   } catch (error) {
     if (error.name === 'AbortError') return;
     composerStatus(`Could not open the original message: ${error.message}`, true);
+  }
+}
+
+async function copyMessageText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // HTTP hosts may not expose the Clipboard API. Keep copying in the click event.
+  const active = document.activeElement;
+  const selection = window.getSelection();
+  const ranges = selection ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index).cloneRange()) : [];
+  const input = node('textarea', 'clipboard-source');
+  input.value = text;
+  input.readOnly = true;
+  document.body.append(input);
+  try {
+    input.select();
+    if (!document.execCommand('copy')) throw new Error('Copy unavailable');
+  } finally {
+    input.remove();
+    active?.focus({ preventScroll: true });
+    if (selection) {
+      selection.removeAllRanges();
+      ranges.forEach(range => selection.addRange(range));
+    }
   }
 }
 
@@ -601,7 +724,7 @@ function messageCard(message) {
     quote.type = 'button';
     const author = original ? agentLabel(original.sender_session, original.sender_agent) : 'original message';
     quote.setAttribute('aria-label', `Show original message from ${author}`);
-    quote.append(node('strong', '', `↩ ${author}`), node('span', '', original?.body || 'Image attachment'));
+    quote.append(node('strong', '', `↩ ${author}`), node('span', '', original?.body || 'File attachment'));
     quote.addEventListener('click', () => jumpToMessage(message.reply_to));
     card.append(quote);
   }
@@ -636,12 +759,20 @@ function messageCard(message) {
       link.href = projectURL(`/api/attachments/${encodeURIComponent(attachment.id)}`);
       link.target = '_blank';
       link.rel = 'noopener';
-      link.setAttribute('aria-label', `Open ${attachment.name} at full size`);
-      const preview = node('img', 'attachment-preview');
-      preview.src = link.href;
-      preview.alt = attachment.name;
-      preview.loading = 'lazy';
-      link.append(preview, node('span', 'attachment-name', attachment.name));
+      const image = IMAGE_MIMES.has(attachment.mime);
+      link.setAttribute('aria-label', image ? `Open ${attachment.name} at full size` : `Download ${attachment.name}`);
+      if (image) {
+        const preview = node('img', 'attachment-preview');
+        preview.src = link.href;
+        preview.alt = attachment.name;
+        preview.loading = 'lazy';
+        link.append(preview, node('span', 'attachment-name', attachment.name));
+      } else {
+        link.download = attachment.name;
+        const tile = node('span', 'attachment-document-type', attachmentType(attachment));
+        tile.setAttribute('aria-hidden', 'true');
+        link.append(tile, node('span', 'attachment-name', attachment.name));
+      }
       images.append(link);
     }
     card.append(images);
@@ -652,6 +783,36 @@ function messageCard(message) {
     acknowledged ? '✓ Acknowledged' : '· Awaiting acknowledgement');
   if (acknowledged) receipt.title = new Date(message.acked_at * 1000).toLocaleString();
   const actions = node('span', 'message-actions');
+  if (message.body) {
+    const copy = node('button', 'copy-message', 'Copy');
+    copy.type = 'button';
+    copy.setAttribute('aria-label', `Copy message from ${sender}`);
+    copy.title = 'Copy full message text';
+    let resetCopy;
+    copy.addEventListener('click', async () => {
+      if (copy.getAttribute('aria-disabled') === 'true') return;
+      clearTimeout(resetCopy);
+      copy.setAttribute('aria-disabled', 'true');
+      $('copy-status').textContent = '';
+      try {
+        await copyMessageText(message.body);
+        copy.textContent = 'Copied!';
+        copy.title = 'Message copied.';
+        $('copy-status').textContent = 'Message copied.';
+      } catch {
+        copy.textContent = 'Copy failed';
+        copy.title = 'Could not copy. Select the message text and copy it manually.';
+        $('copy-status').textContent = copy.title;
+      } finally {
+        copy.removeAttribute('aria-disabled');
+        resetCopy = setTimeout(() => {
+          copy.textContent = 'Copy';
+          copy.title = 'Copy full message text';
+        }, 2000);
+      }
+    });
+    actions.append(copy);
+  }
   if (own || message.recipient_session === state.config?.sender.id) {
     const reply = node('button', 'reply-message', 'Reply');
     reply.type = 'button';
@@ -712,9 +873,12 @@ function renderMessages(forceBottom = false, anchor = feedAnchor()) {
   $('to-me-filter').setAttribute('aria-pressed', String(state.toMe));
   const batches = new Set();
   const rows = [...new Map([...state.originals, ...state.messages]).values()].sort((a, b) => a.seq - b.seq).filter((message) => {
+    if (!matchesConversation(message)) return false;
     let deliveries = messageDeliveries(message);
-    if (state.toMe) deliveries = deliveries.filter((delivery) => delivery.recipient_session === state.config?.sender.id);
-    if (state.selected && message.sender_session !== state.selected) deliveries = deliveries.filter((delivery) => delivery.recipient_session === state.selected);
+    if (state.selected || state.toMe) deliveries = deliveries.filter((delivery) => directDelivery(message) && (
+      (delivery.recipient_session === state.config?.sender.id && (!state.selected || message.sender_session === state.selected)) ||
+      (!state.toMe && state.selected && message.sender_session === state.config?.sender.id && delivery.recipient_session === state.selected)
+    ));
     if (!deliveries.length) return false;
     if (state.ack === 'pending' && !deliveries.some((delivery) => delivery.acked_at == null)) return false;
     if (state.ack === 'acknowledged' && !deliveries.some((delivery) => delivery.acked_at != null)) return false;
@@ -825,9 +989,34 @@ function applySnapshot(data) {
     && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 90;
   const overlap = data.messages.some(message => state.messages.has(message.id));
   const oldVisible = JSON.stringify([...state.messages.values()]);
-  const labels = (sessions) => JSON.stringify((sessions || []).map(({ id, agent }) => [id, agent]));
+  const labels = (sessions) => JSON.stringify((sessions || []).map(({ id, agent, model, reasoning_effort }) => [id, agent, model, reasoning_effort]));
   const labelsChanged = labels(data.sessions) !== labels(state.snapshot?.sessions);
   state.snapshot = data;
+  if (state.selected || state.toMe) {
+    const scoped = data.messages.filter(matchesConversation);
+    const seen = new Set(previous.map((message) => message.batch_id || message.id));
+    for (const message of scoped) {
+      const key = message.batch_id || message.id;
+      if (!initial && message.seq > oldMax && !seen.has(key)) state.newCount++;
+      seen.add(key);
+    }
+    if (!state.viewLoading) {
+      if (!state.messages.size || scoped.some((message) => state.messages.has(message.id))) {
+        const combined = new Map([...state.messages, ...scoped.map((message) => [message.id, message])]);
+        const rows = [...combined.values()].sort((a, b) => a.seq - b.seq);
+        if (rows.length > MESSAGE_WINDOW_LIMIT) state.hasOlder = true;
+        state.messages = new Map(rows.slice(-MESSAGE_WINDOW_LIMIT).map((message) => [message.id, message]));
+      } else if (scoped.some((message) => message.seq > visibleMax)) {
+        state.hasNewer = true;
+      }
+    }
+    pruneExpanded();
+    renderAgents();
+    renderMessages(following && !state.hasNewer);
+    renderResources();
+    if (following && state.hasNewer) loadMessagePage(true);
+    return;
+  }
   const seen = new Set(previous.map((message) => message.batch_id || message.id));
   for (const message of data.messages) {
     const key = message.batch_id || message.id;
@@ -871,6 +1060,7 @@ function pruneExpanded() {
 
 function showLatest() {
   if (state.loadingHistory || !state.snapshot) return;
+  if (state.selected || state.toMe) { loadConversationView(); return; }
   state.historyLoaded = false; state.hasNewer = false; state.historyError = null;
   state.originals.clear(); state.highlighted = null;
   state.messages = new Map(state.snapshot.messages.map((message) => [message.id, message]));
@@ -884,12 +1074,17 @@ async function loadMessagePage(newer = false) {
   const sequences = [...state.messages.values()].map(message => message.seq);
   const cursor = newer ? Math.max(...sequences) : Math.min(...sequences);
   const epoch = state.epoch;
+  const viewGeneration = state.viewGeneration;
   state.loadingHistory = true;
   state.historyDirection = newer ? 'newer' : 'older';
   state.historyError = null;
   renderHistoryStatus();
   try {
-    const result = await fetchJSON(`/api/messages?${newer ? 'after' : 'before'}=${cursor}&limit=${MESSAGE_LIMIT}`);
+    const params = conversationQuery();
+    params.set(newer ? 'after' : 'before', String(cursor));
+    params.set('limit', String(MESSAGE_LIMIT));
+    const result = await fetchJSON(`/api/messages?${params}`);
+    if (viewGeneration !== state.viewGeneration) return;
     const anchor = feedAnchor();
     const messages = new Map([...state.messages, ...result.messages.slice(0, MESSAGE_LIMIT).map(message => [message.id, message])]);
     const rows = [...messages.values()].sort((a, b) => a.seq - b.seq);
@@ -914,7 +1109,7 @@ async function loadMessagePage(newer = false) {
   } catch (error) {
     if (error.name !== 'AbortError') state.historyError = newer ? 'newer' : 'older';
   } finally {
-    if (epoch === state.epoch) {
+    if (epoch === state.epoch && viewGeneration === state.viewGeneration) {
       state.loadingHistory = false;
       state.historyDirection = null;
       renderHistoryStatus();
@@ -935,7 +1130,11 @@ async function fetchJSON(url, options = {}) {
   const response = await fetch(projectURL(url), { cache: 'no-store', ...options });
   const data = await response.json();
   if (epoch !== state.epoch) throw new DOMException('Project changed', 'AbortError');
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -967,10 +1166,15 @@ function renderProjects(data) {
   if (!data.projects) return;
   state.projects = data.projects;
   const select = $('project-select');
-  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(data.projects.map(p => [p.id, p.name]))) {
-    select.replaceChildren(...data.projects.map(p => new Option(p.name, p.id)));
+  const label = project => project.name;
+  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(data.projects.map(p => [p.id, label(p)]))) {
+    select.replaceChildren(...data.projects.map(p => new Option(label(p), p.id)));
   }
   select.value = state.project;
+  const measuring = !!data.projects.find(p => p.id === state.project)?.measurement_running;
+  $('measurement-indicator').hidden = !measuring;
+  $('measurement-button').setAttribute('aria-label', measuring ? 'Measure usage (active)' : 'Measure usage');
+  $('measurement-button').title = measuring ? 'Usage measurement is active' : 'Measure usage for this project';
   projectControls();
 }
 
@@ -1018,6 +1222,7 @@ function switchProject(id) {
   state.measurement = null;
   state.measurementSaving = false;
   state.project = id;
+  state.viewGeneration++; state.viewLoading = false;
   const url = new URL(location.href);
   if (id === 'default') url.searchParams.delete('project'); else url.searchParams.set('project', id);
   history.replaceState(null, '', url);
@@ -1080,6 +1285,7 @@ for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
     $('project-dialog-title').textContent = rename ? 'Rename project' : 'New project';
     $('project-name').value = rename ? state.projects.find(p => p.id === state.project).name : '';
     $('project-error').textContent = '';
+    $('project-error').hidden = true;
     $('project-dialog').showModal(); $('project-name').focus();
   });
 }
@@ -1088,22 +1294,36 @@ $('project-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.busy) return;
   const rename = event.currentTarget.dataset.rename === 'true';
+  $('project-error').textContent = '';
+  $('project-error').hidden = true;
+  const saveLabel = $('save-project').textContent;
+  $('save-project').textContent = rename ? 'Saving…' : 'Creating…';
   state.busy = true; projectControls(); $('save-project').disabled = true;
   try {
-    const result = await fetchJSON(rename ? '/api/projects/rename' : '/api/projects', {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
-      body: JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : {}) }),
+    const path = rename ? '/api/projects/rename' : '/api/projects';
+    const body = JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : {}) });
+    const submit = () => fetchJSON(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token }, body,
     });
+    let result;
+    try {
+      result = await submit();
+    } catch (error) {
+      if (error.status !== 403) throw error;
+      state.config = await fetchJSON('/api/config');
+      renderProjects(state.config);
+      result = await submit();
+    }
     $('project-dialog').close();
     state.busy = false;
     if (rename) applySnapshot(await fetchJSON('/api/snapshot')); else switchProject(result.project.id);
-  } catch (error) { $('project-error').textContent = error.message; }
-  finally { state.busy = false; projectControls(); $('save-project').disabled = false; }
+  } catch (error) { $('project-error').textContent = error.message; $('project-error').hidden = false; }
+  finally { state.busy = false; projectControls(); $('save-project').disabled = false; $('save-project').textContent = saveLabel; }
 });
 $('all-conversations').addEventListener('click', () => selectAgent(null));
 $('search').addEventListener('input', (event) => { state.query = event.target.value.toLowerCase(); renderMessages(true); });
 $('ack-filter').addEventListener('change', (event) => { state.ack = event.target.value; renderMessages(true); });
-$('to-me-filter').addEventListener('click', () => { state.toMe = !state.toMe; renderMessages(true); });
+$('to-me-filter').addEventListener('click', () => { state.toMe = !state.toMe; loadConversationView(); });
 $('retry-button').addEventListener('click', connect);
 $('pause-button').addEventListener('click', () => {
   state.paused = !state.paused;
@@ -1215,7 +1435,7 @@ $('composer').addEventListener('submit', async (event) => {
   const broadcast = !parsed.tags.length && !state.reply;
   if (!parsed.tags.length) recipients.push(...(state.reply ? replyRecipients(state.reply) : sessions.map((session) => session.id)));
   const body = draft.slice(parsed.bodyStart).trim();
-  if (!body && !state.attachments.length) { composerStatus('Write a message or attach an image.', true); return; }
+  if (!body && !state.attachments.length) { composerStatus('Write a message or attach a file.', true); return; }
   if (!recipients.length) { composerStatus('No agents are registered yet.', true); return; }
   if (state.reply && recipients.some((id) => !replyRecipients(state.reply).includes(id))) {
     composerStatus('An @agent differs from this reply. Cancel the reply to start a new conversation.', true);

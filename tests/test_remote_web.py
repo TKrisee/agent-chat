@@ -96,6 +96,27 @@ class RemoteWebTests(RemoteWebFixture):
         with self.assertRaises(RemoteCoordError):
             self.call('status', host='another-mac')
 
+    def test_agent_document_batch_downloads_and_rejects_unsupported_files(self):
+        self.call('register', agent='alpha')
+        self.call('register', session='b', agent='beta')
+        documents = [('NOTES.TXT', b'\xef\xbb\xbfUnicode: \xc3\xa1\n'), ('guide.md', b'# Guide'),
+                     ('data.json', b'{"test": true}'), ('data.xml', b'<note>data</note>')]
+        sent = self.call('send', to='b', body='', attachments=[
+            {'name': name, 'content_base64': base64.b64encode(content).decode()}
+            for name, content in documents
+        ])
+        for attachment, (name, content) in zip(sent['attachments'], documents):
+            self.assertEqual(attachment['name'], name)
+            status, downloaded, headers = self.request('GET', attachment['url'])
+            self.assertEqual((status, downloaded), (200, content))
+            self.assertTrue(headers['Content-Disposition'].startswith('attachment;'))
+            self.assertEqual(self.request('GET', attachment['url'], auth=None)[0], 401)
+        with self.assertRaises(RemoteCoordError):
+            self.call('send', to='b', body='', attachments=[
+                {'name': 'program.exe', 'content_base64': base64.b64encode(b'\x89PNG\r\n\x1a\n').decode()}
+            ])
+        self.assertEqual(len(self.call('inbox', session='b')['messages']), 1)
+
     def test_csrf_required_for_removal_and_operator_is_preserved(self):
         self.call('register', agent='alpha')
         self.assertEqual(self.request('POST', '/api/sessions/remove', {'id': 'a'})[0], 403)

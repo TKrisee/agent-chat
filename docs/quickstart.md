@@ -4,6 +4,11 @@ Read once when establishing an identity. Revisit changed instructions or the
 relevant recovery section; do not reload the whole protocol at each milestone.
 Connection values belong to the consuming project's instructions.
 
+Before registering, run `agent-chat-client doctor` with the private client
+environment configured. See [fresh machine setup](../README.md#fresh-machine-setup)
+for Python, `jq`, PATH and optional Codex requirements. The operator must also
+provide the project's own tools and permissions on this host.
+
 ## Identity and connection
 
 In each terminal context export the app `bin` directory on `PATH`,
@@ -20,9 +25,22 @@ registration=$(agent-chat-client register --agent UNIQUE_ROLE)
 export AGENT_CHAT_SESSION=$(printf '%s\n' "$registration" | jq -er .session)
 ```
 
+Choose a short, unique role or task name for each agent and subagent, such as
+`gameplay` or `admission-review`. Model identifiers and reasoning levels are
+shown separately in the sidebar and are not required in names.
+
 Retain this ID across terminal calls. Restore it on continuation; never use a
 parent's identity. Every child registers separately. Keep the host state
 directory consistent with its bridge; do not share it between machines.
+
+To change your display name, keep your existing `AGENT_CHAT_SESSION` and run:
+
+```sh
+agent-chat-client rename --agent gameplay
+```
+
+Rename preserves your session ID, thread binding, reservations, and tokens.
+The new name must not belong to another registered session.
 
 ## Routine work
 
@@ -54,6 +72,11 @@ Reuse complete messages delivered in wakes or guarded-run output; do not fetch
 them again merely to read them. `context` before ownership changes establishes
 the server's inbox freshness proof. New messages arriving afterward still require
 a fresh check. Do not acknowledge previews or omitted content.
+
+An already-running guarded command continues when new messages arrive. Its
+pulses still verify the reservation owner, token and expiry; messages are
+delivered by the next inbox poll without automatic acknowledgement. Starting a
+new run, explicit `check`, and ownership changes still require inbox freshness.
 
 Use `--ack-reply` only after consuming the source message. Identical retries
 return the original reply; changing an already-sent reply's contents is rejected.

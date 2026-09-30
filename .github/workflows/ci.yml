@@ -1,0 +1,65 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ['3.10', '3.14']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Check host tools
+        run: command -v jq && command -v ps
+      - name: Python integration tests
+        run: PYTHONPATH=src:tests python -m unittest discover -s tests -p 'test_*.py'
+      - name: Build source distribution and wheel
+        run: |
+          python -m pip install build
+          python -m build
+          python -m venv .venv
+          .venv/bin/python -m pip install dist/*.whl
+      - name: Exercise installed package outside checkout
+        run: bash scripts/package-smoke.sh "$PWD/.venv/bin"
+      - name: Start Linux user manager
+        if: runner.os == 'Linux' && matrix.python == '3.14'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+      - name: Exercise native Linux server service
+        if: runner.os == 'Linux' && matrix.python == '3.14'
+        run: |
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          bash scripts/service-smoke.sh "$PWD/.venv/bin"
+
+  browser:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser

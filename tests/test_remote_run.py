@@ -105,6 +105,50 @@ class RemoteRunTests(RemoteWebFixture):
         result=self.invoke('recover','shared','--receipt',self.receipt([run['local_pid']]))
         self.assertTrue(json.loads(result[1])['recovered'])
 
+    def test_run_survives_message_delivered_between_inbox_and_guard_pulse(self):
+        self.call('register', session='b', agent='beta')
+        marker = Path(self.tmp.name) / 'completed'
+        proceed = Path(self.tmp.name) / 'pulses-completed'
+        original = HttpClient.call
+        delivered = False
+        message_id = None
+        pulses = 0
+
+        def deliver_after_inbox(client, path, payload):
+            nonlocal delivered, message_id, pulses
+            result = original(client, path, payload)
+            if payload.get('op') == 'inbox' and not delivered:
+                delivered = True
+                message_id = self.call('send', session='b', to='a',
+                                       body='Delivered after the run inbox response.')['id']
+            if payload.get('op') == 'guard-pulse':
+                pulses += 1
+                if pulses == 2:
+                    proceed.touch()
+            return result
+
+        code = ('import pathlib,time\n'
+                'proceed = pathlib.Path(' + repr(str(proceed)) + ')\n'
+                'deadline = time.monotonic() + 10\n'
+                'while not proceed.exists() and time.monotonic() < deadline: time.sleep(.02)\n'
+                'assert proceed.exists(), "guard pulses did not complete"\n'
+                'pathlib.Path(' + repr(str(marker)) + ').touch()\n')
+        stderr = io.StringIO()
+        with mock.patch.object(HttpClient, 'call', deliver_after_inbox), contextlib.redirect_stderr(stderr):
+            result, _ = self.invoke('run', 'shared', '--', sys.executable, '-c', code)
+        self.assertEqual(result, 0)
+        self.assertTrue(delivered)
+        self.assertGreaterEqual(pulses, 2)
+        self.assertTrue(marker.exists())
+        self.assertIn(message_id, stderr.getvalue())
+        coord = Coordinator(self.db)
+        try:
+            message = coord.db.execute('SELECT acked_at FROM messages WHERE id=?', (message_id,)).fetchone()
+        finally:
+            coord.close()
+        self.assertIsNone(message['acked_at'])
+        self.assertIsNotNone(self.runs()[0]['closed_at'])
+
     def test_lost_attach_response_never_executes_unconfirmed_command(self):
         marker=Path(self.tmp.name)/'sentinel'
         original=HttpClient.call

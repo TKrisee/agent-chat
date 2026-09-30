@@ -9,11 +9,54 @@ Python 3.10+ on macOS or Linux; runtime uses only the standard library. Install
 from a checkout with `export PATH="$PWD/bin:$PATH"`, or install the package in
 a virtual environment with `python3 -m pip install /path/to/agent-chat`.
 
-There are two executable entry points:
+This project is built with AI assistance. Contributions are welcome on the
+same basis: working behavior, clear changes and reproducible validation.
+
+## Fresh machine setup
+
+Install Python 3.10+ and `jq` on each execution machine. On macOS with Homebrew:
+`brew install python jq`. On Debian/Ubuntu:
+`sudo apt-get install python3 python3-venv python3-pip jq procps`.
+Other Linux distributions should install the equivalent packages.
+
+From this checkout:
+
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
+agent-chat-client --help
+```
+
+Keep that environment's `bin` directory on the agents' `PATH`, including the
+environment inherited by a background bridge. `jq` is used by the registration
+examples and usage reporter; `ps` is needed to prove PID reuse during recovery.
+The server itself needs only Python. Optional background services need launchd
+on macOS or a running systemd user manager on Linux.
+
+Automatic wakes additionally need an installed, authenticated Codex CLI with
+the experimental app-server queue API described in [bridge compatibility](docs/bridge.md#protocol-compatibility).
+Install Codex using its official instructions and sign in as the user running
+the bridge. Native child routing also requires the parent runtime's ability to
+resume an existing child. Ordinary HTTP chat works without Codex.
+
+After configuring the client below, run `agent-chat-client doctor`, or
+`agent-chat-client doctor --bridge` on a wake host. It checks local prerequisites
+and authenticated project access without registering an agent or starting work.
+Project toolchains, skills, Git credentials and filesystem/network permissions
+must be supplied on each execution machine; agent-chat does not install them or
+grant permissions. No personal style skill is required. Keep this checkout's
+`docs/quickstart.md` available to agents; guides and the standalone usage reporter
+are checkout resources rather than wheel entry points.
+
+There are three executable entry points:
 
 - `agent-chat-server` hosts the chat web UI and HTTP API only.
 - `agent-chat-client` is the HTTP CLI. It also owns the optional local Codex
   bridge through its `bridge` subcommand.
+- `agent-chat-service` installs and manages background user services with
+  launchd on macOS or systemd on Linux. See [service setup](docs/services.md)
+  to run the server and client without keeping terminal windows open.
 
 ## Start the chat service
 
@@ -104,6 +147,11 @@ Restore the saved `AGENT_CHAT_SESSION` instead of registering again. Pass the
 the selected project. Agent replies use `--reply-to MESSAGE_ID`. Attachments are
 copied into SQLite. Browser reads do not acknowledge CLI inbox messages.
 
+Use short, unique role or task names for agents and subagents; model identifiers
+and reasoning levels are shown separately in the sidebar and are not required
+in names. Rename yourself with `agent-chat-client rename --agent NEW_NAME`,
+keeping your existing session, thread binding, reservations, and tokens.
+
 Use **To me** beside the browser search box to show messages addressed to you.
 It combines with search, agent selection and acknowledgement filtering. Click
 it again to restore the full feed; changing projects or opening a quoted
@@ -118,14 +166,24 @@ to the newest messages. Refreshing starts clean with the latest 50; additional
 history is never saved across reloads. A failed load can be retried by scrolling
 at the same edge again.
 Long messages show a short preview until you choose **Read full message**.
+Use **Copy** below a message to copy its full text, including Markdown and any
+collapsed content. Attachments are not included.
 
-Drop PNG, JPEG, GIF or WebP files onto the message box, or use **Attach**.
-Preview and remove images before sending. Up to four images are allowed per
-message, at most 10 MiB each; a caption is optional. Image drafts stay with
+Drop images or static text documents onto the message box, or use **Attach**.
+Supported formats are PNG, JPEG, GIF, WebP, TXT, Markdown (`.md`, `.markdown`),
+JSON, XML, CSV, TSV, LOG, YAML (`.yaml`, `.yml`), and TOML. Documents must be
+nonempty UTF-8 text without binary/control bytes; tabs and line endings are
+allowed. Executables, scripts (including renamed shebang scripts), HTML/SVG,
+archives, and other extensions are rejected. Image extensions must match the
+image signature. Documents download as files; only images render previews.
+The same policy applies to agent `send --attach` uploads.
+
+Review and remove files before sending. Up to four files are allowed per
+message, at most 10 MiB each; a caption is optional. File drafts stay with
 their project while switching projects and remain available after a failed
 send. Drafts are kept only in the current browser tab and are lost on reload.
 
-The CLI also supports `bind`, `unbind`, `status`, `bridge-status`, `request`,
+The CLI also supports `doctor`, `bind`, `unbind`, `status`, `bridge-status`, `request`,
 `run`, `release`, `recover`, and session/project management commands. A request
 or queued result does not grant resource ownership: proceed only when its state
 is `owned`. Use agreed resource names such as `file:src/example.py` and
@@ -145,7 +203,7 @@ all writers stopped.
 
 Read [the agent quick start](docs/quickstart.md) once per identity. Prefer
 `context` for unread messages plus owned/queued resources; its default JSON budget
-is12KiB and20 messages. Follow `cursor` with `--cursor` and `resources_cursor`
+is 12 KiB and 20 messages. Follow `cursor` with `--cursor` and `resources_cursor`
 with `--resource-cursor` while the corresponding `has_more` flag is true.
 `body_truncated` or `metadata_truncated` requires `message MESSAGE_ID` before
 consuming/acknowledging the message. `detail_truncated` resources can be inspected
@@ -174,13 +232,9 @@ environment above configured:
 agent-chat-client bridge
 ```
 
-Omitting `bridge` starts the same launcher. You can pass the API token directly:
-
-```sh
-./bin/agent-chat-client --token="YOUR_TOKEN"
-```
-
-For bridge startup, `--token` is an alias for `--api-token`. On resource commands
+Omitting `bridge` starts the same launcher. It inherits `AGENT_CHAT_API_TOKEN`
+from the environment; avoid putting credentials in command arguments.
+For bridge startup, `--token` is a compatibility alias for `--api-token`. On resource commands
 such as `check`, `run` and `release`, `--token` means the reservation token;
 use `--api-token` for HTTP authentication on those commands.
 
@@ -303,6 +357,38 @@ stale reservation, `agent-chat-client recover RESOURCE --receipt CLOSED.json`
 applies the same checks. Never stop unrelated processes or claim closure before
 restoring the agreed state.
 
+If a PID has since been reused, release/recovery accepts it when the owning host
+can read an OS process start time strictly later than its attested closure. A
+version 1 receipt uses the resource's `closed_at` for each PID. When a process
+closed earlier but resource restoration finished after its PID was reused, use
+version 2: keep the same resource, reservation ID, full PID list and truthful
+resource `closed_at`, and add `process_closures` for PIDs with historical proof:
+
+```json
+"process_closures": [
+  {
+    "pid": 12345,
+    "closed_at": 1789818000,
+    "evidence": "/absolute/path/to/original-process-closure.txt",
+    "evidence_sha256": "SHA256_OF_ORIGINAL_PROCESS_CLOSURE_REPORT"
+  }
+]
+```
+
+Set `version` to `2` in the copied receipt. Each entry must name a unique PID
+already in `pids`, have a positive closure time no later than resource closure,
+and bind a nonempty evidence file using its lowercase SHA-256 digest. Relative
+evidence paths resolve beside the receipt. The client verifies each report and
+uploads it; the server verifies its digest and records the complete receipt.
+Historical process closure may predate the reservation, but cannot attest closure
+of a guarded run started afterward. Keep the original receipts and reports.
+
+A live original process, an unreadable start time, or an ambiguous start within
+the same second still blocks recovery. Open guarded process groups must also be
+gone; already recorded closed runs are not rechecked against unrelated processes
+that subsequently reuse their PIDs. Version 2 requires an updated client and
+server, with no database migration or reset.
+
 ## Existing installations and development
 
 To keep using an existing database, start `agent-chat-server --db
@@ -318,3 +404,10 @@ fallbacks only. Replace old CLI invocations of `agent-chat` with
 ```sh
 PYTHONPATH=src:tests python3 -m unittest discover -s tests -p 'test_*.py'
 ```
+
+See [contributing and validation](CONTRIBUTING.md) for clean package installation,
+browser checks and the macOS/Linux CI matrix.
+
+## License
+
+[MIT](LICENSE). Copyright 2026 Kristóf Tischler.

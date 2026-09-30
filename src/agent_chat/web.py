@@ -16,13 +16,14 @@ import sqlite3
 import threading
 import time
 import tempfile
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 from agent_chat.core import CoordError, Coordinator, agent_labels
 from .projects import Projects
 from .bridge_state import runtime_snapshot
 from .usage import UsageStore
 from .measurement import MeasurementStore
+from .session_models import SessionModels
 from .measurement_pause import request_pauses
 
 from .auth import authorized, validate_config, origin
@@ -117,12 +118,17 @@ def message_rows(rows, agents, db):
     return items
 
 
-def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None):
+def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=None):
     """Read a consistent view without advancing inboxes or changing ownership."""
     with reader(db_path) as db:
         now = time.time()
         sessions = [dict(row) for row in db.execute(
             'SELECT id,agent,registered_at FROM sessions ORDER BY registered_at,id')]
+        bindings = {}
+        if session_models is not None and db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_bindings'").fetchone():
+            bindings = {row['session_id']: dict(row) for row in db.execute(
+                'SELECT session_id,thread_id,agent_path FROM bridge_bindings')}
         agents = agent_labels(db)
         total = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
         rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY seq DESC LIMIT ?',
@@ -147,27 +153,60 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None):
                     history_truncated=total > len(messages))
     if usage_store is not None:
         data['usage'] = usage_store.status()
+    if session_models is not None:
+        metadata = session_models.read(
+            (route['thread_id'] for route in bindings.values() if route['thread_id']),
+            (route['agent_path'] for route in bindings.values() if route['agent_path']))
+        for session in sessions:
+            route = bindings.get(session['id'], {})
+            observed = metadata.get(route.get('thread_id') or route.get('agent_path'), {})
+            session.update(model=observed.get('model'), reasoning_effort=observed.get('reasoning_effort'))
     return data
 
 
-def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None):
+def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None, operator=None,
+         agent=None, to_me=False):
     def valid_cursor(value):
         return value is None or (type(value) is int and 1 <= value <= 2**63 - 1)
     if ((before is not None and after is not None) or type(limit) is not int
-            or not 1 <= limit <= 200 or not valid_cursor(before) or not valid_cursor(after)):
+            or not 1 <= limit <= 200 or not valid_cursor(before) or not valid_cursor(after)
+            or (agent is not None and (not isinstance(agent, str) or not agent or len(agent) > 256))
+            or (agent is not None or to_me) and not operator):
         raise ValueError('History requires a positive cursor and a limit from 1 to 200')
     with reader(db_path) as db:
         agents = agent_labels(db)
+        conditions = []
+        args = []
+        if agent is not None or to_me:
+            if batch_table(db):
+                conditions.append('NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)')
+            if agent is not None:
+                inbound = '(m.sender_session=? AND m.recipient_session=?)'
+                args.extend((agent, operator))
+                if to_me:
+                    conditions.append(inbound)
+                else:
+                    conditions.append(f'({inbound} OR (m.sender_session=? AND m.recipient_session=?))')
+                    args.extend((operator, agent))
+            else:
+                conditions.append('m.recipient_session=?')
+                args.append(operator)
         if after is not None:
-            rows = db.execute(
-                f'SELECT {MESSAGE_COLUMNS} FROM messages WHERE seq>? ORDER BY seq ASC LIMIT ?',
-                (after, limit + 1)).fetchall()
+            conditions.append('m.seq>?')
+            args.append(after)
+            direction = 'ASC'
+        else:
+            if before is not None:
+                conditions.append('m.seq<?')
+                args.append(before)
+            direction = 'DESC'
+        where = 'WHERE ' + ' AND '.join(conditions) if conditions else ''
+        rows = db.execute(
+            f'SELECT {MESSAGE_COLUMNS} FROM messages m {where} ORDER BY m.seq {direction} LIMIT ?',
+            (*args, limit + 1)).fetchall()
+        if after is not None:
             messages = rows[:limit]
         else:
-            where = 'WHERE seq<?' if before is not None else ''
-            args = (before, limit + 1) if before is not None else (limit + 1,)
-            rows = db.execute(
-                f'SELECT {MESSAGE_COLUMNS} FROM messages {where} ORDER BY seq DESC LIMIT ?', args).fetchall()
             messages = list(reversed(rows[:limit]))
         return dict(messages=message_rows(messages, agents, db), has_more=len(rows) > limit)
 
@@ -223,6 +262,7 @@ class WebServer(http.server.ThreadingHTTPServer):
                 self.bridge_manager = BridgeManager(self.db_path, usage_store=self.usage)
             self.measurements = MeasurementStore(self.db_path, sessions_root=sessions_root, usage_store=self.usage,
                                                  pause_callback=self.pause_measured_agents)
+            self.session_models = SessionModels(self.measurements.sessions_root)
         except BaseException:
             self.server_close()
             raise
@@ -237,6 +277,21 @@ class WebServer(http.server.ThreadingHTTPServer):
         if Path(database).resolve() != Path(current_path).resolve():
             raise CoordError('measurement project database changed')
         request_pauses(current_path, sender, measurement_id, recipients)
+
+    def listed_projects(self):
+        active = self.measurements.active_projects()
+        return [dict(project, measurement_running=project['id'] in active)
+                for project in self.projects.list()]
+
+    def measurement_models(self, result):
+        """Annotate reports using their recorded threads, including retired agents."""
+        agents = [agent for key in ('active', 'latest') if result.get(key)
+                  for agent in result[key]['agents']]
+        metadata = self.session_models.read(agent['thread_id'] for agent in agents)
+        for agent in agents:
+            observed = metadata.get(agent['thread_id'], {})
+            agent.update(model=observed.get('model'), reasoning_effort=observed.get('reasoning_effort'))
+        return result
 
     def project_context(self, project):
         item = self.projects.get(project)
@@ -319,13 +374,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError('Expected a JSON object')
         return value
 
-    def respond(self, code, raw, mime):
+    def respond(self, code, raw, mime, *, download_name=None):
         self.send_response(code)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(len(raw)))
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', CSP)
+        self.send_header('Content-Security-Policy', "default-src 'none'; sandbox" if download_name is not None else CSP)
+        if download_name is not None:
+            self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(download_name, safe=''))
         self.send_header('Connection', 'close')
         self.end_headers()
         self.close_connection = True
@@ -352,7 +409,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return data
 
     def project_snapshot(self):
-        return dict(snapshot(self.db_path, usage_store=self.server.usage), project=self.server.projects.get(self.project['id']), projects=self.server.projects.list())
+        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects())
 
     def json(self, code, data):
         self.respond(code, json.dumps(self.scoped(data), ensure_ascii=False, separators=(',', ':')).encode('utf-8'), 'application/json; charset=utf-8')
@@ -368,23 +425,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if url.path.startswith('/api/') and url.path != '/api/usage':
                 self.select_project()
             if url.path == '/api/projects':
-                self.json(200, {'projects': self.server.projects.list(), 'project': self.project})
+                self.json(200, {'projects': self.server.listed_projects(), 'project': self.project})
             elif url.path == '/api/usage':
                 self.json(200, self.server.usage.status())
             elif url.path == '/api/measurements':
-                self.json(200, self.server.measurements.status(self.project['id']))
+                self.json(200, self.server.measurement_models(self.server.measurements.status(self.project['id'])))
             elif url.path == '/api/snapshot':
                 self.json(200, self.project_snapshot())
             elif url.path == '/api/config':
                 self.json(200, {'sender': {'id': self.sender_session, 'agent': 'operator'},
                                 'csrf_token': self.server.csrf_token, 'project': self.project,
-                                'projects': self.server.projects.list()})
+                                'projects': self.server.listed_projects()})
             elif url.path == '/api/messages':
                 params = parse_qs(url.query, keep_blank_values=True)
                 before_values = params.get('before', [])
                 after_values = params.get('after', [])
                 limit_values = params.get('limit', [str(UI_MESSAGE_LIMIT)])
-                if len(before_values) > 1 or len(after_values) > 1 or len(limit_values) != 1:
+                agent_values = params.get('agent', [])
+                to_me_values = params.get('to_me', [])
+                if (len(before_values) > 1 or len(after_values) > 1 or len(limit_values) != 1
+                        or len(agent_values) > 1 or len(to_me_values) > 1
+                        or to_me_values not in ([], ['1'])):
                     raise ValueError('History cursor and limit parameters must appear once')
                 if before_values and after_values:
                     raise ValueError('Choose either a before or after history cursor')
@@ -400,7 +461,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 before = positive_integer(before_values, 'before')
                 after = positive_integer(after_values, 'after')
                 limit = positive_integer(limit_values, 'limit')
-                self.json(200, page(self.db_path, before, limit, after))
+                self.json(200, page(self.db_path, before, limit, after,
+                                    self.sender_session, agent_values[0] if agent_values else None,
+                                    bool(to_me_values)))
             elif url.path.startswith('/api/messages/'):
                 message_id = url.path.removeprefix('/api/messages/')
                 if set(parse_qs(url.query)) - {'project'} or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
@@ -423,11 +486,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not attachment_table(db):
                         self.json(404, {'error': 'Not found'})
                         return
-                    item = db.execute('SELECT mime,content FROM attachments WHERE id=?', (attachment_id,)).fetchone()
+                    item = db.execute('SELECT name,mime,content FROM attachments WHERE id=?', (attachment_id,)).fetchone()
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                     return
-                self.respond(200, item['content'], item['mime'])
+                self.respond(200, item['content'], item['mime'],
+                             download_name=None if item['mime'] in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'} else item['name'])
             elif url.path == '/api/events':
                 self.events()
             else:
@@ -500,7 +564,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     result = self.server.measurements.stop(self.project['id'])
                 else:
                     raise CoordError('invalid measurement operation')
-                self.json(200, result)
+                self.json(200, self.server.measurement_models(result))
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
@@ -618,10 +682,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif name == 'images':
                 filename = part.get_filename()
                 if not filename:
-                    raise ValueError('Image filename is required')
+                    raise ValueError('Attachment filename is required')
                 content = part.get_payload(decode=True)
                 if content is None:
-                    raise ValueError('Malformed image upload')
+                    raise ValueError('Malformed attachment upload')
                 images.append((self.sanitize_upload_name(filename), content))
             else:
                 raise ValueError('Multipart message contains an unsupported field')
@@ -631,14 +695,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def sanitize_upload_name(name):
-        name = Path(name.replace('\\', '/')).name
-        name = ''.join(char if char.isprintable() and char not in '/\\' else '_' for char in name).strip(' .')
-        return name[:255] or 'image'
+        return Coordinator._attachment_name(name)
 
     @staticmethod
     def write_uploads(directory, uploads):
         if len(uploads) > 4:
-            raise CoordError('at most 4 image attachments are allowed')
+            raise CoordError('at most 4 attachments are allowed')
         if any(len(content) > 10 * 1024 * 1024 for _, content in uploads):
             raise CoordError('attachment exceeds 10 MiB')
         paths = []
@@ -653,13 +715,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def project_action(self, data):
         op = data.get('op')
         if op == 'list' and set(data) == {'op'}:
-            return {'projects': self.server.projects.list()}
+            return {'projects': self.server.listed_projects()}
         if op == 'create' and set(data) == {'op', 'name'}:
             item = self.server.projects.create(data['name'])
             self.server.project_context(item['id'])
-            return {'project': item, 'projects': self.server.projects.list()}
+            return {'project': item, 'projects': self.server.listed_projects()}
         if op == 'rename' and set(data) == {'op', 'id', 'name'}:
-            return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.projects.list()}
+            return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.listed_projects()}
         raise CoordError('invalid project operation')
 
     def usage_action(self, data, machine):

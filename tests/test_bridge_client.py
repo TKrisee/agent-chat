@@ -3,7 +3,11 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -129,13 +133,14 @@ class BridgeClientTests(unittest.TestCase):
                 process.poll.return_value = None
                 first_client = len(_Http.instances)
                 with mock.patch.dict(os.environ, {'AGENT_CHAT_API_TOKEN': 'environment-token'}), \
-                        mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process) as popen:
+                        mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process) as popen, \
+                        mock.patch.object(bridge_client, '_stop_codex') as stop_codex:
                     result = cli.main([*flags, '--server', 'https://chat.example', '--once'])
                 self.assertEqual(result, 0)
                 popen.assert_called_once()
                 self.assertEqual(popen.call_args.kwargs['env']['AGENT_CHAT_API_TOKEN'], 'flag-token')
                 self.assertTrue(all(client.token == 'flag-token' for client in _Http.instances[first_client:]))
-                process.terminate.assert_called_once_with()
+                stop_codex.assert_called_once_with(process)
 
     def test_client_launcher_accepts_connect_only_without_a_command(self):
         with mock.patch.object(bridge_client.subprocess, 'Popen') as popen:
@@ -149,20 +154,21 @@ class BridgeClientTests(unittest.TestCase):
         process.poll.return_value = None
         inherited = {'AGENT_CHAT_SESSION': 'parent', 'AGENT_CHAT_TOKEN': 'lease'}
         with mock.patch.dict(os.environ, inherited, clear=False), \
-                mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process) as popen:
+                mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process) as popen, \
+                mock.patch.object(bridge_client, '_stop_codex') as stop_codex:
             result = bridge_client.main(['--server', 'https://chat.example', '--api-token', 'flag-token',
                                          '--project', 'other', '--once', '--codex-bin', 'custom-codex'])
         self.assertEqual(result, 0)
         self.assertEqual(popen.call_args.args[0], ['custom-codex', 'app-server', '--listen', 'ws://127.0.0.1:4500'])
         self.assertEqual(popen.call_args.kwargs['cwd'], __import__('os').getcwd())
+        self.assertTrue(popen.call_args.kwargs['start_new_session'])
         environment = popen.call_args.kwargs['env']
         self.assertEqual(environment['AGENT_CHAT_SERVER'], 'https://chat.example')
         self.assertEqual(environment['AGENT_CHAT_API_TOKEN'], 'flag-token')
         self.assertEqual(environment['AGENT_CHAT_PROJECT'], 'other')
         for name in inherited:
             self.assertNotIn(name, environment)
-        process.terminate.assert_called_once_with()
-        process.wait.assert_called_once_with(timeout=5)
+        stop_codex.assert_called_once_with(process)
 
     def test_recovery_defaults_to_default_project_without_starting_codex_or_rpc(self):
         with mock.patch.object(bridge_client.subprocess, 'Popen') as popen:
@@ -211,9 +217,46 @@ class BridgeClientTests(unittest.TestCase):
         process = mock.Mock()
         process.poll.side_effect = [None, None, 7, 7]
         process.returncode = 7
-        with mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process):
+        with mock.patch.object(bridge_client.subprocess, 'Popen', return_value=process), \
+                mock.patch.object(bridge_client, '_stop_codex'):
             self.assertEqual(bridge_client.main(['--server', 'https://chat.example', '--project', 'default', '--once']), 2)
         self.assertEqual(_Bridge.ticks, ['default'])
+
+    def test_owned_codex_descendants_stop_even_after_leader_exits(self):
+        for leader_exits in (False, True):
+            with self.subTest(leader_exits=leader_exits), tempfile.TemporaryDirectory() as directory:
+                ready = Path(directory) / 'ready'
+                closed = Path(directory) / 'closed'
+                child = (
+                    'import signal,sys,time; from pathlib import Path; '
+                    'signal.signal(signal.SIGTERM, lambda *_: (Path(' + repr(str(closed)) + ').touch(), sys.exit(0))); '
+                    'Path(' + repr(str(ready)) + ').touch(); time.sleep(30)'
+                )
+                leader = (
+                    'import subprocess,sys,time; from pathlib import Path; '
+                    'subprocess.Popen([sys.executable,"-c",' + repr(child) + ']); '
+                    'ready=Path(' + repr(str(ready)) + '); '
+                    '\nwhile not ready.exists(): time.sleep(.01)\n'
+                    + ('sys.exit(0)' if leader_exits else 'time.sleep(30)')
+                )
+                process = subprocess.Popen([sys.executable, '-c', leader], start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(ready.exists(), 'descendant failed to start')
+                    if leader_exits:
+                        process.wait(timeout=5)
+                    bridge_client._stop_codex(process)
+                    self.assertTrue(closed.exists(), 'descendant survived launcher shutdown')
+                    with self.assertRaises(ProcessLookupError):
+                        os.killpg(process.pid, 0)
+                finally:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    process.wait(timeout=5)
 
     def test_discovery_adds_projects_on_the_next_poll(self):
         class ChangingHttp(_Http):

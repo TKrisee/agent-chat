@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +7,15 @@ name = "agent-chat"
 version = "0.4.0"
 description = "Hosted agent chat with a local Codex client bridge"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
 agent-chat-server = "agent_chat.server:main"
 agent-chat-client = "agent_chat.cli:entrypoint"
+agent-chat-service = "agent_chat.service:main"
 
 [tool.setuptools.package-data]
 agent_chat = ["web/*.html", "web/*.css", "web/*.js"]

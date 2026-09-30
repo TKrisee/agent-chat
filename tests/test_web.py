@@ -15,7 +15,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'src'))
 
 from agent_chat.core import Coordinator
-from agent_chat.web import create_server, snapshot
+from agent_chat.web import create_server, operator_session, page, snapshot
 
 
 class WebApiTests(unittest.TestCase):
@@ -215,6 +215,32 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(self.value('SELECT COUNT(*) FROM messages'), messages)
         self.assertEqual(self.value('SELECT COUNT(*) FROM resources'), resources)
 
+    def test_direct_conversation_pages_skip_groups_and_unrelated_history(self):
+        operator = operator_session(self.db)
+        self.send(self.alpha, operator, 'old direct to operator')
+        self.send(operator, self.alpha, 'old direct to alpha')
+        coordinator = self.coordinator(self.alpha)
+        try:
+            coordinator.send_group_prepared(None, 'quiet group', [])
+            coordinator.send_many([operator, self.beta], 'addressed group')
+        finally:
+            coordinator.close()
+        for index in range(60):
+            self.send(self.beta, self.gamma, 'unrelated %s' % index)
+        self.assertFalse(any(item['body'] == 'old direct to operator' for item in snapshot(self.db)['messages']))
+        incoming = page(self.db, limit=1, operator=operator, to_me=True)
+        self.assertEqual([item['body'] for item in incoming['messages']], ['old direct to operator'])
+        self.assertFalse(incoming['has_more'])
+        conversation = page(self.db, limit=1, operator=operator, agent=self.alpha)
+        self.assertEqual([item['body'] for item in conversation['messages']], ['old direct to alpha'])
+        self.assertTrue(conversation['has_more'])
+        older = page(self.db, before=conversation['messages'][0]['seq'], limit=1,
+                     operator=operator, agent=self.alpha)
+        self.assertEqual([item['body'] for item in older['messages']], ['old direct to operator'])
+        self.assertFalse(older['has_more'])
+        only_incoming = page(self.db, operator=operator, agent=self.alpha, to_me=True)
+        self.assertEqual([item['body'] for item in only_incoming['messages']], ['old direct to operator'])
+
     def test_default_snapshot_events_and_history_load_only_fifty_messages(self):
         coordinator = self.coordinator(self.alpha)
         try:
@@ -326,11 +352,42 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(all(item['attachments'][0]['mime'] == 'image/gif' for item in sent))
         self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 2)
 
+    def test_multipart_documents_download_without_rendering_and_preserve_exact_bytes(self):
+        uploads = [
+            ('notes.txt', 'Notes: árvíz\r\n'.encode()),
+            ('guide.md', b'# Guide\n<script>alert(1)</script>'),
+            ('data.json', b'{"value": true}\n'),
+            ('document.xml', b'<?xml version="1.0"?><!DOCTYPE x [<!ENTITY file SYSTEM "file:///etc/passwd">]><x>&file;</x>'),
+        ]
+        status, _, raw = self.post_multipart({'to': self.beta, 'body': ''}, uploads)
+        self.assertEqual(status, 200, raw)
+        with sqlite3.connect(self.db) as db:
+            rows = db.execute('SELECT id,name,mime,content FROM attachments ORDER BY rowid').fetchall()
+        self.assertEqual([(row[1], row[3]) for row in rows], uploads)
+        self.assertEqual([row[2] for row in rows], ['text/plain', 'text/markdown', 'application/json', 'application/xml'])
+        for attachment_id, name, mime, content in rows:
+            status, headers, downloaded = self.request('GET', '/api/attachments/' + attachment_id)
+            self.assertEqual(status, 200)
+            self.assertEqual(downloaded, content)
+            self.assertEqual(headers['Content-Type'], mime)
+            self.assertEqual(headers['Content-Disposition'], "attachment; filename*=UTF-8''" + name)
+            self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
+            self.assertEqual(headers['Content-Security-Policy'], "default-src 'none'; sandbox")
+
+    def test_rejected_documents_preserve_message_and_attachment_counts(self):
+        before = self.value('SELECT COUNT(*) FROM messages')
+        for name, content in [('unsafe.svg', b'<svg/>'), ('script.txt', b'#!/bin/sh\necho unsafe'),
+                              ('binary.json', b'hello\x00world'), ('data.xml', b'\xff')]:
+            status, _, _ = self.post_multipart({'to': self.beta, 'body': ''}, [('good.txt', b'good'), (name, content)])
+            self.assertEqual(status, 400, name)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM messages'), before)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 0)
+
     def test_invalid_multipart_uploads_do_not_insert_messages(self):
         before = self.value('SELECT COUNT(*) FROM messages')
         image = b'\x89PNG\r\n\x1a\nimage'
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)] * 5)[0], 400)
-        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('bad.txt', b'not an image')])[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('bad.exe', b'not a supported file')])[0], 400)
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('large.png', b'\x89PNG\r\n\x1a\n' + b'x' * (10 * 1024 * 1024))])[0], 400)
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)], extra_fields=[('message', b'{}')])[0], 400)
         self.assertEqual(self.post_multipart(None, [('a.png', image)],

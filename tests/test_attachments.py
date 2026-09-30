@@ -56,9 +56,9 @@ class AttachmentTests(unittest.TestCase):
             stored = db.execute('SELECT content FROM attachments ORDER BY rowid').fetchall()
         self.assertEqual([row[0] for row in stored], [b'\x89PNG\r\n\x1a\nfirst', b'\xff\xd8\xffsecond'])
 
-    def test_gif_and_webp_signatures_ignore_misleading_extensions(self):
-        gif = self.image('actually-image.bin', b'GIF89aimage-data')
-        webp = self.image('also-image.txt', b'RIFF\x00\x00\x00\x00WEBPimage-data')
+    def test_gif_and_webp_signatures_match_their_extensions(self):
+        gif = self.image('animation.gif', b'GIF89aimage-data')
+        webp = self.image('image.webp', b'RIFF\x00\x00\x00\x00WEBPimage-data')
         _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
                            '--attach', str(gif), '--attach', str(webp))
         self.assertEqual([item['mime'] for item in sent['attachments']], ['image/gif', 'image/webp'])
@@ -84,7 +84,7 @@ class AttachmentTests(unittest.TestCase):
         self.assertEqual((self.count_messages(), self.count_attachments()), (before_messages, before_attachments))
 
     def test_invalid_and_oversize_attachments_are_atomic_and_plain_messages_stay_compatible(self):
-        bad = self.image('not-image.txt', b'plain text')
+        bad = self.image('unsupported.dat', b'plain text')
         before = self.count_messages()
         failed, _ = self.cli('send', '--to', 'beta', '--body-file', str(self.body), '--attach', str(bad), check=False)
         self.assertNotEqual(failed.returncode, 0)

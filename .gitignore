@@ -1,6 +1,7 @@
 # Local chat data: SQLite, attachments, operator identity, logs and backups.
 .agent-chat/
 .venv/
+.venv-*/
 __pycache__/
 *.py[cod]
 *.egg-info/

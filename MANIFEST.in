@@ -1,0 +1,12 @@
+include README.md CONTRIBUTING.md LICENSE pyproject.toml package.json package-lock.json
+recursive-include docs *.md
+recursive-include bin agent-chat-*
+recursive-include scripts *.sh *.jq
+recursive-include tests *.py *.cjs
+recursive-include src/agent_chat/web *.html *.css *.js
+global-exclude .DS_Store *.py[cod] *.sqlite3 *.sqlite3-* *.api-token *.web-session.json
+prune .agent-chat
+prune .venv
+prune .venv-build
+prune .venv-package
+prune node_modules

@@ -9,7 +9,8 @@ import secrets
 import time
 from typing import Any
 
-from .core import CoordError, Coordinator
+from .core import CoordError, Coordinator, MAX_ATTACHMENTS
+from .receipts import process_closure_proofs, validate_process_evidence
 
 
 def _string(value: Any, name: str, required: bool = True) -> str | None:
@@ -41,11 +42,24 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
     coord.session = session
     # Hosted file locks are logical keys, independent of server filesystem layout.
     coord.resource_name = resource_name
-    with coord.tx():
-        _schema(coord)
-        _bind_host(coord, session, host_id, op)
+    if op == "rename":
+        # Host authentication for a label edit must also leave expiry untouched.
+        coord.db.execute("BEGIN IMMEDIATE")
+        try:
+            _schema(coord)
+            _bind_host(coord, session, host_id, op)
+        except BaseException:
+            coord.db.rollback()
+            raise
+        else:
+            coord.db.commit()
+    else:
+        with coord.tx():
+            _schema(coord)
+            _bind_host(coord, session, host_id, op)
     # Keep this list auditable.  Do not replace it with getattr.
     if op == "register": return coord.register(_string(params.get("agent"), "agent"))
+    if op == "rename": return coord.rename(_string(params.get("agent"), "agent"))
     if op == "status": return coord.status(params.get("mine", False), params.get("resources"))
     if op == "inbox": return coord.inbox(bool(params.get("all", False)))
     if op == "context": return coord.context(params.get("limit", 20), params.get("max_bytes", 12288),
@@ -130,17 +144,15 @@ def resource_name(raw):
 
 
 def _prepare_attachments(coord: Coordinator, attachments: Any) -> list[tuple[str, str, bytes]]:
-    if not isinstance(attachments, list) or len(attachments) > 4:
-        raise CoordError("attachments must contain at most four images")
+    if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
+        raise CoordError("attachments must contain at most four files")
     prepared = []
     for item in attachments:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("content_base64"), str):
             raise CoordError("remote attachment is invalid")
         try: content = base64.b64decode(item["content_base64"], validate=True)
         except ValueError as error: raise CoordError("remote attachment is invalid base64") from error
-        if not content or len(content) > 10 * 1024 * 1024 or coord._image_mime(content) is None:
-            raise CoordError("remote attachment must be a supported image no larger than 10 MiB")
-        prepared.append((item["name"], coord._image_mime(content), content))
+        prepared.append(coord._prepare_attachment(item["name"], content))
     return prepared
 
 
@@ -210,7 +222,7 @@ def _guard_pulse(coord: Coordinator, session: str, host: str, p: dict) -> dict:
     row = coord.db.execute("SELECT * FROM remote_guarded_runs WHERE run_id=?", (run_id,)).fetchone()
     if not row or row["session_id"] != session or row["host_id"] != host or row["closed_at"] is not None:
         raise CoordError("remote guarded run is not open on this host")
-    return coord.check(row["resource"], token)
+    return coord.check(row["resource"], token, require_fresh=False)
 
 
 def _close_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:
@@ -237,8 +249,17 @@ def _remote_clear(coord: Coordinator, session: str, host: str, p: dict, action: 
     except ValueError as error: raise CoordError("remote receipt evidence is invalid base64") from error
     if not evidence_bytes or len(evidence_bytes) > 2 * 1024 * 1024:
         raise CoordError("remote receipt evidence is missing or too large")
-    required = {"version", "resource", "reservation_id", "restored", "processes_closed", "closed_at", "evidence", "pids"}
-    if set(receipt) != required or receipt.get("version") != 1 or receipt.get("resource") != resource or receipt.get("restored") is not True or receipt.get("processes_closed") is not True:
+    try:
+        proofs = process_closure_proofs(receipt)
+        reports = p.get('process_evidence_base64', {})
+        if not isinstance(reports, dict) or set(reports) != {str(pid) for pid in proofs}:
+            raise ValueError('process closure evidence must cover exactly the receipt proofs')
+        for pid, proof in proofs.items():
+            if not isinstance(reports[str(pid)], str):
+                raise ValueError('process closure evidence is invalid base64')
+            validate_process_evidence(proof, base64.b64decode(reports[str(pid)], validate=True))
+    except ValueError as error: raise CoordError(str(error)) from error
+    if receipt.get("resource") != resource or receipt.get("restored") is not True or receipt.get("processes_closed") is not True:
         raise CoordError("remote receipt does not bind a restored reservation")
     if not isinstance(receipt["closed_at"], (int, float)) or isinstance(receipt["closed_at"], bool) or not isinstance(receipt["pids"], list) or any(not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 for pid in receipt["pids"]):
         raise CoordError("remote receipt has invalid closure data")
@@ -261,10 +282,10 @@ def _remote_clear(coord: Coordinator, session: str, host: str, p: dict, action: 
             # each activated process is explicitly covered by that proof.
             # PID 0 is safe to clear only because the client gate never allows
             # execution until attach-guard-pid commits the actual process group.
-            if any(row["host_id"] != host or (row["local_pid"] != 0 and row["local_pid"] not in receipt["pids"]) or receipt["closed_at"] < row["started_at"] for row in open_rows):
+            if any(row["host_id"] != host or (row["local_pid"] != 0 and row["local_pid"] not in receipt["pids"]) or proofs.get(row["local_pid"], receipt)["closed_at"] < row["started_at"] for row in open_rows):
                 raise CoordError("remote open guarded run is not covered by this host receipt")
             db.executemany("UPDATE remote_guarded_runs SET closed_at=?,close_evidence_sha256=? WHERE run_id=?",
-                           [(receipt["closed_at"], hashlib.sha256(evidence_bytes).hexdigest(), row["run_id"]) for row in open_rows])
+                           [(proofs.get(row["local_pid"], receipt)["closed_at"], proofs.get(row["local_pid"], {}).get('evidence_sha256', hashlib.sha256(evidence_bytes).hexdigest()), row["run_id"]) for row in open_rows])
         open_runs = db.execute("SELECT 1 FROM remote_guarded_runs WHERE reservation_id=? AND closed_at IS NULL", (r["reservation_id"],)).fetchone()
         if open_runs: raise CoordError("remote guarded run remains open")
         latest = db.execute("SELECT MAX(closed_at) value FROM remote_guarded_runs WHERE reservation_id=?", (r["reservation_id"],)).fetchone()["value"]

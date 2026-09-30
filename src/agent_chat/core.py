@@ -23,6 +23,13 @@ import sys
 import time
 from typing import Any, Iterator
 
+if __package__:
+    from .processes import receipt_pid_alive
+    from .receipts import process_closure_proofs, read_process_evidence
+else:  # The legacy coordinator is also exercised as a standalone script.
+    from processes import receipt_pid_alive
+    from receipts import process_closure_proofs, read_process_evidence
+
 def _project_root() -> pathlib.Path:
     """Resolve the caller's project root, never this installed package."""
     return pathlib.Path(
@@ -45,6 +52,16 @@ IMAGE_SIGNATURES = (
     (b"GIF87a", "image/gif"),
     (b"GIF89a", "image/gif"),
 )
+IMAGE_EXTENSIONS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+TEXT_EXTENSIONS = {
+    ".txt": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown",
+    ".json": "application/json", ".xml": "application/xml",
+    ".csv": "text/csv", ".tsv": "text/tab-separated-values", ".log": "text/plain",
+    ".yaml": "application/yaml", ".yml": "application/yaml", ".toml": "application/toml",
+}
 
 
 class CoordError(RuntimeError):
@@ -172,6 +189,24 @@ class Coordinator:
             if old and old["agent"] != agent: raise CoordError("session is already registered to another agent")
             if not old: db.execute("INSERT INTO sessions(id,agent,registered_at) VALUES(?,?,?)", (sid, agent, _now()))
         self.session = sid
+        return {"session": sid, "agent": agent}
+
+    def rename(self, agent: str) -> dict[str, Any]:
+        """Change the caller's display name without replacing its identity."""
+        if not isinstance(agent, str) or not agent.strip():
+            raise CoordError("agent must be nonempty")
+        sid = self.require_session()
+        # A label edit must not observe expiry or otherwise mutate reservations.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if self.db.execute("SELECT 1 FROM sessions WHERE agent=? AND id<>?", (agent, sid)).fetchone():
+                raise CoordError("agent name is already registered to another session")
+            self.db.execute("UPDATE sessions SET agent=? WHERE id=?", (agent, sid))
+        except BaseException:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
         return {"session": sid, "agent": agent}
 
     def remove_session(self, session_id: str) -> dict[str, Any]:
@@ -510,10 +545,43 @@ class Coordinator:
             return "image/webp"
         return None
 
+    @staticmethod
+    def _attachment_name(name: str) -> str:
+        name = pathlib.Path(name.replace("\\", "/")).name
+        name = "".join(char if char.isprintable() and char not in "/\\" else "_" for char in name).strip(" .")
+        return name[:255] or "attachment"
+
+    @classmethod
+    def _prepare_attachment(cls, name: str, content: bytes) -> tuple[str, str, bytes]:
+        name = cls._attachment_name(name)
+        extension = pathlib.Path(name).suffix.lower()
+        mime = IMAGE_EXTENSIONS.get(extension) or TEXT_EXTENSIONS.get(extension)
+        if mime is None:
+            raise CoordError("unsupported attachment type; choose PNG, JPEG, GIF, WebP, TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, or TOML")
+        if not content:
+            raise CoordError("attachment must be nonempty")
+        if len(content) > MAX_ATTACHMENT_SIZE:
+            raise CoordError("attachment exceeds 10 MiB")
+        if extension in IMAGE_EXTENSIONS:
+            if cls._image_mime(content) != mime:
+                raise CoordError("attachment content does not match its image extension")
+        else:
+            # Documents are opaque UTF-8 data: never parse XML, render markup, or
+            # execute configuration. Reject binary payloads and renamed scripts.
+            try:
+                text = content.decode("utf-8-sig")
+            except UnicodeDecodeError as error:
+                raise CoordError("document attachments must contain UTF-8 text") from error
+            if any((ord(char) < 32 and char not in "\t\r\n") or 127 <= ord(char) < 160 for char in text):
+                raise CoordError("document attachments must not contain binary or control bytes")
+            if text.lstrip().startswith("#!"):
+                raise CoordError("executable scripts are not allowed as attachments")
+        return name, mime, content
+
     def _prepare_attachments(self, paths: list[str | os.PathLike[str]] | None) -> list[tuple[str, str, bytes]]:
         paths = paths or []
         if len(paths) > MAX_ATTACHMENTS:
-            raise CoordError(f"at most {MAX_ATTACHMENTS} image attachments are allowed")
+            raise CoordError(f"at most {MAX_ATTACHMENTS} attachments are allowed")
         prepared = []
         for raw in paths:
             path = pathlib.Path(raw)
@@ -528,12 +596,7 @@ class Coordinator:
                     content = stream.read(MAX_ATTACHMENT_SIZE + 1)
             except OSError as error:
                 raise CoordError("attachment is unreadable: " + str(error)) from error
-            if len(content) > MAX_ATTACHMENT_SIZE:
-                raise CoordError("attachment exceeds 10 MiB")
-            mime = self._image_mime(content)
-            if mime is None:
-                raise CoordError("attachment is not a supported PNG, JPEG, GIF, or WebP image")
-            prepared.append((path.name, mime, content))
+            prepared.append(self._prepare_attachment(path.name, content))
         return prepared
 
     @staticmethod
@@ -839,18 +902,23 @@ class Coordinator:
         if not allow_stale and self._state(r)!="owned": raise CoordError("reservation is stale")
         return r
 
-    def check(self,raw:str,token:str)->dict[str,Any]:
+    def check(self,raw:str,token:str,*,require_fresh:bool=True)->dict[str,Any]:
         sid,resource=self.require_session(),self.resource_name(raw)
         with self.tx() as db:
-            self._fresh(db,sid);r=self._verify_owner(db,resource,sid,token)
+            # Active pulses retain ownership; messages arriving after an inbox
+            # poll must not invalidate an otherwise live reservation.
+            if require_fresh: self._fresh(db,sid)
+            r=self._verify_owner(db,resource,sid,token)
         return {"state":"owned","resource":resource,"reservation_id":r["reservation_id"],"deadline":r["deadline"]}
 
-    def _validate_receipt(self,path:str,r:sqlite3.Row)->tuple[str,str,str]:
+    def _validate_receipt(self,path:str,r:sqlite3.Row)->tuple[str,str,str,dict]:
         try: data=json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
         except Exception as e: raise CoordError("receipt is unreadable JSON: "+str(e))
-        needed={"version","resource","reservation_id","restored","processes_closed","closed_at","evidence","pids"}
-        if not isinstance(data,dict) or set(data)!=needed: raise CoordError("receipt must contain exactly the required fields")
-        if data["version"]!=1 or data["resource"]!=r["name"] or data["reservation_id"]!=r["reservation_id"] or data["restored"] is not True or data["processes_closed"] is not True: raise CoordError("receipt does not bind this restored reservation")
+        try:
+            proofs = process_closure_proofs(data)
+            read_process_evidence(proofs, path)
+        except (ValueError, OSError) as error: raise CoordError(str(error)) from error
+        if data["resource"]!=r["name"] or data["reservation_id"]!=r["reservation_id"] or data["restored"] is not True or data["processes_closed"] is not True: raise CoordError("receipt does not bind this restored reservation")
         if not isinstance(data["closed_at"],(int,float)) or isinstance(data["closed_at"],bool) or not r["granted_at"]<=data["closed_at"]<=_now(): raise CoordError("receipt closed_at is invalid")
         if not isinstance(data["evidence"],str) or not data["evidence"].strip() or not isinstance(data["pids"],list) or any(not isinstance(p,int) or isinstance(p,bool) or p<=0 for p in data["pids"]): raise CoordError("receipt evidence or pids is invalid")
         evidence = pathlib.Path(data["evidence"])
@@ -860,11 +928,9 @@ class Coordinator:
         except OSError as e: raise CoordError("receipt evidence report is unavailable: " + str(e))
         if not evidence_bytes: raise CoordError("receipt evidence report is empty")
         for pid in data["pids"]:
-            try: os.kill(pid,0)
-            except ProcessLookupError: continue
-            except PermissionError: raise CoordError("receipt lists a still-live PID")
-            raise CoordError("receipt lists a still-live PID")
-        canonical=json.dumps(data,sort_keys=True,separators=(",",":")); return canonical,hashlib.sha256(canonical.encode()).hexdigest(),hashlib.sha256(evidence_bytes).hexdigest()
+            if receipt_pid_alive(pid, proofs.get(pid, data)["closed_at"]):
+                raise CoordError("receipt lists a still-live PID (or its start time cannot prove PID reuse)")
+        canonical=json.dumps(data,sort_keys=True,separators=(",",":")); return canonical,hashlib.sha256(canonical.encode()).hexdigest(),hashlib.sha256(evidence_bytes).hexdigest(),proofs
 
     @staticmethod
     def _alive(pid:int, group:bool=False)->bool:
@@ -873,21 +939,23 @@ class Coordinator:
         except ProcessLookupError: return False
         except PermissionError: return True
 
-    def _runs_closed(self,db:sqlite3.Connection,resource:str,allow_dead:bool,attested_closed_at:float)->None:
+    def _runs_closed(self,db:sqlite3.Connection,resource:str,allow_dead:bool,attested_closed_at:float,proofs:dict)->None:
         runs=db.execute("SELECT run_id,pid,pgid,started_at FROM guarded_runs WHERE resource=? AND closed_at IS NULL",(resource,)).fetchall()
-        live=[r for r in runs if self._alive(r["pid"]) or (r["pgid"] is not None and self._alive(r["pgid"],True))]
+        closure = lambda r: proofs.get(r["pid"], {"closed_at": attested_closed_at})["closed_at"]
+        if any(closure(r) < r["started_at"] for r in runs): raise CoordError("process closure proof predates an unclosed guarded run")
+        live=[r for r in runs if receipt_pid_alive(r["pid"], closure(r)) or (r["pgid"] is not None and self._alive(r["pgid"],True))]
         if live or (runs and not allow_dead): raise CoordError("guarded run remains open; it must close before release or recovery")
         if any(attested_closed_at < r["started_at"] for r in runs): raise CoordError("receipt predates an unclosed guarded run")
-        if runs: db.executemany("UPDATE guarded_runs SET closed_at=? WHERE run_id=?",[(attested_closed_at,r["run_id"]) for r in runs])
+        if runs: db.executemany("UPDATE guarded_runs SET closed_at=? WHERE run_id=?",[(closure(r),r["run_id"]) for r in runs])
 
     def _clear_with_receipt(self,db:sqlite3.Connection,r:sqlite3.Row,path:str,action:str)->None:
         if self._remote_bound(db, r["owner_session"]):
             raise CoordError("remote reservation requires receipt proof from its owning host via --server")
-        canonical,digest,evidence_digest=self._validate_receipt(path,r)
+        canonical,digest,evidence_digest,proofs=self._validate_receipt(path,r)
         attested=json.loads(canonical)["closed_at"]
         latest=db.execute("SELECT MAX(closed_at) x FROM guarded_runs WHERE reservation_id=?",(r["reservation_id"],)).fetchone()["x"]
         if latest is not None and attested < latest: raise CoordError("receipt predates the most recent guarded run closure")
-        self._runs_closed(db,r["name"],self._state(r)=="stale",attested)
+        self._runs_closed(db,r["name"],self._state(r)=="stale",attested,proofs)
         if db.execute("SELECT 1 FROM receipts WHERE reservation_id=? OR receipt_sha256=?",(r["reservation_id"],digest)).fetchone(): raise CoordError("receipt has already been used")
         db.execute("INSERT INTO receipts(reservation_id,receipt_sha256,evidence_sha256,receipt_json,action,recorded_at) VALUES(?,?,?,?,?,?)",(r["reservation_id"],digest,evidence_digest,canonical,action,_now()))
         db.execute("UPDATE resources SET owner_session=NULL,reservation_id=NULL,token=NULL,granted_at=NULL,deadline=NULL,stale=0,reason=NULL WHERE name=?",(r["name"],))
@@ -961,7 +1029,7 @@ class ValidationGuard:
             self.coord.close()
             raise
     def pulse(self)->None:
-        self._emit_inbox();self.coord.check(self.resource,self.token)
+        self._emit_inbox();self.coord.check(self.resource,self.token,require_fresh=False)
     def __exit__(self,typ:Any,val:Any,tb:Any)->bool:
         if self.run_id and self.safe_to_close: self.coord.close_guard(self.run_id)
         self.coord.close();return False
@@ -1066,6 +1134,7 @@ def main(argv:list[str]|None=None)->int:
     p=argparse.ArgumentParser(prog="agent-chat");p.add_argument("--db");p.add_argument("--session")
     sub=p.add_subparsers(dest="op",required=True)
     x=sub.add_parser("register");x.add_argument("--agent",required=True)
+    x=sub.add_parser("rename", help="change your name while preserving your session");x.add_argument("--agent",required=True)
     x=sub.add_parser("send");x.add_argument("--to",required=True);x.add_argument("--body-file",required=True);x.add_argument("--attach",action="append",default=[]);x.add_argument("--reply-to")
     x=sub.add_parser("link-reply");x.add_argument("id");x.add_argument("--reply-to",required=True)
     x=sub.add_parser("inbox");x.add_argument("--agent");x.add_argument("--all",action="store_true")
@@ -1086,6 +1155,7 @@ def main(argv:list[str]|None=None)->int:
     try:
         c=Coordinator(a.db,a.session)
         if a.op=="register": out=c.register(a.agent)
+        elif a.op=="rename": out=c.rename(a.agent)
         elif a.op=="send": out=c.send(a.to,pathlib.Path(a.body_file).read_text(encoding="utf-8"),a.attach,a.reply_to)
         elif a.op=="link-reply": out=c.link_reply(a.id,a.reply_to)
         elif a.op=="inbox":

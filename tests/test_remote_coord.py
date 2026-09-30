@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 import os
+import time
 from pathlib import Path
 
 from agent_chat.core import Coordinator, CoordError
@@ -42,6 +43,33 @@ class RemoteCoordTests(unittest.TestCase):
         result = self.call("release", resource="shared", token=claim["token"], receipt=receipt,
                            evidence_base64=base64.b64encode(b"proof").decode())
         self.assertTrue(result["released"])
+
+    def test_unread_messages_do_not_bypass_guard_ownership_or_lifecycle_checks(self):
+        self.call('register', agent='alpha')
+        self.call('register', session='b', agent='beta')
+        claim = self.call('request', resource='shared', minutes=5)
+        run = self.call('begin-guard', resource='shared', token=claim['token'])
+        self.call('send', session='b', to='a', body='New coordination message.')
+        params = dict(run_id=run['run_id'], token=claim['token'])
+        self.assertEqual(self.call('guard-pulse', **params)['state'], 'owned')
+        with self.assertRaisesRegex(CoordError, 'reservation token'):
+            self.call('guard-pulse', run_id=run['run_id'], token='invalid')
+        with self.assertRaisesRegex(CoordError, 'not open on this host'):
+            self.call('guard-pulse', session='b', **params)
+        with self.assertRaisesRegex(CoordError, 'read your inbox'):
+            self.call('begin-guard', resource='shared', token=claim['token'])
+        with self.assertRaisesRegex(CoordError, 'read your inbox'):
+            self.call('request', resource='another', minutes=5)
+        coord = Coordinator(self.db)
+        try:
+            coord.db.execute("UPDATE resources SET deadline=? WHERE name='shared'", (time.time()-1,))
+        finally:
+            coord.close()
+        with self.assertRaisesRegex(CoordError, 'reservation is stale'):
+            self.call('guard-pulse', **params)
+        self.call('close-guard', evidence_sha256='0' * 64, **params)
+        with self.assertRaisesRegex(CoordError, 'not open on this host'):
+            self.call('guard-pulse', **params)
 
     def test_legacy_hold_cannot_be_claimed_by_remote_host(self):
         coord = Coordinator(self.db, "legacy")

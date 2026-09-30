@@ -1,3 +1,135 @@
+# Publication readiness review — 2026-09-30
+
+Reviewed the current working tree for fresh installation, macOS/Linux platform
+assumptions, agent tooling and distributable assets. Fixed bridge-owned Codex
+descendant cleanup by starting an isolated process group and closing it even
+after its leader exits. Added read-only `agent-chat-client doctor` and optional
+Codex executable/login checks. Fresh-machine instructions now list Python, jq,
+ps, PATH, native service requirements and independently provisioned project
+tools. Personal communication skills are optional; AI assistance is disclosed.
+
+Added pinned Playwright development dependencies, a source-distribution manifest,
+installed-wheel smoke checks and macOS/Linux GitHub Actions. The broad browser
+suite now waits for asynchronous original-message loading and asserts the current
+direct-conversation and single-member group contracts, retaining attachment,
+project-isolation and per-delivery acknowledgement checks.
+Added the operator-selected MIT license, SPDX package metadata and license
+inclusion in both distribution formats.
+
+Validation on macOS: all 303 Python tests passed on Python 3.10.20 (97.303 s) and
+3.14.7 (106.306 s). All eight browser suites passed with Chrome, including 320 px
+layout, conversations, group receipts, clipboard fallbacks, uploads, projects,
+weekly usage and measurement controls. The source archive rebuilt a wheel that
+installed into a fresh virtual environment; outside-checkout smoke verified
+doctor, project listing, two registered agents, delivery, acknowledgement,
+authenticated packaged assets and the service entry point. npm ci, shell/JS
+syntax, CI YAML parsing and whitespace checks passed. Targeted checks found no
+tracked runtime databases/token sidecars or recognizable private-key/API-token
+patterns in tracked text; this was not an exhaustive secret-history audit.
+
+Codex 0.159.2's locally generated experimental schema retains the queue APIs,
+direct-input capability, turn summaries and quota methods used by the bridge.
+No live model wake was started. Tests and smoke checks used disposable databases,
+servers and process groups, and closed their fixtures.
+
+Remaining publication evidence: there is no Linux runtime on this host, so the new Linux CI jobs and native
+systemd lifecycle smoke have not run here. Linux/macOS simulated service tests
+passed, but Linux CI must pass before claiming verified Linux operation.
+Existing user changes were preserved; no commit or publication was performed.
+
+---
+
+# Receipt recovery after PID reuse — 2026-09-30
+
+Version 1 receipts compare current process birth against resource closure.
+Version 2 adds separate historical process closure timestamps and SHA-256-bound
+evidence reports, so resource restoration can truthfully finish after PID reuse.
+Local and HTTP-client checks compare each PID with its applicable closure proof;
+the server verifies uploaded proof bytes and records their hashes in the receipt.
+Historical proofs cannot close later guarded runs. Unknown or same-second starts
+still block; open process groups retain their independent liveness check.
+
+Validation: the reported process-closure/replacement/restoration ordering passed
+against an isolated HTTP server while the replacement remained running. Local
+and remote regressions also cover altered/missing proof files, malformed proofs,
+closed guards, live groups and proofs predating later guarded work. All 276 Python
+tests passed in 98.725 seconds; diff checks passed. Process-start inspection was
+exercised on macOS. After restarting only the existing server, all 16 original
+Hospital Clinical pass3 holds were recovered through the supported API. All 166
+PIDs, original reservation IDs and resource timestamps were retained. ShipIt and
+the user's Designer/Editors remained running. Original receipts, v2 copies, API
+responses and final free-resource status were retained in the Unity recovery
+handoff's `pid-proof-v2` evidence directory. No database migration/reset occurred.
+
+---
+
+# Static document attachments — 2026-09-26
+
+Operator uploads and agent sends now share an extension/content allowlist for
+images and UTF-8 TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, and TOML files.
+Documents download with attachment disposition, nosniff, and a sandboxed CSP;
+the UI renders filename/type tiles. Unsupported extensions, binary/control
+content, shebang scripts, and mismatched image signatures are rejected before
+messages are inserted. Existing four-file and 10 MiB limits remain.
+
+Validation: all 261 Python tests passed in 87.190 seconds. The new
+`tests/static_attachments_browser.cjs` passed in headless Chrome with isolated
+fixtures: drag/drop and picker uploads, document-only and mixed image/document
+batches, exact downloads, limits, spoofed extensions, failed-draft retention,
+and document-card bounds at 320 px. Desktop/mobile screenshots were inspected.
+Manual HTTP checks also exercised operator and agent XML uploads and download
+headers. Syntax and diff checks passed. Test services were isolated from live
+conversations.
+
+The existing broad browser suite stops at its 320 px header-overflow assertion
+(`tests/web_browser.cjs:165`). The same failure was reproduced with unchanged
+HEAD UI assets; it precedes the upload scenarios and is outside this change.
+
+---
+
+# Portable background services — 2026-09-24
+
+Added `agent-chat-service` install/start/stop/restart/status/uninstall for macOS
+launchd and Linux systemd user services. Separate server/client selection and
+staged installation preserve existing databases and host identities. Private
+wrappers read credentials from files; the service definitions contain no token
+values. macOS registers named helper bundles and Linux units have descriptive
+service names.
+
+Validation: the full 251-test Python suite passed in 85.958 seconds before the
+final bundle-naming change; all 16 affected service tests then passed on the
+final implementation. A real temporary launchd fixture completed installation,
+start, restart, stop and uninstall. The actual services were migrated only after
+six loaded conversations were idle and no guarded runs were open. Four existing
+conversations reconnected automatically and the other two were resumed by their
+original IDs without new turns. Service health and one listener per endpoint
+were verified. macOS Background Task Management and System Settings both show
+enabled **Agent Chat Server** and **Agent Chat Client** entries.
+
+Linux config rendering, escaping, native command generation, and wrapper
+execution are covered by tests. A running Linux systemd instance was not
+available on this Mac, so Linux service activation was not exercised.
+
+---
+
+# Guarded-run inbox race — 2026-09-24
+
+Reproduced the reported native-build abort with an isolated HTTP server and a
+real child process: a message delivered between the inbox read and guard pulse
+raised “read your inbox after the newest message before changing ownership”.
+Active local and remote pulses now verify ownership, token and expiry without
+requiring inbox freshness. New-run authorization, explicit `check`, acquisition,
+release and recovery retain their existing freshness requirements.
+
+Validation: all 238 Python tests passed in 85.555 seconds. New regressions cover
+the local read/pulse race, successful subprocess completion over HTTP, subsequent
+message delivery without acknowledgement, and rejection of invalid tokens,
+wrong sessions, expired reservations and closed runs despite unread messages.
+This validates agent-chat only; Gameplay's four-process world proof remains a
+separate, unrun acceptance step.
+
+---
+
 # Token efficiency — 2026-09-23
 
 Implemented bounded context/message retrieval, filtered resource status, atomic

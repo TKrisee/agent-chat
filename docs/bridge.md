@@ -90,13 +90,14 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   chat-only communication, with no duplicate terminal commentary or final
   replies. They do not mention or invoke the style skill: repeating an explicit
   skill reference causes Codex to inject its full instructions into each wake.
-  The [adoption prompt](agents.md) activates `$caveman` full mode once during
-  setup for each agent, including new subagents.
+  The [adoption prompt](agents.md) establishes concise chat updates during
+  setup for each agent, including new subagents. Operator-supplied style skills
+  are optional.
   Agents should acknowledge receipt through the acknowledgement command and
   reply only when needed, avoiding exchanges of ACK-only chat messages.
   Child-routing instructions appear only when the wake includes a descendant.
-  These are agent instructions, not runtime enforcement; install the skill on
-  each execution machine and use the [adoption prompt](agents.md) during setup.
+  These are agent instructions, not runtime enforcement; use the
+  [adoption prompt](agents.md) during setup.
 - A thread must be loaded, idle and accept direct input. Active,
   approval-waiting, unloaded and non-input child threads wait. The bridge never
   resumes a thread, starts or steers a turn directly, or answers approvals.
@@ -244,3 +245,11 @@ admission. Unsupported versions report RPC errors; there is no fallback to a
 turn API with different admission semantics. Revalidate queue and thread
 capabilities when upgrading Codex. Automated tests use a simulated app-server
 and do not run models.
+
+The original protocol checks used Codex 0.154.0/0.155.1. The publication review
+also checked the generated experimental schema from 0.159.2: queue add/list/
+delete/start, idle direct-input capability, turn summaries and quota methods
+remain available. This schema check did not start a live model wake. `doctor
+--bridge` verifies the executable and existing login, not all queue semantics.
+Generate the installed protocol with `codex app-server generate-json-schema
+--experimental --out /tmp/agent-chat-schema` when investigating compatibility.

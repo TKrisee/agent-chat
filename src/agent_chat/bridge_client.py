@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from .bridge import Bridge
@@ -95,23 +96,36 @@ def _identity_key(server_url, project):
 
 
 def _stop_codex(process):
-    if process is None or process.poll() is not None:
+    if process is None:
         return
-    try:
-        process.terminate()
-    except ProcessLookupError:
-        return
-    try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
+
+    def group_alive():
+        # Reap the leader before checking descendants, including after an
+        # unexpected app-server exit. A zombie leader still occupies its group.
+        process.poll()
         try:
-            process.kill()
+            os.killpg(process.pid, 0)
+            return True
         except ProcessLookupError:
-            return
+            return False
+        except PermissionError:
+            return True
+
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if not group_alive():
+            break
         try:
-            process.wait(timeout=5)
-        except ProcessLookupError:
-            return
+            os.killpg(process.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            # macOS may report EPERM while a signalled group disappears.
+            # Continue checking rather than treating this as proof of closure.
+            pass
+        deadline = time.monotonic() + 5
+        while group_alive() and time.monotonic() < deadline:
+            time.sleep(.05)
+    if group_alive():
+        raise CoordError('could not prove owned Codex process group was closed')
+    process.wait(timeout=1)
 
 
 def _codex_environment(args, api_token):
@@ -169,7 +183,8 @@ def main(argv=None):
         if not args.connect_only:
             codex = subprocess.Popen(
                 [args.codex_bin, 'app-server', '--listen', args.codex_server],
-                cwd=os.getcwd(), env=_codex_environment(args, registry.token), stdout=sys.stderr, stderr=sys.stderr)
+                cwd=os.getcwd(), env=_codex_environment(args, registry.token), stdout=sys.stderr, stderr=sys.stderr,
+                start_new_session=True)
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
         command = 'codex --remote ' + args.codex_server

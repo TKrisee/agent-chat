@@ -12,6 +12,8 @@ import sqlite3
 import sys
 
 from . import core
+from .processes import receipt_pid_alive
+from .receipts import process_closure_proofs, read_process_evidence
 
 def main(argv=None):
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -40,11 +42,15 @@ def main(argv=None):
         return bridge_main(bridge_args + (remainder if default_bridge else remainder[1:]))
     if remainder[0] == 'project':
         return _project_main(remainder[1:], args, args.server)
+    if remainder[0] == 'doctor':
+        from .doctor import main as doctor_main
+        return doctor_main(remainder[1:], connection=args)
     if remainder in (['--help'], ['-h']):
         globals_parser.prog = 'agent-chat-client'
         globals_parser.print_help()
         print('\nRun without a command (or use bridge) to start the local Codex app-server and wake bridge.\n'
-              'Use bridge --help for startup options; project --help for project commands.\n')
+              'Use bridge --help for startup options; project --help for project commands.\n'
+              'Use doctor for read-only connection and tool checks; doctor --bridge also checks Codex.\n')
     return _remote_main(remainder, args, args.server)
 
 
@@ -76,6 +82,7 @@ def _remote_main(raw, global_args, server):
     p = argparse.ArgumentParser(prog='agent-chat-client')
     sub = p.add_subparsers(dest='op', required=True)
     x = sub.add_parser('register'); x.add_argument('--agent', required=True)
+    x = sub.add_parser('rename', help='change your name while preserving your session'); x.add_argument('--agent', required=True)
     x = sub.add_parser('inbox'); x.add_argument('--all', action='store_true'); x.add_argument('--agent')
     x = sub.add_parser('context', help='bounded unread messages and relevant resources')
     x.add_argument('--limit', type=int, default=20); x.add_argument('--max-bytes', type=int, default=12288)
@@ -144,16 +151,21 @@ def _remote_main(raw, global_args, server):
     if op in ('release', 'recover'):
         receipt_path = Path(params.pop('receipt'))
         receipt = json.loads(receipt_path.read_text(encoding='utf-8'))
-        needed = {'version', 'resource', 'reservation_id', 'restored', 'processes_closed', 'closed_at', 'evidence', 'pids'}
-        if not isinstance(receipt, dict) or set(receipt) != needed or receipt['version'] != 1 or receipt['resource'] != params['resource'] or receipt['restored'] is not True or receipt['processes_closed'] is not True:
+        try:
+            proofs = process_closure_proofs(receipt)
+            reports = read_process_evidence(proofs, receipt_path)
+        except (ValueError, OSError) as error:
+            raise core.CoordError(str(error)) from error
+        if receipt['resource'] != params['resource'] or receipt['restored'] is not True or receipt['processes_closed'] is not True:
             raise core.CoordError('receipt does not bind this restored reservation')
         if not isinstance(receipt['pids'], list) or any(not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0 for pid in receipt['pids']):
             raise core.CoordError('receipt PIDs are invalid')
+        if (isinstance(receipt['closed_at'], bool) or not isinstance(receipt['closed_at'], (int, float))
+                or not 0 < receipt['closed_at'] <= time.time()):
+            raise core.CoordError('receipt closed_at is invalid')
         for pid in receipt['pids']:
-            try: os.kill(pid, 0)
-            except ProcessLookupError: continue
-            except PermissionError: raise core.CoordError('receipt lists a still-live PID')
-            raise core.CoordError('receipt lists a still-live PID')
+            if receipt_pid_alive(pid, proofs.get(pid, receipt)['closed_at']):
+                raise core.CoordError('receipt lists a still-live PID (or its start time cannot prove PID reuse)')
         state = call('status', {})
         row = next((item for item in state['resources'] if item['resource'] == params['resource']), None)
         if not row or row['reservation_id'] != receipt['reservation_id']:
@@ -162,12 +174,19 @@ def _remote_main(raw, global_args, server):
         if context['reservation_id'] != receipt['reservation_id']:
             raise core.CoordError('reservation changed while checking proof')
         for run in context['runs']:
-            if run['local_pid'] and (core.Coordinator._alive(run['local_pid']) or core.Coordinator._alive(run['local_pid'], True)):
+            if run['closed_at'] is not None:
+                continue
+            process_closed_at = proofs.get(run['local_pid'], receipt)['closed_at']
+            if process_closed_at < run['started_at']:
+                raise core.CoordError('process closure proof predates an unclosed guarded run')
+            if run['local_pid'] and (receipt_pid_alive(run['local_pid'], process_closed_at) or core.Coordinator._alive(run['local_pid'], True)):
                 raise core.CoordError('guarded process group is still alive; close it before recovery')
         evidence_path = Path(receipt['evidence'])
         if not evidence_path.is_absolute(): evidence_path = receipt_path.parent / evidence_path
         params['receipt'] = receipt
         params['evidence_base64'] = base64.b64encode(evidence_path.read_bytes()).decode('ascii')
+        if receipt['version'] == 2:
+            params['process_evidence_base64'] = {str(pid): base64.b64encode(data).decode('ascii') for pid, data in reports.items()}
     if op == 'run':
         command = params.pop('command')
         if command and command[0] == '--': command = command[1:]
