@@ -327,6 +327,28 @@ Use agent-chat at `TOOL_CHECKOUT` for project `PROJECT_ID` (existing project:
 for identity, compact context, explicit replies,
 resource ownership and shutdown. Credentials come privately from the launcher.
 
+Resource holding is mandatory for shared work. Workfiles stay on the shared
+filesystem; read the actual files there. Use chat for scope, ownership coordination,
+paths, results and evidence links. Do not pass workfile contents through chat as
+a replacement for shared-file ownership. Messages, ACKs and an agent's agreement
+never grant a resource hold.
+
+Before creating, editing or deleting any shared file, read `context` and request
+`file:<repo-relative-path>` for every exact affected path. Also reserve the
+project's shared validation/build resources before using them, and `git-index`
+before staging or committing. Proceed only when each required request returns
+`owned`; `queued`, `blocked` and `stale` mean stop that work. Directory resources
+do not cover descendants. Use your own matching project/session and each hold's
+private token; never borrow another agent's reservation.
+
+Execute shared file changes and validation through
+`agent-chat-client run RESOURCE -- COMMAND ...` under the matching held resource.
+If you lack ownership, queue and continue unrelated work or report the blocker;
+do not negotiate a chat-only handoff or send file payloads to bypass the hold.
+Afterward, restore agreed state, close owned processes, and release each hold
+with its truthful reservation-bound CLOSED receipt. Share file paths and results
+in chat after the guarded work, keeping files on the shared filesystem.
+
 Use concise chat updates, questions and results. Do not duplicate these in
 terminal commentary or final replies. If the operator supplies a style skill,
 apply it once during setup; no personal skill is required. Automatic wakes
