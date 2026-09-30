@@ -65,8 +65,9 @@ class ReceiptFixture:
         return str(path)
 
     def replacement_process(self):
-        # Cross the whole-second ps boundary before starting the replacement.
-        time.sleep(1.1)
+        # Linux ps floors both boot time and elapsed start ticks separately.
+        # Its displayed lower bound can lag the true start by almost two seconds.
+        time.sleep(2.1)
         proc = subprocess.Popen(['sleep', '30'], start_new_session=True)
         def cleanup():
             proc.terminate()

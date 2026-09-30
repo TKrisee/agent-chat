@@ -8,6 +8,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -17,6 +18,26 @@ from agent_chat import server
 
 
 class ServerTests(unittest.TestCase):
+    def test_numeric_listener_serves_without_reverse_dns(self):
+        with tempfile.TemporaryDirectory(prefix='agent-chat-server-dns-') as directory:
+            db = Path(directory) / 'state.sqlite3'
+            server.Coordinator(db).close()
+            with mock.patch('socket.getfqdn', side_effect=AssertionError('reverse DNS must not gate startup')):
+                listener = server.create_server(db, host='127.0.0.1', port=0)
+                try:
+                    self.assertEqual(listener.server_name, '127.0.0.1')
+                    self.assertGreater(listener.server_port, 0)
+                    worker = threading.Thread(target=listener.serve_forever, daemon=True)
+                    worker.start()
+                    try:
+                        with urllib.request.urlopen(listener.origin + '/', timeout=3) as response:
+                            self.assertEqual(response.status, 200)
+                    finally:
+                        listener.shutdown()
+                        worker.join(3)
+                finally:
+                    listener.server_close()
+
     def test_token_file_is_persistent_private_and_bootstraps_parent(self):
         with tempfile.TemporaryDirectory(prefix='agent-chat-server-') as directory:
             db = Path(directory) / 'missing' / 'state.sqlite3'

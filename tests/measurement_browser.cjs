@@ -24,6 +24,7 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-measurement-browser-') as di
     with log.open('a') as out:
         out.write(json.dumps({'type':'turn_context','payload':{'model':'gpt-6.1-sol','effort':'high'}})+'\\n')
     server = create_server(db, port=0, api_token='${token}', sessions_root=logs)
+    server.measurements.interval_seconds = .1
     server.usage.report('fixture-host', 93, None)
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
     print('http://127.0.0.1:' + str(server.server_port), flush=True)

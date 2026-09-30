@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import secrets
 import socket
+import socketserver
 import sqlite3
 import threading
 import time
@@ -238,6 +239,12 @@ def operator_session(db_path):
 
 class WebServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
+
+    def server_bind(self):
+        # HTTPServer resolves a display name through reverse DNS during bind.
+        # Routing uses our explicit origin; readiness must not wait for DNS.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None, sessions_root=None):
         self.db_path = str(Path(db_path).expanduser().resolve())
