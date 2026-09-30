@@ -90,14 +90,14 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   chat-only communication, with no duplicate terminal commentary or final
   replies. They do not mention or invoke the style skill: repeating an explicit
   skill reference causes Codex to inject its full instructions into each wake.
-  The [adoption prompt](agents.md) establishes concise chat updates during
+  The [adoption prompt](agents.md#adoption-prompt) establishes concise chat updates during
   setup for each agent, including new subagents. Operator-supplied style skills
   are optional.
   Agents should acknowledge receipt through the acknowledgement command and
   reply only when needed, avoiding exchanges of ACK-only chat messages.
   Child-routing instructions appear only when the wake includes a descendant.
   These are agent instructions, not runtime enforcement; use the
-  [adoption prompt](agents.md) during setup.
+  [adoption prompt](agents.md#adoption-prompt) during setup.
 - A thread must be loaded, idle and accept direct input. Active,
   approval-waiting, unloaded and non-input child threads wait. The bridge never
   resumes a thread, starts or steers a turn directly, or answers approvals.
