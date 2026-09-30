@@ -47,6 +47,19 @@ class ServiceTests(unittest.TestCase):
         self.assertIn("%%", text)
         self.assertIn("apostrophe' space", text)
 
+    def test_systemd_working_directory_is_a_literal_absolute_path(self):
+        self.args.project_root = '/tmp/project with "quotes" \\backslash $ and %'
+        text = self.manager("Linux").render("server", self.args)
+        self.assertIn('WorkingDirectory=/tmp/project with "quotes" \\backslash $ and %%/\n', text)
+
+    def test_systemd_directory_basename_can_end_in_parser_metacharacters(self):
+        for path, expected in (('/tmp/final\\', 'WorkingDirectory=/tmp/final\\/\n'),
+                               ('/tmp/final ', 'WorkingDirectory=/tmp/final /\n'),
+                               ('/tmp/final/', 'WorkingDirectory=/tmp/final/\n')):
+            with self.subTest(path=path):
+                self.args.project_root = path
+                self.assertIn(expected, self.manager("Linux").render("server", self.args))
+
     def test_linux_paths_honor_xdg_locations(self):
         manager = ServiceManager(system="Linux", home=self.home, python="/opt/python",
             server_bin="/opt/server", client_bin="/opt/client", run=lambda *_args, **_kwargs: None,

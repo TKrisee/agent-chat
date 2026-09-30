@@ -7,13 +7,17 @@ set -euo pipefail
 }
 service_bin=$(cd "${1:?usage: service-smoke.sh /absolute/venv/bin}" && pwd)
 service_dir=$(mktemp -d)
+service_project="$service_dir/project with spaces % and \"quotes\""
+service_project+='\'
+mkdir "$service_project"
 export PATH="$service_bin:$PATH"
 cleanup() {
     agent-chat-service uninstall --component server >/dev/null 2>&1 || true
     rm -rf "$service_dir"
 }
 trap cleanup EXIT
-agent-chat-service install --component server --no-start --db "$service_dir/state.sqlite3" --project-root "$service_dir"
+agent-chat-service install --component server --no-start --db "$service_dir/state.sqlite3" --project-root "$service_project"
+systemd-analyze --user verify "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/agent-chat-server.service"
 agent-chat-service start --component server
 for _ in {1..100}; do
     [ ! -s "$service_dir/state.sqlite3.api-token" ] || break

@@ -41,12 +41,14 @@ def _absolute(value: str | Path) -> str:
     return os.path.abspath(os.path.expanduser(str(value)))
 
 
-def _systemd_value(value: str | Path, *, exec_start: bool = False) -> str:
-    """Quote one systemd directive value without relying on shell quoting."""
+def _systemd_value(value: str | Path, *, exec_start: bool = False, quoted: bool = True) -> str:
+    """Escape specifiers, and quote directives that support word parsing."""
     text = str(value)
     if any(ord(char) < 32 for char in text):
         raise ServiceError("service paths cannot contain control characters")
-    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    text = text.replace("%", "%%")
+    if not quoted: return text
+    text = text.replace("\\", "\\\\").replace('"', '\\"')
     if exec_start: text = text.replace("$", "$$")
     return '"' + text + '"'
 
@@ -155,8 +157,10 @@ class ServiceManager:
     def _systemd(self, component: str, args: argparse.Namespace) -> str:
         paths = self.paths(component); env = self._environment(args)
         description = self._display_name(component) + (" (Codex wake bridge)" if component == "client" else "")
+        # Keep final basename whitespace/backslashes away from parser boundaries.
+        directory = args.project_root if args.project_root.endswith("/") else args.project_root + "/"
         lines = ["[Unit]", "Description=" + description, "", "[Service]", "Type=simple",
-                 "WorkingDirectory=" + _systemd_value(args.project_root), "ExecStart=" + _systemd_value(paths["wrapper"], exec_start=True),
+                 "WorkingDirectory=" + _systemd_value(directory, quoted=False), "ExecStart=" + _systemd_value(paths["wrapper"], exec_start=True),
                  "Restart=on-failure", "RestartSec=10"]
         lines.extend("Environment=" + _systemd_value(k + "=" + v) for k, v in env.items())
         lines.extend(["", "[Install]", "WantedBy=default.target", ""])
