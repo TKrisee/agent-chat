@@ -246,6 +246,34 @@ it does not infer subscription allowance or dollar cost.
 
 ## Shared resource receipts
 
+If an interrupted command leaves a remote guard open, inspect its authenticated
+records from the reservation's existing owner session and original host:
+
+```sh
+agent-chat-client guard-status RESOURCE --reservation-id EXACT_HELD_RESERVATION \
+  > /absolute/private/guard-status.json
+jq '.runs[] | {run_id, local_pid, started_at, closed_at}' /absolute/private/guard-status.json
+```
+
+This read-only command uses the existing HTTP guard context and works for owned
+or stale holds. It rejects another owner, another host, or a changed reservation.
+It prints every guard for that exact reservation, including closed records, and
+does not require or expose a reservation token. It neither closes a guard nor
+releases ownership; updating the client checkout suffices, with no service restart.
+
+For each open record (`closed_at == null`), use its nonzero `local_pid` as the
+authenticated process-group root, then verify the actual root, its group and any
+detached owned work have closed. A zero PID means the guard never attached a
+process; its command was not admitted through the execution gate. Readback alone
+is not proof of restoration or process closure. Include every relevant nonzero
+root and separately owned process in truthful receipt evidence; never invent
+missing PIDs or assume an interrupted CLI closed an external application.
+
+Normal release refuses an open remote guard. Once the same reservation is stale,
+supported `recover RESOURCE --receipt CLOSED.json` can close receipt-covered
+guards and clear the hold atomically after verifying restoration and actual
+process closure. Retain the existing owner, queue and evidence until it succeeds.
+Do not use a raw close operation to bypass receipt checks.
 
 Run guarded commands locally and release ownership with a closure receipt:
 

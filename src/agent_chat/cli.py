@@ -95,6 +95,8 @@ def _remote_main(raw, global_args, server):
     x = sub.add_parser('send'); x.add_argument('--to', action='append'); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to'); x.add_argument('--ack-reply', action='store_true')
     x = sub.add_parser('request'); x.add_argument('resource'); x.add_argument('--minutes', required=True, type=float)
     x = sub.add_parser('status'); x.add_argument('--mine', action='store_true'); x.add_argument('--resource', action='append', dest='resources')
+    x = sub.add_parser('guard-status', help='read your exact reservation guards on their owning host')
+    x.add_argument('resource'); x.add_argument('--reservation-id', required=True)
     x = sub.add_parser('cancel'); x.add_argument('resource')
     x = sub.add_parser('check'); x.add_argument('resource'); x.add_argument('--token')
     x = sub.add_parser('release'); x.add_argument('resource'); x.add_argument('--receipt', required=True); x.add_argument('--token')
@@ -325,6 +327,18 @@ def _remote_main(raw, global_args, server):
             for sig, handler in old_handlers.items(): signal.signal(sig, handler)
             if proc is not None: proc.wait()
         result = {'exit_code': proc.returncode, 'run_id': None if run is None else run['run_id']}
+    elif op == 'guard-status':
+        state = call('status', {'mine': True, 'resources': [params['resource']]})
+        row = next((item for item in state['resources'] if item['resource'] == params['resource']), None)
+        if not row or row['owner_session'] != session:
+            raise core.CoordError('guard-status requires the reservation owning session')
+        if row['reservation_id'] != params['reservation_id']:
+            raise core.CoordError('guard-status reservation does not match the current hold')
+        context = call('guard-context', {'resource': params['resource']})
+        if context['reservation_id'] != params['reservation_id']:
+            raise core.CoordError('reservation changed while reading guard status')
+        result = {'resource': params['resource'], 'reservation_id': context['reservation_id'],
+                  'runs': context['runs']}
     else:
         result = call(op, params)
     if op == 'context':

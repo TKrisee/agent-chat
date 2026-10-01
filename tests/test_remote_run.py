@@ -55,6 +55,80 @@ class RemoteRunTests(RemoteWebFixture):
         try: c.db.execute("UPDATE resources SET deadline=? WHERE name='shared'", (time.time()-1,))
         finally: c.close()
 
+    def guard_status(self):
+        result, output = self.invoke('guard-status', 'shared', '--reservation-id', self.claim['reservation_id'])
+        self.assertEqual(result, 0)
+        return output
+
+    def query_guard_status(self, output, expression, *args):
+        result = subprocess.run(['jq', '-er', *args, expression], input=output,
+                                text=True, capture_output=True, check=True)
+        return result.stdout.strip()
+
+    def test_guard_status_supplies_interrupted_roots_for_truthful_stale_recovery(self):
+        self.assertEqual(self.invoke('run', 'shared', '--', sys.executable, '-c', 'pass')[0], 0)
+        original = HttpClient.call
+        def outage(client, path, payload):
+            if payload.get('op') == 'guard-pulse':
+                raise RemoteCoordError('injected connection loss')
+            return original(client, path, payload)
+        with mock.patch.object(HttpClient, 'call', outage), self.assertRaisesRegex(RemoteCoordError, 'connection loss'):
+            self.invoke('run', 'shared', '--', sys.executable, '-c', 'import time; time.sleep(60)')
+        unattached = self.call('begin-guard', resource='shared', token=self.claim['token'])
+        before = self.runs()
+        held = self.call('status', resources=['shared'])
+        output = self.guard_status()
+        self.query_guard_status(output,
+            '.resource == "shared" and .reservation_id == $reservation and (.runs | length) == 3'
+            ' and (.runs | map(keys) | all(. == ["closed_at", "local_pid", "run_id", "started_at"]))'
+            ' and (.runs | any(.closed_at != null))'
+            ' and (.runs | any(.run_id == $unattached and .local_pid == 0 and .closed_at == null))',
+            '--arg', 'reservation', self.claim['reservation_id'], '--arg', 'unattached', unattached['run_id'])
+        root = int(self.query_guard_status(output, '.runs[] | select(.closed_at == null and .local_pid > 0) | .local_pid'))
+        self.assert_group_dead(root)
+        self.assertNotIn(self.claim['token'], output)
+        self.assertNotIn(TOKEN, output)
+        self.assertEqual(self.runs(), before)
+        self.assertEqual(self.call('status', resources=['shared']), held)
+        self.expire()
+        self.assertEqual(self.guard_status(), output)
+        pids = [int(pid) for pid in self.query_guard_status(output, '.runs[] | select(.local_pid > 0) | .local_pid').splitlines()]
+        self.assertEqual(self.invoke('recover', 'shared', '--receipt', self.receipt(pids))[0], 0)
+        self.assertEqual(self.call('status', resources=['shared'])['resources'][0]['state'], 'free')
+
+    def test_guard_status_rejects_other_session_and_host_without_changing_hold(self):
+        self.call('register', session='b', agent='beta')
+        before = self.call('status', resources=['shared'])
+        self.env['AGENT_CHAT_SESSION'] = 'b'
+        with self.assertRaisesRegex(CoordError, 'owning session'):
+            self.guard_status()
+        self.env['AGENT_CHAT_SESSION'] = 'a'
+        self.env['AGENT_CHAT_HOST_ID'] = 'other-host'
+        with self.assertRaisesRegex(RemoteCoordError, 'different remote host'):
+            self.guard_status()
+        self.assertEqual(self.call('status', resources=['shared']), before)
+        self.assertEqual(self.runs(), [])
+
+    def test_guard_status_requires_exact_existing_reservation(self):
+        with self.assertRaisesRegex(CoordError, 'does not match'):
+            self.invoke('guard-status', 'shared', '--reservation-id', 'old-reservation')
+        with self.assertRaisesRegex(CoordError, 'owning session'):
+            self.invoke('guard-status', 'missing', '--reservation-id', self.claim['reservation_id'])
+        self.query_guard_status(self.guard_status(), '.runs == []')
+        self.assertEqual(self.call('status', resources=['shared'])['resources'][0]['reservation_id'], self.claim['reservation_id'])
+
+    def test_guard_status_rejects_reservation_changed_during_readback(self):
+        original = HttpClient.call
+        def replacement(client, path, payload):
+            result = original(client, path, payload)
+            if payload.get('op') == 'guard-context':
+                result['reservation_id'] = 'replacement-reservation'
+            return result
+        with mock.patch.object(HttpClient, 'call', replacement), self.assertRaisesRegex(CoordError, 'reservation changed'):
+            self.guard_status()
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.call('status', resources=['shared'])['resources'][0]['reservation_id'], self.claim['reservation_id'])
+
     def test_invalid_token_never_executes_command(self):
         marker=Path(self.tmp.name)/'sentinel'
         self.env['AGENT_CHAT_TOKEN']='invalid'
