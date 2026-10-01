@@ -59,6 +59,13 @@
 .draft-image{display:flex;align-items:center;gap:7px;max-width:100%;padding:5px;border:1px solid #dce4d6;border-radius:6px;background:#fff}
 .draft-image img,.draft-image video{width:48px;height:42px;object-fit:contain;border-radius:3px;background:#f1f4ed}
 .message-attachment>a{color:inherit}
+.view-media{background:none;color:inherit;padding:7px 0 0;font-size:11px;text-decoration:underline;text-underline-offset:2px}
+#media-dialog{border:1px solid #dfe5d8;border-radius:12px;padding:20px;width:min(1000px,calc(100vw - 32px));max-height:calc(100dvh - 32px);color:#354e3d;background:#fbfcf8;overflow:auto}
+#media-dialog::backdrop{background:#142019b3}
+.media-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:16px}.media-heading>div{min-width:0}.media-heading h2{margin:4px 0 0;font-size:18px;overflow-wrap:anywhere}
+.media-stage{display:flex;align-items:center;justify-content:center;min-height:150px;background:#eff3ea;border:1px solid #dfe5d8;border-radius:8px;overflow:hidden}.media-full-size{display:block;max-width:100%;max-height:calc(100dvh - 220px);object-fit:contain}.media-stage video{width:100%}
+.media-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:16px}.media-navigation{display:flex;align-items:center;gap:12px}.media-navigation button{border:1px solid #dce5d8;background:#fff}.media-navigation button:disabled{opacity:.4;cursor:default}#media-position{font-size:11px;white-space:nowrap;color:#71806d}#open-media-tab{border:1px solid #dce5d8;background:#fff;color:#587152;text-decoration:none;white-space:nowrap}#media-dialog :focus-visible{outline:2px solid #c58b60;outline-offset:3px}
+@media(max-width:700px){#media-dialog{padding:14px;width:calc(100vw - 20px);max-height:calc(100dvh - 20px)}.media-heading h2{font-size:15px}.media-navigation{gap:8px}.media-navigation button{padding:8px;font-size:11px}.media-full-size{max-height:calc(100dvh - 240px)}}
 .draft-document-type,.attachment-document-type{display:flex;align-items:center;justify-content:center;min-height:42px;padding:5px 8px;border:1px solid #dce3d4;border-radius:5px;background:#e8ece2;color:#52674a;font-size:9px;font-weight:700;letter-spacing:.4px;overflow-wrap:anywhere;text-align:center}
 .draft-document-type{width:48px}
 .message-attachment .attachment-document-type{width:100%;height:72px;padding:12px;font-size:11px}

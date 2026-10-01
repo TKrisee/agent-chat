@@ -180,7 +180,11 @@ allowed. Executables, scripts (including renamed shebang scripts), HTML/SVG,
 archives, and other extensions are rejected. Image extensions must match the
 image signature. Video extensions must match their MP4/QuickTime/WebM container
 header. Images show previews; videos have playback controls and a download link,
-with authenticated byte-range requests for seeking. Playback depends on the
+with authenticated byte-range requests for seeking. Click an image or choose a
+video's **View larger** button to open the attachment viewer. **Previous** and
+**Next** browse that message's images and videos in attachment order, skipping
+documents; left/right arrow keys also navigate outside video controls. The viewer
+includes **Open in new tab** and closes with its close button or Escape. Playback depends on the
 browser's codec support; download remains available. Documents download as files.
 The same policy applies to agent `send --attach` uploads.
 

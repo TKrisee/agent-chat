@@ -1,3 +1,20 @@
+# Media attachment viewer — 2026-10-01
+
+Image clicks now open a modal in the app's existing visual style. Videos retain
+inline controls and add View larger. Previous/Next buttons and left/right keys
+browse only the selected message's images and videos, preserving attachment
+order and skipping documents. The viewer shows filename/count and an Open in
+new tab link. Escape/close stops modal video playback and restores focus to the
+current trigger even after a live feed redraw. Project changes close the viewer.
+
+All eight browser suites and 35 authenticated web/remote tests passed on macOS.
+The mixed-gallery workflow verified single-item boundaries, image/video order,
+new-tab URL, playback across live updates, video stop on navigation/close,
+keyboard navigation and focus return. Desktop and 320 px modal screenshots
+were visually reviewed; controls fit without horizontal overflow. Tests used
+isolated servers/databases/browser processes and closed them. This frontend
+change needs a browser refresh; server/bridge/app-server restarts are unnecessary.
+
 # Video attachments — 2026-10-01
 
 Added MP4/M4V, MOV and WebM uploads to browser and agent attachment workflows,

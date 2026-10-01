@@ -11,6 +11,7 @@ const VIDEO_EXTENSIONS = new Set(['mp4', 'm4v', 'mov', 'webm']);
 const DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
+let mediaViewer = null;
 const state = {
   snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all', toMe: false,
   expanded: new Set(), paused: false, pending: null, connected: false,
@@ -703,6 +704,51 @@ async function copyMessageText(text) {
   }
 }
 
+function renderMediaViewer() {
+  const attachment = mediaViewer.items[mediaViewer.index];
+  for (const video of $('media-stage').querySelectorAll('video')) video.pause();
+  const video = VIDEO_MIMES.has(attachment.mime);
+  const preview = node(video ? 'video' : 'img', 'media-full-size');
+  preview.src = attachment.url;
+  if (video) {
+    preview.controls = true;
+    preview.playsInline = true;
+    preview.preload = 'metadata';
+    preview.setAttribute('aria-label', `Play ${attachment.name}`);
+  } else preview.alt = attachment.name;
+  $('media-error').hidden = true;
+  preview.addEventListener('error', () => {
+    if (!preview.isConnected) return;
+    $('media-error').textContent = 'Preview unavailable. Try opening this attachment in a new tab.';
+    $('media-error').hidden = false;
+  });
+  $('media-stage').replaceChildren(preview);
+  $('media-title').textContent = attachment.name;
+  $('media-position').textContent = `${mediaViewer.index + 1} of ${mediaViewer.items.length}`;
+  $('previous-media').disabled = mediaViewer.index === 0;
+  $('next-media').disabled = mediaViewer.index === mediaViewer.items.length - 1;
+  $('open-media-tab').href = attachment.url;
+}
+
+function openMediaViewer(message, attachment, opener) {
+  const items = message.attachments.filter(item => IMAGE_MIMES.has(item.mime) || VIDEO_MIMES.has(item.mime))
+    .map(item => ({ ...item, url: projectURL(`/api/attachments/${encodeURIComponent(item.id)}`) }));
+  const index = items.findIndex(item => item.id === attachment.id);
+  if (index < 0) return;
+  for (const video of $('messages').querySelectorAll('video')) video.pause();
+  mediaViewer = { items, index, opener };
+  renderMediaViewer();
+  $('media-dialog').showModal();
+}
+
+function stepMedia(direction) {
+  if (!mediaViewer) return;
+  const next = mediaViewer.index + direction;
+  if (next < 0 || next >= mediaViewer.items.length) return;
+  mediaViewer.index = next;
+  renderMediaViewer();
+}
+
 function messageCard(message, videos) {
   const sender = agentLabel(message.sender_session, message.sender_agent);
   const deliveries = messageDeliveries(message);
@@ -779,7 +825,12 @@ function messageCard(message, videos) {
         const download = node('a', 'attachment-name', `Download ${attachment.name}`);
         download.href = preview.src;
         download.download = attachment.name;
-        tile.append(preview, download);
+        const expand = node('button', 'view-media', 'View larger');
+        expand.type = 'button';
+        expand.dataset.attachmentId = attachment.id;
+        expand.setAttribute('aria-label', `View ${attachment.name} in attachment viewer`);
+        expand.addEventListener('click', () => openMediaViewer(message, attachment, expand));
+        tile.append(preview, expand, download);
         images.append(tile);
         continue;
       }
@@ -790,6 +841,12 @@ function messageCard(message, videos) {
       const image = IMAGE_MIMES.has(attachment.mime);
       link.setAttribute('aria-label', image ? `Open ${attachment.name} at full size` : `Download ${attachment.name}`);
       if (image) {
+        link.dataset.attachmentId = attachment.id;
+        link.addEventListener('click', event => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey) return;
+          event.preventDefault();
+          openMediaViewer(message, attachment, link);
+        });
         const preview = node('img', 'attachment-preview');
         preview.src = link.href;
         preview.alt = attachment.name;
@@ -1249,6 +1306,10 @@ async function connect() {
 
 function switchProject(id) {
   if (state.busy || state.sending || id === state.project) return;
+  if ($('media-dialog').open) {
+    mediaViewer.opener = null;
+    $('media-dialog').close();
+  }
   state.drafts.set(state.project, { body: $('message-input').value, attachments: state.attachments });
   closeMeasurement();
   state.measurement = null;
@@ -1307,6 +1368,27 @@ $('cancel-usage').addEventListener('click', () => $('usage-dialog').close());
 $('usage-enabled').addEventListener('change', () => {
   state.usageDialogDirty = true;
   usageFormControls();
+});
+$('close-media').addEventListener('click', () => $('media-dialog').close());
+$('previous-media').addEventListener('click', () => stepMedia(-1));
+$('next-media').addEventListener('click', () => stepMedia(1));
+$('media-dialog').addEventListener('keydown', event => {
+  if (event.target.tagName === 'VIDEO' || event.ctrlKey || event.metaKey || event.altKey) return;
+  if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+    event.preventDefault();
+    event.stopPropagation();
+    stepMedia(event.key === 'ArrowLeft' ? -1 : 1);
+  }
+});
+$('media-dialog').addEventListener('close', () => {
+  for (const video of $('media-stage').querySelectorAll('video')) video.pause();
+  $('media-stage').replaceChildren();
+  const opener = mediaViewer?.opener;
+  const id = opener?.dataset.attachmentId;
+  mediaViewer = null;
+  const currentOpener = opener?.isConnected ? opener
+    : [...$('messages').querySelectorAll('[data-attachment-id]')].find(item => item.dataset.attachmentId === id);
+  if (currentOpener) currentOpener.focus({ preventScroll: true });
 });
 $('usage-threshold').addEventListener('input', () => { state.usageDialogDirty = true; usageError(); });
 $('usage-form').addEventListener('submit', (event) => { event.preventDefault(); saveUsage('configure'); });
@@ -1401,6 +1483,7 @@ $('scrim').addEventListener('click', closePanels);
 $('cancel-reply').addEventListener('click', () => { clearReply(); $('message-input').focus(); });
 $('reply-context').addEventListener('click', () => { if (state.reply) jumpToMessage(state.reply.id); });
 document.addEventListener('keydown', (event) => {
+  if ($('media-dialog').open) return;
   if (event.key === 'Escape') closePanels();
   if (event.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
     event.preventDefault(); $('search').focus();

@@ -152,6 +152,23 @@
       <div class="usage-dialog-actions"><button id="resume-usage" type="button" class="quiet-button" hidden>Allow work</button><span class="usage-actions-spacer"></span><button id="save-usage" type="submit" class="send-button">Save reserve</button></div>
     </form>
   </dialog>
+  <dialog id="media-dialog" aria-labelledby="media-title" aria-describedby="media-description">
+    <header class="media-heading">
+      <div><p class="usage-kicker">ATTACHMENT VIEWER</p><h2 id="media-title"></h2></div>
+      <button id="close-media" class="quiet-button usage-close" type="button" aria-label="Close attachment viewer" autofocus>×</button>
+    </header>
+    <p id="media-description" class="sr-only">Use Previous and Next or the left and right arrow keys to browse this message's images and videos. Escape closes the viewer.</p>
+    <div id="media-stage" class="media-stage"></div>
+    <p id="media-error" class="composer-status error" role="status" hidden></p>
+    <footer class="media-actions">
+      <div class="media-navigation">
+        <button id="previous-media" class="quiet-button" type="button" aria-label="Previous attachment">← Previous</button>
+        <span id="media-position" role="status" aria-live="polite"></span>
+        <button id="next-media" class="quiet-button" type="button" aria-label="Next attachment">Next →</button>
+      </div>
+      <a id="open-media-tab" class="quiet-button" target="_blank" rel="noopener noreferrer">Open in new tab ↗</a>
+    </footer>
+  </dialog>
   <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
 </body>
 </html>

@@ -174,12 +174,90 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     assert.equal((await invalidVideo).status(), 400);
     assert.equal(await page.locator('#composer-images .draft-image').count(), 1);
     await page.getByRole('button', {name: 'Remove fake.mp4', exact: true}).click();
+    const landscape = Buffer.from(await page.evaluate(() => {
+      const canvas = document.createElement('canvas'); canvas.width = 1100; canvas.height = 650;
+      const context = canvas.getContext('2d');
+      const gradient = context.createLinearGradient(0, 0, 1100, 650);
+      gradient.addColorStop(0, '#355b48'); gradient.addColorStop(1, '#d3dfba');
+      context.fillStyle = gradient; context.fillRect(0, 0, 1100, 650);
+      context.fillStyle = '#f6f8ef'; context.font = '48px sans-serif'; context.fillText('Media review fixture', 80, 100);
+      return canvas.toDataURL('image/png').split(',')[1];
+    }), 'base64');
+    await upload.setInputFiles([
+      {name: 'landscape.png', mimeType: 'image/png', buffer: landscape},
+      {name: 'skip-document.txt', mimeType: 'text/plain', buffer: Buffer.from('not part of media navigation')},
+      {...clips[0], name: 'modal.mp4'},
+      {name: 'last-image.png', mimeType: 'image/png', buffer: png},
+      {...clips[1], name: 'modal.webm'},
+    ]);
+    await input.fill('@beta mixed media gallery');
+    const gallerySend = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await gallerySend).status(), 200);
+    const galleryLink = page.getByRole('link', {name: 'Open landscape.png at full size', exact: true});
+    await galleryLink.click();
+    const modal = page.locator('#media-dialog');
+    await page.locator('#media-dialog[open]').waitFor();
+    assert.equal(await page.locator('#media-position').textContent(), '1 of 4');
+    assert.equal(await page.locator('#previous-media').isDisabled(), true);
+    await page.waitForFunction(() => document.querySelector('#media-stage img')?.naturalWidth === 1100);
+    assert.equal(await modal.evaluate(dialog => dialog.contains(document.activeElement)), true);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.SCREENSHOT_DIR, 'media-modal-desktop.png')});
+    const newTab = page.waitForEvent('popup');
+    await page.getByRole('link', {name: 'Open in new tab'}).click();
+    const imageTab = await newTab; await imageTab.waitForLoadState();
+    assert.equal(imageTab.url(), new URL(await galleryLink.getAttribute('href'), url).href);
+    await imageTab.close();
+    await page.locator('#next-media').click();
+    assert.equal(await page.locator('#media-title').textContent(), 'modal.mp4');
+    assert.equal(await page.locator('#media-position').textContent(), '2 of 4');
+    const modalVideo = await modal.locator('video').elementHandle();
+    await modalVideo.evaluate(async video => { video.muted = true; video.playbackRate = 0.2; await video.play(); });
+    const liveUpdate = await page.request.post(url + '/api/messages', {
+      headers: {'Origin': url, 'X-Agent-Chat-CSRF': await page.evaluate(() => state.config.csrf_token)},
+      data: {to: 'beta', body: 'Live update while gallery stays open'},
+    });
+    assert.equal(liveUpdate.status(), 200);
+    await page.locator('.message-body').filter({hasText: 'Live update while gallery stays open'}).waitFor();
+    assert.equal(await modalVideo.evaluate(video => !video.paused), true);
+    assert.equal(await page.locator('#media-title').textContent(), 'modal.mp4');
+    await page.locator('#next-media').click();
+    assert.equal(await modalVideo.evaluate(video => video.paused), true, 'navigation stops previous video');
+    assert.equal(await page.locator('#media-title').textContent(), 'last-image.png');
+    await page.keyboard.press('ArrowRight');
+    assert.equal(await page.locator('#media-title').textContent(), 'modal.webm');
+    assert.equal(await page.locator('#next-media').isDisabled(), true);
+    await page.keyboard.press('ArrowRight');
+    assert.equal(await page.locator('#media-position').textContent(), '4 of 4');
+    await page.keyboard.press('ArrowLeft');
+    assert.equal(await page.locator('#media-position').textContent(), '3 of 4');
+    await page.keyboard.press('/');
+    assert.equal(await modal.evaluate(dialog => dialog.contains(document.activeElement)), true);
+    await page.locator('#close-media').focus();
+    await page.keyboard.press('Tab');
+    assert.equal(await modal.evaluate(dialog => dialog.contains(document.activeElement)), true);
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('#media-dialog').open && document.querySelector('#media-stage').childElementCount === 0);
+    assert.equal(await galleryLink.evaluate(link => document.activeElement === link), true, 'close restores trigger after live redraw');
+    await page.getByRole('button', {name: 'View modal.mp4 in attachment viewer', exact: true}).click();
+    assert.equal(await page.locator('#media-position').textContent(), '2 of 4');
+    const closingVideo = await modal.locator('video').elementHandle();
+    await closingVideo.evaluate(async video => { video.muted = true; await video.play(); });
+    await page.getByRole('button', {name: 'Close attachment viewer', exact: true}).click();
+    await page.waitForFunction(() => document.querySelector('#media-stage').childElementCount === 0);
+    assert.equal(await closingVideo.evaluate(video => video.paused), true, 'close stops video');
+    await modalVideo.dispose(); await closingVideo.dispose();
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'static-desktop.png') });
     await page.setViewportSize({ width: 320, height: 740 });
+    await galleryLink.click();
+    assert.equal(await modal.evaluate(dialog => dialog.scrollWidth <= dialog.clientWidth), true);
+    assert.equal(await page.getByRole('link', {name: 'Open in new tab'}).isVisible(), true);
+    if (process.env.SCREENSHOT_DIR) await page.screenshot({path: path.join(process.env.SCREENSHOT_DIR, 'media-modal-mobile.png')});
+    await page.getByRole('button', {name: 'Close attachment viewer', exact: true}).click();
     assert.equal(await page.locator('.message-card').evaluateAll(cards => cards.every(card => card.scrollWidth <= card.clientWidth)), true);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'static-mobile.png') });
     assert.deepEqual(errors, []);
-    console.log('Browser: uploads, 50-file limit, MP4/WebM playback and seeking, video position across live updates, MOV exact download, spoof rejection, failed draft preservation, mobile layout passed');
+    console.log('Browser: uploads, playback/download, media modal, mixed navigation skips documents, new tab, live update continuity, close cleanup, keyboard/focus, mobile layout passed');
   } finally {
     if (browser) await browser.close();
     if (fixture.exitCode === null) {
