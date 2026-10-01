@@ -145,7 +145,7 @@ def resource_name(raw):
 
 def _prepare_attachments(coord: Coordinator, attachments: Any) -> list[tuple[str, str, bytes]]:
     if not isinstance(attachments, list) or len(attachments) > MAX_ATTACHMENTS:
-        raise CoordError("attachments must contain at most four files")
+        raise CoordError(f"attachments must contain at most {MAX_ATTACHMENTS} files")
     prepared = []
     for item in attachments:
         if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not isinstance(item.get("content_base64"), str):

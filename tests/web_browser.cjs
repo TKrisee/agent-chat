@@ -780,8 +780,8 @@ c.close()
     assert.equal(await draftImages.count(), 2);
     await page.getByRole('button', { name: 'Remove picker.png', exact: true }).click();
     assert.equal(await draftImages.count(), 1);
-    await page.locator('#image-input').setInputFiles(Array.from({ length: 4 }, (_, index) => ({ name: `extra-${index}.png`, mimeType: 'image/png', buffer: png })));
-    await page.locator('#composer-status').filter({ hasText: 'up to 4' }).waitFor();
+    await page.locator('#image-input').setInputFiles(Array.from({ length: 50 }, (_, index) => ({ name: `extra-${index}.png`, mimeType: 'image/png', buffer: png })));
+    await page.locator('#composer-status').filter({ hasText: 'up to 50' }).waitFor();
     assert.equal(await draftImages.count(), 1, 'Over-limit drops leave the current draft intact');
     await page.locator('#image-input').setInputFiles({ name: 'too-big.png', mimeType: 'image/png', buffer: Buffer.alloc(10 * 1024 * 1024 + 1) });
     await page.locator('#composer-status').filter({ hasText: '10 MiB' }).waitFor();

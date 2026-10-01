@@ -374,6 +374,15 @@ class WebApiTests(unittest.TestCase):
             self.assertEqual(headers['X-Content-Type-Options'], 'nosniff')
             self.assertEqual(headers['Content-Security-Policy'], "default-src 'none'; sandbox")
 
+    def test_fifty_multipart_files_and_batch_above_old_body_limit(self):
+        files = [(f'file-{i}.txt', b'valid text') for i in range(50)]
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, files)[0], 200)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 50)
+        image = b'\x89PNG\r\n\x1a\n' + b'x' * (9 * 1024 * 1024 - 8)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''},
+                         [(f'large-{i}.png', image) for i in range(5)])[0], 200)
+        self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 55)
+
     def test_rejected_documents_preserve_message_and_attachment_counts(self):
         before = self.value('SELECT COUNT(*) FROM messages')
         for name, content in [('unsafe.svg', b'<svg/>'), ('script.txt', b'#!/bin/sh\necho unsafe'),
@@ -386,7 +395,7 @@ class WebApiTests(unittest.TestCase):
     def test_invalid_multipart_uploads_do_not_insert_messages(self):
         before = self.value('SELECT COUNT(*) FROM messages')
         image = b'\x89PNG\r\n\x1a\nimage'
-        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)] * 5)[0], 400)
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)] * 51)[0], 400)
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('bad.exe', b'not a supported file')])[0], 400)
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('large.png', b'\x89PNG\r\n\x1a\n' + b'x' * (10 * 1024 * 1024))])[0], 400)
         self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('a.png', image)], extra_fields=[('message', b'{}')])[0], 400)

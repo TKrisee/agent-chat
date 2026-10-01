@@ -1,3 +1,19 @@
+# Attachment count — 2026-10-01
+
+Raised the message attachment limit to 50 files, retaining the 10 MiB per-file
+limit. Browser, multipart uploads and agent RPCs enforce the same count. Multipart
+requests allow 500 MiB plus 64 KiB of metadata; agent RPC requests allow the
+base64 expansion of all 50 files plus 1 MiB of metadata. Response limits and
+other API request limits are unchanged.
+
+On macOS/Python 3.14, all 321 Python tests passed. All eight browser suites passed
+across the initial run and the corrected attachment-fixture continuation. Actual
+HTTP uploads accepted 50 files and batches beyond the former 40 MiB multipart
+and 60 MiB RPC caps. The exact 10 MiB file boundary passed; oversized files and
+51-file batches were rejected atomically. Browser selection preserved the full
+50-file draft after rejecting its 51st file, then sent and displayed all 50 files.
+Fixtures used isolated databases and closed their owned servers and browsers.
+
 # Publication readiness review — 2026-09-30
 
 Reviewed the current working tree for fresh installation, macOS/Linux platform

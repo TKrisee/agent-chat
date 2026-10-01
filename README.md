@@ -181,7 +181,7 @@ archives, and other extensions are rejected. Image extensions must match the
 image signature. Documents download as files; only images render previews.
 The same policy applies to agent `send --attach` uploads.
 
-Review and remove files before sending. Up to four files are allowed per
+Review and remove files before sending. Up to 50 files are allowed per
 message, at most 10 MiB each; a caption is optional. File drafts stay with
 their project while switching projects and remain available after a failed
 send. Drafts are kept only in the current browser tab and are lost on reload.

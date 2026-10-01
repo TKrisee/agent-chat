@@ -19,7 +19,8 @@ import time
 import tempfile
 from urllib.parse import parse_qs, quote, urlsplit
 
-from agent_chat.core import CoordError, Coordinator, agent_labels
+from agent_chat.core import CoordError, Coordinator, agent_labels, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE
+from .remote import MAX_COORD_REQUEST_BYTES
 from .projects import Projects
 from .bridge_state import runtime_snapshot
 from .usage import UsageStore
@@ -38,7 +39,7 @@ STATIC = {
 }
 MESSAGE_COLUMNS = 'seq,id,sender_session,recipient_session,body,created_at,acked_at'
 UI_MESSAGE_LIMIT = 50
-MAX_MULTIPART_BYTES = 4 * 10 * 1024 * 1024 + 64 * 1024
+MAX_MULTIPART_BYTES = MAX_ATTACHMENTS * MAX_ATTACHMENT_SIZE + 64 * 1024
 CSP = "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 
@@ -530,7 +531,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if machine_api:
             try:
-                data = self.read_json(60 * 1024 * 1024 if path == '/api/coord' else 1024 * 1024)
+                data = self.read_json(MAX_COORD_REQUEST_BYTES if path == '/api/coord' else 1024 * 1024)
                 if path == '/api/usage/rpc':
                     self.json(200, self.usage_action(data, machine=True))
                     return
@@ -620,7 +621,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 attachments = None
             else:
                 if not 1 <= size <= MAX_MULTIPART_BYTES:
-                    self.json(413, {'error': 'Images must fit within 40 MiB plus 64 KiB of metadata'})
+                    self.json(413, {'error': f'Files must fit within {MAX_ATTACHMENTS * MAX_ATTACHMENT_SIZE // (1024 * 1024)} MiB plus 64 KiB of metadata'})
                     return
                 data, attachments = self.read_multipart_message(size)
             if not isinstance(data, dict) or 'body' not in data or set(data) - {'to', 'body', 'reply_to'}:
@@ -706,9 +707,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def write_uploads(directory, uploads):
-        if len(uploads) > 4:
-            raise CoordError('at most 4 attachments are allowed')
-        if any(len(content) > 10 * 1024 * 1024 for _, content in uploads):
+        if len(uploads) > MAX_ATTACHMENTS:
+            raise CoordError(f'at most {MAX_ATTACHMENTS} attachments are allowed')
+        if any(len(content) > MAX_ATTACHMENT_SIZE for _, content in uploads):
             raise CoordError('attachment exceeds 10 MiB')
         paths = []
         for index, (name, content) in enumerate(uploads):

@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id);
 const MESSAGE_LIMIT = 50;
 const MESSAGE_WINDOW_LIMIT = 150;
 const MESSAGE_PREVIEW_LENGTH = 2000;
-const MAX_FILES = 4;
+const MAX_FILES = 50;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 const DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
@@ -600,7 +600,7 @@ function renderDraftImages() {
 function addImages(files) {
   if (state.sending || state.busy || !state.config) return;
   if (state.attachments.length + files.length > MAX_FILES) {
-    composerStatus('Attach up to 4 files per message.', true); return;
+    composerStatus('Attach up to 50 files per message.', true); return;
   }
   for (const file of files) {
     const extension = fileExtension(file.name);

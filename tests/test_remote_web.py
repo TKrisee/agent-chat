@@ -117,6 +117,23 @@ class RemoteWebTests(RemoteWebFixture):
             ])
         self.assertEqual(len(self.call('inbox', session='b')['messages']), 1)
 
+    def test_fifty_agent_files_and_base64_batch_above_old_request_limit(self):
+        self.call('register', agent='alpha')
+        self.call('register', session='b', agent='beta')
+        files = [{'name': f'file-{i}.txt', 'content_base64': base64.b64encode(b'valid text').decode()}
+                 for i in range(50)]
+        sent = self.call('send', to='b', body='', attachments=files)
+        self.assertEqual(len(sent['attachments']), 50)
+        with self.assertRaises(RemoteCoordError):
+            self.call('send', to='b', body='', attachments=files + files[:1])
+        self.assertEqual(len(self.call('inbox', session='b')['messages']), 1)
+        image = b'\x89PNG\r\n\x1a\n' + b'x' * (9 * 1024 * 1024 - 8)
+        encoded = base64.b64encode(image).decode()
+        sent = self.call('send', to='b', body='', attachments=[
+            {'name': f'large-{i}.png', 'content_base64': encoded} for i in range(7)])
+        self.assertEqual(len(sent['attachments']), 7)
+        self.assertEqual(self.request('GET', sent['attachments'][0]['url'])[1], image)
+
     def test_csrf_required_for_removal_and_operator_is_preserved(self):
         self.call('register', agent='alpha')
         self.assertEqual(self.request('POST', '/api/sessions/remove', {'id': 'a'})[0], 403)

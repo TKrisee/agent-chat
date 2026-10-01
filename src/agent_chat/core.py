@@ -45,7 +45,7 @@ DEFAULT_DB = ROOT / ".agent-chat" / "state.sqlite3"
 def default_db() -> pathlib.Path:
     """Return the current project's default database location."""
     return _project_root() / ".agent-chat" / "state.sqlite3"
-MAX_ATTACHMENTS = 4
+MAX_ATTACHMENTS = 50
 MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
 IMAGE_SIGNATURES = (
     (b"\x89PNG\r\n\x1a\n", "image/png"),

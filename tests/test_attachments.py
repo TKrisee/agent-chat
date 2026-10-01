@@ -78,10 +78,18 @@ class AttachmentTests(unittest.TestCase):
                              '--attach', str(directory), check=False)
         self.assertNotEqual(failed.returncode, 0)
         failed, _ = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
-                             '--attach', str(good), '--attach', str(good), '--attach', str(good),
-                             '--attach', str(good), '--attach', str(good), check=False)
+                             *(['--attach', str(good)] * 51), check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual((self.count_messages(), self.count_attachments()), (before_messages, before_attachments))
+
+    def test_fifty_files_and_exact_ten_mib_file_are_accepted(self):
+        large = self.image('boundary.png', b'\x89PNG\r\n\x1a\n' + b'x' * (10 * 1024 * 1024 - 8))
+        paths = [large] + [self.image(f'file-{i}.txt', b'valid text') for i in range(49)]
+        args = [value for path in paths for value in ('--attach', str(path))]
+        _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body), *args)
+        self.assertEqual(len(sent['attachments']), 50)
+        self.assertEqual(sent['attachments'][0]['size'], 10 * 1024 * 1024)
+        self.assertEqual(self.count_attachments(), 50)
 
     def test_invalid_and_oversize_attachments_are_atomic_and_plain_messages_stay_compatible(self):
         bad = self.image('unsupported.dat', b'plain text')

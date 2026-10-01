@@ -9,9 +9,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from .core import CoordError
+from .core import CoordError, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE
 
 MAX_RESPONSE_BYTES = 60 * 1024 * 1024
+# Each file expands to four base64 bytes per three input bytes, plus RPC metadata.
+MAX_COORD_REQUEST_BYTES = MAX_ATTACHMENTS * (4 * ((MAX_ATTACHMENT_SIZE + 2) // 3)) + 1024 * 1024
 
 
 class RemoteCoordError(CoordError):
@@ -96,7 +98,8 @@ class HttpClient:
         if not isinstance(payload, dict):
             raise RemoteCoordError("remote coordinator payload must be an object")
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        if len(encoded) > MAX_RESPONSE_BYTES:
+        request_limit = MAX_COORD_REQUEST_BYTES if path == '/api/coord' else MAX_RESPONSE_BYTES
+        if len(encoded) > request_limit:
             raise RemoteCoordError("remote coordinator request is too large")
         headers = {"Content-Type": "application/json", "Accept": "application/json", "X-Agent-Chat-Project": self.project}
         if self.token:
