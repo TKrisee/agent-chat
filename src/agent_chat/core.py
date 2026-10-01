@@ -72,6 +72,12 @@ class CoordError(RuntimeError):
     """A requested coordination operation cannot be performed."""
 
 
+def assert_reset_unlocked(db, session):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_resets'").fetchone():
+        if db.execute("SELECT 1 FROM session_resets WHERE target_session=? AND status NOT IN ('completed','cancelled','failed')", (session,)).fetchone():
+            raise CoordError('fresh-session reset pending; inspect session-reset-status before changing ownership or routing')
+
+
 def _now() -> float: return time.time()
 def _id(prefix: str) -> str: return prefix + "_" + secrets.token_urlsafe(24)
 
@@ -228,6 +234,7 @@ class Coordinator:
             if info is None:
                 raise CoordError(f"unknown session: {session_id}")
             agent_name = info["agent"]
+            assert_reset_unlocked(db, session_id)
 
             # This is deliberately an authenticated administrative operation,
             # never a way for an anonymous client to discard a dead identity.
@@ -294,6 +301,7 @@ class Coordinator:
         return {"removed": session_id, "agent": agent_name}
 
     def _fresh(self, db: sqlite3.Connection, session: str) -> None:
+        assert_reset_unlocked(db, session)
         row = db.execute("SELECT inbox_read_seq FROM sessions WHERE id=?", (session,)).fetchone()
         latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (session,)).fetchone()["n"]
         if row is None: raise CoordError("unknown session")

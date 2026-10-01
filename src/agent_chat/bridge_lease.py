@@ -13,6 +13,8 @@ class BridgeManager:
     def __init__(self, db_path, usage_store=None):
         self.db_path = db_path
         self.usage_store = usage_store
+        self.measurements = None
+        self.project_id = 'default'
         self.mutex = threading.RLock()
         self.lock = None
         c = Coordinator(db_path)
@@ -113,6 +115,24 @@ class BridgeManager:
             return {'released': True}
         usage = self.usage_store.status(host) if self.usage_store else None
         state = BridgeState(c)
+        if op in ('reset-jobs', 'reset-job', 'reset-update'):
+            from .session_reset import SessionResetState
+            resets = SessionResetState(c)
+            if op == 'reset-jobs':
+                return [] if usage and usage['blocked'] else resets.jobs(host)
+            job = resets.job(params.get('job_id'))
+            if job['host_id'] != host:
+                raise CoordError('fresh-session reset belongs to another host')
+            if op == 'reset-job':
+                return job
+            status = params.get('status')
+            if usage and usage['blocked'] and status in ('creating', 'ready', 'adding', 'starting'):
+                raise CoordError(usage['reason'] or 'weekly usage reserve is active')
+            with self.measurements.lock if self.measurements else contextlib.nullcontext():
+                if self.measurements and status in ('creating', 'ready', 'adding', 'starting') and self.measurements.status(self.project_id)['active']:
+                    raise CoordError('finish the active project measurement before resetting a conversation')
+                values = {key: value for key, value in params.items() if key not in ('job_id', 'expected', 'status')}
+                return resets.update(job['id'], params.get('expected'), status, **values)
 
         def route_for(session_id):
             route = state.resolve(session_id)

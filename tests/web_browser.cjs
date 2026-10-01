@@ -654,7 +654,7 @@ print(json.dumps({'history': history['id']}))
     await page.locator('#agents-toggle').click();
     const blockedRemove = page.getByRole('button', { name: 'Remove inactive session blocked', exact: true });
     assert.equal(await blockedRemove.isVisible(), true, 'Mobile keeps the removal control visible');
-    assert.equal(await blockedRemove.evaluate(button => button.parentElement.classList.contains('agent-controls') && button.parentElement.querySelectorAll('button').length === 2), true, 'Removal must be a sibling of selection, never a nested button');
+    assert.equal(await blockedRemove.evaluate(button => button.parentElement.classList.contains('agent-controls') && button.parentElement.querySelectorAll('button').length >= 2 && !button.parentElement.querySelector('button button')), true, 'Removal must be a sibling of selection, never a nested button');
     await input.fill('Keep my removal draft');
     page.once('dialog', dialog => {
       assert.match(dialog.message(), /history will be retained\. Any held reservations must first be closed or released\./);

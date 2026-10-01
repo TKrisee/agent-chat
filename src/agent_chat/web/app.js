@@ -366,11 +366,138 @@ function renderAgents() {
       }
     });
     button.addEventListener('click', () => selectAgent(session.id));
-    controls.append(button, removeBtn);
+    const resetBtn = node('button', 'agent-remove agent-reset', '↻');
+    resetBtn.type = 'button';
+    resetBtn.dataset.session = session.id;
+    resetBtn.title = session.thread_id ? `Start fresh conversation for ${session.agent}` : 'Fresh conversations require a bound main agent';
+    resetBtn.setAttribute('aria-label', `Start fresh conversation for ${session.agent}`);
+    resetBtn.disabled = !session.thread_id;
+    resetBtn.addEventListener('click', () => openResetDialog(session));
+    controls.append(button, removeBtn, resetBtn);
     fragment.append(controls);
   }
   $('agent-list').replaceChildren(fragment);
+  renderResetStatus();
 }
+
+let resetTarget = null;
+let resetRequestId = null;
+let resetSending = false;
+let creatingAgent = false;
+let createdAgentSession = null;
+
+function openResetDialog(session, create = false) {
+  creatingAgent = create;
+  createdAgentSession = null;
+  resetTarget = { ...session, project: state.project };
+  resetRequestId = crypto.randomUUID();
+  $('reset-title').textContent = create ? 'Create independent agent' : `Fresh conversation · ${session.agent}`;
+  $('create-agent-fields').hidden = !create;
+  $('new-agent-name').required = create;
+  $('new-agent-name').value = '';
+  $('reset-description').textContent = create
+    ? 'Create a distinct chat identity and fresh Codex conversation on the selected agent’s existing host. Its model, permissions and workspace are copied; its conversation history is not.'
+    : 'Start a fresh Codex conversation with a new prompt. Keep this agent’s chat identity, inbox and queue position. The old transcript remains available.';
+  $('reset-conditions').hidden = create;
+  $('submit-reset').textContent = create ? 'Create agent' : 'Start fresh conversation';
+  $('reset-prompt').value = '';
+  $('reset-error').hidden = true;
+  renderResetStatus();
+  $('reset-dialog').showModal();
+  $('reset-prompt').focus();
+}
+
+function resetJob() {
+  return state.snapshot?.session_resets?.find(job => job.target_session === (creatingAgent ? createdAgentSession : resetTarget?.id));
+}
+
+$('create-agent').addEventListener('click', () => {
+  const templates = (state.snapshot?.sessions || []).filter(session => session.thread_id);
+  if (!templates.length) return;
+  $('new-agent-template').replaceChildren(...templates.map(session => {
+    const option = node('option', '', session.agent); option.value = session.id; return option;
+  }));
+  openResetDialog(templates[0], true);
+});
+$('new-agent-template').addEventListener('change', () => {
+  const session = state.snapshot.sessions.find(item => item.id === $('new-agent-template').value);
+  if (session && creatingAgent) resetTarget = { ...session, project: state.project };
+});
+
+function renderResetStatus() {
+  $('create-agent').disabled = !(state.snapshot?.sessions || []).some(session => session.thread_id);
+  if (!resetTarget) return;
+  const job = resetJob();
+  const active = job && !['completed', 'cancelled', 'failed'].includes(job.status);
+  $('reset-progress').textContent = job
+    ? `${job.status === 'completed' ? 'Fresh prompt dispatched' : job.status} · ${job.id}${job.error ? `\n${job.error}` : ''}`
+    : 'No reset requested. The existing bridge will wait for this agent’s current turn to finish.';
+  $('submit-reset').disabled = resetSending || Boolean(active) || (creatingAgent && Boolean(job) && job.status !== 'cancelled');
+  $('cancel-reset-request').hidden = !job || !['pending', 'created'].includes(job.status);
+  $('cancel-reset-request').disabled = resetSending;
+}
+
+function resetError(error) {
+  $('reset-error').textContent = error.message;
+  $('reset-error').hidden = false;
+}
+
+$('reset-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (!resetTarget || resetSending || resetTarget.project !== state.project) return;
+  const target = resetTarget;
+  const current = state.snapshot.sessions.find(session => session.id === target.id);
+  if (!current || current.thread_id !== target.thread_id) {
+    resetError(new Error('Agent binding changed. Close and reopen this dialog before requesting a reset.'));
+    return;
+  }
+  const prompt = $('reset-prompt').value;
+  if (!prompt.trim() || new TextEncoder().encode(prompt).length > 65536) {
+    resetError(new Error('Enter a new prompt of at most 64 KiB.'));
+    return;
+  }
+  resetSending = true; renderResetStatus();
+  try {
+    const result = await fetchJSON('/api/sessions/reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify(creatingAgent
+        ? { op:'create', agent:$('new-agent-name').value, template_session:target.id,
+            expected_thread:target.thread_id, prompt, request_id:resetRequestId, confirm:true }
+        : { op: 'request', to: target.id, expected_thread: target.thread_id,
+            prompt, request_id: resetRequestId, confirm: true }),
+    });
+    if (creatingAgent) createdAgentSession = result.target_session;
+    if (target.project === state.project) {
+      $('reset-error').hidden = true;
+      const snapshot = await fetchJSON('/api/snapshot');
+      if (target.project === state.project) applySnapshot(snapshot);
+    }
+  } catch (error) { if (target.project === state.project) resetError(error); }
+  finally { resetSending = false; renderResetStatus(); }
+});
+
+$('cancel-reset-request').addEventListener('click', async () => {
+  const job = resetJob();
+  if (!job || resetSending || resetTarget?.project !== state.project) return;
+  const project = state.project;
+  resetSending = true; renderResetStatus();
+  try {
+    await fetchJSON('/api/sessions/reset', { method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify({ op: 'cancel', id: job.id }) });
+    resetRequestId = crypto.randomUUID();
+    const snapshot = await fetchJSON('/api/snapshot');
+    if (project === state.project) applySnapshot(snapshot);
+  } catch (error) { if (project === state.project) resetError(error); }
+  finally { resetSending = false; renderResetStatus(); }
+});
+$('close-reset').addEventListener('click', () => $('reset-dialog').close());
+$('reset-dialog').addEventListener('close', () => {
+  const button = creatingAgent ? $('create-agent') : [...document.querySelectorAll('.agent-reset')].find(item => item.dataset.session === resetTarget?.id);
+  requestAnimationFrame(() => button?.focus());
+  resetTarget = null;
+});
 
 function mentionSessions() {
   const sessions = (state.snapshot?.sessions || []).filter((item) => item.id !== state.config?.sender.id);
@@ -1305,6 +1432,7 @@ async function connect() {
 }
 
 function switchProject(id) {
+  if ($('reset-dialog').open) $('reset-dialog').close();
   if (state.busy || state.sending || id === state.project) return;
   if ($('media-dialog').open) {
     mediaViewer.opener = null;

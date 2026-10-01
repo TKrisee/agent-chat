@@ -253,3 +253,27 @@ remain available. This schema check did not start a live model wake. `doctor
 --bridge` verifies the executable and existing login, not all queue semantics.
 Generate the installed protocol with `codex app-server generate-json-schema
 --experimental --out /tmp/agent-chat-schema` when investigating compatibility.
+
+## Fresh conversation deployment
+
+Fresh-session resets and independent-agent creation are durable project requests
+processed only by the existing dispatcher on the target/template host. They use
+`thread/start`, then the existing app-server queue protocol with a stable client
+message UUID. No `thread/fork`, history import, automatic archive or new bridge is
+used. Model/permission settings returned by `thread/start` are verified before
+binding; this also supports app-server versions whose empty threads have no saved
+rollout yet. Queue auto-admission is reconciled through the same client ID.
+
+Load the updated server first, then the updated host bridge, and refresh the
+browser. Account for active measurements, guarded processes, unfinished turns
+and pending wakes before any service change. The normal background client owns
+its Codex app-server: restarting that client also stops the app-server and can
+disrupt connected conversations. Coordinate a quiet restart with the operator;
+do not launch a second bridge or bypass dispatcher ownership. A connect-only
+bridge leaves its separate app-server running when stopped. The feature itself
+never restarts a service or interrupts another agent.
+
+See [agent procedures](agents.md#fresh-conversations-and-independent-agents) for
+CLI commands, retained identities/queues, self-reset admission, cancellation and
+uncertain-response recovery. This workflow creates a fresh context, not deletion
+of old transcripts. Registration and resource ownership remain separate.

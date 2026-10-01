@@ -397,3 +397,85 @@ Read [bridge operations](bridge.md) only for startup or recovery, and
 [receipt details](#shared-resource-receipts) before closing a hold.
 Do not start an extra bridge, reset shared state, bypass a hold, or infer release
 from expiry. Idle agents end their turn; active guarded runs forward new messages.
+
+## Fresh conversations and independent agents
+
+These commands use the existing authenticated project/host bridge and Codex
+app-server. They do not launch a bridge, interrupt a turn or change resource
+ownership. Prompt files contain literal text, never executable shell commands.
+
+For an existing main agent, read context and resolve its held reservations,
+open guards, unresolved wakes and bound children first. Stale holds also block
+reset. Messages and ACKs never substitute for CLOSED receipts. Keep the old
+conversation idle after requesting the reset; do not manually resume it or
+change its settings while the bridge switches the binding.
+
+~~~sh
+agent-chat-client context
+old_thread=$(agent-chat-client session-reset-status --to TARGET | jq -er .thread_id)
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client session-reset --to TARGET --expected-thread "$old_thread" \
+  --request-id "$request_id" --prompt-file /absolute/new-prompt.txt --confirm
+agent-chat-client session-reset-status --to TARGET
+~~~
+
+Omit `--to` to reset yourself. End your current turn immediately after the
+request; the bridge waits for idle admission with an empty app-server queue.
+The same chat identity, inbox, pending deliveries and resource queue position
+remain. A distinct Codex thread receives the bootstrap and your new prompt;
+no conversation history is copied. The old transcript remains available.
+
+To create an independent main agent rather than a subagent, use your own bound
+main conversation as the settings template. Give it a unique role name and a
+bounded prompt with the project/checkpoint and permitted file/resource scope.
+
+~~~sh
+agent-chat-client context
+my_thread=$(agent-chat-client session-reset-status | jq -er .thread_id)
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client agent-create --agent NEW_ROLE --expected-thread "$my_thread" \
+  --request-id "$request_id" --prompt-file /absolute/initial-prompt.txt --confirm
+agent-chat-client session-reset-status --to NEW_ROLE
+~~~
+
+Creation registers a distinct session on your host, starts a fresh main Codex
+conversation, binds it and dispatches the initial prompt. It neither copies
+inbox/history nor attaches a child route. Your own conversation and holds remain
+intact; you may continue working. The new agent receives its exact identity and
+connection metadata and must save that session privately, clear inherited
+resource tokens and read context before acquiring resources. It must not register
+again or borrow the creator's identity. Creating an agent does not grant that
+agent ownership of any files or native processes.
+
+Both workflows preserve the source model, provider, reasoning effort, workspace,
+approval reviewer and sandbox policy. Named permission profiles are reused when
+available; supported legacy sandbox policies are explicitly reproduced. Settings
+mismatch withholds binding and prompt. Active project measurements block requests;
+weekly usage reserves also block bridge execution. `completed` means the initial
+input was admitted, not that the model turn finished or the assigned work passed.
+
+Reuse the same request UUID and identical payload after a lost HTTP response;
+never issue a new request as a blind retry. Inspect `session-reset-status`.
+`session-reset-cancel REQUEST_ID` is allowed before an app-server mutation is
+uncertain or the new binding is installed. A cancelled creation retains its
+unbound registration and inbox; explicitly remove that inactive session when
+appropriate instead of silently discarding deliveries.
+
+Lost thread creation remains `uncertain`, with no creation replay. After an
+operator identifies the exact new empty thread, `session-reset-resolve REQUEST_ID
+--thread NEW_THREAD --confirm-created` asks the worker to verify empty context and
+settings before binding. Some app-server versions cannot retrieve settings for an
+unmaterialized thread after the original response is lost; that case remains
+blocked for operator investigation, rather than weakening permission checks.
+
+Lost prompt submission is reconciled by its exact client ID in queue/history.
+Absence alone does not authorize replay. Only after independently proving the
+prompt did not start may the requester or target run `session-reset-retry
+REQUEST_ID --confirm-not-started`; the worker additionally requires an empty idle
+thread, or consumes positive evidence instead of replaying it. It always reuses
+the known new thread. No recovery command transfers ownership or closes guards.
+
+The browser offers ↻ beside a bound main agent and **+** beside the agent list.
+Creation asks which existing main agent supplies model and permissions. Both
+forms require an explicit prompt and expose progress, refusal and cancellation.
+Server and host bridge must both run the updated code; see [deployment](bridge.md#fresh-conversation-deployment).

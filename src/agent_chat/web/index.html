@@ -30,7 +30,7 @@
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
         <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
       </button>
-      <div class="section-label"><span>AGENTS &amp; SUBAGENTS</span><span id="agent-count">0</span></div>
+      <div class="section-label"><span>AGENTS &amp; SUBAGENTS</span><span id="agent-count">0</span><button id="create-agent" type="button" class="quiet-button" aria-label="Create independent agent" title="Create independent agent">+</button></div>
       <nav class="agent-list" id="agent-list" aria-label="Filter by agent"></nav>
       <div class="sidebar-footer"><span class="workspace-dot"></span><span id="project-caption">Project workspace<small id="bridge-caption">Wake bridge not connected</small></span></div>
     </aside>
@@ -150,6 +150,19 @@
       <p class="usage-scope">Once reached, the reserve stays paused through restarts and weekly resets until you choose Allow work. Then send a message or continue the interrupted task.</p>
       <p id="usage-error" class="composer-status error" role="alert" hidden></p>
       <div class="usage-dialog-actions"><button id="resume-usage" type="button" class="quiet-button" hidden>Allow work</button><span class="usage-actions-spacer"></span><button id="save-usage" type="submit" class="send-button">Save reserve</button></div>
+    </form>
+  </dialog>
+  <dialog id="reset-dialog" aria-labelledby="reset-title">
+    <form id="reset-form">
+      <header class="usage-dialog-heading"><h2 id="reset-title">Fresh conversation</h2><button id="close-reset" class="quiet-button usage-close" type="button" aria-label="Close fresh conversation dialog">×</button></header>
+      <p class="usage-scope" id="reset-description">Start a fresh Codex conversation with a new prompt. Keep this agent’s chat identity, inbox and queue position. The old transcript remains available.</p>
+      <p class="usage-scope" id="reset-conditions">Close all held resources and guarded runs, resolve pending wakes and retire children first. The bridge waits for the current turn to finish; it will not interrupt work.</p>
+      <div id="create-agent-fields" hidden><label for="new-agent-name">Agent name</label><input id="new-agent-name" maxlength="64" autocomplete="off"><label for="new-agent-template">Copy model and permissions from</label><select id="new-agent-template"></select></div>
+      <label for="reset-prompt">New prompt</label>
+      <textarea id="reset-prompt" rows="7" required placeholder="Describe the agent’s role, current checkpoint and next task."></textarea>
+      <p id="reset-progress" class="usage-current" role="status" aria-live="polite"></p>
+      <p id="reset-error" class="composer-status error" role="alert" hidden></p>
+      <div class="usage-dialog-actions"><button id="cancel-reset-request" class="quiet-button" type="button" hidden>Cancel pending reset</button><span class="usage-actions-spacer"></span><button id="submit-reset" class="send-button" type="submit">Start fresh conversation</button></div>
     </form>
   </dialog>
   <dialog id="media-dialog" aria-labelledby="media-title" aria-describedby="media-description">

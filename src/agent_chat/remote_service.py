@@ -96,6 +96,24 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         return {"messages": coord.send_many(targets, _string(params.get("body"), "body", False) or "", params.get("reply_to"))}
     if op == "deregister": return coord.remove_session(coord.require_session())
     if op == "remove-session": return coord.remove_session(_string(params.get("id"), "id"))
+    if op.startswith('session-reset') or op == 'agent-create':
+        from .bridge_state import BridgeState
+        from .session_reset import SessionResetState
+        BridgeState(coord)
+        resets = SessionResetState(coord)
+        if op == 'session-reset-status':
+            return resets.status(_string(params.get('to') or session, 'to'))
+        if op == 'session-reset-cancel':
+            return resets.cancel(_string(params.get('id'), 'id'))
+        if op == 'session-reset-resolve':
+            return resets.resolve_creation(_string(params.get('id'), 'id'), params.get('thread'), params.get('confirm_created'))
+        if op == 'session-reset-retry':
+            return resets.retry_prompt(_string(params.get('id'), 'id'), params.get('confirm_not_started'))
+        if op == 'agent-create':
+            return resets.create(params.get('agent'), params.get('expected_thread'), params.get('prompt'), params.get('request_id'), params.get('confirm'))
+        if op == 'session-reset':
+            return resets.request(_string(params.get('to') or session, 'to'), params.get('expected_thread'),
+                                  params.get('prompt'), params.get('request_id'), params.get('confirm'))
     if op in ("bind", "unbind", "bridge-status", "bridge-retry", "bridge-resolve"):
         from .bridge_state import BridgeState
         state = BridgeState(coord)

@@ -127,7 +127,7 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         sessions = [dict(row) for row in db.execute(
             'SELECT id,agent,registered_at FROM sessions ORDER BY registered_at,id')]
         bindings = {}
-        if session_models is not None and db.execute(
+        if db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_bindings'").fetchone():
             bindings = {row['session_id']: dict(row) for row in db.execute(
                 'SELECT session_id,thread_id,agent_path FROM bridge_bindings')}
@@ -153,6 +153,15 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         data = dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
                     resources=resources, total_messages=total,
                     history_truncated=total > len(messages))
+        data['session_resets'] = []
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_resets'").fetchone():
+            data['session_resets'] = [dict(row) for row in db.execute('''SELECT id,requester_session,target_session,
+                old_thread_id,new_thread_id,status,error,created_at,updated_at,kind FROM session_resets
+                WHERE status NOT IN ('completed','cancelled','failed') OR id IN
+                    (SELECT id FROM session_resets ORDER BY created_at DESC LIMIT 20)
+                ORDER BY created_at DESC''')]
+        for session in sessions:
+            session.update(thread_id=bindings.get(session['id'], {}).get('thread_id'))
     if usage_store is not None:
         data['usage'] = usage_store.status()
     if session_models is not None:
@@ -270,6 +279,8 @@ class WebServer(http.server.ThreadingHTTPServer):
                 self.bridge_manager = BridgeManager(self.db_path, usage_store=self.usage)
             self.measurements = MeasurementStore(self.db_path, sessions_root=sessions_root, usage_store=self.usage,
                                                  pause_callback=self.pause_measured_agents)
+            if self.bridge_manager:
+                self.bridge_manager.measurements = self.measurements
             self.session_models = SessionModels(self.measurements.sessions_root)
         except BaseException:
             self.server_close()
@@ -314,6 +325,7 @@ class WebServer(http.server.ThreadingHTTPServer):
                 if self.api_token:
                     from .bridge_lease import BridgeManager
                     manager = BridgeManager(path, usage_store=self.usage)
+                    manager.measurements, manager.project_id = self.measurements, item['id']
                 self.project_contexts[item['id']] = (path, sender, manager)
             return self.project_contexts[item['id']]
 
@@ -581,7 +593,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     coord.context_size = lambda value: len(json.dumps(
                         self.scoped(value), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
                     try:
-                        result = dispatch(coord, data, bridge_manager=self.bridge_manager)
+                        with self.server.measurements.lock if data.get('op') in ('session-reset', 'agent-create') else contextlib.nullcontext():
+                            if data.get('op') in ('session-reset', 'agent-create') and self.server.measurements.status(self.project['id'])['active']:
+                                raise CoordError('finish the active project measurement before resetting a conversation')
+                            result = dispatch(coord, data, bridge_manager=self.bridge_manager)
                     finally:
                         coord.close()
                 else:
@@ -590,7 +605,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if path not in ('/api/messages', '/api/sessions/remove', '/api/projects', '/api/projects/rename', '/api/usage', '/api/measurements'):
+        if path not in ('/api/messages', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/usage', '/api/measurements'):
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
@@ -602,8 +617,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 data = self.read_json()
                 if (isinstance(data, dict) and {'op', 'duration_seconds'} <= set(data)
                         and set(data) <= {'op', 'duration_seconds', 'pause_at_end'} and data['op'] == 'start'):
-                    result = self.server.measurements.start(self.project['id'], self.db_path, data['duration_seconds'],
-                                                            pause_at_end=data.get('pause_at_end', False))
+                    with self.server.measurements.lock:
+                        with contextlib.closing(Coordinator(self.db_path)) as coord:
+                            if coord.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_resets'").fetchone() and coord.db.execute("SELECT 1 FROM session_resets WHERE status NOT IN ('completed','cancelled','failed')").fetchone():
+                                raise CoordError('finish or cancel the pending fresh-session reset before measuring')
+                        result = self.server.measurements.start(self.project['id'], self.db_path, data['duration_seconds'],
+                                                                pause_at_end=data.get('pause_at_end', False))
                 elif isinstance(data, dict) and data == {'op': 'stop'}:
                     result = self.server.measurements.stop(self.project['id'])
                 else:
@@ -624,6 +643,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = self.project_action(dict(data, op='create' if path == '/api/projects' else 'rename'))
                 self.json(200, result)
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
+            return
+        if path == '/api/sessions/reset':
+            try:
+                data = self.read_json()
+                if not isinstance(data, dict):
+                    raise CoordError('invalid fresh-session reset request')
+                from .bridge_state import BridgeState
+                from .session_reset import SessionResetState
+                with self.server.measurements.lock, contextlib.closing(Coordinator(self.db_path, self.sender_session)) as coord:
+                    BridgeState(coord)
+                    resets = SessionResetState(coord)
+                    if data.get('op') == 'cancel' and set(data) == {'op', 'id'}:
+                        result = resets.cancel(data['id'])
+                    elif data.get('op') == 'request' and set(data) == {'op', 'to', 'expected_thread', 'prompt', 'request_id', 'confirm'}:
+                        if self.server.measurements.status(self.project['id'])['active']:
+                            raise CoordError('finish the active project measurement before resetting a conversation')
+                        result = resets.request(data['to'], data['expected_thread'], data['prompt'], data['request_id'], data['confirm'], human=True)
+                    elif data.get('op') == 'create' and set(data) == {'op','agent','template_session','expected_thread','prompt','request_id','confirm'}:
+                        if self.server.measurements.status(self.project['id'])['active']:
+                            raise CoordError('finish the active project measurement before creating an agent')
+                        result = resets.create(data['agent'], data['expected_thread'], data['prompt'], data['request_id'], data['confirm'], template_session=data['template_session'], human=True)
+                    else:
+                        raise CoordError('invalid fresh-session reset operation')
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
         if path == '/api/sessions/remove':

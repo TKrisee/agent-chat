@@ -97,6 +97,20 @@ def _remote_main(raw, global_args, server):
     x = sub.add_parser('status'); x.add_argument('--mine', action='store_true'); x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('guard-status', help='read your exact reservation guards on their owning host')
     x.add_argument('resource'); x.add_argument('--reservation-id', required=True)
+    x = sub.add_parser('session-reset', help='queue a fresh Codex conversation, preserving chat identity and queue')
+    x.add_argument('--to'); x.add_argument('--expected-thread', required=True)
+    x.add_argument('--prompt-file', required=True); x.add_argument('--request-id', required=True)
+    x.add_argument('--confirm', action='store_true')
+    x = sub.add_parser('session-reset-status'); x.add_argument('--to')
+    x = sub.add_parser('session-reset-cancel'); x.add_argument('id')
+    x = sub.add_parser('session-reset-resolve'); x.add_argument('id')
+    x.add_argument('--thread', required=True); x.add_argument('--confirm-created', action='store_true')
+    x = sub.add_parser('session-reset-retry'); x.add_argument('id')
+    x.add_argument('--confirm-not-started', action='store_true')
+    x = sub.add_parser('agent-create', help='create an independent registered agent on your existing host bridge')
+    x.add_argument('--agent', required=True); x.add_argument('--expected-thread', required=True)
+    x.add_argument('--prompt-file', required=True); x.add_argument('--request-id', required=True)
+    x.add_argument('--confirm', action='store_true')
     x = sub.add_parser('cancel'); x.add_argument('resource')
     x = sub.add_parser('check'); x.add_argument('resource'); x.add_argument('--token')
     x = sub.add_parser('release'); x.add_argument('resource'); x.add_argument('--receipt', required=True); x.add_argument('--token')
@@ -133,6 +147,8 @@ def _remote_main(raw, global_args, server):
         params['token'] = os.environ.get('AGENT_CHAT_TOKEN')
     if op == 'inbox' and params.pop('agent') is not None:
         raise core.CoordError('--agent cannot read another agent inbox in remote mode')
+    if op in ('session-reset', 'agent-create'):
+        params['prompt'] = Path(params.pop('prompt_file')).read_text(encoding='utf-8')
     if op == 'send':
         targets = params['to']
         if params['ack_reply'] and not params['reply_to']:

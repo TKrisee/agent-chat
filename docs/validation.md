@@ -1,3 +1,41 @@
+# Fresh conversations and independent agents — 2026-10-02
+
+Implemented retained-identity resets and distinct independent-agent creation in
+the CLI, authenticated browser controls and existing host bridge. Both create
+new Codex threads with verified model, provider, reasoning, workspace and
+permission settings. Resets preserve inbox/queue state and refuse held/stale
+resources, open guards, unresolved wakes and bound children; they wait for the
+current turn without interrupting it. Creation keeps the requesting agent's
+conversation and resource ownership intact. Active measurements and weekly
+usage reserves retain their existing gates.
+
+The isolated full Python suite passed all 349 tests. Twenty-one focused lifecycle
+cases cover identity/queue/inbox preservation, active creators, self-reset idle
+admission, ownership/routing freezes, exact request retries, cancellation,
+settings mismatches, host isolation, interrupted RPC reconciliation, explicit
+prompt retry, empty unmaterialized threads and automatic queue admission. All
+nine browser suites passed, including reset/create forms, literal prompts,
+CSRF rejection, cancellation, live status, keyboard focus and mobile layout.
+The new 390 px dialog screenshot was visually reviewed.
+
+The existing Codex 0.159.2 app-server also exercised both workflows against an
+isolated HTTP service, test identities and temporary workspace. Reset retained
+the exact session and resource queue; creation produced a distinct session and
+main thread. Small no-tool model turns completed; all three successful workflow
+threads were archived and isolated services closed. No Unity agent, native app,
+shared project input or existing conversation was reset or interrupted.
+
+This exposed two protocol details now covered by regressions: new empty threads
+cannot yet resume saved history, so permission validation uses `thread/start`
+settings; queue/add can auto-admit an idle thread, so completion is reconciled
+by exact user-message client ID rather than issuing a second start. Lost thread
+creation remains uncertain without replay. If its settings cannot be retrieved,
+manual resolution stays blocked rather than weakening the checks.
+
+Production server/bridge processes were not reloaded during implementation. The
+installed client owns the app-server; its restart affects connected sessions and
+requires a coordinated quiet window. The feature never restarts a service itself.
+
 # Media attachment viewer — 2026-10-01
 
 Image clicks now open a modal in the app's existing visual style. Videos retain

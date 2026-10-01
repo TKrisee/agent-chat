@@ -55,6 +55,8 @@ class BridgeState:
                 thread_id TEXT PRIMARY KEY, state TEXT NOT NULL,
                 error TEXT, checked_at REAL NOT NULL);
         ''')
+        from .session_reset import SessionResetState
+        SessionResetState(coord)
 
     def resolve(self, session_id):
         """Return the root thread and explicit descendant route, or no binding."""
@@ -77,6 +79,8 @@ class BridgeState:
         # Parent rebinding could redirect descendants with queued input. Freeze
         # routes while a job needs reconciliation instead of silently rerouting it.
         caller = self.coord.require_session()
+        from .session_reset import assert_reset_unlocked
+        assert_reset_unlocked(self.db, caller)
         for row in self.db.execute("SELECT id,thread_id FROM bridge_jobs WHERE status NOT IN ('dispatched','cancelled')"):
             route = self.resolve(caller)
             if route and row['thread_id'] == route['thread_id']:
@@ -99,6 +103,9 @@ class BridgeState:
             if not self.db.execute('SELECT 1 FROM sessions WHERE id=?', (parent_session,)).fetchone():
                 raise CoordError('parent must be an exact registered coordination session ID')
         with self.coord.tx():
+            if parent_session:
+                from .session_reset import assert_reset_unlocked
+                assert_reset_unlocked(self.db, parent_session)
             old = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (caller,)).fetchone()
             if old and (old['thread_id'], old['parent_session'], old['agent_path']) == (thread_id, parent_session, agent_path):
                 return dict(old)
@@ -124,6 +131,8 @@ class BridgeState:
             LEFT JOIN bridge_deliveries d ON d.message_id=m.id
             WHERE m.sender_session<>m.recipient_session
               AND m.acked_at IS NULL AND d.message_id IS NULL
+              AND NOT EXISTS (SELECT 1 FROM session_resets r WHERE r.target_session=m.recipient_session
+                  AND r.status NOT IN ('completed','cancelled','failed'))
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))
             ORDER BY m.seq''')]
@@ -168,6 +177,8 @@ class BridgeState:
             live = []
             for message in messages:
                 row = self.db.execute('SELECT acked_at,recipient_session,sender_session FROM messages WHERE id=?', (message['id'],)).fetchone()
+                from .session_reset import assert_reset_unlocked
+                assert_reset_unlocked(self.db, message['recipient_session'])
                 route = self.resolve(message['recipient_session'])
                 if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
                         and row['sender_session'] != row['recipient_session'] and route and route['thread_id'] == thread_id

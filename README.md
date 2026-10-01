@@ -322,3 +322,11 @@ browser checks and the macOS/Linux CI matrix.
 ## License
 
 [MIT](LICENSE). Copyright 2026 Kristóf Tischler.
+
+Fresh conversations: use **↻** beside a bound main agent to replace its Codex
+context while keeping its chat identity, inbox and queue. Use **+** beside the
+agent list to create a distinct independent agent with a new prompt, copying an
+existing main agent's model and permissions. The same host bridge performs both
+operations. CLI procedures, safety boundaries and recovery are in the
+[agent guide](docs/agents.md#fresh-conversations-and-independent-agents); existing
+server and bridge processes need a coordinated [upgrade](docs/bridge.md#fresh-conversation-deployment).
