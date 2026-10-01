@@ -768,7 +768,7 @@ c.close()
     const draftImages = page.locator('#composer-images .draft-image');
     await dropFiles([{ name: 'script.exe', type: 'image/png', bytes: [65] }]);
     assert.equal(await draftImages.count(), 0);
-    await page.locator('#composer-status').filter({ hasText: 'supported image or text file' }).waitFor();
+    await page.locator('#composer-status').filter({ hasText: 'supported image, video or text file' }).waitFor();
     const beforeImageDraft = await (await page.request.get(fixtureInfo.url + '/api/snapshot?project=' + projectId)).json();
     await dropFiles([{ name: 'drag.png', type: 'image/png', bytes: [...png] }]);
     await page.waitForFunction(() => document.querySelector('#composer-images img')?.naturalWidth === 1);

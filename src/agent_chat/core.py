@@ -56,6 +56,10 @@ IMAGE_EXTENSIONS = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
     ".gif": "image/gif", ".webp": "image/webp",
 }
+VIDEO_EXTENSIONS = {
+    ".mp4": "video/mp4", ".m4v": "video/mp4",
+    ".mov": "video/quicktime", ".webm": "video/webm",
+}
 TEXT_EXTENSIONS = {
     ".txt": "text/plain", ".md": "text/markdown", ".markdown": "text/markdown",
     ".json": "application/json", ".xml": "application/xml",
@@ -551,13 +555,36 @@ class Coordinator:
         name = "".join(char if char.isprintable() and char not in "/\\" else "_" for char in name).strip(" .")
         return name[:255] or "attachment"
 
+    @staticmethod
+    def _video_mime(content: bytes) -> str | None:
+        if len(content) >= 16 and content[4:8] == b'ftyp':
+            size = int.from_bytes(content[:4], 'big')
+            if 16 <= size <= len(content) and size % 4 == 0:
+                brands = [content[8:12]] + [content[i:i+4] for i in range(16, size, 4)]
+                if b'qt  ' in brands:
+                    return 'video/quicktime'
+                if any(brand in {b'isom', b'iso2', b'iso3', b'iso4', b'iso5', b'iso6', b'iso7',
+                                 b'iso8', b'iso9', b'mp41', b'mp42', b'avc1', b'M4V ', b'M4VH', b'dash'}
+                       for brand in brands):
+                    return 'video/mp4'
+        if content.startswith(b'\x1a\x45\xdf\xa3') and len(content) > 5:
+            # Bound the DocType check to the declared EBML header, not media data.
+            first = content[4]
+            width = next((n for n in range(1, 9) if first & (1 << (8 - n))), 0)
+            if width and len(content) >= 4 + width:
+                size = int.from_bytes(content[4:4+width], 'big') & ((1 << (7 * width)) - 1)
+                end = 4 + width + size
+                if end <= len(content) and b'\x42\x82\x84webm' in content[4+width:end]:
+                    return 'video/webm'
+        return None
+
     @classmethod
     def _prepare_attachment(cls, name: str, content: bytes) -> tuple[str, str, bytes]:
         name = cls._attachment_name(name)
         extension = pathlib.Path(name).suffix.lower()
-        mime = IMAGE_EXTENSIONS.get(extension) or TEXT_EXTENSIONS.get(extension)
+        mime = IMAGE_EXTENSIONS.get(extension) or VIDEO_EXTENSIONS.get(extension) or TEXT_EXTENSIONS.get(extension)
         if mime is None:
-            raise CoordError("unsupported attachment type; choose PNG, JPEG, GIF, WebP, TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, or TOML")
+            raise CoordError("unsupported attachment type; choose PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, or TOML")
         if not content:
             raise CoordError("attachment must be nonempty")
         if len(content) > MAX_ATTACHMENT_SIZE:
@@ -565,6 +592,9 @@ class Coordinator:
         if extension in IMAGE_EXTENSIONS:
             if cls._image_mime(content) != mime:
                 raise CoordError("attachment content does not match its image extension")
+        elif extension in VIDEO_EXTENSIONS:
+            if cls._video_mime(content) != mime:
+                raise CoordError("attachment content does not match its video extension")
         else:
             # Documents are opaque UTF-8 data: never parse XML, render markup, or
             # execute configuration. Reject binary payloads and renamed scripts.

@@ -91,7 +91,7 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     const downloaded = await download.path();
     assert.deepEqual(fs.readFileSync(downloaded), files[1].buffer);
     await upload.setInputFiles({ name: 'fake.exe', mimeType: 'image/png', buffer: Buffer.from('fake') });
-    await page.locator('#composer-status').filter({ hasText: 'supported image or text file' }).waitFor();
+    await page.locator('#composer-status').filter({ hasText: 'supported image, video or text file' }).waitFor();
     assert.equal(await page.locator('#composer-images .draft-image').count(), 0);
     await upload.setInputFiles({ name: 'script.txt', mimeType: 'text/plain', buffer: Buffer.from('#!/bin/sh\necho unsafe\n') });
     await input.fill('@beta');
@@ -125,12 +125,61 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     await page.getByRole('link', {name: 'Download boundary-49.txt', exact: true}).waitFor();
     const fiftyCard = page.locator('.message-card').filter({hasText: '50-file boundary'});
     assert.equal(await fiftyCard.locator('.attachment-document-type').count(), 50);
+    // Real 0.5-second, 32x32 silent clips; tests need no ffmpeg installation.
+    const clips = ['mp4', 'webm', 'mov'].map(extension => ({
+      name: `clip.${extension}`, mimeType: 'application/octet-stream',
+      buffer: fs.readFileSync(path.join(__dirname, 'fixtures', `attachment.${extension}`)),
+    }));
+    await upload.setInputFiles(clips);
+    assert.equal(await page.locator('#composer-images video').count(), 3);
+    await input.fill('@beta videos');
+    const videoResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await videoResponse).status(), 200);
+    const player = page.locator('video[aria-label="Play clip.mp4"]');
+    await player.waitFor();
+    await page.waitForFunction(() => document.querySelector('video[aria-label="Play clip.mp4"]').readyState >= 1);
+    assert.equal(await player.evaluate(video => video.videoWidth), 32);
+    await player.evaluate(async video => { video.muted = true; await video.play(); });
+    await page.waitForFunction(() => document.querySelector('video[aria-label="Play clip.mp4"]').currentTime > 0);
+    await player.evaluate(video => { video.pause(); video.currentTime = 0.3; });
+    await page.waitForFunction(() => !document.querySelector('video[aria-label="Play clip.mp4"]').seeking);
+    await input.fill('@beta update during video review');
+    const updateResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await updateResponse).status(), 200);
+    await page.locator('.message-body').filter({hasText: 'update during video review'}).waitFor();
+    assert.equal(await player.evaluate(video => video.currentTime >= 0.25 && video.paused), true,
+      'incoming updates preserve paused video position');
+    const webm = page.locator('video[aria-label="Play clip.webm"]');
+    await webm.evaluate(async video => { video.muted = true; video.playbackRate = 0.2; await video.play(); });
+    await page.waitForFunction(() => document.querySelector('video[aria-label="Play clip.webm"]').currentTime > 0);
+    await input.fill('@beta update during video playback');
+    const playingResponse = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await playingResponse).status(), 200);
+    await page.locator('.message-body').filter({hasText: 'update during video playback'}).waitFor();
+    assert.equal(await webm.evaluate(video => !video.paused && video.currentTime > 0 && video.playbackRate === 0.2), true,
+      'incoming updates preserve active playback');
+    await webm.evaluate(video => video.pause());
+    const movieDownload = page.waitForEvent('download');
+    await page.getByRole('link', {name: 'Download clip.mov', exact: true}).click();
+    const movie = await movieDownload;
+    assert.equal(movie.suggestedFilename(), 'clip.mov');
+    assert.deepEqual(fs.readFileSync(await movie.path()), clips[2].buffer);
+    await upload.setInputFiles({name: 'fake.mp4', mimeType: 'video/mp4', buffer: Buffer.from('not video')});
+    await input.fill('@beta reject spoofed video');
+    const invalidVideo = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await invalidVideo).status(), 400);
+    assert.equal(await page.locator('#composer-images .draft-image').count(), 1);
+    await page.getByRole('button', {name: 'Remove fake.mp4', exact: true}).click();
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'static-desktop.png') });
     await page.setViewportSize({ width: 320, height: 740 });
     assert.equal(await page.locator('.message-card').evaluateAll(cards => cards.every(card => card.scrollWidth <= card.clientWidth)), true);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'static-mobile.png') });
     assert.deepEqual(errors, []);
-    console.log('Browser: drop/picker uploads, static and mixed batches, safe tiles, exact download, limits, spoof rejection, failed draft preservation, mobile document layout passed');
+    console.log('Browser: uploads, 50-file limit, MP4/WebM playback and seeking, video position across live updates, MOV exact download, spoof rejection, failed draft preservation, mobile layout passed');
   } finally {
     if (browser) await browser.close();
     if (fixture.exitCode === null) {

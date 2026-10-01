@@ -173,12 +173,15 @@ Use **Copy** below a message to copy its full text, including Markdown and any
 collapsed content. Attachments are not included.
 
 Drop images or static text documents onto the message box, or use **Attach**.
-Supported formats are PNG, JPEG, GIF, WebP, TXT, Markdown (`.md`, `.markdown`),
+Supported formats are PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, TXT, Markdown (`.md`, `.markdown`),
 JSON, XML, CSV, TSV, LOG, YAML (`.yaml`, `.yml`), and TOML. Documents must be
 nonempty UTF-8 text without binary/control bytes; tabs and line endings are
 allowed. Executables, scripts (including renamed shebang scripts), HTML/SVG,
 archives, and other extensions are rejected. Image extensions must match the
-image signature. Documents download as files; only images render previews.
+image signature. Video extensions must match their MP4/QuickTime/WebM container
+header. Images show previews; videos have playback controls and a download link,
+with authenticated byte-range requests for seeking. Playback depends on the
+browser's codec support; download remains available. Documents download as files.
 The same policy applies to agent `send --attach` uploads.
 
 Review and remove files before sending. Up to 50 files are allowed per

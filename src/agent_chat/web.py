@@ -40,7 +40,7 @@ STATIC = {
 MESSAGE_COLUMNS = 'seq,id,sender_session,recipient_session,body,created_at,acked_at'
 UI_MESSAGE_LIMIT = 50
 MAX_MULTIPART_BYTES = MAX_ATTACHMENTS * MAX_ATTACHMENT_SIZE + 64 * 1024
-CSP = "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+CSP = "default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
 
 
 @contextlib.contextmanager
@@ -382,7 +382,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError('Expected a JSON object')
         return value
 
-    def respond(self, code, raw, mime, *, download_name=None):
+    def respond(self, code, raw, mime, *, download_name=None, extra_headers=None):
         self.send_response(code)
         self.send_header('Content-Type', mime)
         self.send_header('Content-Length', str(len(raw)))
@@ -391,6 +391,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header('Content-Security-Policy', "default-src 'none'; sandbox" if download_name is not None else CSP)
         if download_name is not None:
             self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(download_name, safe=''))
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
         self.send_header('Connection', 'close')
         self.end_headers()
         self.close_connection = True
@@ -398,6 +400,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(raw)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
+
+    def respond_video(self, content, mime):
+        headers = {'Accept-Ranges': 'bytes'}
+        ranges = self.headers.get_all('Range', [])
+        if not ranges:
+            self.respond(200, content, mime, extra_headers=headers)
+            return
+        try:
+            if len(ranges) != 1 or not ranges[0].startswith('bytes='):
+                raise ValueError('invalid byte range')
+            first, last = ranges[0][6:].split('-')
+            if not ((first and first.isascii() and first.isdecimal()) or first == ''):
+                raise ValueError('invalid range start')
+            if not ((last and last.isascii() and last.isdecimal()) or last == ''):
+                raise ValueError('invalid range end')
+            if not first:
+                suffix = int(last)
+                if suffix <= 0:
+                    raise ValueError('invalid suffix')
+                start, end = max(0, len(content) - suffix), len(content) - 1
+            else:
+                start = int(first)
+                end = min(int(last), len(content) - 1) if last else len(content) - 1
+            if not 0 <= start <= end < len(content):
+                raise ValueError('unsatisfiable range')
+        except ValueError:
+            headers['Content-Range'] = f'bytes */{len(content)}'
+            self.respond(416, b'', mime, extra_headers=headers)
+            return
+        headers['Content-Range'] = f'bytes {start}-{end}/{len(content)}'
+        self.respond(206, content[start:end+1], mime, extra_headers=headers)
 
     def select_project(self):
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
@@ -498,8 +531,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                     return
-                self.respond(200, item['content'], item['mime'],
-                             download_name=None if item['mime'] in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'} else item['name'])
+                if item['mime'].startswith('video/'):
+                    self.respond_video(item['content'], item['mime'])
+                else:
+                    self.respond(200, item['content'], item['mime'],
+                                 download_name=None if item['mime'] in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'} else item['name'])
             elif url.path == '/api/events':
                 self.events()
             else:

@@ -1,3 +1,20 @@
+# Video attachments — 2026-10-01
+
+Added MP4/M4V, MOV and WebM uploads to browser and agent attachment workflows,
+with matching container-header checks. The shared 50-file and 10 MiB per-file
+limits remain. Videos offer inline controls and exact downloads; authenticated
+single-byte-range requests support playback and seeking. Invalid or unsatisfiable
+ranges return 416. Browser codec support determines which clips play inline.
+
+On macOS/Python 3.14, all 324 Python tests and all eight final browser suites
+passed. Real MP4/WebM clips played and
+sought successfully; MOV downloaded byte-for-byte. Live-feed updates initially
+rewound video playback; retaining media nodes fixes that measured regression,
+with paused position and active playback covered in the browser workflow.
+Container mismatches, renamed scripts, oversized videos and unauthenticated
+range requests were rejected. Tests use three tiny generated silent clips,
+included in the source archive, and isolated servers/databases/browser processes.
+
 # Attachment count — 2026-10-01
 
 Raised the message attachment limit to 50 files, retaining the 10 MiB per-file

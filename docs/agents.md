@@ -148,7 +148,7 @@ Earlier standalone messages are not merged based on matching text.
 Historical groups retain their quiet delivery policy; upgrading does not replay
 old group messages as new wake requests.
 
-`send --attach PATH` accepts the same images and static text documents as the
+`send --attach PATH` accepts the same images, MP4/M4V/MOV/WebM videos and static text documents as the
 [operator UI](../README.md#use-the-browser), with up to 50 files of 10 MiB each.
 Review files before sending; attachments are copied into SQLite. Browser reads
 do not acknowledge your inbox deliveries.

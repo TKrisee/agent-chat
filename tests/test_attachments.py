@@ -63,6 +63,35 @@ class AttachmentTests(unittest.TestCase):
                            '--attach', str(gif), '--attach', str(webp))
         self.assertEqual([item['mime'] for item in sent['attachments']], ['image/gif', 'image/webp'])
 
+    def test_video_containers_persist_and_mismatches_are_atomic(self):
+        fixtures = ROOT / 'tests' / 'fixtures'
+        videos = [fixtures / f'attachment.{extension}' for extension in ('mp4', 'mov', 'webm')]
+        m4v = self.image('clip.m4v', videos[0].read_bytes())
+        args = [arg for video in [*videos, m4v] for arg in ('--attach', str(video))]
+        _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body), *args)
+        self.assertEqual([item['mime'] for item in sent['attachments']],
+                         ['video/mp4', 'video/quicktime', 'video/webm', 'video/mp4'])
+        before = self.count_messages(), self.count_attachments()
+        invalid = [b'#!/bin/sh\necho fake', videos[1].read_bytes(),
+                   b'\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1']
+        for content in invalid:
+            fake = self.image('fake.mp4', content)
+            result, _ = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
+                                 '--attach', str(videos[0]), '--attach', str(fake), check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((self.count_messages(), self.count_attachments()), before)
+        for content in (videos[0].read_bytes(), b'\x1a\x45\xdf\xa3\x87\x42\x82\x88matroska',
+                        b'\x1a\x45\xdf\xa3\x80\x42\x82\x84webm'):
+            fake = self.image('fake.webm', content)
+            result, _ = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
+                                 '--attach', str(fake), check=False)
+            self.assertNotEqual(result.returncode, 0)
+        oversized = self.image('huge.mp4', videos[0].read_bytes() + b'x' * (10 * 1024 * 1024))
+        result, _ = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
+                             '--attach', str(oversized), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual((self.count_messages(), self.count_attachments()), before)
+
     def test_attachment_limits_nonregular_files_and_later_invalid_attachment_are_atomic(self):
         good = self.image('good.png', b'\x89PNG\r\n\x1a\ngood')
         bad = self.image('bad.dat', b'not image')

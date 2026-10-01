@@ -3,6 +3,7 @@ recursive-include docs *.md
 recursive-include bin agent-chat-*
 recursive-include scripts *.sh *.jq
 recursive-include tests *.py *.cjs
+recursive-include tests/fixtures *.mp4 *.mov *.webm
 recursive-include src/agent_chat/web *.html *.css *.js
 global-exclude .DS_Store *.py[cod] *.sqlite3 *.sqlite3-* *.api-token *.web-session.json
 prune .agent-chat

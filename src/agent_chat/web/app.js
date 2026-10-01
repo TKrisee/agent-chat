@@ -7,8 +7,10 @@ const MESSAGE_PREVIEW_LENGTH = 2000;
 const MAX_FILES = 50;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
+const VIDEO_EXTENSIONS = new Set(['mp4', 'm4v', 'mov', 'webm']);
 const DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
 const state = {
   snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all', toMe: false,
   expanded: new Set(), paused: false, pending: null, connected: false,
@@ -569,10 +571,18 @@ function renderDraftImages() {
     item.setAttribute('role', 'listitem');
     let preview;
     if (attachment.url) {
-      preview = node('img');
+      const video = VIDEO_EXTENSIONS.has(fileExtension(attachment.file.name));
+      preview = node(video ? 'video' : 'img');
       preview.src = attachment.url;
-      preview.alt = attachment.file.name;
-      preview.decoding = 'async';
+      if (video) {
+        preview.muted = true;
+        preview.preload = 'metadata';
+        preview.playsInline = true;
+        preview.setAttribute('aria-label', `Video preview: ${attachment.file.name}`);
+      } else {
+        preview.alt = attachment.file.name;
+        preview.decoding = 'async';
+      }
     } else {
       preview = node('span', 'draft-document-type', fileExtension(attachment.file.name).toUpperCase() || 'FILE');
       preview.setAttribute('aria-hidden', 'true');
@@ -604,14 +614,14 @@ function addImages(files) {
   }
   for (const file of files) {
     const extension = fileExtension(file.name);
-    if (!IMAGE_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
-      composerStatus('Choose a supported image or text file.', true); return;
+    if (!IMAGE_EXTENSIONS.has(extension) && !VIDEO_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
+      composerStatus('Choose a supported image, video or text file.', true); return;
     }
     if (!file.size || file.size > MAX_FILE_BYTES) {
       composerStatus('Each file must be nonempty and no larger than 10 MiB.', true); return;
     }
   }
-  state.attachments.push(...files.map(file => ({ file, url: isImageFile(file) ? URL.createObjectURL(file) : null })));
+  state.attachments.push(...files.map(file => ({ file, url: isImageFile(file) || VIDEO_EXTENSIONS.has(fileExtension(file.name)) ? URL.createObjectURL(file) : null })));
   renderDraftImages();
   composerStatus('');
   $('message-input').focus();
@@ -693,7 +703,7 @@ async function copyMessageText(text) {
   }
 }
 
-function messageCard(message) {
+function messageCard(message, videos) {
   const sender = agentLabel(message.sender_session, message.sender_agent);
   const deliveries = messageDeliveries(message);
   const recipient = deliveries.map((delivery) => agentLabel(delivery.recipient_session, delivery.recipient_agent)).join(', ');
@@ -755,6 +765,24 @@ function messageCard(message) {
   if (message.attachments?.length) {
     const images = node('div', 'message-attachments');
     for (const attachment of message.attachments) {
+      if (VIDEO_MIMES.has(attachment.mime)) {
+        const tile = node('div', 'message-attachment');
+        const source = new URL(projectURL(`/api/attachments/${encodeURIComponent(attachment.id)}`), location.href).href;
+        const preview = videos.get(source) || node('video', 'attachment-preview');
+        if (!preview.src) {
+          preview.src = source;
+          preview.controls = true;
+          preview.playsInline = true;
+          preview.preload = 'metadata';
+          preview.setAttribute('aria-label', `Play ${attachment.name}`);
+        }
+        const download = node('a', 'attachment-name', `Download ${attachment.name}`);
+        download.href = preview.src;
+        download.download = attachment.name;
+        tile.append(preview, download);
+        images.append(tile);
+        continue;
+      }
       const link = node('a', 'message-attachment');
       link.href = projectURL(`/api/attachments/${encodeURIComponent(attachment.id)}`);
       link.target = '_blank';
@@ -866,6 +894,8 @@ function renderHistoryStatus() {
 
 function renderMessages(forceBottom = false, anchor = feedAnchor()) {
   const feed = $('feed');
+  const videos = new Map([...$('messages').querySelectorAll('video')].map(video => [video.src, video]));
+  const playing = [...videos.values()].filter(video => !video.paused && !video.ended);
   const label = state.toMe
     ? (state.selected ? `${agentLabel(state.selected)} → You` : 'Messages to you')
     : (state.selected ? agentLabel(state.selected) : 'All conversations');
@@ -892,9 +922,11 @@ function renderMessages(forceBottom = false, anchor = feedAnchor()) {
     const date = new Date(message.created_at * 1000).toDateString();
     if (date !== previousDate) fragment.append(node('div', 'date-divider', dateLabel(message.created_at)));
     previousDate = date;
-    fragment.append(messageCard(message));
+    fragment.append(messageCard(message, videos));
   }
   $('messages').replaceChildren(fragment);
+  // Moving media nodes can pause playback; keep live-message updates continuous.
+  for (const video of playing) if (video.isConnected) video.play().catch(() => {});
   $('empty-state').hidden = rows.length > 0;
   const filtered = state.query || state.ack !== 'all' || state.toMe;
   $('empty-title').textContent = filtered ? 'No matching messages' : 'The room is quiet';

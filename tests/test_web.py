@@ -383,6 +383,28 @@ class WebApiTests(unittest.TestCase):
                          [(f'large-{i}.png', image) for i in range(5)])[0], 200)
         self.assertEqual(self.value('SELECT COUNT(*) FROM attachments'), 55)
 
+    def test_video_upload_download_and_byte_ranges(self):
+        content = (ROOT / 'tests/fixtures/attachment.mp4').read_bytes()
+        self.assertEqual(self.post_multipart({'to': self.beta, 'body': ''}, [('clip.mp4', content)])[0], 200)
+        url = '/api/attachments/' + self.value('SELECT id FROM attachments')
+        status, headers, raw = self.request('GET', url)
+        self.assertEqual((status, raw), (200, content))
+        self.assertEqual(headers['Content-Type'], 'video/mp4')
+        self.assertEqual(headers['Accept-Ranges'], 'bytes')
+        self.assertNotIn('Content-Disposition', headers)
+        for requested, start, end in [('bytes=0-1', 0, 1), ('bytes=10-', 10, len(content)-1),
+                                       ('bytes=-20', len(content)-20, len(content)-1),
+                                       ('bytes=0-999999', 0, len(content)-1)]:
+            status, headers, raw = self.request('GET', url, headers={'Range': requested})
+            self.assertEqual((status, raw), (206, content[start:end+1]))
+            self.assertEqual(headers['Content-Range'], f'bytes {start}-{end}/{len(content)}')
+            self.assertEqual(int(headers['Content-Length']), len(raw))
+        for requested in ('bytes=999999-', 'bytes=4-2', 'bytes=-0', 'bytes=',
+                          'bytes=0-1,5-6', 'bytes=bad-9'):
+            status, headers, raw = self.request('GET', url, headers={'Range': requested})
+            self.assertEqual((status, raw), (416, b''))
+            self.assertEqual(headers['Content-Range'], f'bytes */{len(content)}')
+
     def test_rejected_documents_preserve_message_and_attachment_counts(self):
         before = self.value('SELECT COUNT(*) FROM messages')
         for name, content in [('unsafe.svg', b'<svg/>'), ('script.txt', b'#!/bin/sh\necho unsafe'),

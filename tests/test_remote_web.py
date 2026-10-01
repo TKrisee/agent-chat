@@ -134,6 +134,21 @@ class RemoteWebTests(RemoteWebFixture):
         self.assertEqual(len(sent['attachments']), 7)
         self.assertEqual(self.request('GET', sent['attachments'][0]['url'])[1], image)
 
+    def test_remote_video_upload_preserves_bytes_and_range_requires_auth(self):
+        self.call('register', agent='alpha')
+        self.call('register', session='b', agent='beta')
+        fixtures = Path(__file__).parent / 'fixtures'
+        clips = [(fixtures / f'attachment.{ext}').read_bytes() for ext in ('mp4', 'mov', 'webm')]
+        sent = self.call('send', to='b', body='', attachments=[
+            {'name': f'clip.{ext}', 'content_base64': base64.b64encode(content).decode()}
+            for ext, content in zip(('mp4', 'mov', 'webm'), clips)])
+        self.assertEqual([a['mime'] for a in sent['attachments']], ['video/mp4', 'video/quicktime', 'video/webm'])
+        for attachment, content in zip(sent['attachments'], clips):
+            self.assertEqual(self.request('GET', attachment['url'])[1], content)
+            self.assertEqual(self.request('GET', attachment['url'], headers={'Range': 'bytes=0-15'})[:2],
+                             (206, content[:16]))
+            self.assertEqual(self.request('GET', attachment['url'], auth=None, headers={'Range': 'bytes=0-15'})[0], 401)
+
     def test_csrf_required_for_removal_and_operator_is_preserved(self):
         self.call('register', agent='alpha')
         self.assertEqual(self.request('POST', '/api/sessions/remove', {'id': 'a'})[0], 403)
