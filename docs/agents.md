@@ -447,8 +447,9 @@ resource tokens and read context before acquiring resources. It must not registe
 again or borrow the creator's identity. Creating an agent does not grant that
 agent ownership of any files or native processes.
 
-Both workflows preserve the source model, provider, reasoning effort, workspace,
-approval reviewer and sandbox policy. Named permission profiles are reused when
+Reset preserves source model, provider, reasoning effort and workspace. Creation
+inherits them unless its explicit model/effort/workspace flags select new values.
+Both preserve approval reviewer and sandbox policy. Named permission profiles are reused when
 available; supported legacy sandbox policies are explicitly reproduced. Settings
 mismatch withholds binding and prompt. Active project measurements block requests;
 weekly usage reserves also block bridge execution. `completed` means the initial
@@ -479,3 +480,99 @@ The browser offers ↻ beside a bound main agent and **+** beside the agent list
 Creation asks which existing main agent supplies model and permissions. Both
 forms require an explicit prompt and expose progress, refusal and cancellation.
 Server and host bridge must both run the updated code; see [deployment](bridge.md#fresh-conversation-deployment).
+
+## One CLI orchestrator
+
+Keep one foreground orchestrator connected to the existing host app-server. Its
+registered independent agents execute through that same app-server and bridge;
+no additional CLI windows or bridge processes are required. Use your own session
+for every management command. Agent names are exact project-local identities.
+
+`agent-create` accepts optional `--model`, `--reasoning-effort` and `--cwd`. Omitted
+values inherit the creator's current settings. The workspace must already exist
+as an absolute directory on the execution host; prepare any approved isolated
+project copy separately. The host resolves that path and uses it for the new
+working directory and runtime workspace roots. Approval policy, reviewer and
+sandbox/profile remain copied; these flags do not select elevated permissions.
+The actual `thread/start` settings must match before binding or initial input.
+Invalid model, effort, workspace or changed settings are visible in
+`session-reset-status`; never pretend a failed candidate is the requested model.
+
+~~~sh
+agent-chat-client context
+my_thread=$(agent-chat-client session-reset-status | jq -er .thread_id)
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client agent-create --agent coding --expected-thread "$my_thread" \
+  --model gpt-6.1-sol --reasoning-effort high --cwd /absolute/approved/workspace \
+  --request-id "$request_id" --prompt-file /absolute/bounded-task.txt --confirm
+agent-chat-client session-reset-status --to coding
+agent-chat-client agents
+~~~
+
+After creation completes, inspect actual runtime settings through a durable host
+readback. `agent-status` returns the admission mode, last observation timestamp,
+thread/current turn, queue count, model, reasoning effort, workspace, permission
+JSON, unresolved wakes, owned reservations, open guards and recent control request
+IDs. It never returns reservation tokens. A cached observation is not a fresh
+runtime check. `--refresh` requires the exact bound main thread and a UUID; check
+that request reaches `completed` and `observation.checked_at` advances.
+
+~~~sh
+target_thread=$(agent-chat-client agent-status --to coding | jq -er .thread_id)
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client agent-status --to coding --refresh --expected-thread "$target_thread" \
+  --request-id "$request_id"
+agent-chat-client agent-status --to coding
+# Decode observed policy only with jq:
+agent-chat-client agent-status --to coding | jq '.observation.permissions_json | fromjson'
+~~~
+
+Stop preserves registration, binding, inbox, ACKs, resource queue positions and
+reservations. New automated wake admission and new resource acquisition stop
+immediately. The default graceful stop lets the current turn finish and permits
+same-owner guarded cleanup, receipt-backed release/recovery and existing-hold
+readback. It remains `stopping` until the thread is idle, direct input is available,
+its app-server queue is empty, and all owned holds/guards are closed. If the owner
+ends a turn with cleanup outstanding, resume it and send a bounded cleanup prompt.
+
+~~~sh
+agent-chat-client context
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client agent-stop --to coding --expected-thread "$target_thread" \
+  --request-id "$request_id" --confirm
+agent-chat-client agent-status --to coding
+~~~
+
+Add `--interrupt` only when deliberately interrupting the exact active model
+turn. The host records its turn ID before the RPC and requires later positive
+terminal/idle readback. Lost responses never trigger another turn interrupt.
+External tools, process groups, guards and reservations remain owned and may
+still be live. `stopped` reports model/admission state, not resource restoration;
+check `ownership` and resume the same owner for cleanup. Bound subagents must be
+retired before stopping their parent main conversation.
+
+Existing app-server queued inputs are preserved. There is no app-server queue
+pause endpoint, so a nonempty queue blocks interrupt/final stop; the bridge does
+not delete or replay those inputs. Previously queued wake intentions remain
+inspectable. Prepared wakes wait for resume; crossed RPC intentions reconcile
+normally. These controls govern app-managed admission, not manual operator input
+through another Codex client. Avoid manual input while stopping/stopped.
+
+~~~sh
+request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
+agent-chat-client agent-resume --to coding --expected-thread "$target_thread" \
+  --request-id "$request_id" --confirm
+agent-chat-client agent-status --to coding
+# Normal targeted send supplies a bounded continuation after resume.
+agent-chat-client send --to coding --body-file /absolute/continuation.txt
+~~~
+
+Resume keeps the exact conversation and context. It can cancel a graceful stop
+that has not recorded an interrupt. An unresolved recorded interrupt must first
+reconcile; resume never hides its outcome. A fresh-context reset remains a
+separate `session-reset` operation and waits while admission is paused. Active
+project measurements block stop/resume mutations; usage reserves block resume
+and new agent/reset execution. Readbacks and stops remain available at the usage
+reserve. Request UUIDs make identical retries idempotent; changed retry payloads
+are rejected. No stop, resume or reset authorizes workfile access: every agent
+must acquire exact file/resource holds before shared mutation.

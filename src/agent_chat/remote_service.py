@@ -96,6 +96,19 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         return {"messages": coord.send_many(targets, _string(params.get("body"), "body", False) or "", params.get("reply_to"))}
     if op == "deregister": return coord.remove_session(coord.require_session())
     if op == "remove-session": return coord.remove_session(_string(params.get("id"), "id"))
+    if op in ('agent-stop','agent-resume','agent-status','agents'):
+        from .bridge_state import BridgeState
+        from .agent_control import AgentControlState
+        BridgeState(coord)
+        controls = AgentControlState(coord)
+        if op == 'agents': return {'agents':controls.roster()}
+        target = _string(params.get('to') or session, 'to')
+        if op == 'agent-status':
+            refresh = None
+            if params.get('refresh'):
+                refresh = controls.request(target, params.get('expected_thread'), 'inspect', params.get('request_id'), True)
+            return dict(controls.status(target), refresh=refresh)
+        return controls.request(target, params.get('expected_thread'), op.removeprefix('agent-'), params.get('request_id'), params.get('confirm'), params.get('interrupt',False))
     if op.startswith('session-reset') or op == 'agent-create':
         from .bridge_state import BridgeState
         from .session_reset import SessionResetState
@@ -110,7 +123,7 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         if op == 'session-reset-retry':
             return resets.retry_prompt(_string(params.get('id'), 'id'), params.get('confirm_not_started'))
         if op == 'agent-create':
-            return resets.create(params.get('agent'), params.get('expected_thread'), params.get('prompt'), params.get('request_id'), params.get('confirm'))
+            return resets.create(params.get('agent'), params.get('expected_thread'), params.get('prompt'), params.get('request_id'), params.get('confirm'), model=params.get('model'), reasoning_effort=params.get('reasoning_effort'), cwd=params.get('cwd'))
         if op == 'session-reset':
             return resets.request(_string(params.get('to') or session, 'to'), params.get('expected_thread'),
                                   params.get('prompt'), params.get('request_id'), params.get('confirm'))
@@ -229,6 +242,8 @@ def _begin_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:
     with coord.tx() as db:
         coord._fresh(db, session)
         r = coord._verify_owner(db, coord.resource_name(resource), session, token, restore)
+        from .core import assert_agent_running
+        assert_agent_running(db, session, cleanup=True)
         if restore:
             if coord._state(r) != "stale": raise CoordError("restoration requires a stale reservation")
             if r["reservation_id"] != reservation_id: raise CoordError("restoration reservation_id does not match")

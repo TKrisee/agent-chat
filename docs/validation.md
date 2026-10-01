@@ -1,3 +1,28 @@
+# One CLI orchestration — 2026-10-02
+
+Creation now supports explicit model, reasoning effort and an existing host
+workspace while preserving and verifying approval/sandbox policy. Durable
+main-agent stop/resume and requested runtime readbacks use the existing bridge.
+No extra CLI process or bridge is launched. Stop preserves messages, ACKs,
+resource queue positions, guards and reservations; default stop waits for actual
+owner cleanup. Explicit interrupt records one exact turn and never replays after
+an ambiguous response. App-server queued input blocks interrupt/final stop and
+is preserved. Same-thread resume reopens normal delivery.
+
+Validation: 359 Python tests passed; final focused lifecycle/control suite passed
+33 cases, including two additional queue-race/later-turn recovery regressions.
+All nine existing browser suites passed. Actual app-server validation created a
+separate gpt-6.1-sol/high main in an isolated workspace; its shell tool wrote an
+exact sentinel without another CLI. Idle stop preserved unread input and resume
+dispatched it normally. An actual exact-turn interrupt preserved a separately
+running guarded process and its hold; the test owner then reaped that process,
+closed its guard and normally released the reservation. Both owned test threads
+were archived and the temporary coordinator/workspace removed.
+
+Production loading remains pending a coordinated quiet server/client restart.
+No existing project conversation, guard or service was changed for validation.
+Private full logs and test driver retained in the maintainer host evidence.
+
 # Fresh conversations and independent agents — 2026-10-02
 
 Implemented retained-identity resets and distinct independent-agent creation in

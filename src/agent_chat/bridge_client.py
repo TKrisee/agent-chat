@@ -47,6 +47,10 @@ class RemoteBridgeState:
         return self.call('observe', thread_id=thread_id, state=state, error=error)
     def heartbeat(self, server, pid, error=None):
         return self.call('heartbeat', server=server, pid=pid, error=error)
+    def control_jobs(self): return self.call('control-jobs')
+    def control_job(self, job_id): return self.call('control-job', job_id=job_id)
+    def control_update(self, job_id, expected, status, **values):
+        return self.call('control-update', job_id=job_id, expected=expected, status=status, **values)
     def reset_jobs(self): return self.call('reset-jobs')
     def reset_job(self, job_id): return self.call('reset-job', job_id=job_id)
     def reset_update(self, job_id, expected, status, **values):

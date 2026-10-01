@@ -115,6 +115,20 @@ class BridgeManager:
             return {'released': True}
         usage = self.usage_store.status(host) if self.usage_store else None
         state = BridgeState(c)
+        if op in ('control-jobs','control-job','control-update'):
+            from .agent_control import AgentControlState
+            controls = AgentControlState(c)
+            if op == 'control-jobs': return controls.jobs(host)
+            job = controls.job(params.get('job_id'))
+            if job['host_id'] != host: raise CoordError('agent control belongs to another host')
+            if op == 'control-job': return job
+            if job['action'] == 'resume' and params.get('status') == 'completed' and usage and usage['blocked']:
+                raise CoordError(usage['reason'] or 'weekly usage reserve is active')
+            values = {key:value for key,value in params.items() if key not in ('job_id','expected','status')}
+            with self.measurements.lock if self.measurements else contextlib.nullcontext():
+                if self.measurements and job['action'] != 'inspect' and self.measurements.status(self.project_id)['active']:
+                    raise CoordError('finish the active project measurement before changing agent admission')
+                return controls.update(job['id'], params.get('expected'), params.get('status'), **values)
         if op in ('reset-jobs', 'reset-job', 'reset-update'):
             from .session_reset import SessionResetState
             resets = SessionResetState(c)
@@ -126,6 +140,9 @@ class BridgeManager:
             if op == 'reset-job':
                 return job
             status = params.get('status')
+            if status in ('creating','ready','adding','starting'):
+                from .core import assert_agent_running
+                assert_agent_running(c.db, job['target_session'])
             if usage and usage['blocked'] and status in ('creating', 'ready', 'adding', 'starting'):
                 raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             with self.measurements.lock if self.measurements else contextlib.nullcontext():

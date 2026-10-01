@@ -277,3 +277,14 @@ See [agent procedures](agents.md#fresh-conversations-and-independent-agents) for
 CLI commands, retained identities/queues, self-reset admission, cancellation and
 uncertain-response recovery. This workflow creates a fresh context, not deletion
 of old transcripts. Registration and resource ownership remain separate.
+
+## Independent-agent orchestration
+
+The existing bridge also processes durable `agent-stop`, `agent-resume` and
+`agent-status --refresh` requests for exact main threads on its authenticated
+host. It neither starts another bridge nor closes external guarded processes.
+Creation accepts explicit model, reasoning effort and an existing workspace,
+while verifying copied approval/sandbox policy before initial input. See the
+[one CLI procedure](agents.md#one-cli-orchestrator) for identity, queue, cleanup
+and interrupted-turn recovery boundaries. Load both server and host client code
+during a coordinated quiet service restart before using these commands.

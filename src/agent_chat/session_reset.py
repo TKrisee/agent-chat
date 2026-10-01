@@ -21,6 +21,9 @@ class SessionResetState:
             self.db.execute("ALTER TABLE session_resets ADD COLUMN kind TEXT NOT NULL DEFAULT 'reset'")
         if 'new_settings_digest' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
             self.db.execute('ALTER TABLE session_resets ADD COLUMN new_settings_digest TEXT')
+        for column in ('requested_model', 'requested_effort', 'requested_cwd'):
+            if column not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
+                self.db.execute(f'ALTER TABLE session_resets ADD COLUMN {column} TEXT')
 
     def target(self, name):
         row = self.db.execute('SELECT id,agent FROM sessions WHERE id=? OR agent=? ORDER BY (id=?) DESC', (name, name, name)).fetchone()
@@ -89,13 +92,18 @@ class SessionResetState:
                 (request_id, caller, target, host['host_id'], old_thread, prompt, 'pending', now, now))
         return self.public(self.job(request_id))
 
-    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False):
+    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False, model=None, reasoning_effort=None, cwd=None):
         caller = self.coord.require_session()
         template = self.target(template_session or caller)['id']
         if not human and template != caller:
             raise CoordError('agent creation uses the requester\'s own conversation settings')
         if not isinstance(agent, str) or not agent.strip() or len(agent) > 64:
             raise CoordError('new agent name must be nonempty and at most 64 characters')
+        for value, label, limit in ((model, 'model', 128), (reasoning_effort, 'reasoning effort', 32), (cwd, 'cwd', 4096)):
+            if value is not None and (not isinstance(value, str) or not value.strip() or len(value) > limit):
+                raise CoordError(f'creation {label} must be a nonempty bounded string')
+        if cwd is not None and not cwd.startswith('/'):
+            raise CoordError('creation cwd must be an absolute existing directory on the agent host')
         try:
             request_id = str(uuid.UUID(request_id))
         except (ValueError, TypeError, AttributeError):
@@ -105,7 +113,7 @@ class SessionResetState:
         with self.coord.tx():
             existing = self.db.execute('SELECT * FROM session_resets WHERE id=?', (request_id,)).fetchone()
             if existing:
-                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent']) != ('create', caller, template_thread, prompt, agent):
+                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent'], existing['requested_model'], existing['requested_effort'], existing['requested_cwd']) != ('create', caller, template_thread, prompt, agent, model, reasoning_effort, cwd):
                     raise CoordError('creation retry payload differs from the original')
                 return self.public(dict(existing))
             if not human:
@@ -122,8 +130,8 @@ class SessionResetState:
             now, target = time.time(), 'session_'+uuid.uuid4().hex
             self.db.execute('INSERT INTO sessions(id,agent,registered_at) VALUES(?,?,?)', (target, agent, now))
             self.db.execute('INSERT INTO remote_session_hosts VALUES(?,?,?,?)', (target, host['host_id'], now, now))
-            self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at,kind) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                (request_id, caller, target, host['host_id'], template_thread, prompt, 'pending', now, now, 'create'))
+            self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at,kind,requested_model,requested_effort,requested_cwd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (request_id, caller, target, host['host_id'], template_thread, prompt, 'pending', now, now, 'create', model, reasoning_effort, cwd))
         return self.public(self.job(request_id))
 
     def retry_prompt(self, job_id, confirmed):
@@ -148,7 +156,7 @@ class SessionResetState:
 
     def jobs(self, host):
         return [self.job(row['id']) for row in self.db.execute(
-            "SELECT * FROM session_resets WHERE host_id=? AND status NOT IN ('completed','cancelled','failed') ORDER BY created_at", (host,))]
+            "SELECT r.* FROM session_resets r WHERE r.host_id=? AND r.status NOT IN ('completed','cancelled','failed') AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=r.target_session AND c.mode<>'running') ORDER BY r.created_at", (host,))]
 
     def update(self, job_id, expected, status, **values):
         transitions = {

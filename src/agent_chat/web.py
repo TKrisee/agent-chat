@@ -593,8 +593,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     coord.context_size = lambda value: len(json.dumps(
                         self.scoped(value), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
                     try:
-                        with self.server.measurements.lock if data.get('op') in ('session-reset', 'agent-create') else contextlib.nullcontext():
-                            if data.get('op') in ('session-reset', 'agent-create') and self.server.measurements.status(self.project['id'])['active']:
+                        with self.server.measurements.lock if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume') else contextlib.nullcontext():
+                            if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume') and self.server.measurements.status(self.project['id'])['active']:
                                 raise CoordError('finish the active project measurement before resetting a conversation')
                             result = dispatch(coord, data, bridge_manager=self.bridge_manager)
                     finally:

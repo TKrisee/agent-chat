@@ -195,6 +195,11 @@ class Bridge:
                 # If Codex is unavailable, let reconnect fail into poll backoff.
                 self.rpc.close()
                 self.rpc.connect()
+        if hasattr(self.state, 'control_jobs'):
+            from .control_worker import ControlWorker
+            for control in self.state.control_jobs():
+                try: ControlWorker(self).advance(control)
+                except (CoordError, sqlite3.Error, TransportError) as error: record(error)
         if hasattr(self.state, 'reset_jobs'):
             from .reset_worker import ResetWorker
             for reset in self.state.reset_jobs():

@@ -5,7 +5,7 @@ import time
 import uuid
 import json
 
-from .core import CoordError, Coordinator
+from .core import CoordError, Coordinator, assert_agent_running
 
 TERMINAL = ('dispatched', 'cancelled')
 
@@ -57,6 +57,8 @@ class BridgeState:
         ''')
         from .session_reset import SessionResetState
         SessionResetState(coord)
+        from .agent_control import AgentControlState
+        AgentControlState(coord)
 
     def resolve(self, session_id):
         """Return the root thread and explicit descendant route, or no binding."""
@@ -81,6 +83,7 @@ class BridgeState:
         caller = self.coord.require_session()
         from .session_reset import assert_reset_unlocked
         assert_reset_unlocked(self.db, caller)
+        assert_agent_running(self.db, caller)
         for row in self.db.execute("SELECT id,thread_id FROM bridge_jobs WHERE status NOT IN ('dispatched','cancelled')"):
             route = self.resolve(caller)
             if route and row['thread_id'] == route['thread_id']:
@@ -106,6 +109,7 @@ class BridgeState:
             if parent_session:
                 from .session_reset import assert_reset_unlocked
                 assert_reset_unlocked(self.db, parent_session)
+                assert_agent_running(self.db, parent_session)
             old = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (caller,)).fetchone()
             if old and (old['thread_id'], old['parent_session'], old['agent_path']) == (thread_id, parent_session, agent_path):
                 return dict(old)
@@ -133,6 +137,7 @@ class BridgeState:
               AND m.acked_at IS NULL AND d.message_id IS NULL
               AND NOT EXISTS (SELECT 1 FROM session_resets r WHERE r.target_session=m.recipient_session
                   AND r.status NOT IN ('completed','cancelled','failed'))
+              AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=m.recipient_session AND c.mode<>'running')
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))
             ORDER BY m.seq''')]
@@ -141,6 +146,7 @@ class BridgeState:
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
             JOIN messages m ON m.id=d.message_id
             WHERE d.job_id=? AND m.acked_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=m.recipient_session AND c.mode<>'running')
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id)) LIMIT 1''', (job_id,)).fetchone())
 
@@ -179,6 +185,7 @@ class BridgeState:
                 row = self.db.execute('SELECT acked_at,recipient_session,sender_session FROM messages WHERE id=?', (message['id'],)).fetchone()
                 from .session_reset import assert_reset_unlocked
                 assert_reset_unlocked(self.db, message['recipient_session'])
+                assert_agent_running(self.db, message['recipient_session'])
                 route = self.resolve(message['recipient_session'])
                 if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
                         and row['sender_session'] != row['recipient_session'] and route and route['thread_id'] == thread_id
@@ -201,11 +208,19 @@ class BridgeState:
         return dict(row)
 
     def jobs(self):
-        return [dict(r) for r in self.db.execute("SELECT * FROM bridge_jobs WHERE status NOT IN ('dispatched','cancelled') ORDER BY created_at")]
+        return [dict(r) for r in self.db.execute("""SELECT j.* FROM bridge_jobs j WHERE j.status NOT IN ('dispatched','cancelled')
+            AND NOT (j.status='prepared' AND EXISTS (SELECT 1 FROM bridge_bindings b JOIN agent_controls c ON c.target_session=b.session_id WHERE b.thread_id=j.thread_id AND c.mode<>'running')) ORDER BY j.created_at""")]
 
     def update(self, job_id, status, queue_id=None, error=None):
-        self.db.execute('UPDATE bridge_jobs SET status=?,queue_id=COALESCE(?,queue_id),error=?,updated_at=? WHERE id=?',
-                        (status, queue_id, error, time.time(), job_id))
+        def write():
+            if status in ('adding','starting'):
+                row = self.db.execute('SELECT b.session_id FROM bridge_jobs j JOIN bridge_bindings b ON b.thread_id=j.thread_id WHERE j.id=?', (job_id,)).fetchone()
+                if row: assert_agent_running(self.db, row['session_id'])
+            self.db.execute('UPDATE bridge_jobs SET status=?,queue_id=COALESCE(?,queue_id),error=?,updated_at=? WHERE id=?',
+                            (status, queue_id, error, time.time(), job_id))
+        if self.db.in_transaction: write()
+        else:
+            with self.coord.tx(): write()
 
     def retry(self, job_id, confirmed=False):
         if not confirmed:

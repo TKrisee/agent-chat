@@ -78,6 +78,13 @@ def assert_reset_unlocked(db, session):
             raise CoordError('fresh-session reset pending; inspect session-reset-status before changing ownership or routing')
 
 
+def assert_agent_running(db, session, *, cleanup=False):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_controls'").fetchone():
+        row = db.execute('SELECT mode FROM agent_controls WHERE target_session=?', (session,)).fetchone()
+        if row and row['mode'] != 'running' and not (cleanup and row['mode'] == 'stopping'):
+            raise CoordError('agent admission is ' + row['mode'] + '; inspect agent-status or resume the same identity')
+
+
 def _now() -> float: return time.time()
 def _id(prefix: str) -> str: return prefix + "_" + secrets.token_urlsafe(24)
 
@@ -235,6 +242,9 @@ class Coordinator:
                 raise CoordError(f"unknown session: {session_id}")
             agent_name = info["agent"]
             assert_reset_unlocked(db, session_id)
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_control_requests'").fetchone():
+                if db.execute("SELECT 1 FROM agent_control_requests WHERE target_session=? AND status NOT IN ('completed','failed','cancelled')", (session_id,)).fetchone():
+                    raise CoordError('resolve pending agent controls before removing its identity')
 
             # This is deliberately an authenticated administrative operation,
             # never a way for an anonymous client to discard a dead identity.
@@ -880,6 +890,7 @@ class Coordinator:
                 st=self._state(r)
                 if st == "stale": raise CoordError("your reservation is stale; release or recover it with a receipt")
                 return self._reservation_result(r, "owned", 0)
+            assert_agent_running(db, sid)
             first = db.execute("SELECT session FROM resource_queue WHERE resource=? ORDER BY seq LIMIT 1", (resource,)).fetchone()
             if (not r or not r["owner_session"]) and (not first or first["session"] == sid):
                 db.execute("DELETE FROM resource_queue WHERE resource=? AND session=?", (resource,sid))
@@ -1031,6 +1042,7 @@ class Coordinator:
             if self._remote_bound(db, sid): raise CoordError("remote-bound reservation must use agent-chat --server run")
             # Reading inbox here is deliberate and satisfies the ownership mutation guard.
             self._fresh(db,sid);r=self._verify_owner(db,resource,sid,token)
+            assert_agent_running(db, sid, cleanup=True)
             run=_id("run"); db.execute("INSERT INTO guarded_runs(run_id,resource,reservation_id,session,pid,started_at) VALUES(?,?,?,?,?,?)",(run,resource,r["reservation_id"],sid,pid,_now()))
         return run,r
 
