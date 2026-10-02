@@ -142,6 +142,10 @@ class RootOrchestratorTests(RemoteWebFixture):
         self.assertIn(project, text)
         self.assertEqual(len(self.rpc.history[status['thread_id']]), 1)
         self.assertEqual(self.rpc.started[status['thread_id']]['runtimeWorkspaceRoots'], [str(self.workspace)])
+        renamed = self.client.call('/api/projects/rpc', dict(op='rename', id=project, name='Calendar renamed'))['project']
+        self.assertNotIn('instructions', renamed)
+        self.assertTrue(renamed['has_instructions'])
+        self.assertEqual(self.server.projects.get(project)['instructions'], brief)
 
     def test_provision_missing_assignment_or_overlapping_workspace_dispatches_nothing(self):
         project = self.project()

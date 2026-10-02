@@ -923,12 +923,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if op == 'create' and {'op', 'name'} <= set(data) <= {'op', 'name', 'workspace', 'instructions'}:
             item = self.server.projects.create(data['name'], data.get('workspace'), data.get('instructions'))
             self.server.project_context(item['id'])
-            public = {key: value for key, value in item.items() if key != 'instructions'}
-            public['has_instructions'] = bool(item.get('instructions'))
-            return {'project': public, 'projects': self.server.listed_projects()}
-        if op == 'rename' and set(data) == {'op', 'id', 'name'}:
-            return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.listed_projects()}
-        raise CoordError('invalid project operation')
+        elif op == 'rename' and set(data) == {'op', 'id', 'name'}:
+            item = self.server.projects.rename(data['id'], data['name'])
+        else:
+            raise CoordError('invalid project operation')
+        public = {key: value for key, value in item.items() if key != 'instructions'}
+        public['has_instructions'] = bool(item.get('instructions'))
+        return {'project': public, 'projects': self.server.listed_projects()}
 
     def root_action(self, data):
         if not isinstance(data, dict) or set(data) != {'op','session','host_id','params'} or not isinstance(data['params'], dict):
