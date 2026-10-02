@@ -1,3 +1,19 @@
+# Parent-grouped agent sidebar — 2026-10-02
+
+The browser now uses actual `parent_session` bindings from the snapshot to group
+subagents immediately after their parent. Children indent 14 px per level,
+capped at four visual levels for narrow sidebars. Main agents and siblings retain
+alphabetical order. Names containing a slash remain independent when unbound.
+Selection, full identity labels, model details, removal and reset controls stay
+available. Live rename/add and reload preserve grouping and selection.
+
+Validation: focused browser workflow passed actual two-level bindings, order and
+pixel indentation, slash-name independence, selection, disabled child reset,
+live parent rename/new sibling, reload and mobile width. Desktop and mobile
+screenshots visually reviewed. All ten browser suites and 45 relevant Python
+snapshot/session-model/remote-web tests passed. Production backend loading still
+requires the coordinated service restart already pending for orchestration.
+
 # One CLI orchestration — 2026-10-02
 
 Creation now supports explicit model, reasoning effort and an existing host

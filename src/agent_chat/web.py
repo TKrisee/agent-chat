@@ -130,7 +130,7 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         if db.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='bridge_bindings'").fetchone():
             bindings = {row['session_id']: dict(row) for row in db.execute(
-                'SELECT session_id,thread_id,agent_path FROM bridge_bindings')}
+                'SELECT session_id,thread_id,parent_session,agent_path FROM bridge_bindings')}
         agents = agent_labels(db)
         total = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
         rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY seq DESC LIMIT ?',
@@ -161,7 +161,8 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
                     (SELECT id FROM session_resets ORDER BY created_at DESC LIMIT 20)
                 ORDER BY created_at DESC''')]
         for session in sessions:
-            session.update(thread_id=bindings.get(session['id'], {}).get('thread_id'))
+            route = bindings.get(session['id'], {})
+            session.update(thread_id=route.get('thread_id'), parent_session=route.get('parent_session'))
     if usage_store is not None:
         data['usage'] = usage_store.status()
     if session_models is not None:

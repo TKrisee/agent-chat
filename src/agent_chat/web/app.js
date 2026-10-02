@@ -320,17 +320,38 @@ function renderAgents() {
   $('all-count').textContent = state.snapshot.total_messages.toLocaleString();
   $('all-conversations').classList.toggle('selected', !state.selected);
   $('all-conversations').setAttribute('aria-pressed', String(!state.selected));
-  const fragment = document.createDocumentFragment();
+  const visible = new Set(sessions.map(session => session.id));
+  const children = new Map();
+  const roots = [];
   for (const session of sessions) {
-    const isSubagent = session.agent.includes('/');
+    if (session.parent_session && visible.has(session.parent_session)) {
+      if (!children.has(session.parent_session)) children.set(session.parent_session, []);
+      children.get(session.parent_session).push(session);
+    } else roots.push(session);
+  }
+  const ordered = [];
+  const visited = new Set();
+  function appendBranch(session, depth) {
+    if (visited.has(session.id)) return;
+    visited.add(session.id);
+    ordered.push({ session, depth });
+    for (const child of children.get(session.id) || []) appendBranch(child, depth + 1);
+  }
+  for (const session of roots) appendBranch(session, 0);
+  // Keep every registration visible even if a stale route has no visible root.
+  for (const session of sessions) appendBranch(session, 0);
+  const fragment = document.createDocumentFragment();
+  for (const { session, depth } of ordered) {
+    const isSubagent = Boolean(session.parent_session);
     const controls = node('div', 'agent-controls');
+    controls.style.marginLeft = `${Math.min(depth, 4) * 14}px`;
     const button = node('button', `agent-button${isSubagent ? ' subagent' : ''}${state.selected === session.id ? ' selected' : ''}`);
     button.type = 'button';
     button.title = `${session.agent}\n${session.id}`;
     button.setAttribute('aria-label', `Show conversations with ${session.agent}`);
     button.setAttribute('aria-pressed', String(state.selected === session.id));
     const label = node('span', 'agent-label');
-    label.append(node('span', 'agent-name', isSubagent ? session.agent.slice(session.agent.indexOf('/') + 1) : session.agent));
+    label.append(node('span', 'agent-name', session.agent));
     const details = [session.model, session.reasoning_effort && `${session.reasoning_effort} reasoning`].filter(Boolean).join(' · ');
     const metadata = node('span', 'agent-model', details || 'Model details unavailable');
     metadata.title = details ? `Latest observed: ${details}` : 'No model or reasoning level has been observed for this session';

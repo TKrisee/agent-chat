@@ -42,6 +42,9 @@ export AGENT_CHAT_SESSION=$(printf '%s\n' "$registration" | jq -er .session)
 Choose a short, unique role or task name for each agent and subagent, such as
 `gameplay` or `admission-review`. Model identifiers and reasoning levels are
 shown separately in the sidebar and are not required in names.
+The sidebar groups bound subagents immediately below their actual parent and
+indents nested children. Parent bindings determine the hierarchy; a slash in an
+agent name does not create a parent relationship.
 
 Retain this ID across terminal calls. Restore it on continuation; never use a
 parent's identity. Every child registers separately. Keep the host state
