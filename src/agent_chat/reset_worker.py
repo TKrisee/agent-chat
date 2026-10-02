@@ -1,8 +1,8 @@
 """Fresh contexts on the existing host app-server, with durable RPC boundaries."""
-import hashlib
 import json
 from pathlib import Path
 
+from .creation_settings import settings_data, profile_chain, resolve_workspace_settings, creation_settings
 from .core import CoordError
 from .rpc import RpcError, TransportError
 
@@ -22,16 +22,22 @@ class ResetWorker:
         data = self.rpc.request('thread/resume', {'threadId': thread, 'excludeTurns': True})
         return self.settings_data(data)
 
-    @staticmethod
-    def settings_data(data):
-        keys = ('model', 'modelProvider', 'cwd', 'approvalPolicy', 'approvalsReviewer',
-                'reasoningEffort', 'sandbox', 'activePermissionProfile', 'runtimeWorkspaceRoots',
-                'multiAgentMode', 'serviceTier')
-        values = {key: data.get(key) for key in keys}
-        if not all(values.get(key) for key in ('model', 'modelProvider', 'cwd', 'sandbox')):
-            raise CoordError('app-server did not return complete settings; reset withheld')
-        digest = hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
-        return values, digest
+    settings_data = staticmethod(settings_data)
+
+    def creation_settings(self, source, job):
+        cwd = source['cwd']
+        if job.get('requested_cwd'):
+            directory = Path(job['requested_cwd'])
+            if not directory.is_absolute() or not directory.is_dir():
+                raise CoordError('requested workspace must already exist as an absolute directory on this host')
+            cwd = str(directory.resolve())
+        desired = creation_settings(source, job, cwd)
+        profile = (source.get('activePermissionProfile') or {}).get('id')
+        if profile and not profile.startswith(':') and cwd != source['cwd']:
+            profiles = [profile_chain(self.rpc.request('config/read', {'cwd': root, 'includeLayers': False})['config'], profile)
+                        for root in (source['cwd'], cwd)]
+            desired = resolve_workspace_settings(source, desired, *profiles)
+        return settings_data(desired)
 
     def empty_history(self, thread):
         try:
@@ -125,15 +131,7 @@ class ResetWorker:
                     return
                 settings, digest = self.settings(job['old_thread_id'])
                 if job.get('kind') == 'create':
-                    if job.get('requested_model'): settings['model'] = job['requested_model']
-                    if job.get('requested_effort'): settings['reasoningEffort'] = job['requested_effort']
-                    if job.get('requested_cwd'):
-                        directory = Path(job['requested_cwd'])
-                        if not directory.is_absolute() or not directory.is_dir():
-                            raise CoordError('requested workspace must already exist as an absolute directory on this host')
-                        settings['cwd'] = str(directory.resolve())
-                        settings['runtimeWorkspaceRoots'] = [settings['cwd']]
-                    settings, digest = self.settings_data(settings)
+                    settings, digest = self.creation_settings(settings, job)
                 params = self.start_params(settings)
                 job = self.update(job, 'creating', settings_digest=digest, error=None)
                 created = self.rpc.request('thread/start', params)

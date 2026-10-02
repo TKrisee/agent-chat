@@ -1,5 +1,6 @@
 """Durable fresh-conversation requests; never transfer resource ownership."""
 import time
+import json
 import uuid
 
 from .core import CoordError, assert_reset_unlocked
@@ -24,6 +25,9 @@ class SessionResetState:
         for column in ('requested_model', 'requested_effort', 'requested_cwd'):
             if column not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
                 self.db.execute(f'ALTER TABLE session_resets ADD COLUMN {column} TEXT')
+
+        if 'workspace_revalidated' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
+            self.db.execute('ALTER TABLE session_resets ADD COLUMN workspace_revalidated INTEGER NOT NULL DEFAULT 0')
 
     def target(self, name):
         row = self.db.execute('SELECT id,agent FROM sessions WHERE id=? OR agent=? ORDER BY (id=?) DESC', (name, name, name)).fetchone()
@@ -133,6 +137,55 @@ class SessionResetState:
             self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at,kind,requested_model,requested_effort,requested_cwd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (request_id, caller, target, host['host_id'], template_thread, prompt, 'pending', now, now, 'create', model, reasoning_effort, cwd))
         return self.public(self.job(request_id))
+
+    def revalidate_info(self, job_id):
+        job = self.job(job_id)
+        caller = self.coord.require_session()
+        host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (caller,)).fetchone()
+        if caller != job['requester_session'] or not host or host['host_id'] != job['host_id']:
+            raise CoordError('only the original requester on the creation host may revalidate settings')
+        if job['kind'] != 'create' or not job['requested_cwd']:
+            raise CoordError('workspace revalidation requires an explicit-workspace agent creation')
+        if not job['workspace_revalidated'] and (job['status'] != 'created' or not job['new_thread_id'] or job['queue_id'] or not job['new_settings_digest']):
+            raise CoordError('workspace revalidation requires the exact created candidate before prompt submission')
+        return self.public(job)
+
+    def revalidate_workspace(self, job_id, proof, confirmed):
+        from .creation_settings import creation_settings, resolve_workspace_settings, settings_data
+        with self.coord.tx():
+            self.revalidate_info(job_id)
+            job = self.job(job_id)
+            if confirmed is not True:
+                raise CoordError('workspace revalidation requires explicit confirmation')
+            if job['workspace_revalidated']:
+                return self.public(job)
+            self.coord._fresh(self.db, self.coord.require_session())
+            if self.db.execute('SELECT 1 FROM bridge_bindings WHERE session_id=? OR thread_id=?', (job['target_session'], job['new_thread_id'])).fetchone():
+                raise CoordError('candidate acquired an unexpected binding; revalidation withheld')
+            if not isinstance(proof, dict) or set(proof) != {'source', 'source_profiles', 'target_profiles', 'thread_id'} or proof['thread_id'] != job['new_thread_id']:
+                raise CoordError('workspace revalidation proof must name the exact candidate')
+            try:
+                source, _ = settings_data(proof['source'])
+                desired = creation_settings(source, job, job['requested_cwd'])
+                if settings_data(desired)[1] != job['settings_digest']:
+                    raise CoordError('original creation settings changed; revalidation withheld')
+                # The existing authenticated bridge, not the requester-supplied
+                # proof, anchors permissions that were implicit in the old cwd.
+                observed = self.db.execute('SELECT * FROM agent_control_observations WHERE target_session=? AND thread_id=?', (job['requester_session'], job['old_thread_id'])).fetchone()
+                binding = self.db.execute('SELECT thread_id FROM bridge_bindings WHERE session_id=?', (job['requester_session'],)).fetchone()
+                if not observed or not binding or binding['thread_id'] != job['old_thread_id'] or observed['checked_at'] < job['created_at'] or time.time() - observed['checked_at'] > 120:
+                    raise CoordError('refresh the original requester agent-status through the existing bridge before revalidation')
+                permissions = {key: source.get(key) for key in ('sandbox', 'approvalPolicy', 'approvalsReviewer', 'activePermissionProfile', 'runtimeWorkspaceRoots')}
+                if (observed['cwd'], observed['model'], observed['reasoning_effort'], json.loads(observed['permissions_json'])) != (source['cwd'], source['model'], source['reasoningEffort'], permissions):
+                    raise CoordError('source settings do not match the authenticated bridge observation')
+                corrected = resolve_workspace_settings(source, desired, proof['source_profiles'], proof['target_profiles'])
+                digest = settings_data(corrected)[1]
+            except (KeyError, TypeError, AttributeError, ValueError) as error:
+                raise CoordError('invalid workspace revalidation proof') from error
+            if digest == job['settings_digest'] or digest != job['new_settings_digest']:
+                raise CoordError('captured candidate settings do not match resolved original permissions; revalidation withheld')
+            self.db.execute('UPDATE session_resets SET settings_digest=?,workspace_revalidated=1,error=NULL,updated_at=? WHERE id=?', (digest, time.time(), job_id))
+        return self.public(self.job(job_id))
 
     def retry_prompt(self, job_id, confirmed):
         with self.coord.tx():

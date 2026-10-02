@@ -107,6 +107,9 @@ def _remote_main(raw, global_args, server):
     x.add_argument('--thread', required=True); x.add_argument('--confirm-created', action='store_true')
     x = sub.add_parser('session-reset-retry'); x.add_argument('id')
     x.add_argument('--confirm-not-started', action='store_true')
+    x = sub.add_parser('session-reset-revalidate', help='revalidate a withheld explicit-workspace creation against its captured settings; never recreate')
+    x.add_argument('id'); x.add_argument('--confirm', action='store_true')
+    x.add_argument('--codex-server', default=os.environ.get('AGENT_CHAT_CODEX_SERVER') or 'ws://127.0.0.1:4500')
     x = sub.add_parser('agent-create', help='create an independent registered agent on your existing host bridge')
     x.add_argument('--agent', required=True); x.add_argument('--expected-thread', required=True)
     x.add_argument('--model'); x.add_argument('--reasoning-effort')
@@ -176,6 +179,23 @@ def _remote_main(raw, global_args, server):
     client, host = HttpClient(server, global_args.api_token, project=global_args.project), client_host_id()
     def call(operation, values):
         return client.call('/api/coord', {'op': operation, 'session': session, 'host_id': host, 'params': values})
+    if op == 'session-reset-revalidate':
+        if not params['confirm']:
+            raise core.CoordError('workspace revalidation requires --confirm')
+        job = call('session-reset-revalidate-info', {'id': params['id']})
+        if job.get('workspace_revalidated'):
+            print(json.dumps(job, sort_keys=True))
+            return 0
+        from .creation_settings import revalidation_proof
+        from .rpc import RpcClient, RpcError
+        try:
+            with RpcClient(params.pop('codex_server')) as rpc:
+                params['proof'] = revalidation_proof(rpc, job)
+        except RpcError as error:
+            raise core.CoordError(str(error)) from error
+        result = call(op, params)
+        print(json.dumps(result, sort_keys=True))
+        return 0
     if 'resource' in params:
         from .remote_service import resource_name
         params['resource'] = resource_name(params['resource'])

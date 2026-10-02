@@ -512,6 +512,47 @@ agent-chat-client session-reset-status --to coding
 agent-chat-client agents
 ~~~
 
+Named permission profiles are resolved in both the original and requested
+workspace. Their complete selected inheritance chains must agree. An explicit
+profile workspace grant that was implicit in the original runtime workspace may
+appear as an extra `sandbox.writableRoots` entry after relocation. This is the
+same existing grant, not a permission upgrade; all remaining settings still
+require an exact match. Changed project-local policy withholds creation.
+
+For a creation already withheld in `created` by an older bridge because of that
+specific root reclassification, preserve the exact request and empty candidate.
+The original CLI requester can revalidate it without creating another thread:
+
+~~~sh
+agent-chat-client context
+agent-chat-client agent-status --refresh --expected-thread "$my_thread" \
+  --request-id "$(python3 -c 'import uuid; print(uuid.uuid4())')"
+# Read agent-status until that inspection is completed by the existing bridge.
+# The observation must be no older than two minutes when revalidation runs.
+agent-chat-client agent-status
+agent-chat-client session-reset-revalidate "$request_id" --confirm
+agent-chat-client session-reset-status --to world
+~~~
+
+Revalidation reads the original settings and selected profiles from the local
+app-server and independently verifies that the candidate is idle with no queue
+or input history. The coordinator anchors original effective permissions to the
+existing authenticated bridge observation, verifies the immutable original and
+captured candidate setting hashes, and corrects only that proven comparison.
+The existing bridge then repeats normal admission checks before binding and
+submitting the original prompt once. Repeating an accepted revalidation is
+read-only. Other settings changes, unknown history, another requester/host,
+symlink-normalization differences or an already submitted prompt cannot be
+repaired with this command. There is no force or permission-override option.
+Use `--codex-server` only for the existing host's loopback endpoint if it differs
+from `ws://127.0.0.1:4500`.
+
+A coordinator-only reload can load revalidation while preserving an older
+bridge's empty in-memory candidate. Do not restart its owned app-server before
+that candidate has received its verified first input; unmaterialized threads may
+not survive a restart. Coordinate any reload with affected owners and active
+measurements, and distinguish installed code from the running bridge version.
+
 After creation completes, inspect actual runtime settings through a durable host
 readback. `agent-status` returns the admission mode, last observation timestamp,
 thread/current turn, queue count, model, reasoning effort, workspace, permission

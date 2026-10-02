@@ -114,6 +114,10 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         from .session_reset import SessionResetState
         BridgeState(coord)
         resets = SessionResetState(coord)
+        if op == 'session-reset-revalidate-info':
+            return resets.revalidate_info(_string(params.get('id'), 'id'))
+        if op == 'session-reset-revalidate':
+            return resets.revalidate_workspace(_string(params.get('id'), 'id'), params.get('proof'), params.get('confirm'))
         if op == 'session-reset-status':
             return resets.status(_string(params.get('to') or session, 'to'))
         if op == 'session-reset-cancel':
