@@ -177,7 +177,16 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         if resource_page is not None:
             data['resource_page'] = resource_page
         data['session_resets'] = []
+        orchestrators = set()
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_resets'").fetchone():
+            # Role follows durable main-creation relationships, not names/models
+            # or the limited recent lifecycle activity shown in the browser.
+            creations = list(db.execute('''SELECT requester_session,target_session FROM session_resets
+                WHERE kind='create' AND status='completed'
+                AND requester_session IN (SELECT id FROM sessions)
+                AND target_session IN (SELECT id FROM sessions)'''))
+            created = {row['target_session'] for row in creations}
+            orchestrators = {row['requester_session'] for row in creations} - created
             data['session_resets'] = [dict(row) for row in db.execute('''SELECT id,requester_session,target_session,
                 old_thread_id,new_thread_id,status,error,created_at,updated_at,kind FROM session_resets
                 WHERE status NOT IN ('completed','cancelled','failed') OR id IN
@@ -186,6 +195,9 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         for session in sessions:
             route = bindings.get(session['id'], {})
             session.update(thread_id=route.get('thread_id'), parent_session=route.get('parent_session'))
+            session['is_orchestrator'] = (session['id'] in orchestrators
+                                          and bool(route.get('thread_id'))
+                                          and not route.get('parent_session'))
     if usage_store is not None:
         data['usage'] = usage_store.status()
     if session_models is not None:

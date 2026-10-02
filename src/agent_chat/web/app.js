@@ -323,6 +323,12 @@ function renderAgents() {
   $('all-conversations').classList.toggle('selected', !state.selected);
   $('all-conversations').setAttribute('aria-pressed', String(!state.selected));
   const visible = new Set(sessions.map(session => session.id));
+  // Existing coordinators expose recent creation jobs but lack the role flag.
+  const mains = new Set(sessions.filter(session => session.thread_id && !session.parent_session).map(session => session.id));
+  const creations = (state.snapshot.session_resets || []).filter(job => job.kind === 'create'
+    && job.status === 'completed' && mains.has(job.requester_session) && mains.has(job.target_session));
+  const created = new Set(creations.map(job => job.target_session));
+  const orchestrators = new Set(creations.map(job => job.requester_session).filter(id => !created.has(id)));
   const children = new Map();
   const roots = [];
   for (const session of sessions) {
@@ -353,7 +359,18 @@ function renderAgents() {
     button.setAttribute('aria-label', `Show conversations with ${session.agent}`);
     button.setAttribute('aria-pressed', String(state.selected === session.id));
     const label = node('span', 'agent-label');
-    label.append(node('span', 'agent-name', session.agent));
+    const nameRow = node('span', 'agent-name-row');
+    nameRow.append(node('span', 'agent-name', session.agent));
+    if (session.is_orchestrator ?? orchestrators.has(session.id)) {
+      const crown = node('span', 'agent-orchestrator', '👑');
+      crown.id = `orchestrator-${encodeURIComponent(session.id)}`;
+      crown.title = 'Orchestrator';
+      crown.setAttribute('role', 'img');
+      crown.setAttribute('aria-label', 'Orchestrator');
+      button.setAttribute('aria-describedby', crown.id);
+      nameRow.append(crown);
+    }
+    label.append(nameRow);
     const details = [session.model, session.reasoning_effort && `${session.reasoning_effort} reasoning`].filter(Boolean).join(' · ');
     const metadata = node('span', 'agent-model', details || 'Model details unavailable');
     metadata.title = details ? `Latest observed: ${details}` : 'No model or reasoning level has been observed for this session';

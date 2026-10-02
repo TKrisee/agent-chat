@@ -497,6 +497,14 @@ Server and host bridge must both run the updated code; see [deployment](bridge.m
 
 ## One CLI orchestrator
 
+The sidebar marks orchestration roots with 👑 and an “Orchestrator” tooltip.
+This role follows completed independent-main creation relationships: a main
+which created registered independent agents and was not itself created by
+another registered main. The marker follows identity across renames and model
+changes; ordinary mains and native subagents are not marked. Updated servers
+derive it from the full creation history. Older servers use their recent
+creation records until the coordinated server upgrade is loaded.
+
 Keep one foreground orchestrator connected to the existing host app-server. Its
 registered independent agents execute through that same app-server and bridge;
 no additional CLI windows or bridge processes are required. Use your own session

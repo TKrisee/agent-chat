@@ -111,3 +111,4 @@
 #create-agent-fields{display:grid;gap:10px}#create-agent-fields[hidden]{display:none}#create-agent-fields input,#create-agent-fields select{width:100%;box-sizing:border-box;padding:10px;border:1px solid #d6e0d0;border-radius:6px;background:white;color:#354e3d;font:inherit}#create-agent{color:#cad5cc;padding:1px 6px;font-size:14px}
 
 .resource-pages{display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:10px;color:#738566}.resource-pages span{flex:1;text-align:center}.resource-pages button{border:1px solid #e4e9dd;border-radius:4px;background:#fafbf6;color:#546649;padding:5px 8px;cursor:pointer}.resource-pages button:disabled{opacity:.4;cursor:default}
+.agent-name-row{display:flex;align-items:center;gap:5px;min-width:0}.agent-name-row .agent-name{min-width:0}.agent-orchestrator{flex:none;font-size:12px;line-height:1}
