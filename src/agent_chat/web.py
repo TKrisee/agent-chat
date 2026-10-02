@@ -753,7 +753,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path in ('/api/projects', '/api/projects/rename'):
             try:
-                data = self.read_json()
+                # Escaped JSON can be larger than the validated UTF-8 assignment.
+                data = self.read_json(512 * 1024 if path == '/api/projects' else 65536)
                 result = self.project_action(dict(data, op='create' if path == '/api/projects' else 'rename'))
                 self.json(200, result)
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
@@ -919,10 +920,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         op = data.get('op')
         if op == 'list' and set(data) == {'op'}:
             return {'projects': self.server.listed_projects()}
-        if op == 'create' and set(data) == {'op', 'name'}:
-            item = self.server.projects.create(data['name'])
+        if op == 'create' and {'op', 'name'} <= set(data) <= {'op', 'name', 'workspace', 'instructions'}:
+            item = self.server.projects.create(data['name'], data.get('workspace'), data.get('instructions'))
             self.server.project_context(item['id'])
-            return {'project': item, 'projects': self.server.listed_projects()}
+            public = {key: value for key, value in item.items() if key != 'instructions'}
+            public['has_instructions'] = bool(item.get('instructions'))
+            return {'project': public, 'projects': self.server.listed_projects()}
         if op == 'rename' and set(data) == {'op', 'id', 'name'}:
             return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.listed_projects()}
         raise CoordError('invalid project operation')
@@ -934,6 +937,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         fields = {
             'enroll': {'expected_thread','confirm'}, 'status': set(), 'route': {'project'},
             'configure': {'project','agent','cwd','prompt','request_id','confirm','model','effort'},
+            'provision': {'project','agent','request_id','confirm','model','effort'},
             'adopt': {'project','target','expected_thread','cwd','confirm'}, 'detach': {'confirm'}, 'resume-routing': {'confirm'},
             'retry-setup': {'project','request_id','confirm'},
         }
@@ -956,6 +960,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if self.server.measurements.status(params['project'])['active']:
                 raise CoordError('finish the active target project measurement before orchestration setup')
             if op == 'retry-setup': return roots.retry_setup(*args, params['project'], params['request_id'], params['confirm'])
+            if op == 'provision':
+                return roots.provision(*args, params['project'], params['agent'], params['request_id'], params['confirm'], params['model'], params['effort'])
             if op == 'configure':
                 return roots.configure(*args, params['project'], params['agent'], params['cwd'], params['prompt'], params['request_id'], params['confirm'], params['model'], params['effort'])
             return roots.adopt(*args, params['project'], params['target'], params['expected_thread'], params['cwd'], params['confirm'])

@@ -18,7 +18,11 @@ class Projects:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as db:
             db.execute('CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, name_key TEXT UNIQUE NOT NULL, created_at REAL NOT NULL)')
-            db.execute("INSERT OR IGNORE INTO projects VALUES('default','Default project','default project',?)", (time.time(),))
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(projects)')}
+            for column in ('workspace', 'instructions'):
+                if column not in columns:
+                    db.execute(f'ALTER TABLE projects ADD COLUMN {column} TEXT')
+            db.execute("INSERT OR IGNORE INTO projects(id,name,name_key,created_at) VALUES('default','Default project','default project',?)", (time.time(),))
         os.chmod(self.path, 0o600)
 
     @contextlib.contextmanager
@@ -44,7 +48,7 @@ class Projects:
         if not isinstance(project, str) or not project:
             raise CoordError('project ID is required')
         with self.connection() as db:
-            row = db.execute('SELECT id,name,created_at FROM projects WHERE id=?', (project,)).fetchone()
+            row = db.execute('SELECT id,name,created_at,workspace,instructions FROM projects WHERE id=?', (project,)).fetchone()
         if not row: raise CoordError('unknown project; select an existing project or create one explicitly')
         return dict(row)
 
@@ -53,12 +57,22 @@ class Projects:
         if item['id'] == 'default': return self.database
         return self.database.parent / (self.database.name + '.projects') / item['id'] / 'state.sqlite3'
 
-    def create(self, name):
+    def create(self, name, workspace=None, instructions=None):
         with self.root_lock:
-            return self._create(name)
+            return self._create(name, workspace, instructions)
 
-    def _create(self, name):
+    def _create(self, name, workspace, instructions):
         name = self.name(name)
+        if workspace is not None:
+            if not isinstance(workspace, str) or len(workspace) > 4096 or '\x00' in workspace:
+                raise CoordError('project workspace must be a bounded absolute path')
+            workspace = workspace.strip() or None
+            if workspace and not workspace.startswith('/'):
+                raise CoordError('project workspace must be an absolute path on the agent host')
+        if instructions is not None:
+            if not isinstance(instructions, str) or len(instructions.encode('utf-8')) > 59000:
+                raise CoordError('project instructions must be text of at most 59000 UTF-8 bytes')
+            instructions = instructions if instructions.strip() else None
         key = 'project_' + uuid.uuid4().hex
         path = self.database.parent / (self.database.name + '.projects') / key / 'state.sqlite3'
         with self.connection() as db:
@@ -76,7 +90,8 @@ class Projects:
                     c.execute("INSERT INTO meta(key,value) VALUES('project_registry',?)", (str(self.database),))
                     c.commit()
                 finally: c.close()
-                db.execute('INSERT INTO projects VALUES(?,?,?,?)', (key, name, name.casefold(), time.time()))
+                db.execute('INSERT INTO projects(id,name,name_key,created_at,workspace,instructions) VALUES(?,?,?,?,?,?)',
+                           (key, name, name.casefold(), time.time(), workspace, instructions))
                 db.commit()
             except BaseException:
                 db.rollback()

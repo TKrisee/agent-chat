@@ -1694,6 +1694,11 @@ for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
     $('project-form').dataset.rename = String(rename);
     $('project-dialog-title').textContent = rename ? 'Rename project' : 'New project';
     $('project-name').value = rename ? state.projects.find(p => p.id === state.project).name : '';
+    if ($('project-creation-scope')) {
+      $('project-creation-scope').hidden = rename;
+      $('project-workspace').value = '';
+      $('project-instructions').value = '';
+    }
     $('project-error').textContent = '';
     $('project-error').hidden = true;
     $('project-dialog').showModal(); $('project-name').focus();
@@ -1711,7 +1716,10 @@ $('project-form').addEventListener('submit', async event => {
   state.busy = true; projectControls(); $('save-project').disabled = true;
   try {
     const path = rename ? '/api/projects/rename' : '/api/projects';
-    const body = JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : {}) });
+    const scope = !rename && $('project-workspace') &&
+      ($('project-workspace').value.trim() || $('project-instructions').value.trim())
+      ? {workspace:$('project-workspace').value, instructions:$('project-instructions').value} : {};
+    const body = JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : scope) });
     const submit = () => fetchJSON(path, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token }, body,
     });

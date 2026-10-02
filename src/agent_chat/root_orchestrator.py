@@ -233,8 +233,13 @@ class RootOrchestrator:
                     raise CoordError('root home operator identity is missing')
                 mid = 'message_' + uuid.uuid4().hex
                 item = self.projects.get(project)
+                setup = (f"Saved workspace: {item['workspace']}. Operator supplied project instructions. "
+                         f"Provision this project's orchestrator through root provision --project-id {project} with one saved request UUID; "
+                         "the saved assignment is forwarded without loading it into root's conversation. "
+                         if item.get('workspace') and item.get('instructions') else
+                         "Project creation scope is incomplete; ask the operator for missing workspace/task, then configure or adopt. ")
                 body = (f"Project registered: {item['name']} (project ID {project}). Your distinct quiet root registration is bound to this same conversation. "
-                        "Inspect root status; configure workspace and a bounded orchestrator prompt, or adopt an existing project main. "
+                        + setup + "Inspect root status; retain an existing designated team rather than creating a duplicate. "
                         "Do not acquire project resource holds as root. This notice creates no native agent or resource ownership.")
                 db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
                            (mid, operator['id'], root['home_session'], body, time.time()))
@@ -251,6 +256,20 @@ class RootOrchestrator:
         if not row or not row['joined']:
             raise CoordError('root project onboarding incomplete: ' + (row['error'] if row else target_project))
         return dict(project=target_project, session=row['session_id'], cwd=row['cwd'])
+
+    def provision(self, project, session, host, target_project, agent, request_id, confirmed, model=None, effort=None):
+        self.authorize(project, session, host)
+        item = self.projects.get(target_project)
+        if not item.get('workspace') or not item.get('instructions'):
+            raise CoordError('project creation needs workspace and instructions before provisioning')
+        prompt = (f"Act as project orchestrator for {item['name']} (project ID {target_project}). "
+                  "Manage this project's workers through agent-chat using your own project/session. "
+                  "Keep goals, implementation and detailed project context with this team. Global root relays bounded operator questions/answers; "
+                  "send only routing/readiness metadata unless an operator question needs limited project detail. Tag each question with project and request ID. "
+                  "Read the agent-chat quickstart and agent guide; preserve exact resource ownership and receipt guarantees.\n\n"
+                  "Operator's project assignment (literal):\n" + item['instructions'])
+        return self.configure(project, session, host, target_project, agent, item['workspace'], prompt,
+                              request_id, confirmed, model, effort)
 
     def configure(self, project, session, host, target_project, agent, cwd, prompt, request_id, confirmed, model=None, effort=None):
         root = self.authorize(project, session, host)
@@ -377,7 +396,11 @@ class RootOrchestrator:
             rows = [dict(row) for row in db.execute('SELECT * FROM root_projects ORDER BY project_id')]
         for row in rows:
             row.pop('prompt', None)
-            row['name'] = self.projects.get(row['project_id'])['name']
+            setup = self.projects.get(row['project_id'])
+            row['name'] = setup['name']
+            row['creation_workspace'] = setup.get('workspace')
+            row['has_instructions'] = bool(setup.get('instructions'))
+            row['provision_ready'] = bool(setup.get('workspace') and setup.get('instructions'))
             row['creation'] = None
             row['orchestrator'] = None
             from .bridge_state import runtime_snapshot
@@ -401,7 +424,8 @@ class RootOrchestrator:
                         if job:
                             row['creation'] = SessionResetState.public(dict(job))
             row['setup'] = 'routing_error' if not row['joined'] else ('adopted' if row['adopted'] else
-                (row['creation']['status'] if row['creation'] else ('awaiting_original_request_retry' if row['request_id'] else 'needs_workspace_and_prompt')))
+                (row['creation']['status'] if row['creation'] else ('awaiting_original_request_retry' if row['request_id'] else
+                 ('ready_to_provision' if row['provision_ready'] else 'needs_workspace_and_prompt'))))
         return dict(enabled=True, root=root, projects=rows)
 
     def detach(self, project, session, host, confirmed):

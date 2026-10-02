@@ -52,13 +52,33 @@ async function main() {
     });
     await page.evaluate(() => { state.config.csrf_token = 'expired'; });
     await page.locator('#project-name').fill('New workspace');
+    await page.locator('#project-workspace').fill('/projects/calendar');
+    await page.locator('#project-instructions').fill('Build a calendar.\nKeep literal $(data).');
+    if (process.env.AGENT_CHAT_PROJECT_SCREENSHOT) {
+      await page.screenshot({path:process.env.AGENT_CHAT_PROJECT_SCREENSHOT, fullPage:true});
+      await page.setViewportSize({width:390,height:844});
+      await page.screenshot({path:process.env.AGENT_CHAT_PROJECT_SCREENSHOT.replace('.png','-mobile.png'), fullPage:true});
+      await page.setViewportSize({width:1280,height:720});
+    }
+    const brief = 'Build a calendar.\nKeep literal $(data).\n' + '"'.repeat(35000);
+    await page.locator('#project-instructions').fill(brief);
+    const creationBodies = [];
+    page.on('request', request => {
+      if (new URL(request.url()).pathname === '/api/projects' && request.method() === 'POST') creationBodies.push(request.postData());
+    });
     await page.locator('#save-project').click();
     await page.waitForFunction(() => document.querySelector('#project-select').value !== 'default');
     assert.equal(await page.locator('#project-dialog').evaluate(dialog => dialog.open), false);
     assert.equal(await page.locator('#project-select option:checked').textContent(), 'New workspace');
     assert.deepEqual(statuses, [403, 200]);
+    assert.equal(creationBodies.length, 2);
+    assert.equal(creationBodies[1], JSON.stringify({name:'New workspace',workspace:'/projects/calendar',instructions:brief}));
+    assert.ok(Buffer.byteLength(creationBodies[1]) > 65536);
+    await page.getByRole('button', {name:'Rename project'}).click();
+    assert.equal(await page.locator('#project-creation-scope').isVisible(), false);
+    await page.locator('#cancel-project').click();
     assert.deepEqual(errors, []);
-    console.log('PASS: duplicate project name is visible, retry creates and switches project');
+    console.log('PASS: duplicate rejection, CSRF retry preserves project brief/workspace, rename hides creation scope');
   } finally {
     if (browser) await browser.close();
     const exited = once(fixture, 'exit');

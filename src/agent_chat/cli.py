@@ -70,8 +70,15 @@ def _project_main(raw, args, server):
     sub = parser.add_subparsers(dest='op', required=True)
     sub.add_parser('list')
     create = sub.add_parser('create'); create.add_argument('--name', required=True)
+    create.add_argument('--workspace'); create.add_argument('--prompt-file')
     rename = sub.add_parser('rename'); rename.add_argument('id'); rename.add_argument('--name', required=True)
     values = vars(parser.parse_args(raw))
+    if 'prompt_file' in values:
+        prompt_file = values.pop('prompt_file')
+        if prompt_file:
+            values['instructions'] = Path(prompt_file).read_text(encoding='utf-8')
+        if values.get('workspace') is None:
+            values.pop('workspace', None)
     from .remote import HttpClient
     # Registry actions work even when a previously selected project no longer exists.
     result = HttpClient(server, args.api_token, project='default').call('/api/projects/rpc', values)
@@ -111,6 +118,11 @@ def _root_main(raw, args, server):
     configure.add_argument('--model'); configure.add_argument('--reasoning-effort', dest='effort')
     configure.add_argument('--prompt-file', required=True); configure.add_argument('--request-id', required=True)
     configure.add_argument('--confirm', action='store_true')
+    provision = sub.add_parser('provision', help='start a project orchestrator using its saved creation workspace and instructions')
+    provision.add_argument('--project-id', required=True, dest='project')
+    provision.add_argument('--agent', default='orchestrator')
+    provision.add_argument('--model'); provision.add_argument('--reasoning-effort', dest='effort')
+    provision.add_argument('--request-id', required=True); provision.add_argument('--confirm', action='store_true')
     adopt = sub.add_parser('adopt', help='designate an existing project main, without dispatch or replacement')
     adopt.add_argument('--project-id', required=True, dest='project'); adopt.add_argument('--to', required=True, dest='target')
     adopt.add_argument('--expected-thread', required=True); adopt.add_argument('--cwd', required=True)

@@ -7,8 +7,9 @@ orchestrator** screen at `/root` shows only your direct canonical-home conversat
 compact project overview. Project messages and attachments remain in their rooms.
 Use **Open project** to enter a project room; drafts remain separate between views.
 
-Root receives concise reports and delegates bounded requests. Detailed technical
-reasoning stays with project orchestrators. This reduces requirements and
+Root keeps project/orchestrator routing and relays bounded operator questions.
+Initial assignments and detailed technical reasoning stay with project orchestrators.
+This reduces requirements and
 assumptions leaking between projects; it cannot guarantee that a model never
 makes a cross-project assumption. Explicit project IDs and matching registrations
 guard operations; project agents still review scope against local context.
@@ -57,11 +58,38 @@ exact file/native holds and retain truthful receipt-backed closure.
 
 ## Configure or retain a team
 
-Create a project normally (`project create --name NAME` or browser **+**), read
-root context, then inspect `root status`. A new project reports
-`needs_workspace_and_prompt`; root asks the operator for missing scope instead
-of guessing directories or copying another project's instructions. Root does
-not prepare or edit project files: an approved project worker/operator does.
+Root boots once with project-neutral standing rules. Project assignments arrive
+later through project creation or operator messages; they are not root boot prompts.
+In browser **New project**, supply a name, an existing absolute workspace on the
+agent host and project instructions. CLI creation supports the same inputs:
+
+```sh
+agent-chat-client project create --name NAME --workspace /absolute/project \
+  --prompt-file /absolute/project-assignment.txt
+```
+
+Creation persists the literal assignment, joins root and sends one compact setup
+notice. It does not start a native conversation before root acts. When the scope
+is complete, root consumes that notice, saves a request UUID and provisions the
+project orchestrator without another operator confirmation round trip:
+
+```sh
+agent-chat-client root provision --project-id EXACT_PROJECT_ID \
+  --model gpt-6.1-sol --reasoning-effort high --request-id SAVED_UUID --confirm
+```
+
+Provisioning forwards the stored assignment to the independent project conversation
+with project-orchestrator guidance. Root notices/directory contain only readiness
+and workspace metadata, not the full assignment. Existing settings checks, scoped
+permissions, measurement guards and receipt/queue guarantees remain enforced.
+Retry only the saved UUID; reconcile uncertain setup through `root retry-setup`.
+Root must retain an already configured/adopted team rather than creating duplicates.
+
+Name-only creation remains supported. Missing workspace/task yields incomplete scope;
+root asks for only those missing details instead of guessing directories or copying
+another project's instructions. Root does not prepare or edit project files: an
+approved project worker/operator does. For an assignment supplied directly in chat,
+root creates/selects the project and uses `root configure` below with that assignment.
 
 Use the workspace's canonical absolute path on the execution host. Symlinks must
 be resolved there; project workspaces cannot overlap each other or root's neutral
@@ -220,3 +248,6 @@ project's measurement. Project orchestrators and workers remain measured; the
 global weekly usage guard still applies to root. Directory/team designations
 survive clean detach and re-enrollment of the same home identity. Retained root
 registrations remain quiet even during that refresh.
+Use [root-AGENTS.md](root-AGENTS.md) as reusable standing guidance in the neutral
+workspace's `AGENTS.md`. Keep per-project assignments in project creation or setup
+messages. Create that file before launching the new root conversation.

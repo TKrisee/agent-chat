@@ -38,6 +38,23 @@ class ProjectStoreTests(unittest.TestCase):
         c = Coordinator(self.base, 'old'); self.addCleanup(c.close)
         self.assertEqual(c.require_session(), 'old')
 
+    def test_creation_scope_survives_reopen_without_loading_briefs_in_directory(self):
+        brief = 'Build a planner.\nKeep literal $(shell-looking data) and 日本語.\n'
+        item = self.projects.create('Scoped project', '/projects/planner', brief)
+        reopened = Projects(self.base)
+        self.assertEqual(reopened.get(item['id'])['instructions'], brief)
+        self.assertEqual(reopened.get(item['id'])['workspace'], '/projects/planner')
+        self.assertNotIn('instructions', reopened.list()[-1])
+        self.assertIsNone(reopened.get('default')['instructions'])
+
+    def test_invalid_creation_scope_creates_no_project(self):
+        before = self.projects.list()
+        for options in ({'workspace':'relative/path'}, {'workspace':'/bad\x00path'},
+                        {'instructions':42}, {'instructions':'語' * 20000}):
+            with self.assertRaises(CoordError):
+                self.projects.create('Invalid', **options)
+        self.assertEqual(self.projects.list(), before)
+
     def test_same_labels_and_resources_are_isolated_and_tokens_cannot_cross(self):
         item = self.projects.create('Second')
         path = self.projects.db_path(item['id'])

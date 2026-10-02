@@ -107,6 +107,13 @@
       <h2 id="project-dialog-title">New project</h2>
       <label for="project-name">Project name</label>
       <input id="project-name" name="name" maxlength="80" required autocomplete="off">
+      <div id="project-creation-scope">
+        <label for="project-workspace">Workspace on agent host</label>
+        <input id="project-workspace" name="workspace" maxlength="4096" placeholder="/absolute/path/to/project" autocomplete="off">
+        <label for="project-instructions">Project instructions</label>
+        <textarea id="project-instructions" name="instructions" rows="5" maxlength="59000" placeholder="Describe the goal, scope and constraints for this project's orchestrator."></textarea>
+        <p class="project-scope-help">Provide both to let your root orchestrator start the project team. Leave blank to set up later.</p>
+      </div>
       <p id="project-error" class="composer-status error" role="alert" hidden></p>
       <div class="project-dialog-actions"><button type="button" id="cancel-project" class="quiet-button">Cancel</button><button type="submit" id="save-project" class="send-button">Create project</button></div>
     </form>

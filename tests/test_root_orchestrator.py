@@ -112,6 +112,63 @@ class RootOrchestratorTests(RemoteWebFixture):
         self.assertTrue(reply['acknowledged_reply'])
         self.assertEqual(self.call('inbox')['messages'][0]['body'].split(':')[0], 'Project registered')
 
+    def test_saved_ui_assignment_provisions_once_without_brief_in_root_notice(self):
+        brief = 'Create a calendar.\nKeep literal $(do-not-execute) and 日本語.\n'
+        created = self.client.call('/api/projects/rpc', dict(op='create', name='Calendar',
+            workspace=str(self.workspace), instructions=brief))['project']
+        project = created['id']
+        self.assertNotIn('instructions', created)
+        self.assertTrue(created['has_instructions'])
+        notices = self.call('context')['messages']
+        notice = next(message for message in notices if project in message['body'])
+        self.assertIn('root provision', notice['body'])
+        self.assertNotIn(brief, notice['body'])
+        ready = next(row for row in self.root('status')['projects'] if row['project_id'] == project)
+        self.assertTrue(ready['provision_ready'])
+        self.assertEqual(ready['setup'], 'ready_to_provision')
+        self.assertNotIn('instructions', ready)
+        params = dict(project=project, agent='orchestrator', request_id=str(uuid.uuid4()),
+            confirm=True, model='test-model', effort='high')
+        first = self.root('provision', **params)
+        again = self.root('provision', **params)
+        self.assertEqual(first['creation']['id'], again['creation']['id'])
+        state, bridge = self.project_bridge(project)
+        bridge.tick()
+        status = self.routed(project, 'session-reset-status', to='orchestrator')
+        self.assertEqual(status['resets'][0]['status'], 'completed')
+        text = self.rpc.history[status['thread_id']][0]['content'][0]['text']
+        self.assertTrue(text.endswith(brief))
+        self.assertIn('Act as project orchestrator for Calendar', text)
+        self.assertIn(project, text)
+        self.assertEqual(len(self.rpc.history[status['thread_id']]), 1)
+        self.assertEqual(self.rpc.started[status['thread_id']]['runtimeWorkspaceRoots'], [str(self.workspace)])
+
+    def test_provision_missing_assignment_or_overlapping_workspace_dispatches_nothing(self):
+        project = self.project()
+        params = dict(project=project, agent='orchestrator', request_id=str(uuid.uuid4()),
+            confirm=True, model=None, effort=None)
+        with self.assertRaisesRegex(RemoteCoordError, 'workspace and instructions'):
+            self.root('provision', **params)
+        other = self.client.call('/api/projects/rpc', dict(op='create', name='Overlap',
+            workspace=str(self.neutral), instructions='Do work.'))['project']['id']
+        self.call('context')
+        params.update(project=other, request_id=str(uuid.uuid4()))
+        with self.assertRaisesRegex(RemoteCoordError, 'neutral'):
+            self.root('provision', **params)
+        self.assertEqual(self.rpc.started, {})
+
+    def test_cli_provisions_saved_creation_without_reading_a_root_prompt_file(self):
+        project = self.client.call('/api/projects/rpc', dict(op='create', name='CLI project',
+            workspace=str(self.workspace), instructions='Plan only.'))['project']['id']
+        self.call('context')
+        with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID':'mac'}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['--server', self.url, '--api-token', TOKEN, '--session', 'a',
+                'root', 'provision', '--project-id', project, '--model', 'test-model',
+                '--reasoning-effort', 'high', '--request-id', str(uuid.uuid4()), '--confirm']), 0)
+        jobs = self.routed(project, 'session-reset-status', to='orchestrator')['resets']
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]['status'], 'pending')
+
     def test_creation_narrows_root_grants_and_dispatches_exact_project_prompt_once(self):
         project = self.project()
         result = self.configure(project)
