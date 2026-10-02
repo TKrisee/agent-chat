@@ -3,7 +3,7 @@
   "private": true,
   "description": "Development-only browser checks; Python runtime has no Node dependencies",
   "scripts": {
-    "test:browser": "node tests/web_browser.cjs && node tests/group_browser.cjs && node tests/conversation_browser.cjs && node tests/project_browser.cjs && node tests/copy_browser.cjs && node tests/static_attachments_browser.cjs && node tests/usage_browser.cjs && node tests/measurement_browser.cjs && node tests/reset_browser.cjs && node tests/agent_tree_browser.cjs"
+    "test:browser": "node tests/web_browser.cjs && node tests/group_browser.cjs && node tests/conversation_browser.cjs && node tests/project_browser.cjs && node tests/copy_browser.cjs && node tests/static_attachments_browser.cjs && node tests/usage_browser.cjs && node tests/measurement_browser.cjs && node tests/reset_browser.cjs && node tests/agent_tree_browser.cjs && node tests/resource_browser.cjs"
   },
   "devDependencies": {
     "playwright": "1.63.0"

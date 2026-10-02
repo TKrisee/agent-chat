@@ -86,6 +86,11 @@
 
     <aside class="resources-panel" id="resources-panel" aria-label="Shared resources">
       <div class="resource-summary"><span class="resource-summary-number" id="held-count">0</span><span>resources held<span id="waiting-count">No agents waiting</span></span></div>
+      <nav class="resource-pages" aria-label="Resource pages">
+        <button id="resource-previous" type="button" aria-label="Previous resource page" disabled>←</button>
+        <span id="resource-page-label" role="status"></span>
+        <button id="resource-next" type="button" aria-label="Next resource page" disabled>→</button>
+      </nav>
       <div class="resource-list" id="resource-list"></div>
       <details class="available-resources" id="available-resources"><summary id="available-summary">Available resources</summary><div id="available-list"></div></details>
     </aside>

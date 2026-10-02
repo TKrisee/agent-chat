@@ -67,6 +67,22 @@ class WebApiTests(unittest.TestCase):
         else:
             os.environ["AGENT_CHAT_SESSION"] = self.old_session
 
+    def test_resource_page_snapshot_counts(self):
+        import subprocess
+        status, _, raw = self.request('GET', '/api/snapshot?resource_limit=1&resource_offset=0')
+        self.assertEqual(status, 200)
+        result = subprocess.check_output(['jq', '-er',
+            '(.resources|length)==1 and .resource_page.limit==1 and .resource_page.held==1'], input=raw)
+        self.assertEqual(result.strip(), b'true')
+
+    def test_invalid_resource_snapshot_and_stream_pages(self):
+        for endpoint in ('snapshot', 'events'):
+            for query in ('resource_limit=0', 'resource_limit=201', 'resource_offset=-1',
+                          'resource_limit=50&resource_limit=50', 'resource_offset=wat'):
+                with self.subTest(endpoint=endpoint, query=query):
+                    status, _, _ = self.request('GET', f'/api/{endpoint}?{query}')
+                    self.assertEqual(status, 400)
+
     def coordinator(self, session):
         return Coordinator(self.db, session)
 

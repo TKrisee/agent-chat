@@ -4,6 +4,7 @@ const $ = (id) => document.getElementById(id);
 const MESSAGE_LIMIT = 50;
 const MESSAGE_WINDOW_LIMIT = 150;
 const MESSAGE_PREVIEW_LENGTH = 2000;
+const RESOURCE_PAGE_LIMIT = 50;
 const MAX_FILES = 50;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
@@ -23,6 +24,7 @@ const state = {
   historyDirection: null, historyError: null, scrollTop: 0,
   viewGeneration: 0, viewLoading: false,
   attachments: [],
+  resourceOffset: 0, resourceBusy: false, resourceRenderKey: null,
   usage: null, usageDialogDirty: false, usageSaving: false,
   measurement: null, measurementLoading: false, measurementSaving: false, measurementRequest: 0, measurementPoll: null,
 };
@@ -378,7 +380,7 @@ function renderAgents() {
         });
         if (state.selected === session.id) state.selected = null;
         if (state.reply && (state.reply.sender_session === session.id || messageDeliveries(state.reply).some((delivery) => delivery.recipient_session === session.id))) clearReply();
-        applySnapshot(await fetchJSON('/api/snapshot'));
+        applySnapshot(await fetchJSON(resourceSnapshotURL()));
         composerStatus(`Removed ${session.agent}. Its history is retained.`);
       } catch (error) {
         composerStatus(error.message, true);
@@ -491,7 +493,7 @@ $('reset-form').addEventListener('submit', async event => {
     if (creatingAgent) createdAgentSession = result.target_session;
     if (target.project === state.project) {
       $('reset-error').hidden = true;
-      const snapshot = await fetchJSON('/api/snapshot');
+      const snapshot = await fetchJSON(resourceSnapshotURL());
       if (target.project === state.project) applySnapshot(snapshot);
     }
   } catch (error) { if (target.project === state.project) resetError(error); }
@@ -508,7 +510,7 @@ $('cancel-reset-request').addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
       body: JSON.stringify({ op: 'cancel', id: job.id }) });
     resetRequestId = crypto.randomUUID();
-    const snapshot = await fetchJSON('/api/snapshot');
+    const snapshot = await fetchJSON(resourceSnapshotURL());
     if (project === state.project) applySnapshot(snapshot);
   } catch (error) { if (project === state.project) resetError(error); }
   finally { resetSending = false; renderResetStatus(); }
@@ -1158,14 +1160,32 @@ function prettyResource(value) {
 
 function renderResources() {
   if (!state.snapshot) return;
+  const paging = state.snapshot.resource_page;
   const priorities = { 'validation-clone': 0, 'main-inputs': 1, 'git-index': 2 };
-  const held = state.snapshot.resources.filter((item) => item.state !== 'free').sort((a, b) =>
+  // Older servers return the entire roster. Bound their DOM too, until activation.
+  const resources = paging ? state.snapshot.resources : [...state.snapshot.resources].sort((a, b) =>
+    ({owned: 0, stale: 1, free: 2}[a.state] - {owned: 0, stale: 1, free: 2}[b.state]) ||
     (priorities[a.resource] ?? 3) - (priorities[b.resource] ?? 3) || a.resource.localeCompare(b.resource));
-  const available = state.snapshot.resources.filter((item) => item.state === 'free');
-  const waiting = held.reduce((sum, item) => sum + item.queue.length, 0);
-  $('held-count').textContent = held.length;
-  $('mobile-resource-count').textContent = held.length;
+  const total = paging?.total ?? resources.length;
+  state.resourceOffset = paging?.offset ?? Math.min(state.resourceOffset, Math.max(0, Math.ceil(total / RESOURCE_PAGE_LIMIT) - 1) * RESOURCE_PAGE_LIMIT);
+  const visible = paging ? resources : resources.slice(state.resourceOffset, state.resourceOffset + RESOURCE_PAGE_LIMIT);
+  const held = visible.filter(item => item.state !== 'free');
+  const available = visible.filter(item => item.state === 'free');
+  const heldCount = paging?.held ?? resources.filter(item => item.state !== 'free').length;
+  const freeCount = paging?.free ?? resources.filter(item => item.state === 'free').length;
+  const waiting = paging?.waiting ?? resources.reduce((sum, item) => sum + item.queue.length, 0);
+  $('held-count').textContent = heldCount;
+  $('mobile-resource-count').textContent = heldCount;
   $('waiting-count').textContent = waiting ? `${waiting} queued ${waiting === 1 ? 'request' : 'requests'}` : 'No agents waiting';
+  $('resource-page-label').textContent = total ? `${state.resourceOffset + 1}–${state.resourceOffset + visible.length} of ${total.toLocaleString()}` : 'No resources';
+  $('resource-previous').disabled = state.resourceBusy || state.paused || !state.resourceOffset;
+  $('resource-next').disabled = state.resourceBusy || state.paused || state.resourceOffset + visible.length >= total;
+  $('available-summary').textContent = `${freeCount} available ${freeCount === 1 ? 'resource' : 'resources'}`;
+  $('available-resources').hidden = !freeCount;
+  if ($('browse-available')) $('browse-available').disabled = state.resourceBusy || state.paused;
+  const key = JSON.stringify([visible, heldCount, freeCount, state.snapshot.sessions.map(({id, agent}) => [id, agent])]);
+  if (key === state.resourceRenderKey) { updateResourceCountdowns(); return; }
+  state.resourceRenderKey = key;
   const fragment = document.createDocumentFragment();
   for (const resource of held) {
     const card = node('section', 'resource-card');
@@ -1174,8 +1194,10 @@ function renderResources() {
     name.title = resource.resource;
     top.append(name, node('span', `resource-status ${resource.state}`, resource.state === 'stale' ? 'Stale hold' : 'Reserved'));
     card.append(top, node('div', 'resource-owner', agentLabel(resource.owner_session, resource.owner_agent)));
-    const remaining = Math.max(0, Math.ceil(resource.deadline - Date.now() / 1000));
-    card.append(node('div', 'resource-time', resource.state === 'stale' || !remaining ? 'Waiting for verified closure' : `${Math.floor(remaining / 60)}m ${String(remaining % 60).padStart(2, '0')}s remaining`));
+    const countdown = node('div', 'resource-time');
+    countdown.dataset.deadline = resource.deadline;
+    countdown.dataset.state = resource.state;
+    card.append(countdown);
     if (resource.reason) card.append(node('p', 'resource-reason', resource.reason));
     if (resource.queue.length) {
       const queue = node('div', 'queue');
@@ -1189,15 +1211,74 @@ function renderResources() {
     }
     fragment.append(card);
   }
-  if (!held.length) fragment.append(node('p', 'resource-reason', 'No shared resources are reserved right now.'));
+  if (!held.length) fragment.append(node('p', 'resource-reason', heldCount ? 'No held resources on this page.' : 'No shared resources are reserved right now.'));
   $('resource-list').replaceChildren(fragment);
-  $('available-summary').textContent = `${available.length} available ${available.length === 1 ? 'resource' : 'resources'}`;
-  $('available-resources').hidden = !available.length;
   $('available-list').replaceChildren(...available.map((item) => {
     const row = node('div', 'available-item', `○ ${prettyResource(item.resource)}`);
     row.title = item.resource;
     return row;
   }));
+  if (!available.length && freeCount) {
+    const browse = node('button', 'quiet-button', 'Browse available resources');
+    browse.id = 'browse-available';
+    browse.type = 'button';
+    browse.disabled = state.resourceBusy || state.paused;
+    browse.addEventListener('click', () => changeResourcePage(0, Math.floor(heldCount / RESOURCE_PAGE_LIMIT) * RESOURCE_PAGE_LIMIT));
+    $('available-list').append(browse);
+  }
+  updateResourceCountdowns();
+}
+
+function updateResourceCountdowns() {
+  for (const countdown of $('resource-list').querySelectorAll('.resource-time')) {
+    const remaining = Math.max(0, Math.ceil(Number(countdown.dataset.deadline) - Date.now() / 1000));
+    const text = countdown.dataset.state === 'stale' || !remaining ? 'Waiting for verified closure'
+      : `${Math.floor(remaining / 60)}m ${String(remaining % 60).padStart(2, '0')}s remaining`;
+    if (countdown.textContent !== text) countdown.textContent = text;
+  }
+}
+
+function resourceSnapshotURL(path = '/api/snapshot') {
+  return `${path}?resource_limit=${RESOURCE_PAGE_LIMIT}&resource_offset=${state.resourceOffset}`;
+}
+
+function startSnapshotSource(epoch) {
+  state.source?.close();
+  const source = new EventSource(projectURL(resourceSnapshotURL('/api/events')));
+  state.source = source;
+  source.onopen = () => { if (epoch === state.epoch && state.source === source) setConnection(true); };
+  source.addEventListener('snapshot', event => {
+    if (epoch !== state.epoch || state.source !== source) return;
+    try { applySnapshot(JSON.parse(event.data)); setConnection(true); }
+    catch { setConnection(false); }
+  });
+  source.onerror = () => { if (epoch === state.epoch && state.source === source) setConnection(false); };
+}
+
+async function changeResourcePage(direction, offset = null) {
+  if (state.resourceBusy || state.paused) return;
+  const epoch = state.epoch;
+  const previous = state.resourceOffset;
+  state.resourceOffset = offset ?? Math.max(0, previous + direction * RESOURCE_PAGE_LIMIT);
+  state.resourceBusy = true;
+  state.source?.close();
+  $('resource-previous').disabled = true;
+  $('resource-next').disabled = true;
+  try {
+    const data = await fetchJSON(resourceSnapshotURL());
+    if (epoch !== state.epoch) return;
+    applySnapshot(data);
+  } catch (error) {
+    if (epoch !== state.epoch) return;
+    state.resourceOffset = previous;
+    composerStatus(`Could not load resources: ${error.message}`, true);
+  } finally {
+    if (epoch === state.epoch) {
+      state.resourceBusy = false;
+      renderResources();
+      startSnapshotSource(epoch);
+    }
+  }
 }
 
 function applySnapshot(data) {
@@ -1249,7 +1330,8 @@ function applySnapshot(data) {
     }
     pruneExpanded();
     renderAgents();
-    renderMessages(following && !state.hasNewer);
+    if (initial || labelsChanged || oldVisible !== JSON.stringify([...state.messages.values()])) renderMessages(following && !state.hasNewer);
+    else renderHistoryStatus();
     renderResources();
     if (following && state.hasNewer) loadMessagePage(true);
     return;
@@ -1416,6 +1498,7 @@ function renderProjects(data) {
 }
 
 async function connect() {
+  state.resourceOffset = 0; state.resourceBusy = false; state.resourceRenderKey = null;
   const epoch = ++state.epoch;
   state.loadingHistory = false;
   state.historyDirection = null; state.historyError = null;
@@ -1432,19 +1515,11 @@ async function connect() {
   try {
     state.config = await fetchJSON('/api/config');
     renderProjects(state.config);
-    applySnapshot(await fetchJSON('/api/snapshot'));
+    applySnapshot(await fetchJSON(resourceSnapshotURL()));
     $('message-input').disabled = false;
     $('send-button').disabled = false;
     composerStatus('');
-    const source = new EventSource(projectURL('/api/events'));
-    state.source = source;
-    source.onopen = () => { if (epoch === state.epoch) setConnection(true); };
-    source.addEventListener('snapshot', (event) => {
-      if (epoch !== state.epoch) return;
-      try { applySnapshot(JSON.parse(event.data)); setConnection(true); }
-      catch { setConnection(false); }
-    });
-    source.onerror = () => { if (epoch === state.epoch) setConnection(false); };
+    startSnapshotSource(epoch);
   } catch (error) {
     if (epoch !== state.epoch) return;
     composerStatus(error.message + '. Reconnect to try again.', true);
@@ -1579,7 +1654,7 @@ $('project-form').addEventListener('submit', async event => {
     }
     $('project-dialog').close();
     state.busy = false;
-    if (rename) applySnapshot(await fetchJSON('/api/snapshot')); else switchProject(result.project.id);
+    if (rename) applySnapshot(await fetchJSON(resourceSnapshotURL())); else switchProject(result.project.id);
   } catch (error) { $('project-error').textContent = error.message; $('project-error').hidden = false; }
   finally { state.busy = false; projectControls(); $('save-project').disabled = false; $('save-project').textContent = saveLabel; }
 });
@@ -1594,6 +1669,7 @@ $('pause-button').addEventListener('click', () => {
   $('pause-label').textContent = state.paused ? 'Resume feed' : 'Pause feed';
   $('pause-icon').textContent = state.paused ? '▷' : 'Ⅱ';
   if (!state.paused && state.pending) { applySnapshot(state.pending); state.pending = null; }
+  renderResources();
   setConnection(state.connected);
 });
 $('new-messages').addEventListener('click', showLatest);
@@ -1730,7 +1806,7 @@ $('composer').addEventListener('submit', async (event) => {
     clearReply();
     composerStatus(broadcast ? `Group info sent to ${sent.messages.length} agents; no wake requested` : `Sent; wake requested for ${recipients.map((id) => agentLabel(id)).join(', ')}`);
     try {
-      applySnapshot(await fetchJSON('/api/snapshot'));
+      applySnapshot(await fetchJSON(resourceSnapshotURL()));
       showLatest();
     } catch { setConnection(false); }
   } catch (error) {
@@ -1742,6 +1818,8 @@ $('composer').addEventListener('submit', async (event) => {
     $('message-input').disabled = false;
   }
 });
-setInterval(() => { if (!state.paused) renderResources(); }, 1000);
+$('resource-previous').addEventListener('click', () => changeResourcePage(-1));
+$('resource-next').addEventListener('click', () => changeResourcePage(1));
+setInterval(() => { if (!state.paused) updateResourceCountdowns(); }, 1000);
 window.addEventListener('beforeunload', () => state.source?.close());
 connect();

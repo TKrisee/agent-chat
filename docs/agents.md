@@ -158,6 +158,17 @@ do not acknowledge your inbox deliveries.
 
 ## Resources and validation
 
+The browser resource sidebar shows 50 exact resources per page, with live held
+and queued totals across the project. Active holds appear before stale holds and
+available resources. Page arrows browse the remaining records; pagination does
+not release or recover any hold. Countdown updates preserve existing cards.
+The browser requests `resource_limit=50&resource_offset=N` on `/api/snapshot`
+and `/api/events`. Those read-only responses include `resource_page` totals and
+the selected resource rows. The maximum requested page size is 200; requests
+without these parameters retain the complete resource list for older clients.
+On an older server, the new browser still limits rendered rows locally, but
+smaller network payloads require the updated coordinator to be loaded.
+
 Reserve exact resources with `request RESOURCE --minutes N`; proceed only on
 `owned`. Export its session-bound token as `AGENT_CHAT_TOKEN`, then run shared
 validation through `run RESOURCE -- COMMAND ...`. Directory names do not lock

@@ -120,7 +120,8 @@ def message_rows(rows, agents, db):
     return items
 
 
-def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=None):
+def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=None,
+             resource_limit=None, resource_offset=0):
     """Read a consistent view without advancing inboxes or changing ownership."""
     with reader(db_path) as db:
         now = time.time()
@@ -138,7 +139,27 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         messages = message_rows(list(reversed(rows)), agents, db)
         resources = []
         columns = 'name,owner_session,reservation_id,deadline,stale,reason'
-        for row in db.execute(f'SELECT {columns} FROM resources ORDER BY name'):
+        resource_page = None
+        if resource_limit is not None:
+            if (type(resource_limit) is not int or not 1 <= resource_limit <= 200
+                    or type(resource_offset) is not int or resource_offset < 0):
+                raise ValueError('Resource page requires a limit from 1 to 200 and a nonnegative offset')
+            counts = db.execute('''SELECT COUNT(*),COUNT(owner_session),
+                COALESCE(SUM(owner_session IS NOT NULL AND (stale OR deadline<=?)),0)
+                FROM resources''', (now,)).fetchone()
+            total_resources, held_resources, stale_resources = counts
+            resource_offset = min(resource_offset, max(0, (total_resources-1)//resource_limit)*resource_limit)
+            resource_page = dict(offset=resource_offset, limit=resource_limit, total=total_resources,
+                                 held=held_resources, stale=stale_resources,
+                                 free=total_resources-held_resources,
+                                 waiting=db.execute('SELECT COUNT(*) FROM resource_queue').fetchone()[0])
+            resource_rows = db.execute(f'''SELECT {columns} FROM resources
+                ORDER BY CASE WHEN owner_session IS NULL THEN 2 WHEN stale OR deadline<=? THEN 1 ELSE 0 END,
+                CASE name WHEN 'validation-clone' THEN 0 WHEN 'main-inputs' THEN 1 WHEN 'git-index' THEN 2 ELSE 3 END,name
+                LIMIT ? OFFSET ?''', (now, resource_limit, resource_offset))
+        else:
+            resource_rows = db.execute(f'SELECT {columns} FROM resources ORDER BY name')
+        for row in resource_rows:
             state = 'free' if not row['owner_session'] else (
                 'stale' if row['stale'] or row['deadline'] <= now else 'owned')
             queue = [dict(session=item['session'], agent=agents.get(item['session']), position=i + 1)
@@ -153,6 +174,8 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         data = dict(bridge=bridge, server_time=now, sessions=sessions, messages=messages,
                     resources=resources, total_messages=total,
                     history_truncated=total > len(messages))
+        if resource_page is not None:
+            data['resource_page'] = resource_page
         data['session_resets'] = []
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_resets'").fetchone():
             data['session_resets'] = [dict(row) for row in db.execute('''SELECT id,requester_session,target_session,
@@ -463,7 +486,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return data
 
     def project_snapshot(self):
-        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects())
+        params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+        paging = {}
+        if 'resource_limit' in params or 'resource_offset' in params:
+            for name, default in [('resource_limit', '50'), ('resource_offset', '0')]:
+                values = params.get(name, [default])
+                if len(values) != 1 or not values[0].isascii() or not values[0].isdecimal():
+                    raise ValueError('Resource page parameters must be single nonnegative integers')
+                paging[name] = int(values[0])
+            if not 1 <= paging['resource_limit'] <= 200:
+                raise ValueError('Resource page limit must be from 1 to 200')
+        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects())
 
     def json(self, code, data):
         self.respond(code, json.dumps(self.scoped(data), ensure_ascii=False, separators=(',', ':')).encode('utf-8'), 'application/json; charset=utf-8')
@@ -835,6 +868,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         raise CoordError('invalid usage operation')
 
     def events(self):
+        # Validate paging before committing the streaming response headers.
+        data = self.scoped(self.project_snapshot())
         self.send_response(200)
         self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Cache-Control', 'no-store')
@@ -843,7 +878,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         prior = None
         try:
             while not self.server.stop_event.is_set():
-                data = self.scoped(self.project_snapshot())
                 comparable = dict(data)
                 comparable.pop('server_time')
                 if comparable != prior:
@@ -854,6 +888,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(payload.encode())
                 self.wfile.flush()
                 self.server.stop_event.wait(1)
+                data = self.scoped(self.project_snapshot())
         except (OSError, sqlite3.Error, RuntimeError):
             pass
         finally:
