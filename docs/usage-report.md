@@ -58,3 +58,8 @@ scripts/usage-report.sh /path/to/rollout-a.jsonl /path/to/rollout-b.jsonl > usag
 Each `threads` row preserves source, thread source and the unique `models` seen in `turn_context.payload.model`. `model` is set only when there is exactly one such model, otherwise it is null. Rows without a usable record stream have `usage_status: "missing"` and null token fields. If any token field is absent in an owned record, the row is `partial` and that metric remains null rather than falling back to zero.
 
 Some older rollouts only expose `event_msg` `token_count` cumulative counters. They appear in `legacy_last_cumulative` only, are explicitly excluded from `aggregate`, and must never be summed across files or added to record-stream totals.
+
+Global root-orchestrator projections are omitted from timed project subjects and
+optional project pause recipients. Their one conversation spans projects, so its
+usage cannot be attributed to a single project from rollout totals. Project
+orchestrators/workers remain measured. Global weekly usage enforcement is unchanged.

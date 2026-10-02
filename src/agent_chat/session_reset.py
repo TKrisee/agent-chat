@@ -28,6 +28,8 @@ class SessionResetState:
 
         if 'workspace_revalidated' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
             self.db.execute('ALTER TABLE session_resets ADD COLUMN workspace_revalidated INTEGER NOT NULL DEFAULT 0')
+        if 'project_scope' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
+            self.db.execute('ALTER TABLE session_resets ADD COLUMN project_scope INTEGER NOT NULL DEFAULT 0')
 
     def target(self, name):
         row = self.db.execute('SELECT id,agent FROM sessions WHERE id=? OR agent=? ORDER BY (id=?) DESC', (name, name, name)).fetchone()
@@ -70,6 +72,9 @@ class SessionResetState:
     def request(self, name, old_thread, prompt, request_id, confirmed, *, human=False):
         caller = self.coord.require_session()
         target = self.target(name)['id']
+        from .root_orchestrator import assert_local_lifecycle, assert_management_target
+        assert_local_lifecycle(self.db, target)
+        assert_management_target(self.db, caller, target)
         try:
             request_id = str(uuid.UUID(request_id))
         except (ValueError, TypeError, AttributeError):
@@ -96,9 +101,20 @@ class SessionResetState:
                 (request_id, caller, target, host['host_id'], old_thread, prompt, 'pending', now, now))
         return self.public(self.job(request_id))
 
-    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False, model=None, reasoning_effort=None, cwd=None):
+    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False, model=None, reasoning_effort=None, cwd=None, project_scope=False, project_orchestrator=False):
         caller = self.coord.require_session()
         template = self.target(template_session or caller)['id']
+        from .root_orchestrator import projection
+        root = projection(self.db, template)
+        if root:
+            if not project_orchestrator:
+                raise CoordError('root creates project orchestrators through root configure; project orchestrators create workers')
+            from .core import assert_agent_running
+            assert_agent_running(self.db, template)
+            if not root['cwd'] or cwd not in (None, root['cwd']):
+                raise CoordError('configure the exact project workspace before using root as a creation template')
+            project_scope, cwd = True, root['cwd']
+            model, reasoning_effort = model or root['model'], reasoning_effort or root['effort']
         if not human and template != caller:
             raise CoordError('agent creation uses the requester\'s own conversation settings')
         if not isinstance(agent, str) or not agent.strip() or len(agent) > 64:
@@ -117,7 +133,7 @@ class SessionResetState:
         with self.coord.tx():
             existing = self.db.execute('SELECT * FROM session_resets WHERE id=?', (request_id,)).fetchone()
             if existing:
-                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent'], existing['requested_model'], existing['requested_effort'], existing['requested_cwd']) != ('create', caller, template_thread, prompt, agent, model, reasoning_effort, cwd):
+                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent'], existing['requested_model'], existing['requested_effort'], existing['requested_cwd'], existing['project_scope']) != ('create', caller, template_thread, prompt, agent, model, reasoning_effort, cwd, int(project_scope)):
                     raise CoordError('creation retry payload differs from the original')
                 return self.public(dict(existing))
             if not human:
@@ -136,11 +152,17 @@ class SessionResetState:
             self.db.execute('INSERT INTO remote_session_hosts VALUES(?,?,?,?)', (target, host['host_id'], now, now))
             self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at,kind,requested_model,requested_effort,requested_cwd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (request_id, caller, target, host['host_id'], template_thread, prompt, 'pending', now, now, 'create', model, reasoning_effort, cwd))
+            if project_scope:
+                self.db.execute('UPDATE session_resets SET project_scope=1 WHERE id=?', (request_id,))
+            if project_orchestrator:
+                self.db.execute('INSERT OR REPLACE INTO project_orchestrators VALUES(?,?)', (target, caller))
         return self.public(self.job(request_id))
 
     def revalidate_info(self, job_id):
         job = self.job(job_id)
         caller = self.coord.require_session()
+        from .root_orchestrator import assert_management_target
+        assert_management_target(self.db, caller, job['target_session'])
         host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (caller,)).fetchone()
         if caller != job['requester_session'] or not host or host['host_id'] != job['host_id']:
             raise CoordError('only the original requester on the creation host may revalidate settings')
@@ -190,6 +212,8 @@ class SessionResetState:
     def retry_prompt(self, job_id, confirmed):
         with self.coord.tx():
             job = self.job(job_id)
+            from .root_orchestrator import assert_management_target
+            assert_management_target(self.db, self.coord.require_session(), job['target_session'])
             if self.coord.require_session() not in (job['requester_session'], job['target_session']):
                 raise CoordError('only the requester or target can retry a reset prompt')
             if confirmed is not True or job['status'] != 'uncertain' or not job['new_thread_id']:
@@ -200,6 +224,8 @@ class SessionResetState:
     def cancel(self, job_id):
         with self.coord.tx():
             job = self.job(job_id)
+            from .root_orchestrator import assert_management_target
+            assert_management_target(self.db, self.coord.require_session(), job['target_session'])
             if self.coord.require_session() not in (job['requester_session'], job['target_session']):
                 raise CoordError('only the requester or target can cancel a reset')
             if job['status'] not in ('pending', 'created', 'failed', 'cancelled'):
@@ -207,9 +233,9 @@ class SessionResetState:
             self.db.execute("UPDATE session_resets SET status='cancelled',updated_at=? WHERE id=?", (time.time(), job_id))
         return self.public(self.job(job_id))
 
-    def jobs(self, host):
+    def jobs(self, host, project_scope=False):
         return [self.job(row['id']) for row in self.db.execute(
-            "SELECT r.* FROM session_resets r WHERE r.host_id=? AND r.status NOT IN ('completed','cancelled','failed') AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=r.target_session AND c.mode<>'running') ORDER BY r.created_at", (host,))]
+            "SELECT r.* FROM session_resets r WHERE r.host_id=? AND (r.project_scope=0 OR ?) AND r.status NOT IN ('completed','cancelled','failed') AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=r.target_session AND c.mode<>'running') ORDER BY r.created_at", (host, int(project_scope)))]
 
     def update(self, job_id, expected, status, **values):
         transitions = {
@@ -251,6 +277,8 @@ class SessionResetState:
     def resolve_creation(self, job_id, thread_id, confirmed):
         with self.coord.tx():
             job = self.job(job_id)
+            from .root_orchestrator import assert_management_target
+            assert_management_target(self.db, self.coord.require_session(), job['target_session'])
             if self.coord.require_session() not in (job['requester_session'], job['target_session']):
                 raise CoordError('only the requester or target can resolve a reset')
             if confirmed is not True or job['status'] != 'uncertain' or job['new_thread_id']:

@@ -40,6 +40,9 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
     if coord.db.execute("SELECT 1 FROM retired_sessions WHERE id=?", (session,)).fetchone():
         raise CoordError("session is deregistered; register a new session")
     coord.session = session
+    from .root_orchestrator import projection
+    if projection(coord.db, session) and op in ('block','cancel','begin-guard','attach-guard','pulse-guard','rename'):
+        raise CoordError('global root is control-only; use project agents for resource work and detach before a local rename')
     # Hosted file locks are logical keys, independent of server filesystem layout.
     coord.resource_name = resource_name
     if op == "rename":
@@ -101,7 +104,13 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         from .agent_control import AgentControlState
         BridgeState(coord)
         controls = AgentControlState(coord)
-        if op == 'agents': return {'agents':controls.roster()}
+        if op == 'agents':
+            rows = controls.roster()
+            from .root_orchestrator import projection
+            if projection(coord.db, session):
+                allowed = {row['session_id'] for row in coord.db.execute('SELECT session_id FROM project_orchestrators WHERE root_session=?',(session,))} | {session}
+                rows = [row for row in rows if row['id'] in allowed]
+            return {'agents':rows}
         target = _string(params.get('to') or session, 'to')
         if op == 'agent-status':
             refresh = None
@@ -127,7 +136,9 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         if op == 'session-reset-retry':
             return resets.retry_prompt(_string(params.get('id'), 'id'), params.get('confirm_not_started'))
         if op == 'agent-create':
-            return resets.create(params.get('agent'), params.get('expected_thread'), params.get('prompt'), params.get('request_id'), params.get('confirm'), model=params.get('model'), reasoning_effort=params.get('reasoning_effort'), cwd=params.get('cwd'))
+            return resets.create(params.get('agent'), params.get('expected_thread'), params.get('prompt'),
+                params.get('request_id'), params.get('confirm'), model=params.get('model'),
+                reasoning_effort=params.get('reasoning_effort'), cwd=params.get('cwd'))
         if op == 'session-reset':
             return resets.request(_string(params.get('to') or session, 'to'), params.get('expected_thread'),
                                   params.get('prompt'), params.get('request_id'), params.get('confirm'))

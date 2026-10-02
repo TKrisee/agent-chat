@@ -43,6 +43,8 @@ def main(argv=None):
         return bridge_main(bridge_args + (remainder if default_bridge else remainder[1:]))
     if remainder[0] == 'project':
         return _project_main(remainder[1:], args, args.server)
+    if remainder[0] == 'root':
+        return _root_main(remainder[1:], args, args.server)
     if remainder[0] == 'doctor':
         from .doctor import main as doctor_main
         return doctor_main(remainder[1:], connection=args)
@@ -73,6 +75,57 @@ def _project_main(raw, args, server):
     from .remote import HttpClient
     # Registry actions work even when a previously selected project no longer exists.
     result = HttpClient(server, args.api_token, project='default').call('/api/projects/rpc', values)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+def _root_main(raw, args, server):
+    """Resolve only the caller's own root projection; never borrow a peer."""
+    from .remote import HttpClient, client_host_id
+    session = args.session or os.environ.get('AGENT_CHAT_SESSION')
+    if not session:
+        raise core.CoordError('root commands require your canonical home --session')
+    client = HttpClient(server, args.api_token, project=args.project)
+    identity = dict(session=session, host_id=client_host_id())
+    if raw and raw[0] == 'in':
+        if len(raw) < 3:
+            raise core.CoordError('use root in PROJECT_ID COMMAND ...')
+        allowed = {'context','message','inbox','acknowledge','send','agents','agent-status',
+                   'agent-stop','agent-resume','session-reset','session-reset-status',
+                   'session-reset-cancel','session-reset-resolve','session-reset-retry',
+                   'remove-session','bridge-status','status'}
+        if raw[2] not in allowed:
+            raise core.CoordError('root in accepts project-scoped messaging, readback and agent management only')
+        route = client.call('/api/root/rpc', dict(identity, op='route', params={'project':raw[1]}))
+        routed = argparse.Namespace(session=route['session'], server=server, api_token=args.api_token,
+                                   project=route['project'], root_scope=True)
+        return _remote_main(raw[2:], routed, server)
+    parser = argparse.ArgumentParser(prog='agent-chat-client root')
+    sub = parser.add_subparsers(dest='op', required=True)
+    enroll = sub.add_parser('enroll', help='join every project with your one neutral main conversation')
+    enroll.add_argument('--expected-thread', required=True); enroll.add_argument('--confirm', action='store_true')
+    sub.add_parser('status', help='root directory and durable project onboarding state')
+    configure = sub.add_parser('configure', help='create one independent project orchestrator, with project-only workspace grants')
+    configure.add_argument('--project-id', required=True, dest='project')
+    configure.add_argument('--agent', default='orchestrator'); configure.add_argument('--cwd', required=True)
+    configure.add_argument('--model'); configure.add_argument('--reasoning-effort', dest='effort')
+    configure.add_argument('--prompt-file', required=True); configure.add_argument('--request-id', required=True)
+    configure.add_argument('--confirm', action='store_true')
+    adopt = sub.add_parser('adopt', help='designate an existing project main, without dispatch or replacement')
+    adopt.add_argument('--project-id', required=True, dest='project'); adopt.add_argument('--to', required=True, dest='target')
+    adopt.add_argument('--expected-thread', required=True); adopt.add_argument('--cwd', required=True)
+    adopt.add_argument('--confirm', action='store_true')
+    detach = sub.add_parser('detach', help='remove global routing role after every root projection is clean; retain registrations and inboxes')
+    detach.add_argument('--confirm', action='store_true')
+    resume = sub.add_parser('resume-routing', help='resume a refused clean detach without deleting queued input')
+    resume.add_argument('--confirm', action='store_true')
+    retry = sub.add_parser('retry-setup', help='reconcile the exact journaled project setup; no new UUID or thread replay')
+    retry.add_argument('--project-id', required=True, dest='project'); retry.add_argument('--request-id', required=True)
+    retry.add_argument('--confirm', action='store_true')
+    params = vars(parser.parse_args(raw)); op = params.pop('op')
+    if 'prompt_file' in params:
+        params['prompt'] = Path(params.pop('prompt_file')).read_text(encoding='utf-8')
+    result = client.call('/api/root/rpc', dict(identity, op=op, params=params))
     print(json.dumps(result, sort_keys=True))
     return 0
 
@@ -178,7 +231,8 @@ def _remote_main(raw, global_args, server):
         params['attachments'] = attachments
     client, host = HttpClient(server, global_args.api_token, project=global_args.project), client_host_id()
     def call(operation, values):
-        return client.call('/api/coord', {'op': operation, 'session': session, 'host_id': host, 'params': values})
+        result = client.call('/api/coord', {'op': operation, 'session': session, 'host_id': host, 'params': values})
+        return dict(result, project=client.project) if getattr(global_args, 'root_scope', False) else result
     if op == 'session-reset-revalidate':
         if not params['confirm']:
             raise core.CoordError('workspace revalidation requires --confirm')

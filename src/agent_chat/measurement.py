@@ -109,7 +109,11 @@ class MeasurementStore:
             # its parent's thread again would duplicate usage, so retain only
             # actual thread bindings.
             rows = [dict(r) for r in db.execute('SELECT session_id,thread_id FROM bridge_bindings WHERE thread_id IS NOT NULL')]
-            return [(sessions.get(r['session_id'], r['session_id']), r['session_id'], r['thread_id']) for r in rows]
+            from .root_orchestrator import projection
+            # One global control thread spans projects; timed project attribution
+            # and project-local pause must include only actual project agents.
+            return [(sessions.get(r['session_id'], r['session_id']), r['session_id'], r['thread_id']) for r in rows
+                    if not projection(db, r['session_id'])]
         finally: db.close()
 
     def _paths(self, thread_id):

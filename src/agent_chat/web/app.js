@@ -14,6 +14,7 @@ const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp
 const VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
 let mediaViewer = null;
 const state = {
+  rootView: location.pathname === '/root',
   snapshot: null, messages: new Map(), selected: null, query: '', ack: 'all', toMe: false,
   expanded: new Set(), paused: false, pending: null, connected: false,
   hasOlder: false, source: null, newCount: 0, config: null, sending: false,
@@ -304,6 +305,7 @@ function closePanels() {
 }
 
 function selectAgent(id) {
+  if (state.rootView) return;
   state.selected = id;
   if (id && id !== state.config?.sender.id) {
     const session = mentionSessions().find((item) => item.id === id);
@@ -317,7 +319,7 @@ function selectAgent(id) {
 function renderAgents() {
   if (!state.snapshot) return;
   const sessions = state.snapshot.sessions.filter((item) => item.id !== state.config?.sender.id)
-    .sort((a, b) => a.agent.localeCompare(b.agent) || a.registered_at - b.registered_at);
+    .sort((a, b) => Number(!!b.is_root_orchestrator) - Number(!!a.is_root_orchestrator) || a.agent.localeCompare(b.agent) || a.registered_at - b.registered_at);
   $('agent-count').textContent = sessions.length;
   $('all-count').textContent = state.snapshot.total_messages.toLocaleString();
   $('all-conversations').classList.toggle('selected', !state.selected);
@@ -332,9 +334,10 @@ function renderAgents() {
   const children = new Map();
   const roots = [];
   for (const session of sessions) {
-    if (session.parent_session && visible.has(session.parent_session)) {
-      if (!children.has(session.parent_session)) children.set(session.parent_session, []);
-      children.get(session.parent_session).push(session);
+    const parent = session.parent_session || session.orchestration_parent;
+    if (parent && visible.has(parent)) {
+      if (!children.has(parent)) children.set(parent, []);
+      children.get(parent).push(session);
     } else roots.push(session);
   }
   const ordered = [];
@@ -364,9 +367,9 @@ function renderAgents() {
     if (session.is_orchestrator ?? orchestrators.has(session.id)) {
       const crown = node('span', 'agent-orchestrator', '👑');
       crown.id = `orchestrator-${encodeURIComponent(session.id)}`;
-      crown.title = 'Orchestrator';
+      crown.title = session.is_root_orchestrator ? 'Root orchestrator' : 'Orchestrator';
       crown.setAttribute('role', 'img');
-      crown.setAttribute('aria-label', 'Orchestrator');
+      crown.setAttribute('aria-label', crown.title);
       button.setAttribute('aria-describedby', crown.id);
       nameRow.append(crown);
     }
@@ -383,6 +386,7 @@ function renderAgents() {
     }
     const removeBtn = node('button', 'agent-remove', '×');
     removeBtn.type = 'button';
+    removeBtn.disabled = !!session.is_root_orchestrator;
     removeBtn.title = `Remove inactive session ${session.agent}`;
     removeBtn.setAttribute('aria-label', `Remove inactive session ${session.agent}`);
     removeBtn.addEventListener('click', async () => {
@@ -410,8 +414,9 @@ function renderAgents() {
     resetBtn.type = 'button';
     resetBtn.dataset.session = session.id;
     resetBtn.title = session.thread_id ? `Start fresh conversation for ${session.agent}` : 'Fresh conversations require a bound main agent';
+    if (session.is_root_orchestrator) resetBtn.title = 'Detach global root cleanly before resetting its shared conversation';
     resetBtn.setAttribute('aria-label', `Start fresh conversation for ${session.agent}`);
-    resetBtn.disabled = !session.thread_id;
+    resetBtn.disabled = !session.thread_id || session.is_root_orchestrator;
     resetBtn.addEventListener('click', () => openResetDialog(session));
     controls.append(button, removeBtn, resetBtn);
     fragment.append(controls);
@@ -1123,7 +1128,7 @@ function renderMessages(forceBottom = false, anchor = feedAnchor()) {
   const label = state.toMe
     ? (state.selected ? `${agentLabel(state.selected)} → You` : 'Messages to you')
     : (state.selected ? agentLabel(state.selected) : 'All conversations');
-  $('conversation-title').textContent = label;
+  $('conversation-title').textContent = state.rootView ? 'Root orchestrator' : label;
   $('to-me-filter').setAttribute('aria-pressed', String(state.toMe));
   const batches = new Set();
   const rows = [...new Map([...state.originals, ...state.messages]).values()].sort((a, b) => a.seq - b.seq).filter((message) => {
@@ -1155,6 +1160,10 @@ function renderMessages(forceBottom = false, anchor = feedAnchor()) {
   const filtered = state.query || state.ack !== 'all' || state.toMe;
   $('empty-title').textContent = filtered ? 'No matching messages' : 'The room is quiet';
   $('empty-description').textContent = filtered ? 'Try a different search or message filter.' : 'New agent messages will appear here automatically. You can start a conversation below.';
+  if (state.rootView && !state.root) {
+    $('empty-title').textContent = 'Connect your root orchestrator';
+    $('empty-description').textContent = 'Enroll one main conversation from a neutral workspace using the root setup guide.';
+  }
   renderHistoryStatus();
   if (forceBottom) {
     feed.scrollTop = feed.scrollHeight;
@@ -1463,7 +1472,7 @@ function loadAtScrollEdge(direction) {
 
 async function fetchJSON(url, options = {}) {
   const epoch = state.epoch;
-  const response = await fetch(projectURL(url), { cache: 'no-store', ...options });
+  const response = await fetch(projectURL(url, options.method || 'GET'), { cache: 'no-store', ...options });
   const data = await response.json();
   if (epoch !== state.epoch) throw new DOMException('Project changed', 'AbortError');
   if (!response.ok) {
@@ -1481,24 +1490,60 @@ async function fetchUsage(url, options = {}) {
   return data;
 }
 
-function projectURL(path) {
+function projectURL(path, method = 'GET') {
   const url = new URL(path, location.origin);
+  if (state.rootView && method === 'GET' && /^\/api\/(config|snapshot|events|messages)(\/|$)/.test(url.pathname)) {
+    url.pathname = url.pathname.replace('/api/', '/api/root/');
+  }
   if (state.project !== 'default') url.searchParams.set('project', state.project);
   return url.pathname + url.search;
 }
 
 function projectControls() {
   const disabled = state.busy || state.sending;
+  if ($('root-conversation')) $('root-conversation').disabled = disabled || !state.config;
   $('measurement-button').disabled = disabled || !state.config;
   $('project-select').disabled = disabled;
   $('new-project').disabled = disabled || !state.config;
   $('rename-project').disabled = disabled || !state.config;
-  $('attach-button').disabled = disabled || !state.config;
-  $('image-input').disabled = disabled || !state.config;
+  $('attach-button').disabled = disabled || !state.config || (state.rootView && !state.root);
+  $('image-input').disabled = disabled || !state.config || (state.rootView && !state.root);
   for (const button of $('composer-images').querySelectorAll('button')) button.disabled = disabled;
 }
 
 function renderProjects(data) {
+  if ('root_orchestrator' in data) state.root = data.root_orchestrator;
+  if (state.rootView) state.selected = state.root?.home_session || null;
+  document.body.classList.toggle('root-screen', state.rootView);
+  if ($('resources-button-label')) $('resources-button-label').textContent = state.rootView ? 'Projects' : 'Resources';
+  $('resources-panel').setAttribute('aria-label', state.rootView ? 'Project overview' : 'Shared resources');
+  document.title = state.rootView ? 'Root orchestrator · Agent chat' : 'Agent room · Agent chat';
+  $('message-input').placeholder = state.rootView ? 'Message your root orchestrator…' : 'Message all agents, @tag recipients, or drop files…';
+  if ($('root-directory')) $('root-directory').hidden = !state.rootView;
+  if (state.rootView && data.root_overview && $('root-projects')) {
+    const key = JSON.stringify(data.root_overview);
+    if (state.rootOverviewKey !== key) {
+      state.rootOverviewKey = key;
+      const cards = (data.root_overview.projects || []).map(project => {
+        const card = node('article', 'root-project');
+        card.append(node('h3', '', project.name), node('p', 'root-project-state', project.setup.replaceAll('_', ' ')));
+        if (project.agent) card.append(node('p', '', `${project.agent}${project.model ? ` · ${project.model}` : ''}`));
+        if (project.error) card.append(node('p', 'root-project-error', project.error));
+        const bridge = project.bridge;
+        if (!bridge?.recent || !bridge.project_scope_worker) card.append(node('p', 'root-project-error', !bridge?.recent ? 'Wake bridge unavailable' : 'Project creation awaits bridge activation'));
+        const open = node('button', 'quiet-button', 'Open project');
+        open.type = 'button'; open.setAttribute('aria-label', `Open project ${project.name}`);
+        open.addEventListener('click', () => switchProject(project.project_id));
+        card.append(open); return card;
+      });
+      $('root-projects').replaceChildren(...cards);
+    }
+  }
+  if ($('root-conversation')) {
+    $('root-conversation').hidden = !state.root && !state.rootView;
+    $('root-conversation').classList.toggle('selected', state.rootView);
+    $('root-conversation').disabled = state.busy || state.sending || !state.config;
+  }
   if (!data.projects) return;
   state.projects = data.projects;
   const select = $('project-select');
@@ -1531,10 +1576,11 @@ async function connect() {
   projectControls();
   try {
     state.config = await fetchJSON('/api/config');
+    if (state.rootView) state.project = state.config.project.id;
     renderProjects(state.config);
     applySnapshot(await fetchJSON(resourceSnapshotURL()));
-    $('message-input').disabled = false;
-    $('send-button').disabled = false;
+    $('message-input').disabled = state.rootView && !state.root;
+    $('send-button').disabled = state.rootView && !state.root;
     composerStatus('');
     startSnapshotSource(epoch);
   } catch (error) {
@@ -1544,20 +1590,22 @@ async function connect() {
   }
 }
 
-function switchProject(id) {
+function switchProject(id, rootView = false) {
   if ($('reset-dialog').open) $('reset-dialog').close();
-  if (state.busy || state.sending || id === state.project) return;
+  if (state.busy || state.sending || (id === state.project && rootView === state.rootView)) return;
   if ($('media-dialog').open) {
     mediaViewer.opener = null;
     $('media-dialog').close();
   }
-  state.drafts.set(state.project, { body: $('message-input').value, attachments: state.attachments });
+  state.drafts.set(`${state.rootView ? 'root' : 'project'}:${state.project}`, { body: $('message-input').value, attachments: state.attachments });
   closeMeasurement();
   state.measurement = null;
   state.measurementSaving = false;
   state.project = id;
+  state.rootView = rootView; state.rootOverviewKey = null;
   state.viewGeneration++; state.viewLoading = false;
   const url = new URL(location.href);
+  url.pathname = rootView ? '/root' : '/';
   if (id === 'default') url.searchParams.delete('project'); else url.searchParams.set('project', id);
   history.replaceState(null, '', url);
   state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
@@ -1567,8 +1615,9 @@ function switchProject(id) {
   state.historyDirection = null; state.historyError = null;
   $('pause-button').setAttribute('aria-pressed', 'false'); $('pause-label').textContent = 'Pause feed'; $('pause-icon').textContent = 'Ⅱ';
   $('search').value = ''; $('ack-filter').value = 'all';
-  const draft = state.drafts.get(id);
-  state.drafts.delete(id);
+  const draftKey = `${rootView ? 'root' : 'project'}:${id}`;
+  const draft = state.drafts.get(draftKey);
+  state.drafts.delete(draftKey);
   $('message-input').value = draft?.body || '';
   state.attachments = draft?.attachments || [];
   renderDraftImages();
@@ -1579,8 +1628,14 @@ function switchProject(id) {
   $('held-count').textContent = '0'; $('mobile-resource-count').textContent = '0';
   $('waiting-count').textContent = ''; $('bridge-caption').textContent = 'Connecting…';
   renderMessages(true);
-  connect();
+  return connect();
 }
+
+$('root-conversation')?.addEventListener('click', async () => {
+  const root = state.root;
+  if (!root || state.busy || state.sending) return;
+  await switchProject(root.home_project, true);
+});
 
 $('project-select').addEventListener('change', event => switchProject(event.target.value));
 $('usage-button').addEventListener('click', () => {
@@ -1789,8 +1844,8 @@ $('composer').addEventListener('submit', async (event) => {
     if (!recipients.includes(session.id)) recipients.push(session.id);
   }
   if (parsed.invalid) { composerStatus('Complete the @agent tag or remove it to message all agents.', true); return; }
-  const broadcast = !parsed.tags.length && !state.reply;
-  if (!parsed.tags.length) recipients.push(...(state.reply ? replyRecipients(state.reply) : sessions.map((session) => session.id)));
+  const broadcast = !state.rootView && !parsed.tags.length && !state.reply;
+  if (!parsed.tags.length) recipients.push(...(state.rootView ? [state.root?.home_session].filter(Boolean) : (state.reply ? replyRecipients(state.reply) : sessions.map((session) => session.id))));
   const body = draft.slice(parsed.bodyStart).trim();
   if (!body && !state.attachments.length) { composerStatus('Write a message or attach a file.', true); return; }
   if (!recipients.length) { composerStatus('No agents are registered yet.', true); return; }

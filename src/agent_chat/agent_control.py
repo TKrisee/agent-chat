@@ -41,6 +41,13 @@ class AgentControlState:
             raise CoordError('agent stop/resume requires explicit confirmation')
         caller = self.coord.require_session()
         target = SessionResetState(self.coord).target(name)['id']
+        from .root_orchestrator import assert_management_target
+        if action == 'inspect':
+            assert_management_target(self.db, caller, target, inspect=True)
+        if action != 'inspect':
+            from .root_orchestrator import assert_local_lifecycle
+            assert_local_lifecycle(self.db, target)
+            assert_management_target(self.db, caller, target)
         with self.coord.tx():
             existing = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
             if existing:

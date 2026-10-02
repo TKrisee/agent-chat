@@ -93,7 +93,7 @@ class HttpClient:
         self._opener = urllib.request.build_opener(_NoRedirect)
 
     def call(self, path: str, payload: dict) -> dict:
-        if path not in ("/api/coord", "/api/bridge/rpc", "/api/projects/rpc", "/api/usage/rpc"):
+        if path not in ("/api/coord", "/api/bridge/rpc", "/api/projects/rpc", "/api/usage/rpc", "/api/root/rpc"):
             raise RemoteCoordError("remote coordinator path is not permitted")
         if not isinstance(payload, dict):
             raise RemoteCoordError("remote coordinator payload must be an object")

@@ -27,6 +27,7 @@ from .usage_guard import UsageGuard
 class RemoteBridgeState:
     def __init__(self, client, server_url, identity):
         self.client, self.server_url, self.identity = client, server_url, identity
+        self.scoped_resets = set()
 
     def call(self, op, **params):
         return self.client.call('/api/bridge/rpc', dict(self.identity, op=op, params=params))['result']
@@ -46,14 +47,21 @@ class RemoteBridgeState:
     def observe(self, thread_id, state, error=None):
         return self.call('observe', thread_id=thread_id, state=state, error=error)
     def heartbeat(self, server, pid, error=None):
-        return self.call('heartbeat', server=server, pid=pid, error=error)
+        return self.call('heartbeat', server=server, pid=pid, error=error, capabilities=['project-scope-v1'])
     def control_jobs(self): return self.call('control-jobs')
     def control_job(self, job_id): return self.call('control-job', job_id=job_id)
     def control_update(self, job_id, expected, status, **values):
         return self.call('control-update', job_id=job_id, expected=expected, status=status, **values)
-    def reset_jobs(self): return self.call('reset-jobs')
-    def reset_job(self, job_id): return self.call('reset-job', job_id=job_id)
+    def reset_jobs(self):
+        jobs = self.call('reset-jobs', capabilities=['project-scope-v1'])
+        self.scoped_resets.update(job['id'] for job in jobs if job.get('project_scope'))
+        return jobs
+    def reset_job(self, job_id):
+        job = self.call('reset-job', job_id=job_id, capabilities=['project-scope-v1'])
+        if job.get('project_scope'): self.scoped_resets.add(job_id)
+        return job
     def reset_update(self, job_id, expected, status, **values):
+        if job_id in self.scoped_resets: values['capabilities'] = ['project-scope-v1']
         return self.call('reset-update', job_id=job_id, expected=expected, status=status, **values)
 
 

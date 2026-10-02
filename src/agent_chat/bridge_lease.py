@@ -132,9 +132,12 @@ class BridgeManager:
         if op in ('reset-jobs', 'reset-job', 'reset-update'):
             from .session_reset import SessionResetState
             resets = SessionResetState(c)
+            scoped_worker = params.get('capabilities') == ['project-scope-v1']
             if op == 'reset-jobs':
-                return [] if usage and usage['blocked'] else resets.jobs(host)
+                return [] if usage and usage['blocked'] else resets.jobs(host, project_scope=scoped_worker)
             job = resets.job(params.get('job_id'))
+            if job.get('project_scope') and not scoped_worker:
+                raise CoordError('upgrade the existing bridge for project-scoped root creation; no input admitted')
             if job['host_id'] != host:
                 raise CoordError('fresh-session reset belongs to another host')
             if op == 'reset-job':
@@ -148,7 +151,7 @@ class BridgeManager:
             with self.measurements.lock if self.measurements else contextlib.nullcontext():
                 if self.measurements and status in ('creating', 'ready', 'adding', 'starting') and self.measurements.status(self.project_id)['active']:
                     raise CoordError('finish the active project measurement before resetting a conversation')
-                values = {key: value for key, value in params.items() if key not in ('job_id', 'expected', 'status')}
+                values = {key: value for key, value in params.items() if key not in ('job_id', 'expected', 'status', 'capabilities')}
                 return resets.update(job['id'], params.get('expected'), status, **values)
 
         def route_for(session_id):
@@ -245,6 +248,6 @@ class BridgeManager:
             error = params.get('error')
             if error is not None and not isinstance(error, str):
                 raise CoordError('invalid heartbeat error')
-            state.heartbeat(params['server'], params['pid'], error, host_id=host)
+            state.heartbeat(params['server'], params['pid'], error, host_id=host, project_scope_worker=params.get('capabilities') == ['project-scope-v1'])
             return {'heartbeat': True}
         raise CoordError('unsupported bridge operation')

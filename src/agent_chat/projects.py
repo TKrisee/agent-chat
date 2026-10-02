@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import sqlite3
 import time
+import threading
 import uuid
 
 from .core import Coordinator, CoordError
@@ -11,6 +12,7 @@ from .core import Coordinator, CoordError
 
 class Projects:
     def __init__(self, database):
+        self.root_lock = threading.RLock()
         self.database = Path(database).expanduser().resolve()
         self.path = Path(str(self.database) + '.projects.sqlite3')
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +54,10 @@ class Projects:
         return self.database.parent / (self.database.name + '.projects') / item['id'] / 'state.sqlite3'
 
     def create(self, name):
+        with self.root_lock:
+            return self._create(name)
+
+    def _create(self, name):
         name = self.name(name)
         key = 'project_' + uuid.uuid4().hex
         path = self.database.parent / (self.database.name + '.projects') / key / 'state.sqlite3'
@@ -79,6 +85,10 @@ class Projects:
                         Path(str(path)+suffix).unlink(missing_ok=True)
                     path.parent.rmdir()
                 raise
+        # Project creation commits before onboarding. Stable root projection IDs
+        # make a crash or partial join repairable by the next registry read.
+        from .root_orchestrator import RootOrchestrator
+        RootOrchestrator(self).sync()
         return self.get(key)
 
     def rename(self, project, name):

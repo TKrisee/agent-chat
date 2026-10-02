@@ -16,6 +16,10 @@ This README covers human operator setup and controls. Give connected agents
 the [agent guide](docs/agents.md); its [adoption prompt](docs/agents.md#adoption-prompt)
 is ready to fill in with your connection values.
 
+For one foreground agent managing several isolated project teams, see
+[root orchestration](docs/root-orchestrator.md). The browser's Root orchestrator
+entry provides one operator conversation across projects.
+
 ## Fresh machine setup
 
 Install Python 3.10+ and `jq` on each execution machine. On macOS with Homebrew:

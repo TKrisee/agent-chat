@@ -55,6 +55,8 @@ class BridgeState:
                 thread_id TEXT PRIMARY KEY, state TEXT NOT NULL,
                 error TEXT, checked_at REAL NOT NULL);
         ''')
+        if 'project_scope_worker' not in {row['name'] for row in self.db.execute('PRAGMA table_info(bridge_client_runtime)')}:
+            self.db.execute('ALTER TABLE bridge_client_runtime ADD COLUMN project_scope_worker INTEGER NOT NULL DEFAULT 0')
         from .session_reset import SessionResetState
         SessionResetState(coord)
         from .agent_control import AgentControlState
@@ -81,6 +83,8 @@ class BridgeState:
         # Parent rebinding could redirect descendants with queued input. Freeze
         # routes while a job needs reconciliation instead of silently rerouting it.
         caller = self.coord.require_session()
+        from .root_orchestrator import assert_local_lifecycle
+        assert_local_lifecycle(self.db, caller)
         from .session_reset import assert_reset_unlocked
         assert_reset_unlocked(self.db, caller)
         assert_agent_running(self.db, caller)
@@ -107,6 +111,8 @@ class BridgeState:
                 raise CoordError('parent must be an exact registered coordination session ID')
         with self.coord.tx():
             if parent_session:
+                from .root_orchestrator import assert_local_lifecycle
+                assert_local_lifecycle(self.db, parent_session)
                 from .session_reset import assert_reset_unlocked
                 assert_reset_unlocked(self.db, parent_session)
                 assert_agent_running(self.db, parent_session)
@@ -130,7 +136,7 @@ class BridgeState:
         return {'unbound': True}
 
     def pending(self):
-        return [dict(r) for r in self.db.execute('''
+        messages = [dict(r) for r in self.db.execute('''
             SELECT m.id,m.recipient_session FROM messages m
             LEFT JOIN bridge_deliveries d ON d.message_id=m.id
             WHERE m.sender_session<>m.recipient_session
@@ -141,6 +147,8 @@ class BridgeState:
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))
             ORDER BY m.seq''')]
+        from .root_orchestrator import projection
+        return [message for message in messages if not (projection(self.db, message['recipient_session']) or {}).get('paused')]
 
     def still_unread(self, job_id):
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
@@ -208,8 +216,13 @@ class BridgeState:
         return dict(row)
 
     def jobs(self):
-        return [dict(r) for r in self.db.execute("""SELECT j.* FROM bridge_jobs j WHERE j.status NOT IN ('dispatched','cancelled')
+        jobs = [dict(r) for r in self.db.execute("""SELECT j.* FROM bridge_jobs j WHERE j.status NOT IN ('dispatched','cancelled')
             AND NOT (j.status='prepared' AND EXISTS (SELECT 1 FROM bridge_bindings b JOIN agent_controls c ON c.target_session=b.session_id WHERE b.thread_id=j.thread_id AND c.mode<>'running')) ORDER BY j.created_at""")]
+        from .root_orchestrator import projection
+        def paused(job):
+            row = self.db.execute('SELECT session_id FROM bridge_bindings WHERE thread_id=?', (job['thread_id'],)).fetchone()
+            return row and (projection(self.db, row['session_id']) or {}).get('paused')
+        return [job for job in jobs if not (job['status'] == 'prepared' and paused(job))]
 
     def update(self, job_id, status, queue_id=None, error=None):
         def write():
@@ -235,12 +248,12 @@ class BridgeState:
             self.db.execute("UPDATE bridge_jobs SET status='prepared',queue_id=NULL,error=NULL,updated_at=? WHERE id=?", (time.time(), job_id))
         return self.job(job_id)
 
-    def heartbeat(self, server, pid, error=None, *, host_id=None):
+    def heartbeat(self, server, pid, error=None, *, host_id=None, project_scope_worker=False):
         if host_id is None:
             self.db.execute('INSERT OR REPLACE INTO bridge_runtime VALUES(1,?,?,?,?)', (server, pid, time.time(), error))
         else:
-            self.db.execute('INSERT OR REPLACE INTO bridge_client_runtime VALUES(?,?,?,?,?)',
-                            (host_id, server, pid, time.time(), error))
+            self.db.execute('INSERT OR REPLACE INTO bridge_client_runtime VALUES(?,?,?,?,?,?)',
+                            (host_id, server, pid, time.time(), error, int(project_scope_worker)))
 
     def observe(self, thread_id, state, error=None):
         self.db.execute('INSERT OR REPLACE INTO bridge_observations VALUES(?,?,?,?)',

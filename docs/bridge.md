@@ -1,5 +1,17 @@
 # Codex wake bridge
 
+Global [root orchestration](root-orchestrator.md) requires updated coordinator
+and existing host bridge. Upgrade coordinator first; old bridges safely withhold
+`project_scope` creation jobs. Updated workers advertise `project-scope-v1`;
+root status reports actual matching host coverage and capability. Static browser
+controls can load separately, but do not activate this backend workflow.
+
+Coordinate bridge changes with the operator, active measurements, guards, wakes
+and any empty unmaterialized creation candidates. Preserve the existing app-server
+and its conversations. Do not start an extra bridge or use dispatcher recovery
+unless its documented stopped-client proof applies. A coordinator-only reload
+cannot update the already-imported worker policy.
+
 The chat service stores messages and serves the browser UI and HTTP API. It
 does not launch Codex or execute project work. On each execution machine,
 `agent-chat-client bridge` starts one local Codex app-server and a bridge that
@@ -288,3 +300,10 @@ while verifying copied approval/sandbox policy before initial input. See the
 [one CLI procedure](agents.md#one-cli-orchestrator) for identity, queue, cleanup
 and interrupted-turn recovery boundaries. Load both server and host client code
 during a coordinated quiet service restart before using these commands.
+
+The default bridge owns the app-server it launches; a normal bridge stop also
+stops that child. Do not describe its service restart as preserving app-server
+state. A bridge started with `--connect-only` attaches to an independently managed
+app-server. Inspect the actual launch mode before planning activation. An owning
+bridge needs a coordinated ownership handoff or a quiet app-server restart;
+never stop it during active turns or abandon unmaterialized candidates.

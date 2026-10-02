@@ -112,3 +112,19 @@
 
 .resource-pages{display:flex;align-items:center;gap:8px;margin-bottom:14px;font-size:10px;color:#738566}.resource-pages span{flex:1;text-align:center}.resource-pages button{border:1px solid #e4e9dd;border-radius:4px;background:#fafbf6;color:#546649;padding:5px 8px;cursor:pointer}.resource-pages button:disabled{opacity:.4;cursor:default}
 .agent-name-row{display:flex;align-items:center;gap:5px;min-width:0}.agent-name-row .agent-name{min-width:0}.agent-orchestrator{flex:none;font-size:12px;line-height:1}
+
+/* Global control room reuses the bounded conversation and attachment viewer. */
+.root-screen .resources-panel> :not(#root-directory){display:none}
+.root-screen #all-conversations,.root-screen .section-label,.root-screen #agent-list,.root-screen #measurement-button,.root-screen #rename-project,.root-screen #to-me-filter{display:none}
+.root-kicker{font-size:10px;letter-spacing:.1em;color:#70806b;margin:0 0 8px}
+#root-directory h2{font-size:18px;margin:0 0 10px;color:#35563d}
+.root-description{font-size:12px;line-height:1.6;color:#71816a}
+.root-project{padding:16px 0;border-top:1px solid #dce4d5;overflow-wrap:anywhere}
+.root-project h3{font-size:14px;margin:0 0 7px;color:#35563d}
+.root-project p{font-size:11px;line-height:1.6;margin:5px 0;color:#71816a}
+.root-project .root-project-error{color:#9a593e}
+.root-project .quiet-button{margin-top:8px;border:1px solid #dce4d5}
+.root-screen #root-conversation{background:#304b3a;color:#f0f5e8}
+.root-screen .sidebar-footer #project-caption{font-size:0}
+.root-screen .sidebar-footer #bridge-caption{font-size:10px}
+.root-screen #mobile-resource-count{display:none}

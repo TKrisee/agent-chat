@@ -31,7 +31,19 @@ class ResetWorker:
             if not directory.is_absolute() or not directory.is_dir():
                 raise CoordError('requested workspace must already exist as an absolute directory on this host')
             cwd = str(directory.resolve())
+            if job.get('project_scope') and cwd != job['requested_cwd']:
+                raise CoordError('root project workspace must be the canonical host path; resolve symlinks before configuration')
         desired = creation_settings(source, job, cwd)
+        if job.get('project_scope'):
+            if source['sandbox'].get('type') not in ('workspaceWrite','dangerFullAccess'):
+                raise CoordError('root policy does not authorize writable project agents; creation withheld')
+            # Deliberate narrowing for a global-root-created project main.
+            # Built-in :workspace drops named-profile extra project grants.
+            desired['activePermissionProfile'] = {'id': ':workspace', 'extends': None}
+            desired['sandbox'] = dict(type='workspaceWrite', writableRoots=[], networkAccess=False,
+                                      excludeTmpdirEnvVar=False, excludeSlashTmp=False)
+            desired['runtimeWorkspaceRoots'] = [cwd]
+            return settings_data(desired)
         profile = (source.get('activePermissionProfile') or {}).get('id')
         if profile and not profile.startswith(':') and cwd != source['cwd']:
             profiles = [profile_chain(self.rpc.request('config/read', {'cwd': root, 'includeLayers': False})['config'], profile)

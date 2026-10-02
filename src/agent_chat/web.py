@@ -33,6 +33,7 @@ from .auth import authorized, validate_config, origin
 HERE = Path(__file__).resolve().parent
 STATIC = {
     '/': ('index.html', 'text/html; charset=utf-8'),
+    '/root': ('index.html', 'text/html; charset=utf-8'),
     '/markdown.js': ('markdown.js', 'application/javascript; charset=utf-8'),
     '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
     '/style.css': ('style.css', 'text/css; charset=utf-8'),
@@ -198,6 +199,16 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
             session['is_orchestrator'] = (session['id'] in orchestrators
                                           and bool(route.get('thread_id'))
                                           and not route.get('parent_session'))
+            from .root_orchestrator import projection
+            session['is_root_orchestrator'] = bool(projection(db, session['id']))
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_orchestrators'").fetchone():
+                role = db.execute('SELECT root_session FROM project_orchestrators WHERE session_id=?', (session['id'],)).fetchone()
+                if role and route.get('thread_id'):
+                    session['is_orchestrator'] = True
+                    if projection(db, role['root_session']):
+                        session['orchestration_parent'] = role['root_session']
+            if session['is_root_orchestrator']:
+                session['is_orchestrator'] = True
     if usage_store is not None:
         data['usage'] = usage_store.status()
     if session_models is not None:
@@ -305,6 +316,9 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.usage = UsageStore(self.db_path)
         self.measurements = None
         self.projects = Projects(self.db_path)
+        from .root_orchestrator import RootOrchestrator
+        self.roots = RootOrchestrator(self.projects)
+        self.root_lock = self.projects.root_lock
         self.project_contexts = {}
         self.project_lock = threading.RLock()
         super().__init__(address, handler)
@@ -318,6 +332,7 @@ class WebServer(http.server.ThreadingHTTPServer):
             if self.bridge_manager:
                 self.bridge_manager.measurements = self.measurements
             self.session_models = SessionModels(self.measurements.sessions_root)
+            self.roots.sync()
         except BaseException:
             self.server_close()
             raise
@@ -490,6 +505,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.project = self.server.projects.get(project)
         self.db_path, self.sender_session, self.bridge_manager = self.server.project_context(project)
 
+    def select_root_home(self):
+        root = self.server.roots.config()
+        self.project = self.server.projects.get(root['home_project'] if root else 'default')
+        self.db_path, self.sender_session, self.bridge_manager = self.server.project_context(self.project['id'])
+        return root
+
+    def root_snapshot(self):
+        root = self.select_root_home()
+        root_id = root['home_session'] if root else None
+        messages = self.root_page() if root else {'messages':[], 'has_more':False}
+        with reader(self.db_path) as db:
+            from .bridge_state import runtime_snapshot
+            bridge = runtime_snapshot(db)
+            sessions = [dict(row) for row in db.execute('SELECT id,agent,registered_at FROM sessions WHERE id IN (?,?)', (self.sender_session,root_id))]
+            total = db.execute('''SELECT COUNT(*) FROM messages m WHERE
+                ((sender_session=? AND recipient_session=?) OR (sender_session=? AND recipient_session=?))
+                AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)''',
+                (self.sender_session,root_id,root_id,self.sender_session)).fetchone()[0]
+            for session in sessions:
+                if session['id'] == root_id:
+                    session.update(thread_id=root['thread_id'],is_root_orchestrator=True,is_orchestrator=True)
+        return dict(messages=messages['messages'],history_truncated=messages['has_more'],total_messages=total,
+            sessions=sessions,resources=[],session_resets=[],server_time=time.time(),
+            usage=self.server.usage.status(),bridge=bridge,project=self.project,
+            projects=self.server.listed_projects(),root_orchestrator=self.root_summary(),root_overview=self.server.roots.status())
+
+    def root_page(self, before=None, limit=UI_MESSAGE_LIMIT, after=None, to_me=False):
+        root = self.server.roots.config()
+        if not root:
+            return {'messages':[], 'has_more':False}
+        result = page(self.db_path,before,limit,after,self.sender_session,root['home_session'],to_me)
+        return result
+
     def scoped(self, data):
         if not hasattr(self, 'project') or self.project['id'] == 'default': return data
         if isinstance(data, list): return [self.scoped(item) for item in data]
@@ -498,6 +546,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return data
 
     def project_snapshot(self):
+        if urlsplit(self.path).path == '/api/root/events':
+            return self.root_snapshot()
         params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         paging = {}
         if 'resource_limit' in params or 'resource_offset' in params:
@@ -508,7 +558,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 paging[name] = int(values[0])
             if not 1 <= paging['resource_limit'] <= 200:
                 raise ValueError('Resource page limit must be from 1 to 200')
-        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects())
+        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects(), root_orchestrator=self.root_summary())
+
+    def root_summary(self):
+        root = self.server.roots.config()
+        return {key: root[key] for key in ('home_project','home_session','agent','mode')} if root else None
 
     def json(self, code, data):
         self.respond(code, json.dumps(self.scoped(data), ensure_ascii=False, separators=(',', ':')).encode('utf-8'), 'application/json; charset=utf-8')
@@ -521,21 +575,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticate():
             return
         try:
-            if url.path.startswith('/api/') and url.path != '/api/usage':
+            root_view = url.path.startswith('/api/root/') and url.path != '/api/root/rpc'
+            root = self.select_root_home() if root_view else None
+            if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view:
                 self.select_project()
             if url.path == '/api/projects':
                 self.json(200, {'projects': self.server.listed_projects(), 'project': self.project})
+            elif url.path == '/api/root':
+                self.json(200, self.server.roots.status())
             elif url.path == '/api/usage':
                 self.json(200, self.server.usage.status())
             elif url.path == '/api/measurements':
                 self.json(200, self.server.measurement_models(self.server.measurements.status(self.project['id'])))
-            elif url.path == '/api/snapshot':
-                self.json(200, self.project_snapshot())
-            elif url.path == '/api/config':
+            elif url.path in ('/api/snapshot','/api/root/snapshot'):
+                self.json(200, self.root_snapshot() if root_view else self.project_snapshot())
+            elif url.path in ('/api/config','/api/root/config'):
                 self.json(200, {'sender': {'id': self.sender_session, 'agent': 'operator'},
                                 'csrf_token': self.server.csrf_token, 'project': self.project,
-                                'projects': self.server.listed_projects()})
-            elif url.path == '/api/messages':
+                                'projects': self.server.listed_projects(), 'root_orchestrator': self.root_summary()})
+            elif url.path in ('/api/messages','/api/root/messages'):
                 params = parse_qs(url.query, keep_blank_values=True)
                 before_values = params.get('before', [])
                 after_values = params.get('after', [])
@@ -560,17 +618,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 before = positive_integer(before_values, 'before')
                 after = positive_integer(after_values, 'after')
                 limit = positive_integer(limit_values, 'limit')
-                self.json(200, page(self.db_path, before, limit, after,
-                                    self.sender_session, agent_values[0] if agent_values else None,
-                                    bool(to_me_values)))
-            elif url.path.startswith('/api/messages/'):
-                message_id = url.path.removeprefix('/api/messages/')
+                if root_view and (not root or agent_values and agent_values != [root['home_session']]):
+                    if root: raise CoordError('root screen shows only the operator/root conversation')
+                    self.json(200, {'messages':[], 'has_more':False})
+                else:
+                    self.json(200, self.root_page(before,limit,after,bool(to_me_values)) if root_view else
+                        page(self.db_path,before,limit,after,self.sender_session,agent_values[0] if agent_values else None,bool(to_me_values)))
+            elif url.path.startswith(('/api/messages/','/api/root/messages/')):
+                message_id = url.path.rsplit('/',1)[1]
                 if set(parse_qs(url.query)) - {'project'} or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
                     self.json(404, {'error': 'Not found'})
                     return
                 with reader(self.db_path) as db:
                     agents = agent_labels(db)
                     row = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages WHERE id=?', (message_id,)).fetchone()
+                    if root_view and row and (not root or (row['sender_session'],row['recipient_session']) not in
+                            ((self.sender_session,root['home_session']),(root['home_session'],self.sender_session))
+                            or db.execute('SELECT 1 FROM message_batches WHERE message_id=?',(message_id,)).fetchone()):
+                        row = None
                     item = message_rows([row], agents, db)[0] if row else None
                 if item is None:
                     self.json(404, {'error': 'Not found'})
@@ -594,7 +659,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     self.respond(200, item['content'], item['mime'],
                                  download_name=None if item['mime'] in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'} else item['name'])
-            elif url.path == '/api/events':
+            elif url.path in ('/api/events','/api/root/events'):
                 self.events()
             else:
                 spec = STATIC.get(url.path)
@@ -614,7 +679,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(403, {'error': 'Untrusted host or origin'})
             return
         path = urlsplit(self.path).path
-        machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc', '/api/usage/rpc')
+        machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc', '/api/usage/rpc', '/api/root/rpc')
         if not self.authenticate(bearer_only=machine_api):
             return
         try:
@@ -631,6 +696,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 if path == '/api/projects/rpc':
                     self.json(200, self.project_action(data))
+                    return
+                if path == '/api/root/rpc':
+                    self.json(200, self.root_action(data))
                     return
                 if path == '/api/coord':
                     from .remote_service import dispatch
@@ -858,6 +926,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if op == 'rename' and set(data) == {'op', 'id', 'name'}:
             return {'project': self.server.projects.rename(data['id'], data['name']), 'projects': self.server.listed_projects()}
         raise CoordError('invalid project operation')
+
+    def root_action(self, data):
+        if not isinstance(data, dict) or set(data) != {'op','session','host_id','params'} or not isinstance(data['params'], dict):
+            raise CoordError('invalid root orchestrator request')
+        op, params = data['op'], data['params']
+        fields = {
+            'enroll': {'expected_thread','confirm'}, 'status': set(), 'route': {'project'},
+            'configure': {'project','agent','cwd','prompt','request_id','confirm','model','effort'},
+            'adopt': {'project','target','expected_thread','cwd','confirm'}, 'detach': {'confirm'}, 'resume-routing': {'confirm'},
+            'retry-setup': {'project','request_id','confirm'},
+        }
+        if op not in fields or set(params) != fields[op]:
+            raise CoordError('invalid root orchestrator operation or fields')
+        roots = self.server.roots
+        args = (self.project['id'], data['session'], data['host_id'])
+        with self.server.root_lock, self.server.measurements.lock:
+            if op == 'enroll':
+                if self.server.measurements.status(self.project['id'])['active']:
+                    raise CoordError('finish the active project measurement before root enrollment')
+                return roots.enroll(*args, params['expected_thread'], params['confirm'])
+            roots.authorize(*args)
+            if op == 'status':
+                roots.sync()
+                return roots.status()
+            if op == 'route': return roots.route(*args, params['project'])
+            if op == 'detach': return roots.detach(*args, params['confirm'])
+            if op == 'resume-routing': return roots.resume_routing(*args, params['confirm'])
+            if self.server.measurements.status(params['project'])['active']:
+                raise CoordError('finish the active target project measurement before orchestration setup')
+            if op == 'retry-setup': return roots.retry_setup(*args, params['project'], params['request_id'], params['confirm'])
+            if op == 'configure':
+                return roots.configure(*args, params['project'], params['agent'], params['cwd'], params['prompt'], params['request_id'], params['confirm'], params['model'], params['effort'])
+            return roots.adopt(*args, params['project'], params['target'], params['expected_thread'], params['cwd'], params['confirm'])
 
     def usage_action(self, data, machine):
         if not isinstance(data, dict) or not isinstance(data.get('op'), str):

@@ -79,6 +79,11 @@ def assert_reset_unlocked(db, session):
 
 
 def assert_agent_running(db, session, *, cleanup=False):
+    if __package__:
+        from .root_orchestrator import projection
+        root = projection(db, session)
+        if root and root['paused']:
+            raise CoordError('root routing is paused for clean detach; inspect root status')
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_controls'").fetchone():
         row = db.execute('SELECT mode FROM agent_controls WHERE target_session=?', (session,)).fetchone()
         if row and row['mode'] != 'running' and not (cleanup and row['mode'] == 'stopping'):
@@ -233,6 +238,10 @@ class Coordinator:
         remain, preserving attribution without keeping an active recipient.
         """
         caller = self.require_session()
+        if __package__:
+            from .root_orchestrator import assert_local_lifecycle, assert_management_target
+            assert_local_lifecycle(self.db, session_id)
+            assert_management_target(self.db, caller, session_id)
         if not session_id:
             raise CoordError("session_id must be nonempty")
         with self.tx() as db:
@@ -774,6 +783,9 @@ class Coordinator:
             if targets is None:
                 recipients = [row["id"] for row in db.execute(
                     "SELECT id FROM sessions WHERE id<>? ORDER BY registered_at,id", (sid,))]
+                if __package__:
+                    from .root_orchestrator import quiet
+                    recipients = [recipient for recipient in recipients if not quiet(db, recipient)]
                 if not recipients:
                     raise CoordError("no other registered sessions are available")
             else:
@@ -882,6 +894,10 @@ class Coordinator:
         return db.execute("SELECT * FROM resources WHERE name=?", (resource,)).fetchone()
 
     def request(self, raw: str, minutes: float) -> dict[str, Any]:
+        if __package__:
+            from .root_orchestrator import projection
+            if projection(self.db, self.require_session()):
+                raise CoordError('global root is control-only; delegate exact resource work to the project orchestrator')
         if not math.isfinite(minutes) or minutes <= 0 or minutes > float.fromhex('0x1.fffffffffffffp+1023') / 60: raise CoordError("minutes must be positive and finite")
         sid, resource = self.require_session(), self.resource_name(raw)
         with self.tx() as db:

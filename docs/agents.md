@@ -497,6 +497,11 @@ Server and host bridge must both run the updated code; see [deployment](bridge.m
 
 ## One CLI orchestrator
 
+For one neutral root conversation across several projects, see the
+[root orchestrator guide](root-orchestrator.md): automatic quiet registrations,
+canonical operator routing, project setup/adoption, scoped creation and clean
+global routing detach. Commands below cover ordinary project-local orchestration.
+
 The sidebar marks orchestration roots with 👑 and an “Orchestrator” tooltip.
 This role follows completed independent-main creation relationships: a main
 which created registered independent agents and was not itself created by

@@ -27,6 +27,7 @@
         <button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button>
       </div>
       <div class="room-label">COMMUNICATIONS</div>
+      <button class="room-button" id="root-conversation" type="button" hidden><span class="room-icon" aria-hidden="true">👑</span><span>Root orchestrator</span></button>
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
         <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
       </button>
@@ -36,7 +37,7 @@
     </aside>
 
     <main class="main">
-      <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false">Resources <span id="mobile-resource-count">0</span></button></div>
+      <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false"><span id="resources-button-label">Resources</span> <span id="mobile-resource-count">0</span></button></div>
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
         <div class="conversation-actions">
@@ -85,6 +86,12 @@
     </main>
 
     <aside class="resources-panel" id="resources-panel" aria-label="Shared resources">
+      <section id="root-directory" hidden aria-labelledby="root-directory-title">
+        <p class="root-kicker">PROJECT OVERVIEW</p>
+        <h2 id="root-directory-title">Your projects</h2>
+        <p class="root-description">Decisions here. Project work stays with each team.</p>
+        <div id="root-projects"></div>
+      </section>
       <div class="resource-summary"><span class="resource-summary-number" id="held-count">0</span><span>resources held<span id="waiting-count">No agents waiting</span></span></div>
       <nav class="resource-pages" aria-label="Resource pages">
         <button id="resource-previous" type="button" aria-label="Previous resource page" disabled>←</button>
