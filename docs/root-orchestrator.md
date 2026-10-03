@@ -6,6 +6,8 @@ workspace, instructions, checkpoints and workers. The browser's **Root
 orchestrator** screen at `/root` shows only your direct canonical-home conversation and a
 compact project overview. Project messages and attachments remain in their rooms.
 Use **Open project** to enter a project room; drafts remain separate between views.
+The left project selector shows a blank choice while Root chat is active. Select
+any project there to open its room, including root's home project.
 
 Root keeps project/orchestrator routing and relays bounded operator questions.
 Initial assignments and detailed technical reasoning stay with project orchestrators.

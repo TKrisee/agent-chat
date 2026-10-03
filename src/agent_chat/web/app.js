@@ -1547,11 +1547,17 @@ function renderProjects(data) {
   if (!data.projects) return;
   state.projects = data.projects;
   const select = $('project-select');
-  const label = project => project.name;
-  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(data.projects.map(p => [p.id, label(p)]))) {
-    select.replaceChildren(...data.projects.map(p => new Option(label(p), p.id)));
+  const choices = data.projects.map(project => [project.id, project.name]);
+  if (state.rootView) choices.unshift(['', '']);
+  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(choices)) {
+    select.replaceChildren(...choices.map(([id, label]) => {
+      const option = new Option(label, id);
+      option.disabled = !id;
+      return option;
+    }));
   }
-  select.value = state.project;
+  select.value = state.rootView ? '' : state.project;
+  select.setAttribute('aria-label', state.rootView ? 'Root chat active; select a project' : 'Project');
   const measuring = !!data.projects.find(p => p.id === state.project)?.measurement_running;
   $('measurement-indicator').hidden = !measuring;
   $('measurement-button').setAttribute('aria-label', measuring ? 'Measure usage (active)' : 'Measure usage');
@@ -1637,7 +1643,9 @@ $('root-conversation')?.addEventListener('click', async () => {
   await switchProject(root.home_project, true);
 });
 
-$('project-select').addEventListener('change', event => switchProject(event.target.value));
+$('project-select').addEventListener('change', event => {
+  if (event.target.value) switchProject(event.target.value);
+});
 $('usage-button').addEventListener('click', () => {
   state.usageDialogDirty = false;
   usageError();
