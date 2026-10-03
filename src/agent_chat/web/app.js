@@ -626,6 +626,7 @@ function renderMentionSelection() {
 }
 
 function showMentions() {
+  if (state.rootView) { hideMentions(); return; }
   const input = $('message-input');
   const active = activeMention();
   if (!active) { hideMentions(); return; }
@@ -811,7 +812,8 @@ function startReply(message) {
   const recipients = replyRecipients(message);
   const sessions = mentionSessions().filter((item) => recipients.includes(item.id));
   if (!sessions.length) return;
-  insertRecipients(sessions);
+  if (state.rootView) $('message-input').focus();
+  else insertRecipients(sessions);
   state.reply = message;
   $('reply-label').textContent = `Replying to ${agentLabel(message.sender_session, message.sender_agent)}`;
   $('reply-excerpt').textContent = message.body.slice(0, 240) || 'File attachment';
@@ -1852,7 +1854,8 @@ $('composer').addEventListener('submit', async (event) => {
   event.preventDefault();
   if (state.sending || !state.config) return;
   const draft = $('message-input').value.trimStart();
-  const parsed = addressTags(draft), sessions = mentionSessions();
+  const parsed = state.rootView ? {tags: [], bodyStart: 0, invalid: false} : addressTags(draft);
+  const sessions = state.rootView ? [] : mentionSessions();
   const recipients = [];
   for (const tag of parsed.tags) {
     const session = sessions.find((item) => item.key === tag.key || item.id === tag.key);
@@ -1869,7 +1872,8 @@ $('composer').addEventListener('submit', async (event) => {
     composerStatus('An @agent differs from this reply. Cancel the reply to start a new conversation.', true);
     return;
   }
-  const to = broadcast ? null : (recipients.length === 1 && !state.reply?.batch_id ? recipients[0] : recipients);
+  const to = state.rootView ? state.root.home_session
+    : broadcast ? null : (recipients.length === 1 && !state.reply?.batch_id ? recipients[0] : recipients);
   hideMentions();
   state.sending = true;
   projectControls();

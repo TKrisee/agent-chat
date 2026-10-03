@@ -8,6 +8,9 @@ compact project overview. Project messages and attachments remain in their rooms
 Use **Open project** to enter a project room; drafts remain separate between views.
 The left project selector shows a blank choice while Root chat is active. Select
 any project there to open its room, including root's home project.
+Every message in Root chat is addressed directly to root automatically. No
+`@mention` is required; typed `@names` remain literal message text and do not
+select recipients. Project rooms retain their normal mention/group behavior.
 
 Root keeps project/orchestrator routing and relays bounded operator questions.
 Initial assignments and detailed technical reasoning stay with project orchestrators.

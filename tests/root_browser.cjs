@@ -16,6 +16,7 @@ test.call('register',session='technical',agent='technical')
 test.call('send',session='technical',to=test.server.sender_session,body='LOCAL TECHNICAL CHAT')
 empty=RemoteWebFixture();empty.setUp()
 print(test.url,flush=True);print(project,flush=True);print(empty.url,flush=True)
+print(test.root('status')['root']['home_session'],flush=True)
 try:
     for command in sys.stdin:
         if command.strip()=='new':
@@ -29,11 +30,16 @@ finally:test.tearDown();empty.tearDown()
   });
   const lines = readline.createInterface({input:child.stdout})[Symbol.asyncIterator]();
   const url=(await lines.next()).value, project=(await lines.next()).value, emptyURL=(await lines.next()).value;
+  const rootSession=(await lines.next()).value;
   let browser;
   try {
     browser=await chromium.launch({headless:true});
     const context=await browser.newContext({httpCredentials:{username:'operator',password:'test-only-token-for-remote-hosting-123456789'}});
     const page=await context.newPage(); const errors=[];
+    const sentBodies=[];
+    page.on('request', request => {
+      if(new URL(request.url()).pathname==='/api/messages' && request.method()==='POST') sentBodies.push(request.postData());
+    });
     page.on('pageerror',error=>errors.push(String(error)));
     await page.goto(url+'/?project='+project);
     const agent=name=>page.getByRole('button',{name:'Show conversations with '+name,exact:true});
@@ -56,6 +62,24 @@ finally:test.tearDown();empty.tearDown()
     await page.locator('#message-input').fill('Coordinate both projects; report decisions only.');
     await page.locator('#send-button').click();
     await page.locator('#messages').getByText('Coordinate both projects; report decisions only.',{exact:false}).waitFor();
+    assert.equal(sentBodies.at(-1), JSON.stringify({to:rootSession,body:'Coordinate both projects; report decisions only.'}));
+    await page.locator('#message-input').fill('@');
+    assert(await page.locator('#mention-list').isHidden(), 'Root chat never offers recipient selection');
+    for(const body of ['@root Please coordinate.', '@technical Review this with your team.', '@missing Literal name.', '@[Incomplete']) {
+      await page.locator('#message-input').fill(body);
+      await page.locator('#send-button').click();
+      await page.locator('#messages .message-body').getByText(body,{exact:true}).waitFor();
+      assert.equal(sentBodies.at(-1), JSON.stringify({to:rootSession,body}));
+    }
+    const original = page.locator('.message').filter({has:page.getByText('@root Please coordinate.',{exact:true})});
+    const originalId = await original.getAttribute('data-message-id');
+    await original.getByRole('button',{name:'Reply to You',exact:true}).click();
+    assert.equal(await page.locator('#message-input').inputValue(), '', 'Root replies never prefill recipient tags');
+    const replyBody='@technical Literal reply to root.';
+    await page.locator('#message-input').fill(replyBody);
+    await page.locator('#send-button').click();
+    await page.locator('#messages .message-body').getByText(replyBody,{exact:true}).waitFor();
+    assert.equal(sentBodies.at(-1), JSON.stringify({to:rootSession,body:replyBody,reply_to:originalId}));
     await page.screenshot({path:'/private/tmp/chat-maintainer-root-desktop.png'});
     await page.locator('#message-input').fill('Root-only draft');
     await selector.selectOption('default');
