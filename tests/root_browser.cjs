@@ -12,13 +12,20 @@ from test_remote_web import RemoteWebFixture
 test=RootOrchestratorTests();test.setUp()
 project=test.project();created=test.configure(project)
 state,bridge=test.project_bridge(project);bridge.tick()
+notice=next(message for message in test.call('context')['messages'] if message['body'].startswith('Project registered:'))
+test.call('send',to=test.server.sender_session,body='ROOT PRIVATE ANSWER',reply_to=notice['id'],ack_reply=True)
 test.call('register',session='technical',agent='technical')
+test.call('send',to='technical',body='ROOT PROJECT COORDINATION')
 test.call('send',session='technical',to=test.server.sender_session,body='LOCAL TECHNICAL CHAT')
 empty=RemoteWebFixture();empty.setUp()
 print(test.url,flush=True);print(project,flush=True);print(empty.url,flush=True)
 print(test.root('status')['root']['home_session'],flush=True)
 try:
     for command in sys.stdin:
+        if command.strip()=='private':
+            test.call('send',to=test.server.sender_session,body='LIVE ROOT PRIVATE ANSWER')
+            test.call('send',session='technical',to=test.server.sender_session,body='LIVE PROJECT UPDATE')
+            print('updated',flush=True)
         if command.strip()=='new':
             print(test.project('Second project'),flush=True)
 finally:test.tearDown();empty.tearDown()
@@ -57,6 +64,11 @@ finally:test.tearDown();empty.tearDown()
     assert.equal(await selector.locator('option:checked').textContent(), '');
     assert(await selector.locator('option[value=""]').isDisabled());
     assert.equal(await page.locator('#messages').getByText('LOCAL TECHNICAL CHAT',{exact:true}).count(),0);
+    await page.locator('#messages .message-body').getByText('ROOT PRIVATE ANSWER',{exact:true}).waitFor();
+    const noticeCard=page.locator('.message').filter({has:page.locator('.message-body').filter({hasText:'Project registered:'})});
+    assert.equal(await noticeCard.locator('.sender-button').textContent(),'Service notice');
+    assert.equal(await noticeCard.evaluate(card=>card.classList.contains('own')),false);
+    await page.getByRole('button',{name:'Show original message from Service notice',exact:true}).waitFor();
     await page.locator('#root-projects').getByRole('heading',{name:'Project A',exact:true}).waitFor();
     assert(await page.locator('#create-agent').isHidden());
     await page.locator('#message-input').fill('Coordinate both projects; report decisions only.');
@@ -85,6 +97,13 @@ finally:test.tearDown();empty.tearDown()
     await selector.selectOption('default');
     await page.waitForURL(url+'/');
     await agent('technical').waitFor();
+    await page.locator('#messages .message-body').getByText('LOCAL TECHNICAL CHAT',{exact:true}).waitFor();
+    await page.locator('#messages .message-body').getByText('ROOT PROJECT COORDINATION',{exact:true}).waitFor();
+    assert.equal(await page.locator('#messages .message-body').getByText('ROOT PRIVATE ANSWER',{exact:true}).count(),0);
+    assert.equal(await page.locator('#messages .message-body').getByText('Plain operator request.',{exact:true}).count(),0);
+    child.stdin.write('private\n'); assert.equal((await lines.next()).value,'updated');
+    await page.locator('#messages .message-body').getByText('LIVE PROJECT UPDATE',{exact:true}).waitFor();
+    assert.equal(await page.locator('#messages .message-body').getByText('LIVE ROOT PRIVATE ANSWER',{exact:true}).count(),0);
     assert.equal(await selector.inputValue(), 'default');
     assert.equal(await selector.locator('option[value=""]').count(), 0);
     await page.locator('#message-input').fill('Home-project draft');
@@ -92,6 +111,7 @@ finally:test.tearDown();empty.tearDown()
     await page.waitForURL('**/root');
     await page.locator('#root-directory').waitFor();
     assert.equal(await selector.inputValue(), '');
+    await page.locator('#messages .message-body').getByText('LIVE ROOT PRIVATE ANSWER',{exact:true}).waitFor();
     assert.equal(await page.locator('#message-input').inputValue(), 'Root-only draft');
     await selector.selectOption(project);
     await page.waitForURL('**/?project='+project);

@@ -383,6 +383,82 @@ class RootOrchestratorTests(RemoteWebFixture):
         status, _, _ = self.request('GET','/root',auth=None)
         self.assertEqual(status,401)
 
+    def view_field(self, path, expression):
+        status, body, _ = self.request('GET', path)
+        self.assertEqual(status, 200, path)
+        return subprocess.run(['jq', '-er', expression], input=body,
+            capture_output=True, check=True).stdout.decode().strip()
+
+    def test_project_feed_excludes_private_root_traffic_before_count_and_pagination(self):
+        operator = self.server.sender_session
+        self.call('register', session='worker', agent='worker')
+        local = self.call('send', session='worker', to=operator, body='Project worker report')
+        coordination = self.call('send', to='worker', body='Root project coordination')
+        for index in range(55):
+            self.call('send', to=operator, body=f'Private root report {index}')
+        private = self.call('send', session=operator, to='a', body='Private operator request')
+        reply = self.call('send', to=operator, body='Private root answer',
+            reply_to=private['id'], ack_reply=True)
+        self.assertTrue(reply['acknowledged_reply'])
+        self.assertEqual(self.view_field('/api/snapshot', '.total_messages'), '2')
+        self.assertEqual(self.view_field('/api/snapshot', '.history_truncated | tostring'), 'false')
+        self.assertEqual(self.view_field('/api/snapshot', '.messages | length'), '2')
+        coordination_seq = self.view_field('/api/messages/'+coordination['id'], '.seq')
+        local_seq = self.view_field('/api/messages/'+local['id'], '.seq')
+        first = self.view_field('/api/messages?limit=1', '.messages[0].id')
+        self.assertEqual(first, coordination['id'])
+        self.assertEqual(self.view_field('/api/messages?before='+coordination_seq+'&limit=1',
+            '.messages[0].id'), local['id'])
+        self.assertEqual(self.view_field('/api/messages?after='+local_seq+'&limit=1',
+            '.messages[0].id'), coordination['id'])
+        self.assertEqual(self.view_field('/api/messages?agent=a', '.messages | length'), '0')
+        self.assertEqual(self.view_field('/api/messages?to_me=1', '.messages | length'), '1')
+        self.assertEqual(self.request('GET', '/api/messages/'+private['id'])[0], 404)
+        self.assertEqual(self.request('GET', '/api/root/messages/'+private['id'])[0], 200)
+        self.assertEqual(self.view_field('/api/root/messages', '.messages[-1].id'), reply['id'])
+        self.assertIsNotNone(self.call('message', id=private['id'])['message']['acked_at'])
+
+    def test_project_feed_keeps_shared_root_batches_and_hides_retained_old_root_directs(self):
+        operator = self.server.sender_session
+        self.call('register', session='worker', agent='worker')
+        shared = self.call('send', to=[operator, 'worker'], body='Shared project decision')
+        self.assertEqual(self.view_field('/api/snapshot', '.messages | length'), '2')
+        self.assertEqual(self.view_field('/api/snapshot', '.messages[0].deliveries | length'), '2')
+        # Isolated historical fixture: routing removed, durable quiet identity remains.
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            coord.db.execute('DELETE FROM root_projections WHERE session_id=?', ('a',))
+        direct = self.call('send', to=operator, body='Retained root private history')
+        self.assertEqual(self.view_field('/api/snapshot', '.messages | length'), '2')
+        self.assertEqual(self.request('GET', '/api/messages/'+direct['id'])[0], 404)
+        self.assertEqual(self.view_field('/api/messages', '.messages[0].body'), 'Shared project decision')
+
+    def test_shared_reply_does_not_quote_private_root_history_in_project_view(self):
+        operator = self.server.sender_session
+        private = self.call('send', session=operator, to='a', body='Private operator context')
+        shared = self.call('send', to=[operator], body='Explicitly shared reply', reply_to=private['id'])
+        delivery = shared['deliveries'][0]['id']
+        self.assertEqual(self.view_field('/api/messages/'+delivery, '.body'), 'Explicitly shared reply')
+        self.assertEqual(self.view_field('/api/messages/'+delivery, '.reply_preview | tostring'), 'null')
+        retained = self.call('message', session=operator, id=delivery)['message']
+        self.assertEqual(retained['reply_to'], private['id'])
+        self.assertEqual(retained['reply_preview']['body'], 'Private operator context')
+
+    def test_service_notices_and_quoted_notices_have_truthful_attribution(self):
+        self.project()
+        notice = self.view_field('/api/root/messages',
+            '.messages[] | select(.body | startswith("Project registered:")) | .id')
+        self.assertEqual(self.view_field('/api/root/messages/'+notice, '.service_notice | tostring'), 'true')
+        reply = self.call('send', to=self.server.sender_session, body='Setup completed',
+            reply_to=notice, ack_reply=True)
+        self.assertEqual(self.view_field('/api/root/messages/'+reply['id'],
+            '.reply_preview.service_notice | tostring'), 'true')
+        self.assertEqual(self.view_field('/api/root/messages/'+reply['id'],
+            '.service_notice | tostring'), 'false')
+        self.assertEqual(self.view_field('/api/root/messages/'+notice, '.sender_session'), self.server.sender_session)
+        self.assertEqual(self.view_field('/api/snapshot', '.messages | length'), '0')
+        ordinary = self.call('send', to=self.server.sender_session, body='Project registered: literal agent text')
+        self.assertEqual(self.view_field('/api/root/messages/'+ordinary['id'], '.service_notice | tostring'), 'false')
+
     def test_interrupted_setup_retries_original_intent_without_new_payload(self):
         from agent_chat.session_reset import SessionResetState
         project = self.project(); request = str(uuid.uuid4())

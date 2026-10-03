@@ -73,7 +73,34 @@ def batch_table(db):
     return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_batches'").fetchone())
 
 
-def message_rows(rows, agents, db):
+def project_message_filter(db, operator, alias='m'):
+    """Exclude private operator/root pairs; shared batches stay in project rooms.
+
+    Quiet identities persist after routing removal so retained private history
+    cannot reappear when a root detaches or is replaced.
+    """
+    if not operator or not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='quiet_root_sessions'").fetchone():
+        return '1', ()
+    private = f'''(({alias}.recipient_session=? AND EXISTS
+        (SELECT 1 FROM quiet_root_sessions q WHERE q.session_id={alias}.sender_session))
+        OR ({alias}.sender_session=? AND EXISTS
+        (SELECT 1 FROM quiet_root_sessions q WHERE q.session_id={alias}.recipient_session)))'''
+    if batch_table(db):
+        private = f'({private} AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id={alias}.id))'
+    return f'NOT ({private})', (operator, operator)
+
+
+def service_notice_ids(db, ids):
+    if not ids or not db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_project_notices'").fetchone():
+        return set()
+    marks = ','.join('?' for _ in ids)
+    return {row['message_id'] for row in db.execute(
+        f'SELECT message_id FROM root_project_notices WHERE message_id IN ({marks})', list(ids))}
+
+
+def message_rows(rows, agents, db, project_operator=None):
     items = [dict(row, sender_agent=agents.get(row['sender_session']),
                   recipient_agent=agents.get(row['recipient_session']), attachments=[],
                   reply_to=None, reply_preview=None, batch_id=None, deliveries=[]) for row in rows]
@@ -81,6 +108,9 @@ def message_rows(rows, agents, db):
         return items
     by_message = {item['id']: item for item in items}
     marks = ','.join('?' for _ in by_message)
+    notices = service_notice_ids(db, by_message)
+    for item in items:
+        item['service_notice'] = item['id'] in notices
     if attachment_table(db):
         for row in db.execute(f'SELECT id,message_id,name,mime,size FROM attachments WHERE message_id IN ({marks}) ORDER BY rowid', list(by_message)):
             by_message[row['message_id']]['attachments'].append({
@@ -91,11 +121,15 @@ def message_rows(rows, agents, db):
         query = f'''SELECT r.message_id,r.reply_to,p.seq,p.sender_session,p.recipient_session,p.body
                      FROM message_replies r JOIN messages p ON p.id=r.reply_to
                      WHERE r.message_id IN ({marks})'''
-        for row in db.execute(query, list(by_message)):
+        condition, args = project_message_filter(db, project_operator, 'p')
+        parents = db.execute(query + f' AND ({condition})', (*by_message, *args)).fetchall()
+        notices = service_notice_ids(db, {row['reply_to'] for row in parents})
+        for row in parents:
             by_message[row['message_id']].update(reply_to=row['reply_to'], reply_preview={
                 'id': row['reply_to'], 'seq': row['seq'], 'sender_session': row['sender_session'],
                 'recipient_session': row['recipient_session'],
                 'sender_agent': agents.get(row['sender_session']), 'body': row['body'][:240],
+                'service_notice': row['reply_to'] in notices,
             })
     if batch_table(db):
         memberships = db.execute(
@@ -122,7 +156,7 @@ def message_rows(rows, agents, db):
 
 
 def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=None,
-             resource_limit=None, resource_offset=0):
+             resource_limit=None, resource_offset=0, operator=None):
     """Read a consistent view without advancing inboxes or changing ownership."""
     with reader(db_path) as db:
         now = time.time()
@@ -134,10 +168,11 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
             bindings = {row['session_id']: dict(row) for row in db.execute(
                 'SELECT session_id,thread_id,parent_session,agent_path FROM bridge_bindings')}
         agents = agent_labels(db)
-        total = db.execute('SELECT COUNT(*) FROM messages').fetchone()[0]
-        rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages ORDER BY seq DESC LIMIT ?',
-                          (limit,)).fetchall()
-        messages = message_rows(list(reversed(rows)), agents, db)
+        condition, args = project_message_filter(db, operator)
+        total = db.execute(f'SELECT COUNT(*) FROM messages m WHERE {condition}', args).fetchone()[0]
+        rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages m WHERE {condition} ORDER BY seq DESC LIMIT ?',
+                          (*args, limit)).fetchall()
+        messages = message_rows(list(reversed(rows)), agents, db, operator)
         resources = []
         columns = 'name,owner_session,reservation_id,deadline,stale,reason'
         resource_page = None
@@ -223,7 +258,7 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
 
 
 def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None, operator=None,
-         agent=None, to_me=False):
+         agent=None, to_me=False, project_feed=False):
     def valid_cursor(value):
         return value is None or (type(value) is int and 1 <= value <= 2**63 - 1)
     if ((before is not None and after is not None) or type(limit) is not int
@@ -235,6 +270,10 @@ def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None, operator=None
         agents = agent_labels(db)
         conditions = []
         args = []
+        if project_feed:
+            condition, values = project_message_filter(db, operator)
+            conditions.append(condition)
+            args.extend(values)
         if agent is not None or to_me:
             if batch_table(db):
                 conditions.append('NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)')
@@ -266,7 +305,7 @@ def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None, operator=None
             messages = rows[:limit]
         else:
             messages = list(reversed(rows[:limit]))
-        return dict(messages=message_rows(messages, agents, db), has_more=len(rows) > limit)
+        return dict(messages=message_rows(messages, agents, db, operator if project_feed else None), has_more=len(rows) > limit)
 
 
 def operator_session(db_path):
@@ -558,7 +597,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 paging[name] = int(values[0])
             if not 1 <= paging['resource_limit'] <= 200:
                 raise ValueError('Resource page limit must be from 1 to 200')
-        return dict(snapshot(self.db_path, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects(), root_orchestrator=self.root_summary())
+        return dict(snapshot(self.db_path, operator=self.sender_session, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects(), root_orchestrator=self.root_summary())
 
     def root_summary(self):
         root = self.server.roots.config()
@@ -623,7 +662,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(200, {'messages':[], 'has_more':False})
                 else:
                     self.json(200, self.root_page(before,limit,after,bool(to_me_values)) if root_view else
-                        page(self.db_path,before,limit,after,self.sender_session,agent_values[0] if agent_values else None,bool(to_me_values)))
+                        page(self.db_path,before,limit,after,self.sender_session,agent_values[0] if agent_values else None,bool(to_me_values),project_feed=True))
             elif url.path.startswith(('/api/messages/','/api/root/messages/')):
                 message_id = url.path.rsplit('/',1)[1]
                 if set(parse_qs(url.query)) - {'project'} or not message_id.startswith('message_') or '/' in message_id or not all(char.isalnum() or char in '_-' for char in message_id):
@@ -631,12 +670,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 with reader(self.db_path) as db:
                     agents = agent_labels(db)
-                    row = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages WHERE id=?', (message_id,)).fetchone()
+                    condition, args = project_message_filter(db, None if root_view else self.sender_session)
+                    row = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages m WHERE id=? AND ({condition})',
+                                     (message_id, *args)).fetchone()
                     if root_view and row and (not root or (row['sender_session'],row['recipient_session']) not in
                             ((self.sender_session,root['home_session']),(root['home_session'],self.sender_session))
                             or db.execute('SELECT 1 FROM message_batches WHERE message_id=?',(message_id,)).fetchone()):
                         row = None
-                    item = message_rows([row], agents, db)[0] if row else None
+                    item = message_rows([row], agents, db, None if root_view else self.sender_session)[0] if row else None
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                 else:
