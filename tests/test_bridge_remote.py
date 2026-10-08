@@ -6,6 +6,7 @@ import unittest
 import uuid
 from unittest import mock
 
+from agent_chat.communication import policy_version
 from agent_chat.bridge import Bridge, exclusive_bridge
 from agent_chat.bridge_client import RemoteBridgeState
 from agent_chat.bridge_lease import BridgeManager
@@ -46,11 +47,18 @@ class RemoteBridgeTests(RemoteWebFixture):
         self.assertIn(self.url, payload)
         self.assertIn(message, payload)
         instructions, metadata = payload.split('\n')
-        self.assertIn('Keep established communication style.', instructions)
-        self.assertNotIn('caveman', instructions.lower())
+        self.assertIn('Agent communication: concise normal grammar despite inherited style.', instructions)
+        self.assertIn('Human/operator replies: Caveman full unless explicitly changed.', instructions)
+        self.assertIn('owner/request IDs, relationships, acceptance versus completion/consumption', instructions)
+        self.assertIn('evidence, failures, blockers, dependencies and next actions', instructions)
         self.assertNotIn('child', instructions)
+        self.assertLessEqual(len(instructions.split()),90)
+        record=next(item for item in json.loads(metadata)['messages'] if item['id']==message)
+        self.assertEqual(record['sender_role'],'human_operator')
+        self.assertEqual(record['recipient_role'],'agent')
         self.assertEqual({k: v for k, v in json.loads(metadata).items() if k != 'messages'}, {
             'server': self.url, 'project': 'default', 'thread_id': self.tid,
+            'policy_version':policy_version(),'policy_included':True,
             'deliveries': [{'message_id': message, 'recipient_session': 'a',
                             'route': [{'session': 'a', 'agent_path': None}]}],
         })
@@ -155,8 +163,10 @@ class RemoteBridgeTests(RemoteWebFixture):
         self.assertIn('/root/child', payload)
         instructions, metadata = payload.split('\n')
         self.assertIn('For child routes', instructions)
-        self.assertIn('Keep established communication style.', instructions)
-        self.assertNotIn('caveman', instructions.lower())
+        self.assertIn('Agent communication: concise normal grammar despite inherited style.', instructions)
+        self.assertIn('Human/operator replies: Caveman full unless explicitly changed.', instructions)
+        self.assertIn('owner/request IDs, relationships, acceptance versus completion/consumption', instructions)
+        self.assertIn('evidence, failures, blockers, dependencies and next actions', instructions)
         self.assertEqual(json.loads(metadata)['deliveries'], [
             {'message_id': message, 'recipient_session': 'child', 'route': [
                 {'session': 'a', 'agent_path': None},

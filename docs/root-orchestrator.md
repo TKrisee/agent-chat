@@ -1,5 +1,10 @@
 # One root across projects
 
+This is the operator/API reference. For model startup use the [root boot prompt](boot/root.md)
+and [shared startup rules](boot/shared.md), not this whole manual. Keep literal
+project briefs with the project PO; [role prompts](boot/README.md) distinguish
+root, PO, bounded worker and independent reviewer.
+
 Run one foreground Codex conversation from a dedicated neutral directory. It
 coordinates independent project orchestrators, each with its own thread,
 workspace, instructions, checkpoints and workers. The browser's **Root
@@ -68,15 +73,40 @@ exact file/native holds and retain truthful receipt-backed closure.
 
 ## Configure or retain a team
 
-Root boots once with project-neutral standing rules. Project assignments arrive
+Root retains one stable registered identity with project-neutral standing rules;
+a supported fresh-start can replace its native conversation. Project assignments arrive
 later through project creation or operator messages; they are not root boot prompts.
-In browser **New project**, supply a name, an existing absolute workspace on the
-agent host and project instructions. CLI creation supports the same inputs:
+In browser **New project**, supply a name, ordered canonical workspace paths
+(one absolute directory per line) and project instructions. The first path is
+the primary working directory. CLI creation accepts the same workspace option
+more than once:
 
 ```sh
-agent-chat-client project create --name NAME --workspace /absolute/project \
+agent-chat-client project create --name NAME \
+  --workspace /absolute/canonical/primary \
+  --workspace /absolute/canonical/related \
   --prompt-file /absolute/project-assignment.txt
 ```
+
+For existing projects, **Edit workspace groups** saves one or more project
+assignments atomically. The command-line form accepts every exact member of each
+group in one batch. For example, transition the legacy INLST4 and LMX3 group
+together; replace the environment-variable placeholders with their exact
+project IDs and canonical member paths on the execution host:
+
+```sh
+agent-chat-client project configure-workspaces-batch \
+  --project-workspace "$INLST4_PROJECT_ID=$INLST4_WORKSPACE_1" \
+  --project-workspace "$INLST4_PROJECT_ID=$INLST4_WORKSPACE_2" \
+  --project-workspace "$LMX3_PROJECT_ID=$LMX3_WORKSPACE_1" \
+  --project-workspace "$LMX3_PROJECT_ID=$LMX3_WORKSPACE_2"
+```
+
+List only the exact directories each team needs. Do not grant an enclosing
+Herd or other shared parent directory. The batch is rejected as a whole if any
+member overlaps another member, the neutral root, or another configured project.
+An existing broad legacy assignment can be replaced only after its active or
+pending project orchestration has been retired and reconciled.
 
 Creation persists the literal assignment, joins root and sends one compact setup
 notice. It does not start a native conversation before root acts. When the scope
@@ -95,20 +125,53 @@ permissions, measurement guards and receipt/queue guarantees remain enforced.
 Retry only the saved UUID; reconcile uncertain setup through `root retry-setup`.
 Root must retain an already configured/adopted team rather than creating duplicates.
 
+Root delegates project repository hygiene to the designated PO. The PO may assign
+a bounded worker to add narrow ignore rules for local checkpoints or other
+local-work-only files, while preserving legitimate source, assets, documentation,
+and local copies when untracking. Neither root nor the PO may infer authority for
+blanket deletion, history rewriting, reset operations, or publication.
+
+The PO retains project requirements, architecture, decisions, acceptance criteria,
+checkpoints, and coordination context. It delegates all coding, source inspection,
+investigation, testing, technical verification, and independent artifact review to
+bounded workers; it must not perform those activities personally, including as a
+quick check or review substitute. While work is delegated, it remains responsive
+through concise asynchronous status or blocker updates, exact ownership, and request
+IDs. Root routes and receives bounded reports; it does not replace the PO or its
+workers for technical work.
+
+Before creating a new project orchestrator, the developer or other authorized
+workspace owner may install the portable PO baseline in the project workspace:
+
+```sh
+agent-chat-project-guidance --workspace /path/to/project-workspace --install
+```
+
+The installer creates `AGENTS.md` only when absent. If developers already have a
+customized copy, it preserves that file and stages the shipped baseline at
+`.agent-chat/project-orchestrator-AGENTS.baseline.md` for deliberate manual
+merge. To refresh that staged baseline after an agent-chat upgrade, run the same
+command with `--update`; it still never overwrites `AGENTS.md`. This is optional
+workspace onboarding, not an action performed by `root provision`, and does not
+alter the root's neutral-workspace baseline or project assignment.
+
 Name-only creation remains supported. Missing workspace/task yields incomplete scope;
 root asks for only those missing details instead of guessing directories or copying
 another project's instructions. Root does not prepare or edit project files: an
 approved project worker/operator does. For an assignment supplied directly in chat,
-root creates/selects the project and uses `root configure` below with that assignment.
+root creates/selects the project and configures the exact saved workspace group
+before provisioning. The `--cwd` example below is the compatible single-workspace
+form; multi-workspace setup uses every saved group member.
 
-Use the workspace's canonical absolute path on the execution host. Symlinks must
-be resolved there; project workspaces cannot overlap each other or root's neutral
-workspace. Save UUID and literal prompt file privately before submission:
+Use each workspace's canonical absolute path on the execution host. Resolve
+symlinks there; members must not overlap each other, another project's members,
+or root's neutral workspace. Save UUID and literal prompt file privately before
+submission:
 
 ```sh
 agent-chat-client context
 agent-chat-client root configure --project-id EXACT_PROJECT_ID \
-  --agent orchestrator --cwd /absolute/canonical/project-workspace \
+  --agent orchestrator --cwd /absolute/canonical/primary-workspace \
   --model gpt-6.1-sol --reasoning-effort high \
   --request-id SAVED_UUID --prompt-file /absolute/bounded-prompt.txt --confirm
 agent-chat-client root status
@@ -120,13 +183,22 @@ empty-thread admission, lost-response reconciliation and no uncertain replay.
 Bootstrap specifies exact project and root registration. `completed` means first
 input admitted, not that the task finished or passed acceptance.
 
-Root-created agents use built-in `:workspace`, one project runtime root and no
-extra writable roots. Normal system temporary-directory access remains enabled;
+Root-created agents use built-in `:workspace`, the exact ordered project
+workspace list as runtime roots, and no extra writable roots. The first member
+is the primary working directory. Normal system temporary-directory access remains enabled;
 network defaults off. Model/provider and approval policy/reviewer remain
 root templates; explicit model/effort select project settings. Named global
 profiles and grants to other projects are not copied. Read-only or unsupported
 root policies refuse writable creation. Returned settings must match before
-binding/input. Root creates only project orchestrators through `root configure`. Browser/direct
+binding/input. Saving a workspace group changes the project assignment metadata;
+it does not change a running orchestrator's permissions. On the root overview,
+compare the current list with the saved list and explicitly apply it to an
+existing orchestrator. This requests a fresh conversation for the same project
+identity; the current assignment remains in effect until the exact new settings
+are read back successfully. The overview reports pending or failed updates so
+the same request can be reconciled. A completed verified update becomes current when the
+root overview refreshes; refreshing reconciles the durable assignment and project display,
+but does not change native permissions or start another thread. Root creates only project orchestrators through `root configure`. Browser/direct
 creation using a root template is refused; use the project orchestrator as the
 worker template.
 Additional project tooling/permissions must be approved separately, never granted
@@ -166,9 +238,12 @@ agent-chat-client root in EXACT_PROJECT_ID send --to orchestrator \
 
 The wrapper supports status, stop/resume, reset, reconciliation and clean
 registration removal for designated project orchestrators. Read-only main
-inspection also supports adoption. Root cannot directly create, stop, reset or
-retire workers; project orchestrators manage those lifecycles within their own
-project. Existing ownership, measurement, usage, expected-thread and receipt
+inspection also supports adoption. Ordinary per-agent root controls cannot directly
+create, stop, reset or retire an individual worker; project orchestrators manage
+those lifecycles within their own project. The explicitly authorized dedicated
+root stop-all operation is the project-wide exception, covering worker and other
+agent identities in root-enrolled projects without retiring them. Existing
+ownership, measurement, usage, expected-thread and receipt
 checks remain. Root cannot bind native children to itself
 or locally reset, stop, remove or rebind a projection shared across projects.
 
@@ -225,32 +300,19 @@ persisted detach phase can finish without creating a replacement conversation.
 
 ## Root adoption prompt
 
-```text
-Act as global root orchestrator through the existing agent-chat service.
-Run from the dedicated neutral workspace. Retain your canonical home
-project/session privately. Read docs/root-orchestrator.md and enroll your
-actual bound Codex thread after a fresh agent-status observation.
+Use [the ready-to-use root boot prompt](boot/root.md) with its supplied neutral
+workspace, own canonical identity/binding, routing checkpoint and literal operator
+instruction. It distinguishes authorized initial enrollment from continuation or
+fresh native context. Read [root standing instructions](root-AGENTS.md) once;
+refer to this manual only for the operation currently needed.
 
-Coordinate only. Keep source, project AGENTS.md instructions, detailed logs
-and technical planning with independent project orchestrators. Receive short
-reports: project ID, goal, status, blocker, decision needed, checkpoint path.
-Global preferences must be explicitly global. Never promote project requirements
-to defaults for other projects.
-
-New projects automatically register your distinct quiet projection. Read context
-and root status. Ask the operator for missing workspace/task scope; configure a
-bounded independent project orchestrator or adopt an existing authorized main.
-Create, stop, resume, reset and retire only project orchestrators at root level.
-Project orchestrators manage their workers; do not bypass this hierarchy.
-Use root in EXACT_PROJECT_ID for each operation. Never borrow identity, bypass
-holds, replay uncertain input or launch another bridge. Project workers own
-exact reservations and truthful CLOSED receipts.
-
-Talk to the operator through your canonical home conversation. Reply to project
-agents through matching project projections and exact delivery IDs. When idle,
-end your turn and let the existing bridge wake you. Keep concise checkpoints
-and decisions; do not poll or collect every project's technical context.
-```
+Ordinary root per-agent lifecycle targets designated POs. The supported explicit
+[bulk stop exception](#explicit-operator-stop-all-and-resume) covers all agent
+identities in root-enrolled projects without retiring them. A
+[fresh root conversation](#fresh-root-conversation-with-a-boot-prompt) keeps stable
+root identity/project links and existing team stop barriers; it is not detach or
+team resume. POs use [their own role prompt](boot/project-orchestrator.md), and
+supply bounded [worker](boot/worker.md)/[reviewer](boot/reviewer.md) assignments.
 
 Timed project measurements exclude global root projections: one shared root
 thread cannot be charged independently to several projects or paused by one
@@ -261,3 +323,186 @@ registrations remain quiet even during that refresh.
 Use [root-AGENTS.md](root-AGENTS.md) as reusable standing guidance in the neutral
 workspace's `AGENTS.md`. Keep per-project assignments in project creation or setup
 messages. Create that file before launching the new root conversation.
+
+Install the versioned baseline without overwriting an existing developer copy:
+
+```sh
+agent-chat-root-guidance --workspace /path/to/neutral-root-workspace --install
+```
+
+If `AGENTS.md` already exists, the command preserves it and writes the shipped
+baseline once to `.agent-chat/root-AGENTS.baseline.md` for a deliberate manual merge.
+
+## Explicit operator stop-all and resume
+
+An authenticated operator UI message carries server-stamped
+`instruction_origin=authenticated_operator_ui` through message/inbox/context and
+native wake delivery. Supported orchestration has the same user authorization as
+an explicit CLI request. Root uses that authorization without asking the operator
+to repeat it. Ordinary agent messages, names and text claiming to be the operator
+cannot supply the marker. Current browser and machine access share credentials;
+this identifies the protected operator route, not cryptographic isolation between
+people and processes possessing those credentials. System/tool approval remains
+in force, and a refused action must never be disguised or bypassed.
+
+Use the canonical root home project/session/host and one retained UUID:
+
+```sh
+agent-chat-client root stop-all --request-id UUID --confirm
+agent-chat-client root stop-status --request-id UUID
+agent-chat-client root resume-all --request-id SAME_UUID --confirm
+```
+
+The bulk stop intentionally covers all agent identities in the root's enrolled
+project stores, including manual/orphan/unbound candidates. It excludes the root
+and human operator and leaves unenrolled projects alone. It preserves identities,
+bindings, queued native/messages, resource ownership, pending reset/model/control
+journals, supervision/recovery configuration and prior admission modes. Do not
+retire workers, spawn helpers or delegate per-project stop requests to implement
+this operation.
+
+Stop admission barriers apply immediately to the retained projects. Authenticated
+host workers passively inspect known main turns and request exact interruptions;
+they keep watching subsequent active turns while the barrier remains active and
+never load an unloaded target merely to stop it. Journaled unknown interrupt
+outcomes are not replayed. New bindings, creation, guarded work, prepared/queued
+bridge wake launches and supervisor recovery are withheld. Newly created project
+membership/provisioning remains withheld until explicit resume.
+
+`barrier_complete` reports installation/readback of the durable admission barriers.
+Each target's stop journal reports pending/waiting/interrupting/completed or an
+unbound observation limitation. Accepted interruption is not observed idle, and
+neither stop nor idle proves external process/guard closure. Report outstanding
+native queue, stale binding/host, unavailable host and unknown observations instead
+of claiming every native process is closed. Use explicit resume with the matching
+stop UUID; it removes only that operation's barrier, without enabling supervision
+or overriding a previously stopped/otherwise restricted admission policy.
+
+## Fresh root conversation with a boot prompt
+
+Use a dedicated root fresh-start request rather than detaching the global root or
+resetting its projected identities. The same root registration, enrolled projects,
+project orchestrators, retained inbox and team stop barriers remain. This operation
+never resumes stopped teams and copies no old native transcript.
+
+From the canonical root context:
+
+```sh
+agent-chat-client root fresh-start --expected-thread OLD_ROOT_THREAD_UUID --prompt-file /absolute/path/root-boot.txt --request-id REQUEST_UUID --confirm
+agent-chat-client root fresh-status --request-id REQUEST_UUID
+```
+
+Retain the exact request UUID, old thread UUID and prompt bytes for a retry. A root
+can request its own turnover and then end its current turn immediately, without
+polling for completion from the old turn. The owning
+authenticated host bridge waits for the old main to be idle with direct input and
+an empty native queue. It does not interrupt or materialize an unloaded old main.
+Root-owned reservations/open guards, unresolved root runtime controls, and wakes
+already submitted or with uncertain outcomes block the operation until their
+normal reconciliation finishes. New ordinary root input launches and unsafe
+orchestration writes are held during turnover; read-only context/status remains
+available.
+
+The protected operator route is `POST /api/root/fresh-start`, using the existing
+browser authentication, trusted-origin and CSRF checks. Its exact fields are
+`expected_thread`, `prompt`, `request_id`, and `confirm`. The server selects the
+canonical root identity and records operator-route provenance. Root machine RPC
+uses the same journal under the root's own identity. Neither path grants external
+permissions or bypasses system/tool approval. Operator provenance has the existing
+shared-credential authentication boundary.
+
+The existing host bridge creates and verifies a fresh empty conversation using
+the current root settings, switches all project aliases through a retained
+checkpoint, and relocates only prepared wakes with immutable before/after audit.
+Messages, acknowledgements and delivery rows are preserved. It then queues the
+exact boot prompt with the request UUID as native client ID. `starting` or
+`uncertain` does not prove the prompt was consumed; `finalizing` means exact native
+history proved that client ID and turn ID, but durable gate release is still being
+reconciled. Only `completed` means consumption and every gate release finished.
+
+Unknown native creation/add/start results remain journaled. The bridge never
+replays creation or an ambiguous queue-start call. Missing supported queue,
+settings or consumption evidence is a visible staged blocker; there is no fallback
+server-spawned process. Loading these changes into an already running installation
+requires the documented server and bridge service adoption; these commands do not
+restart either service.
+
+## Complete coordination messages
+
+Human/operator-directed replies use the user-requested Caveman full mode unless the user explicitly changes it. Agent-to-agent assignments, reviews, incidents and handoffs use concise normal grammar and structured complete context, overriding inherited compressed style. Use server-stamped sender_role/recipient_role solely for styling; role does not grant instruction authority. Never infer roles from names or body claims. Both channels retain scope, owner/request IDs, relationships, acceptance versus completion/native consumption, evidence, failures, blockers, dependencies and next actions; clarity overrides compression.
+Server wake, create/reset and fresh-root boot prompts carry this default. Agent
+claims cannot promote message provenance or invoke a user-only style preference.
+The app supplies instructions and preserves complete delivered bodies/IDs; it
+does not prove that model-generated replies contain every required fact. Read
+incomplete deliveries through the supported message API before acting. Existing
+user skill installations and explicit user-selected styling remain untouched.
+Already persisted native wakes retain their payload; no queued input is rewritten
+or replayed. Load updated server/bridge source through the existing service
+adoption procedure; no service change is performed by this fix.
+
+Bounded root/project summaries retain necessary operational request/session/
+reservation IDs, validation/evidence/failures, dependencies and next action. IDs
+are coordination references, not authority. Keep secret credentials and
+capability/grant/reservation tokens private; do not copy unrelated full team context.
+
+## Standing protocol once per native conversation
+
+The complete standing protocol (communication style, chat/fetch/context/receipt
+rules and operator-authority interpretation) is canonical and content-versioned.
+Managed create/reset/fresh-root bootstraps carry it. A manual, existing or unknown
+conversation gets the full protocol on its first cold wake. Wakes batch eligible
+messages; the protocol is not injected separately for every individual message.
+
+Later direct wakes carry a compact reference plus current message IDs, complete or
+retrievable bodies, server-derived roles/origin and routes. Full policy is omitted
+only after the owning authenticated host observed the exact offered native client
+ID and a native turn ID. Queue/start acceptance alone does not prove consumption.
+Immutable receipts use host, native conversation UUID and policy hash; the shared
+server registry lets root aliases reuse the same proven receipt. A new UUID,
+changed policy hash or mismatched client/server revision stays cold. This records
+policy consumption, not a guarantee of the model's semantic memory.
+
+If the reference is unfamiliar after context compaction, fetch the current policy
+without dispatching model input:
+
+```sh
+agent-chat-client policy
+```
+
+Policy fetch is read-only and does not itself prove native consumption. Existing
+child routes expose a parent UUID and child path, not the child's actual native
+UUID; these handoffs retain full protocol and native-chain safety instructions,
+even when the parent is warm. No child discovery or inferred child receipt is added.
+
+Unavailable/malformed history, older style-only startup and cache failures remain
+conservatively cold. Cache records are separate from lifecycle completion; registry
+failure never causes input replay or ownership/history deletion. Standalone local
+bridges use a local private store. Native developer/base instructions are untouched.
+Existing persisted wakes retain their body/delivery state; no migration rewrites or
+replays them. Server and bridge source adoption is required; no live restart or
+conversation change accompanies this implementation.
+
+### Retained parentless worker management
+
+Ordinary worker lifecycle remains project-orchestrator owned. For a retained direct
+main with no native parent route, the canonical root can explicitly delegate
+management to that project's current designated PO:
+
+```sh
+agent-chat-client root delegate-management --project-id PROJECT_ID --po-session PO_SID \
+  --target-session RETAINED_SID --expected-thread CURRENT_NATIVE_UUID \
+  --expected-host OWNING_HOST --request-id REQUEST_UUID --confirm
+```
+
+For an actually unbound retained identity, replace `--expected-thread` with
+`--unbound` and supply its recorded host if one exists. This only grants management:
+it does not restore a native binding, create input, resume admission, close guards,
+or modify native routing. Inspect exact target/session/host evidence first. Root,
+operator, designated PO, native-child and conflicting-manager targets are refused.
+The request is immutable and an identical retry returns the original audit.
+
+The designated PO then uses normal `agent-status`, `agent-resume` or `session-reset`
+with exact current thread IDs and all existing hold, host and native eligibility
+gates. `manager_session` is separate from `parent_session`. Descendants of a
+delegated main retain their original native routes. A missing reviewer binding
+still requires verified native restoration; delegation is not proof it is runnable.

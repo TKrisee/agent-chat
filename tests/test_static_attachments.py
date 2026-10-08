@@ -12,6 +12,7 @@ from agent_chat.remote_service import dispatch
 
 
 FILES = {
+    'report.PDF': ((Path(__file__).parent / 'fixtures' / 'attachment.pdf').read_bytes(), 'application/pdf'),
     'image.png': (b'\x89PNG\r\n\x1a\npng', 'image/png'),
     'image.jpg': (b'\xff\xd8\xffjpeg', 'image/jpeg'),
     'image.jpeg': (b'\xff\xd8\xffjpeg', 'image/jpeg'),
@@ -118,6 +119,9 @@ class StaticAttachmentTests(unittest.TestCase):
             'invalid-utf8.txt': b'\xff',
             'disguised.txt': b'\x89PNG\r\n\x1a\npng',
             'wrong.png': b'plain text',
+            'fake.pdf': b'plain text',
+            'empty.pdf': b'',
+            'huge.pdf': b'%PDF-1.4\n' + b'x' * (10 * 1024 * 1024),
             'empty.txt': b'',
             'control.log': b'hello\x1b[31mworld',
         }

@@ -70,8 +70,32 @@ def creation_settings(source, job, cwd):
     if job.get('requested_effort'): result['reasoningEffort'] = job['requested_effort']
     if job.get('requested_cwd'):
         result['cwd'] = cwd
-        result['runtimeWorkspaceRoots'] = [cwd]
+        members = list(job.get('requested_workspaces') or [cwd])
+        result['runtimeWorkspaceRoots'] = members
+        # A named :workspace profile grants the child cwd implicitly.  Its
+        # explicit writable roots therefore come only from the child's saved
+        # secondary workspace intent, never from the parent template.
+        profile = (source.get('activePermissionProfile') or {}).get('id')
+        if (not job.get('project_scope') and profile == ':workspace'
+                and result['sandbox'].get('type') == 'workspaceWrite'):
+            result['sandbox']['writableRoots'] = members[1:]
     return settings_data(result)[0]
+
+
+def project_scope_settings(source, job, cwd):
+    """Explicit root assignment grants only its complete member directories."""
+    if source['sandbox'].get('type') not in ('workspaceWrite', 'dangerFullAccess'):
+        raise CoordError('root policy does not authorize writable project agents; creation withheld')
+    result = creation_settings(source, job, cwd)
+    result['activePermissionProfile'] = {'id': ':workspace', 'extends': None}
+    result['sandbox'] = dict(type='workspaceWrite', writableRoots=[], networkAccess=False,
+                            excludeTmpdirEnvVar=False, excludeSlashTmp=False)
+    members = list(job.get('requested_workspaces') or [cwd])
+    result['runtimeWorkspaceRoots'] = members
+    # The primary cwd is implicit; the app-server reports the remaining saved
+    # project members as explicit writable roots, in this exact order.
+    result['sandbox']['writableRoots'] = members[1:]
+    return result
 
 
 def revalidation_proof(rpc, job):

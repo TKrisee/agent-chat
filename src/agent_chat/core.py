@@ -80,6 +80,12 @@ def assert_reset_unlocked(db, session):
 
 def assert_agent_running(db, session, *, cleanup=False):
     if __package__:
+        from .root_restart import held
+        if held(db, session) and not cleanup:
+            raise CoordError('root fresh-start is pending; inspect root fresh-status before changing routing or ownership')
+        from .root_lifecycle import stopped
+        if stopped(db, session) and not cleanup:
+            raise CoordError('root stop-all barrier is active; explicit root resume-all is required')
         from .root_orchestrator import projection
         root = projection(db, session)
         if root and root['paused']:
@@ -99,6 +105,7 @@ def agent_labels(db):
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='retired_sessions'").fetchone():
         labels.update({row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM retired_sessions')})
     labels.update({row['id']: row['agent'] for row in db.execute('SELECT id,agent FROM sessions')})
+    labels['system:supervisor'] = 'supervisor'
     return labels
 
 
@@ -133,6 +140,13 @@ class Coordinator:
           sender_session TEXT NOT NULL, recipient_session TEXT NOT NULL,
           body TEXT NOT NULL, created_at REAL NOT NULL, acked_at REAL,
           UNIQUE(id));
+        CREATE TABLE IF NOT EXISTS operator_identities (session_id TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS operator_message_origins (
+          message_id TEXT PRIMARY KEY, sender_session TEXT NOT NULL, channel TEXT NOT NULL);
+        CREATE TRIGGER IF NOT EXISTS immutable_operator_origin_update BEFORE UPDATE ON operator_message_origins
+          BEGIN SELECT RAISE(ABORT, 'operator message origin is immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS immutable_operator_origin_delete BEFORE DELETE ON operator_message_origins
+          BEGIN SELECT RAISE(ABORT, 'operator message origin is immutable'); END;
         CREATE TABLE IF NOT EXISTS attachments (
           id TEXT PRIMARY KEY, message_id TEXT NOT NULL, name TEXT NOT NULL,
           mime TEXT NOT NULL, size INTEGER NOT NULL, content BLOB NOT NULL,
@@ -176,9 +190,16 @@ class Coordinator:
         if version != "1": raise CoordError("unsupported coordinator schema version")
 
     @contextlib.contextmanager
-    def tx(self) -> Iterator[sqlite3.Connection]:
-        self.db.execute("BEGIN IMMEDIATE")
+    def tx(self, observer=None) -> Iterator[sqlite3.Connection]:
+        if observer: observer.mark('transaction_acquire', 'start')
+        try:
+            self.db.execute("BEGIN IMMEDIATE")
+        except BaseException:
+            if observer: observer.mark('transaction_acquire', 'end', 'error')
+            raise
+        if observer: observer.mark('transaction_acquire', 'end')
         observed_at = _now()
+        if observer: observer.mark('transaction_held', 'start')
         try:
             self.db.execute(
                 "UPDATE resources SET stale=1 WHERE owner_session IS NOT NULL AND deadline<?",
@@ -192,8 +213,11 @@ class Coordinator:
                 "UPDATE resources SET stale=1 WHERE owner_session IS NOT NULL AND deadline<?",
                 (observed_at,),
             )
+            if observer: observer.mark('transaction_held', 'end', 'error')
             raise
-        else: self.db.commit()
+        else:
+            self.db.commit()
+            if observer: observer.mark('transaction_held', 'end')
 
     def require_session(self) -> str:
         if not self.session: raise CoordError("AGENT_CHAT_SESSION or --session is required")
@@ -204,6 +228,8 @@ class Coordinator:
     def register(self, agent: str) -> dict[str, Any]:
         if not agent or not agent.strip(): raise CoordError("agent must be nonempty")
         sid = self.session or _id("session")
+        if sid == 'system:supervisor':
+            raise CoordError('system:supervisor is reserved for durable system notices')
         with self.tx() as db:
             if db.execute("SELECT 1 FROM retired_sessions WHERE id=?", (sid,)).fetchone():
                 raise CoordError("session is deregistered; register a new session instead of reusing its ID")
@@ -351,13 +377,26 @@ class Coordinator:
             result[row["message_id"]].append({"id": row["id"], "name": row["name"], "mime": row["mime"], "size": row["size"], "url": "/api/attachments/" + row["id"]})
         return result
 
+    def _stamp_operator_origin(self, db, message_id, sender):
+        if getattr(self, '_operator_message_origin', False):
+            if not db.execute('SELECT 1 FROM operator_identities WHERE session_id=?', (sender,)).fetchone():
+                raise CoordError('operator message origin requires the server selected UI identity')
+            db.execute('INSERT INTO operator_message_origins VALUES(?,?,?)',
+                       (message_id, sender, 'authenticated_operator_ui'))
+
     def _message_dicts(self, db: sqlite3.Connection, rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         labels = agent_labels(db)
+        operators = {row['session_id'] for row in db.execute('SELECT session_id FROM operator_identities')}
         attachments = self._attachment_metadata(db, [row["id"] for row in rows])
         replies = self._reply_metadata(db, [row["id"] for row in rows])
         batches = self._batch_metadata(db, [row["id"] for row in rows])
         return [{**{key: row[key] for key in ("id", "sender_session", "body", "created_at", "acked_at")},
                  "sender_agent": labels.get(row["sender_session"]),
+                 "sender_role": "human_operator" if row["sender_session"] in operators else "agent",
+                 "recipient_role": "human_operator" if row["recipient_session"] in operators else "agent",
+                 "instruction_origin": ('authenticated_operator_ui' if db.execute(
+                     'SELECT 1 FROM operator_message_origins WHERE message_id=? AND sender_session=?',
+                     (row['id'], row['sender_session'])).fetchone() else 'agent_message'),
                  "attachments": attachments[row["id"]], **replies[row["id"]], **batches[row["id"]]} for row in rows]
 
     def _batch_metadata(self, db: sqlite3.Connection, message_ids: list[str]) -> dict[str, dict[str, Any]]:
@@ -402,13 +441,20 @@ class Coordinator:
             }
         return result
 
-    def inbox(self, all_messages: bool = False) -> dict[str, Any]:
+    def inbox(self, all_messages: bool = False, observer=None) -> dict[str, Any]:
         sid = self.require_session()
-        with self.tx() as db:
-            rows = db.execute("SELECT id,sender_session,body,created_at,acked_at,seq FROM messages WHERE recipient_session=? " + ("ORDER BY seq" if all_messages else "AND acked_at IS NULL ORDER BY seq"), (sid,)).fetchall()
-            latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (sid,)).fetchone()["n"]
-            db.execute("UPDATE sessions SET inbox_read_seq=? WHERE id=?", (latest, sid))
-            messages = self._message_dicts(db, rows)
+        with self.tx(observer=observer) as db:
+            if observer: observer.mark('inbox_query', 'start')
+            try:
+                rows = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages WHERE recipient_session=? " + ("ORDER BY seq" if all_messages else "AND acked_at IS NULL ORDER BY seq"), (sid,)).fetchall()
+                latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (sid,)).fetchone()["n"]
+                db.execute("UPDATE sessions SET inbox_read_seq=? WHERE id=?", (latest, sid))
+                messages = self._message_dicts(db, rows)
+            except BaseException:
+                if observer: observer.mark('inbox_query', 'end', 'error')
+                raise
+            else:
+                if observer: observer.mark('inbox_query', 'end')
         return {"messages": messages}
 
     @staticmethod
@@ -422,6 +468,8 @@ class Coordinator:
     @staticmethod
     def _context_message(message: dict[str, Any], body: str) -> dict[str, Any]:
         return {"id": message["id"], "sender_session": message["sender_session"],
+                "instruction_origin": message.get('instruction_origin','agent_message'),
+                "sender_role": message["sender_role"], "recipient_role": message["recipient_role"],
                 "sender_agent": message["sender_agent"], "created_at": message["created_at"],
                 "body": body, "body_truncated": body != message["body"],
                 "attachments": message["attachments"], "reply_to": message["reply_to"],
@@ -463,7 +511,7 @@ class Coordinator:
                 else:
                     clauses.append("id IN (" + ",".join("?" for _ in message_ids) + ")")
                     args.extend(message_ids)
-            rows = db.execute("SELECT id,sender_session,body,created_at,acked_at,seq FROM messages WHERE " +
+            rows = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages WHERE " +
                               " AND ".join(clauses) + " ORDER BY seq LIMIT ?", (*args, limit + 1)).fetchall()
             has_more = len(rows) > limit
             rows = rows[:limit]
@@ -484,6 +532,10 @@ class Coordinator:
                                       "has_more": has_more, "truncated": False,
                                       "resources_cursor": resource_cursor,
                                       "resources_has_more": resources_has_more}
+            from .management import manager
+            explicit_manager = manager(db, sid)
+            if explicit_manager is not None:
+                result["manager_session"] = explicit_manager
             if self.context_size(result) > max_bytes:
                 raise CoordError("max_bytes is too small for context metadata")
             resource_budget = max_bytes // 3
@@ -557,7 +609,7 @@ class Coordinator:
         if not isinstance(message_id, str) or not message_id:
             raise CoordError("id must be a nonempty string")
         with self.tx() as db:
-            row = db.execute("SELECT id,sender_session,body,created_at,acked_at,seq FROM messages "
+            row = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages "
                              "WHERE id=? AND recipient_session=?", (message_id, sid)).fetchone()
             if row is None:
                 raise CoordError("message is not in caller inbox")
@@ -609,9 +661,9 @@ class Coordinator:
     def _prepare_attachment(cls, name: str, content: bytes) -> tuple[str, str, bytes]:
         name = cls._attachment_name(name)
         extension = pathlib.Path(name).suffix.lower()
-        mime = IMAGE_EXTENSIONS.get(extension) or VIDEO_EXTENSIONS.get(extension) or TEXT_EXTENSIONS.get(extension)
+        mime = IMAGE_EXTENSIONS.get(extension) or VIDEO_EXTENSIONS.get(extension) or TEXT_EXTENSIONS.get(extension) or ("application/pdf" if extension == ".pdf" else None)
         if mime is None:
-            raise CoordError("unsupported attachment type; choose PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, or TOML")
+            raise CoordError("unsupported attachment type; choose PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, PDF, TXT, Markdown, JSON, XML, CSV, TSV, LOG, YAML, or TOML")
         if not content:
             raise CoordError("attachment must be nonempty")
         if len(content) > MAX_ATTACHMENT_SIZE:
@@ -622,6 +674,9 @@ class Coordinator:
         elif extension in VIDEO_EXTENSIONS:
             if cls._video_mime(content) != mime:
                 raise CoordError("attachment content does not match its video extension")
+        elif extension == ".pdf":
+            if not content.startswith(b"%PDF-"):
+                raise CoordError("attachment content does not match its PDF extension")
         else:
             # Documents are opaque UTF-8 data: never parse XML, render markup, or
             # execute configuration. Reject binary payloads and renamed scripts.
@@ -714,6 +769,7 @@ class Coordinator:
             if ack_reply and parent is not None and parent["recipient_session"] != sid:
                 raise CoordError("ack_reply parent must be in caller inbox")
             db.execute("INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)", (mid,sid,recipients[0],body,_now()))
+            self._stamp_operator_origin(db, mid, sid)
             if parent is not None:
                 db.execute("INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)", (mid,reply_to))
             metadata = []
@@ -813,6 +869,7 @@ class Coordinator:
                 message_id = _id("message")
                 db.execute("INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)",
                            (message_id, sid, recipient, body, created_at))
+                self._stamp_operator_origin(db, message_id, sid)
                 db.execute("INSERT INTO message_batches(message_id,batch_id) VALUES(?,?)", (message_id, batch_id))
                 # Explicit recipients request attention; an unaddressed broadcast
                 # remains available in context without starting a model turn.
@@ -893,7 +950,7 @@ class Coordinator:
         db.execute("INSERT INTO resources(name,owner_session,reservation_id,token,granted_at,deadline,stale,reason) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET owner_session=excluded.owner_session,reservation_id=excluded.reservation_id,token=excluded.token,granted_at=excluded.granted_at,deadline=excluded.deadline,stale=0,reason=excluded.reason", (resource,sid,rid,token,now,now+minutes*60,0,reason))
         return db.execute("SELECT * FROM resources WHERE name=?", (resource,)).fetchone()
 
-    def request(self, raw: str, minutes: float) -> dict[str, Any]:
+    def request(self, raw: str, minutes: float, on_acquire: Any = None) -> dict[str, Any]:
         if __package__:
             from .root_orchestrator import projection
             if projection(self.db, self.require_session()):
@@ -910,7 +967,10 @@ class Coordinator:
             first = db.execute("SELECT session FROM resource_queue WHERE resource=? ORDER BY seq LIMIT 1", (resource,)).fetchone()
             if (not r or not r["owner_session"]) and (not first or first["session"] == sid):
                 db.execute("DELETE FROM resource_queue WHERE resource=? AND session=?", (resource,sid))
-                return self._reservation_result(self._acquire(db,resource,sid,minutes),"owned",0)
+                acquired = self._acquire(db,resource,sid,minutes)
+                if on_acquire is not None:
+                    on_acquire(db, acquired)
+                return self._reservation_result(acquired,"owned",0)
             db.execute("INSERT OR IGNORE INTO resource_queue(resource,session,queued_at) VALUES(?,?,?)", (resource,sid,_now()))
             pos=db.execute("SELECT COUNT(*) n FROM resource_queue WHERE resource=? AND seq <= (SELECT seq FROM resource_queue WHERE resource=? AND session=?)", (resource,resource,sid)).fetchone()["n"]
             return {"state":"queued","resource":resource,"reservation_id":None,"token":None,"deadline":None,"queue_position":pos}
@@ -929,6 +989,24 @@ class Coordinator:
         return {"resource": r["name"], "owner_session": r["owner_session"], "owner_agent": owner,
                 "state": self._state(r), "reservation_id": r["reservation_id"], "deadline": r["deadline"],
                 "reason": r["reason"], "queue": q}
+
+    def retained_reservation_result(self, db: sqlite3.Connection, resource: str,
+                                    reservation_id: str) -> dict[str, Any]:
+        """Report only an exact reservation that the caller still owns.
+
+        Receipt insertion and resource clearing share one transaction, so a
+        retained matching row with no receipt proves that this reservation has
+        not committed a receipt-backed clear.  Historical receipt data is never
+        returned: once the hold is cleared its owner binding is gone.
+        """
+        sid = self.require_session()
+        r = self._row(db, resource)
+        if (not r or r["owner_session"] != sid or r["reservation_id"] != reservation_id
+                or self._state(r) != "owned"
+                or db.execute("SELECT 1 FROM receipts WHERE reservation_id=?", (reservation_id,)).fetchone()):
+            return {"state": "unknown"}
+        return {"state": "retained", "resource": resource, "reservation_id": reservation_id,
+                "receipt_backed_clear": False}
 
     def status(self, mine: bool = False, resources: list[str] | None = None) -> dict[str, Any]:
         self.require_session()
@@ -1199,6 +1277,7 @@ def main(argv:list[str]|None=None)->int:
             divider=raw.index("--",run_at+1); run_tail=raw[divider+1:]; raw=raw[:divider]
     p=argparse.ArgumentParser(prog="agent-chat");p.add_argument("--db");p.add_argument("--session")
     sub=p.add_subparsers(dest="op",required=True)
+    sub.add_parser("policy", help="read standing coordination policy")
     x=sub.add_parser("register");x.add_argument("--agent",required=True)
     x=sub.add_parser("rename", help="change your name while preserving your session");x.add_argument("--agent",required=True)
     x=sub.add_parser("send");x.add_argument("--to",required=True);x.add_argument("--body-file",required=True);x.add_argument("--attach",action="append",default=[]);x.add_argument("--reply-to")
@@ -1220,7 +1299,13 @@ def main(argv:list[str]|None=None)->int:
     c: Coordinator | None = None
     try:
         c=Coordinator(a.db,a.session)
-        if a.op=="register": out=c.register(a.agent)
+        if a.op=="policy":
+            if __package__:
+                from .communication import current_policy
+            else:
+                from communication import current_policy
+            out=current_policy()
+        elif a.op=="register": out=c.register(a.agent)
         elif a.op=="rename": out=c.rename(a.agent)
         elif a.op=="send": out=c.send(a.to,pathlib.Path(a.body_file).read_text(encoding="utf-8"),a.attach,a.reply_to)
         elif a.op=="link-reply": out=c.link_reply(a.id,a.reply_to)

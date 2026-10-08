@@ -2,17 +2,18 @@
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { spawn, execFileSync } = require('node:child_process');
 const { once } = require('node:events');
 const readline = require('node:readline');
 const path = require('node:path');
 const fixtureCode = `
 from pathlib import Path
-import signal, sys, tempfile, threading
+import os, signal, sqlite3, sys, tempfile, threading
 sys.path.insert(0, str(Path.cwd() / 'src'))
 from agent_chat.core import Coordinator
 from agent_chat.web import create_server
 with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directory:
+    print('Fixture PID=' + str(os.getpid()), file=sys.stderr, flush=True)
     db = Path(directory) / 'state.sqlite3'
     for sid in ('alpha', 'beta'):
         coord = Coordinator(db, sid)
@@ -34,6 +35,11 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     finally:
         server.stop_event.set()
         server.server_close()
+        with sqlite3.connect(db) as connection:
+            row = connection.execute("SELECT mime,size,content FROM attachments WHERE name=?", ('résumé.PDF',)).fetchone()
+        pdf = (Path.cwd() / 'tests/fixtures/attachment.pdf').read_bytes()
+        assert row == ('application/pdf', len(pdf), pdf), row
+        print('PDF SQLite MIME/size/bytes verified; fixture server closed', file=sys.stderr, flush=True)
 `;
 
 (async () => {
@@ -91,7 +97,7 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     const downloaded = await download.path();
     assert.deepEqual(fs.readFileSync(downloaded), files[1].buffer);
     await upload.setInputFiles({ name: 'fake.exe', mimeType: 'image/png', buffer: Buffer.from('fake') });
-    await page.locator('#composer-status').filter({ hasText: 'supported image, video or text file' }).waitFor();
+    await page.locator('#composer-status').filter({ hasText: 'supported image, video, PDF or text file' }).waitFor();
     assert.equal(await page.locator('#composer-images .draft-image').count(), 0);
     await upload.setInputFiles({ name: 'script.txt', mimeType: 'text/plain', buffer: Buffer.from('#!/bin/sh\necho unsafe\n') });
     await input.fill('@beta');
@@ -101,6 +107,65 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     await page.locator('#composer-status').filter({ hasText: 'executable scripts' }).waitFor();
     assert.equal(await page.locator('#composer-images .draft-image').count(), 1);
     await page.getByRole('button', { name: 'Remove script.txt', exact: true }).click();
+    // Use the real chooser and a valid PDF, ignoring browser-supplied MIME.
+    assert.ok((await upload.getAttribute('accept')).split(',').includes('.pdf'));
+    const pdf = fs.readFileSync(path.join(__dirname, 'fixtures', 'attachment.pdf'));
+    const chooserEvent = page.waitForEvent('filechooser');
+    await page.locator('#attach-button').click();
+    await (await chooserEvent).setFiles({ name: 'résumé.PDF', mimeType: 'application/octet-stream', buffer: pdf });
+    assert.equal(await page.locator('#composer-images .draft-document-type').textContent(), 'PDF');
+    await input.fill('@beta PDF attachment');
+    const pdfSent = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    const pdfResponse = await pdfSent;
+    assert.equal(pdfResponse.status(), 200);
+    const metadata = await pdfResponse.text();
+    assert.equal(execFileSync('jq', ['-r', '.attachments[0].mime'], { input: metadata, encoding: 'utf8' }).trim(), 'application/pdf');
+    assert.equal(execFileSync('jq', ['-r', '.attachments[0].name'], { input: metadata, encoding: 'utf8' }).trim(), 'résumé.PDF');
+    assert.equal(execFileSync('jq', ['-r', '.attachments[0].size'], { input: metadata, encoding: 'utf8' }).trim(), String(pdf.length));
+    const pdfLink = page.getByRole('link', { name: 'Download résumé.PDF', exact: true });
+    await pdfLink.waitFor();
+    const pdfURL = new URL(await pdfLink.getAttribute('href'), url).href;
+    const response = await page.request.get(pdfURL);
+    assert.equal(response.status(), 200);
+    assert.equal(response.headers()['content-type'], 'application/pdf');
+    assert.equal(response.headers()['content-disposition'], "attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.PDF");
+    assert.equal(response.headers()['x-content-type-options'], 'nosniff');
+    assert.deepEqual(await response.body(), pdf);
+    const anonymous = await browser.newContext();
+    try { assert.equal((await anonymous.request.get(pdfURL)).status(), 401); }
+    finally { await anonymous.close(); }
+    const pdfDownloadEvent = page.waitForEvent('download');
+    await pdfLink.click();
+    const pdfDownload = await pdfDownloadEvent;
+    assert.equal(pdfDownload.suggestedFilename(), 'résumé.PDF');
+    assert.deepEqual(fs.readFileSync(await pdfDownload.path()), pdf);
+    // Failed PDF content preserves the draft and cannot persist a message.
+    const countMessages = async () => execFileSync('jq', ['-r', '.messages | length'], {
+      input: await (await page.request.get(url + '/api/snapshot')).text(), encoding: 'utf8',
+    }).trim();
+    const beforePDFReject = await countMessages();
+    await upload.setInputFiles({ name: 'fake.pdf', mimeType: 'application/pdf', buffer: Buffer.from('plain text') });
+    await input.fill('@beta invalid PDF');
+    const fakeSent = page.waitForResponse(r => new URL(r.url()).pathname === '/api/messages' && r.request().method() === 'POST');
+    await page.locator('#send-button').click();
+    assert.equal((await fakeSent).status(), 400);
+    await page.locator('#composer-status').filter({ hasText: 'PDF extension' }).waitFor();
+    assert.equal(await page.locator('#composer-images .draft-image').count(), 1);
+    await page.getByRole('button', { name: 'Remove fake.pdf', exact: true }).click();
+    const hugePDF = Buffer.concat([pdf, Buffer.alloc(10 * 1024 * 1024)]);
+    await upload.setInputFiles({ name: 'huge.pdf', mimeType: 'application/pdf', buffer: hugePDF });
+    await page.locator('#composer-status').filter({ hasText: '10 MiB' }).waitFor();
+    assert.equal(await page.locator('#composer-images .draft-image').count(), 0);
+    for (const buffer of [Buffer.alloc(0), hugePDF]) {
+      const rejected = await page.request.post(url + '/api/messages', {
+        headers: {'Origin': url, 'X-Agent-Chat-CSRF': await page.evaluate(() => state.config.csrf_token)},
+        multipart: {
+        to: 'beta', body: 'invalid PDF', images: { name: 'bad.pdf', mimeType: 'application/pdf', buffer },
+      } });
+      assert.equal(rejected.status(), 400);
+    }
+    assert.equal(await countMessages(), beforePDFReject);
     const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aK5sAAAAASUVORK5CYII=', 'base64');
     await upload.setInputFiles([{ name: 'mixed.png', mimeType: 'image/png', buffer: png },
                               { name: 'mixed.csv', mimeType: 'text/csv', buffer: Buffer.from('key,value\na,1') }]);
@@ -257,13 +322,14 @@ with tempfile.TemporaryDirectory(prefix='agent-chat-static-browser-') as directo
     assert.equal(await page.locator('.message-card').evaluateAll(cards => cards.every(card => card.scrollWidth <= card.clientWidth)), true);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'static-mobile.png') });
     assert.deepEqual(errors, []);
-    console.log('Browser: uploads, playback/download, media modal, mixed navigation skips documents, new tab, live update continuity, close cleanup, keyboard/focus, mobile layout passed');
+    console.log('Browser: PDF picker/MIME/download/auth/invalid-content/empty/oversized, uploads, playback/download, media modal, mixed navigation skips documents, new tab, live update continuity, close cleanup, keyboard/focus, mobile layout passed');
   } finally {
     if (browser) await browser.close();
     if (fixture.exitCode === null) {
       const closed = once(fixture, 'exit');
       fixture.kill('SIGTERM');
-      await closed;
+      const [code] = await closed;
+      assert.equal(code, 0, 'fixture closes and verifies stored PDF bytes');
     }
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

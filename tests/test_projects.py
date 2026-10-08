@@ -1,4 +1,6 @@
 import base64
+import contextlib
+import sqlite3
 import json
 import os
 from pathlib import Path
@@ -82,6 +84,161 @@ class ProjectStoreTests(unittest.TestCase):
 
 
 
+class ProjectWorkspaceStoreTests(unittest.TestCase):
+    """Service-free saved configuration contracts in disposable SQLite stores."""
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='agent-chat-workspace-registry-')
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        self.base = self.home / 'state.sqlite3'
+        Coordinator(self.base).close()
+        self.projects = Projects(self.base)
+
+    def member(self, name):
+        path = self.home / 'synthetic-Herd' / name
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def legacy_pair(self):
+        left = self.projects.create('INLST', instructions='Preserve INLST instructions')
+        right = self.projects.create('LMX', instructions='Preserve LMX instructions')
+        parent = str(self.home / 'synthetic-Herd')
+        with self.projects.connection() as db:
+            db.execute('UPDATE projects SET workspace=? WHERE id IN (?,?)', (parent, left['id'], right['id']))
+        first = [self.member(name) for name in ('inlst-core', 'inlst-api', 'inlst-client', 'inlst-web')]
+        second = [self.member(name) for name in ('lmx-account-registrar', 'lmx-api', 'lmx-web')]
+        return left, right, first, second
+
+    def assignment(self, project, roots, *, pending=False, registered=False):
+        from agent_chat.root_orchestrator import RootOrchestrator
+        RootOrchestrator(self.projects)
+        target = 'synthetic-po-' + project
+        request = 'synthetic-request-' + project
+        with self.projects.connection() as db:
+            db.execute('INSERT INTO root_projects(project_id,session_id,cwd,agent,request_id,orchestrator_session) VALUES(?,?,?,?,?,?)',
+                       (project, 'synthetic-root-' + project, roots[0], 'synthetic-po', request, target))
+            db.execute('CREATE TABLE IF NOT EXISTS root_project_workspaces(project_id TEXT,position INTEGER,path TEXT)')
+            db.executemany('INSERT INTO root_project_workspaces VALUES(?,?,?)', [(project, index, root) for index, root in enumerate(roots)])
+        with contextlib.closing(sqlite3.connect(self.projects.db_path(project))) as state:
+            if registered:
+                state.execute('INSERT INTO sessions(id,agent,registered_at) VALUES(?,?,?)', (target, 'synthetic-po', 1))
+            state.execute('CREATE TABLE IF NOT EXISTS session_resets(id TEXT PRIMARY KEY,status TEXT)')
+            state.execute('INSERT INTO session_resets VALUES(?,?)', (request, 'pending' if pending else 'completed'))
+            state.commit()
+        return target, request
+
+    def test_ordered_members_primary_alias_reopen_and_legacy_fallback(self):
+        paths = [self.member(name) for name in ('inlst-core', 'inlst-api', 'inlst-client', 'inlst-web')]
+        item = self.projects.create('INLST', instructions='literal assignment', workspaces=paths)
+        reopened = Projects(self.base)
+        self.assertEqual(reopened.get(item['id'])['workspaces'], paths)
+        self.assertEqual(reopened.get(item['id'])['workspace'], paths[0])
+        self.assertEqual(reopened.get(item['id'])['instructions'], 'literal assignment')
+        self.assertNotIn('instructions', reopened.list()[-1])
+        self.assertEqual(reopened.list()[-1]['workspaces'], paths)
+        legacy = self.projects.create('Legacy', self.member('legacy'), 'keep')
+        with self.projects.connection() as db:
+            db.execute('DELETE FROM project_workspaces WHERE project_id=?', (legacy['id'],))
+        self.assertEqual(Projects(self.base).get(legacy['id'])['workspaces'], [legacy['workspace']])
+        self.assertEqual(reopened.get('default')['workspaces'], [])
+
+    def test_legacy_parent_transition_is_atomic_and_primary_is_first_member(self):
+        left, right, first, second = self.legacy_pair()
+        before = [self.projects.get(item['id']) for item in (left, right)]
+        with self.assertRaisesRegex(CoordError, 'overlaps'):
+            self.projects.configure_workspaces(left['id'], first)
+        self.assertEqual([self.projects.get(item['id']) for item in (left, right)], before)
+        self.projects.configure_workspaces_batch([
+            {'id': left['id'], 'workspaces': first}, {'id': right['id'], 'workspaces': second}])
+        for item, paths in ((left, first), (right, second)):
+            changed = Projects(self.base).get(item['id'])
+            self.assertEqual(changed['workspace'], paths[0])
+            self.assertEqual(changed['workspaces'], paths)
+            self.assertEqual((changed['name'], changed['instructions']), (item['name'], item['instructions']))
+            self.assertNotIn(str(self.home / 'synthetic-Herd'), changed['workspaces'])
+
+    def test_invalid_members_and_unknown_or_duplicate_projects_preserve_saved_setup(self):
+        item = self.projects.create('Original', self.member('original'), 'keep instructions')
+        before = self.projects.get(item['id'])
+        parent = self.member('other')
+        invalid = [[], 'not-a-list', ['relative'], [parent + '/..'], [parent + '//child'],
+                   [parent + '/'], [parent + '\x00'], [parent + '\n'], [parent + '\x7f'], [parent, parent],
+                   [parent, parent + '/child'], [None], [parent] * 33]
+        for members in invalid:
+            with self.subTest(members=members), self.assertRaises(CoordError):
+                self.projects.configure_workspaces(item['id'], members)
+            self.assertEqual(self.projects.get(item['id']), before)
+        for batch in ([{'id': 'missing', 'workspaces': [parent]}],
+                      [{'id': item['id'], 'workspaces': [parent]}] * 2,
+                      [{'id': item['id'], 'workspaces': [parent], 'instructions': 'replace'}]):
+            with self.assertRaises(CoordError): self.projects.configure_workspaces_batch(batch)
+            self.assertEqual(self.projects.get(item['id']), before)
+
+    def test_cross_project_all_member_overlap_and_failed_create_leave_no_artifacts(self):
+        first = self.projects.create('First', workspaces=[self.member('first-main'), self.member('first-extra')])
+        second = self.projects.create('Second', self.member('second'), 'preserve')
+        before = self.projects.get(second['id'])
+        with self.assertRaisesRegex(CoordError, 'overlaps'):
+            self.projects.configure_workspaces(second['id'], [self.member('new-primary'), first['workspaces'][1] + '/nested'])
+        self.assertEqual(self.projects.get(second['id']), before)
+        count = len(self.projects.list())
+        directory = self.base.parent / (self.base.name + '.projects')
+        directories = set(directory.iterdir())
+        with self.assertRaisesRegex(CoordError, 'overlaps'):
+            self.projects.create('Conflict', workspaces=[first['workspaces'][1]])
+        self.assertEqual(len(self.projects.list()), count)
+        self.assertEqual(set(directory.iterdir()), directories)
+
+    def test_neutral_root_and_registered_or_pending_assignments_block_updates(self):
+        from agent_chat.root_orchestrator import RootOrchestrator
+        RootOrchestrator(self.projects)
+        item = self.projects.create('Target', self.member('target'), 'preserve')
+        neutral = self.member('neutral')
+        with self.projects.connection() as db:
+            db.execute('INSERT INTO root_config(singleton,home_project,home_session,thread_id,host_id,cwd,agent,created_at) VALUES(1,?,?,?,?,?,?,?)',
+                       ('default', 'root', 'synthetic-thread', 'synthetic-host', neutral, 'root', 1))
+        before = self.projects.get(item['id'])
+        with self.assertRaisesRegex(CoordError, 'neutral root'):
+            self.projects.configure_workspaces(item['id'], [neutral + '/nested'])
+        self.assertEqual(self.projects.get(item['id']), before)
+        # Remove only synthetic enrollment metadata; no server or root sync runs.
+        with self.projects.connection() as db: db.execute('DELETE FROM root_config')
+        owner = self.projects.create('Assigned', self.member('assigned-saved'))
+        active = [self.member('assigned-current'), self.member('assigned-secondary')]
+        self.assignment(owner['id'], active, registered=True)
+        with self.assertRaisesRegex(CoordError, 'active or pending'):
+            self.projects.configure_workspaces(item['id'], [active[1] + '/nested'])
+        self.assertEqual(self.projects.get(item['id']), before)
+        pending_owner = self.projects.create('Pending', self.member('pending-saved'))
+        pending = [self.member('pending-current')]
+        self.assignment(pending_owner['id'], pending, pending=True)
+        with self.assertRaisesRegex(CoordError, 'active or pending'):
+            self.projects.configure_workspaces(item['id'], [pending[0] + '/nested'])
+        self.assertEqual(self.projects.get(item['id']), before)
+
+    def test_legacy_parent_active_assignment_requires_proven_retirement(self):
+        left, right, first, second = self.legacy_pair()
+        parent = str(self.home / 'synthetic-Herd')
+        target, request = self.assignment(right['id'], [parent], registered=True)
+        before = [self.projects.get(item['id']) for item in (left, right)]
+        batch = [{'id': left['id'], 'workspaces': first}, {'id': right['id'], 'workspaces': second}]
+        with self.assertRaisesRegex(CoordError, 'active or pending'):
+            self.projects.configure_workspaces_batch(batch)
+        self.assertEqual([self.projects.get(item['id']) for item in (left, right)], before)
+        with contextlib.closing(sqlite3.connect(self.projects.db_path(right['id']))) as state:
+            state.execute('DELETE FROM sessions WHERE id=?', (target,))
+            state.execute("UPDATE session_resets SET status='pending' WHERE id=?", (request,))
+            state.commit()
+        with self.assertRaisesRegex(CoordError, 'active or pending'):
+            self.projects.configure_workspaces_batch(batch)
+        with contextlib.closing(sqlite3.connect(self.projects.db_path(right['id']))) as state:
+            state.execute("UPDATE session_resets SET status='completed' WHERE id=?", (request,))
+            state.commit()
+        self.projects.configure_workspaces_batch(batch)
+        self.assertEqual(self.projects.get(left['id'])['workspaces'], first)
+        self.assertEqual(self.projects.get(right['id'])['workspaces'], second)
+
+
 class ProjectHttpTests(RemoteWebFixture):
     def setUp(self):
         super().setUp()
@@ -152,3 +309,20 @@ class ProjectHttpTests(RemoteWebFixture):
             self.assertIsNone(c.db.execute("SELECT 1 FROM sessions WHERE id='a'").fetchone())
             self.assertEqual(c.db.execute("SELECT agent FROM retired_sessions WHERE id='a'").fetchone()[0], 'finished')
         finally: c.close()
+
+
+class WorkspaceCliTests(unittest.TestCase):
+    def test_repeatable_grouped_workspace_arguments_preserve_project_and_member_order(self):
+        import argparse
+        from agent_chat import cli
+        client = mock.Mock()
+        client.call.return_value = {'projects':[]}
+        args = argparse.Namespace(session=None,project='default',api_token=None)
+        with mock.patch('agent_chat.remote.HttpClient',return_value=client), mock.patch('builtins.print'):
+            cli._project_main(['configure-workspaces-batch','--project-workspace','INLST=/synthetic/inlst-core',
+                '--project-workspace','LMX=/synthetic/lmx-account-registrar','--project-workspace','INLST=/synthetic/inlst-api'],
+                args,'http://synthetic',mock.Mock())
+        self.assertEqual(client.call.call_args.args[1], {'op':'configure-workspaces-batch','assignments':[
+            {'id':'INLST','workspaces':['/synthetic/inlst-core','/synthetic/inlst-api']},
+            {'id':'LMX','workspaces':['/synthetic/lmx-account-registrar']}]})
+

@@ -625,3 +625,58 @@ class WebApiStartupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkspaceBrowserRouteTests(unittest.TestCase):
+    """Disposable loopback checks for operator browser auth and CSRF routing."""
+    def setUp(self):
+        from unittest import mock
+        self.tmp = tempfile.TemporaryDirectory(prefix='agent-chat-workspace-browser-route-')
+        self.addCleanup(self.tmp.cleanup)
+        sessions_root = pathlib.Path(self.tmp.name)/'synthetic-sessions'
+        sessions_root.mkdir()
+        database = pathlib.Path(self.tmp.name)/'state.sqlite3'
+        Coordinator(database).close()
+        self.server = create_server(database, port=0, sessions_root=sessions_root)
+        self.project = self.server.projects.create('Synthetic workspace target')['id']
+        self.root = dict(home_project='default',home_session='synthetic-root',host_id='synthetic-host',
+                         agent='root',thread_id=str(uuid.uuid4()),mode='running')
+        self.server.roots = mock.Mock()
+        self.server.roots.config.return_value = self.root
+        self.server.roots.provision.return_value = {'creation':{'id':'synthetic-request','status':'pending'}}
+        self.server.roots.reconfigure_workspaces.return_value = {'reconfiguration':{'id':'synthetic-request','status':'pending'}}
+        self.thread = threading.Thread(target=self.server.serve_forever,kwargs={'poll_interval':.01},daemon=True)
+        self.thread.start()
+        self.addCleanup(self.stop)
+
+    def stop(self):
+        self.server.shutdown(); self.thread.join(3)
+        self.server.stop_event.set(); self.server.server_close()
+        self.assertFalse(self.thread.is_alive())
+
+    def post(self, path, data, csrf=True):
+        connection = http.client.HTTPConnection('127.0.0.1',self.server.server_port,timeout=5)
+        try:
+            headers = {'Content-Type':'application/json'}
+            if csrf: headers['X-Agent-Chat-CSRF'] = self.server.csrf_token
+            connection.request('POST',path,json.dumps(data),headers)
+            response = connection.getresponse(); status=response.status; body=response.read()
+            return status,body
+        finally: connection.close()
+
+    def test_browser_provision_requires_csrf_and_derives_bound_root_identity(self):
+        data = dict(project=self.project,agent='orchestrator',request_id=str(uuid.uuid4()),confirm=True,model=None,effort=None)
+        self.assertEqual(self.post('/api/root/provision',data,csrf=False)[0],403)
+        self.server.roots.provision.assert_not_called()
+        self.assertEqual(self.post('/api/root/provision',data)[0],200)
+        self.server.roots.authorize.assert_called_with('default','synthetic-root','synthetic-host')
+        self.server.roots.provision.assert_called_with('default','synthetic-root','synthetic-host',self.project,'orchestrator',data['request_id'],True,None,None)
+        self.assertEqual(self.post('/api/root/provision',dict(data,host_id='foreign'))[0],400)
+
+    def test_browser_reconfigure_passes_exact_members_and_current_thread(self):
+        data = dict(project=self.project,expected_thread=str(uuid.uuid4()),workspaces=['/synthetic/main','/synthetic/secondary'],
+                    prompt='Read checkpoint.',request_id=str(uuid.uuid4()),confirm=True)
+        self.assertEqual(self.post('/api/root/workspaces',data)[0],200)
+        self.server.roots.reconfigure_workspaces.assert_called_with('default','synthetic-root','synthetic-host',self.project,
+            data['expected_thread'],data['workspaces'],data['prompt'],data['request_id'],True)
+

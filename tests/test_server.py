@@ -13,11 +13,39 @@ import time
 import unittest
 from unittest import mock
 import urllib.request
+import urllib.error
 
 from agent_chat import server
+from agent_chat.app_logging import LoggingConfig
 
 
 class ServerTests(unittest.TestCase):
+    def test_explicit_logging_runtime_is_owner_selected_and_fixed_schema(self):
+        with tempfile.TemporaryDirectory(prefix='agent-chat-log-') as directory:
+            db = Path(directory) / 'state.sqlite3'
+            log = Path(directory) / 'private' / 'server.jsonl'
+            server.Coordinator(db).close()
+            listener = server.create_server(db, port=0, api_token='test-only-logging-token-123456789',
+                                            logging_config=LoggingConfig(level='INFO', path=str(log)))
+            worker = threading.Thread(target=listener.serve_forever, daemon=True)
+            worker.start()
+            try:
+                request = urllib.request.Request(listener.origin + '/api/coord', data=b'{}', method='POST')
+                try:
+                    urllib.request.urlopen(request, timeout=3)
+                except urllib.error.HTTPError as error:
+                    self.assertEqual(error.code, 401)
+            finally:
+                listener.shutdown()
+                worker.join(3)
+                listener.server_close()
+            rows = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertIn('request_start', [row['event'] for row in rows])
+            self.assertIn('request_rejected', [row['event'] for row in rows])
+            self.assertTrue(all(set(row) == {'timestamp', 'monotonic_ns', 'sequence', 'component',
+                                             'channel', 'severity', 'event', 'correlation_id',
+                                             'error_category'} for row in rows))
+
     def test_numeric_listener_serves_without_reverse_dns(self):
         with tempfile.TemporaryDirectory(prefix='agent-chat-server-dns-') as directory:
             db = Path(directory) / 'state.sqlite3'

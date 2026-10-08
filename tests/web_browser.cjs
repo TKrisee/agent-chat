@@ -66,6 +66,67 @@ async function run() {
       assert.equal(await page.locator(selector).count(), 0, `${selector} should be removed`);
     }
 
+    // The guide is local-only: a first visit opens it, dismissal and completion persist,
+    // and an operator can still reopen it deliberately.
+    const setupGuide = page.locator('#setup-dialog');
+    const setupNext = page.locator('#setup-next');
+    await setupGuide.waitFor({ state: 'visible' });
+    assert.match(await setupGuide.textContent(), /Install the tools in the Agent chat checkout/);
+    assert.match(await setupGuide.textContent(), /If Homebrew is already installed on macOS/);
+    assert.match(await setupGuide.textContent(), /brew install python jq/);
+    assert.match(await setupGuide.textContent(), /python3 -m venv \.venv/);
+    assert.match(await setupGuide.textContent(), /agent-chat-server --db/);
+    assert.match(await setupGuide.textContent(), /http:\/\/127\.0\.0\.1:8765/);
+    assert.match(await setupGuide.textContent(), /AGENT_CHAT_SERVER/);
+    assert.match(await setupGuide.textContent(), /YOUR_PRIVATE_TOKEN/);
+    assert.match(await setupGuide.textContent(), /agent-chat-client bridge/);
+    assert.match(await setupGuide.textContent(), /agent-chat-root-guidance --workspace/);
+    assert.match(await setupGuide.textContent(), /does not start, create, or enroll any agent/);
+    assert.match(await setupGuide.textContent(), /Change a main agent’s model on the same thread/);
+    assert.match(await setupGuide.textContent(), /complete exact agent, bound thread, requested model, reasoning effort, and request-ID sequence/);
+    assert.equal((await setupGuide.textContent()).includes('agent-chat-client agent-status --refresh'), false, 'The optional workflow must not show an incomplete refresh command');
+    assert.equal(await page.locator('#setup-progress').textContent(), 'Step 1 of 7');
+    assert.equal(await page.locator('#setup-back').isDisabled(), true);
+    await setupNext.click();
+    assert.equal(await page.locator('#setup-progress').textContent(), 'Step 2 of 7');
+    const visibleSetupStep = setupGuide.locator('li:not([hidden])');
+    assert.match(await visibleSetupStep.textContent(), /Onboard Codex before connecting a bridge/);
+    assert.match(await visibleSetupStep.textContent(), /ChatGPT desktop app/);
+    assert.match(await visibleSetupStep.textContent(), /sign in, choose a project, and send a first message/);
+    assert.match(await visibleSetupStep.textContent(), /signed-in Codex session with that first response/);
+    const codexOnboarding = visibleSetupStep.getByRole('link', { name: 'OpenAI’s Codex onboarding', exact: true });
+    assert.equal(await codexOnboarding.getAttribute('href'), 'https://developers.openai.com/learn/developers-codex-plugin');
+    assert.equal(await codexOnboarding.getAttribute('target'), '_blank');
+    assert.equal(await codexOnboarding.getAttribute('rel'), 'noopener noreferrer');
+    await page.locator('#setup-back').click();
+    assert.equal(await page.locator('#setup-progress').textContent(), 'Step 1 of 7');
+    await page.getByRole('button', { name: 'Dismiss setup guide', exact: true }).click();
+    await page.waitForFunction(() => !document.querySelector('#setup-dialog').open);
+    assert.equal(await page.evaluate(() => localStorage.getItem('agent-chat.setup-guide.v1')), 'complete');
+    await page.reload();
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    assert.equal(await setupGuide.evaluate(dialog => dialog.open), false, 'Dismissed guide stays closed after refresh');
+    await page.getByRole('button', { name: 'Setup guide', exact: true }).click();
+    await setupGuide.waitFor({ state: 'visible' });
+    for (let step = 1; step < 7; step += 1) await setupNext.click();
+    assert.equal(await page.locator('#setup-progress').textContent(), 'Step 7 of 7');
+    assert.equal(await setupNext.textContent(), 'Finish');
+    assert.match(await setupGuide.textContent(), /Verify the connection and send a message/);
+    await setupNext.click();
+    await page.waitForFunction(() => !document.querySelector('#setup-dialog').open);
+    await page.goto(fixtureInfo.url + '?project=default');
+    await page.waitForFunction(() => !document.querySelector('#message-input').disabled);
+    assert.equal(await setupGuide.evaluate(dialog => dialog.open), false, 'Finished guide stays closed after navigation');
+    await page.evaluate(() => localStorage.removeItem('agent-chat.setup-guide.v1'));
+    await page.reload();
+    await setupGuide.waitFor({ state: 'visible' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, 'The first-time guide fits on a narrow screen');
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.keyboard.press('Escape');
+    await page.waitForFunction(() => !document.querySelector('#setup-dialog').open);
+    assert.equal(await page.evaluate(() => localStorage.getItem('agent-chat.setup-guide.v1')), 'complete', 'Escape dismisses the guide persistently');
+
     const input = page.locator('#message-input');
     await input.fill('Draft body stays intact');
     await page.getByRole('button', { name: 'Show conversations with alpha/nested', exact: true }).click();
@@ -775,7 +836,7 @@ c.close()
     const draftImages = page.locator('#composer-images .draft-image');
     await dropFiles([{ name: 'script.exe', type: 'image/png', bytes: [65] }]);
     assert.equal(await draftImages.count(), 0);
-    await page.locator('#composer-status').filter({ hasText: 'supported image, video or text file' }).waitFor();
+    await page.locator('#composer-status').filter({ hasText: 'supported image, video, PDF or text file' }).waitFor();
     const beforeImageDraft = await (await page.request.get(fixtureInfo.url + '/api/snapshot?project=' + projectId)).json();
     await dropFiles([{ name: 'drag.png', type: 'image/png', bytes: [...png] }]);
     await page.waitForFunction(() => document.querySelector('#composer-images img')?.naturalWidth === 1);
@@ -870,7 +931,7 @@ c.close()
     assert.equal(await imageGroupCard.locator('.attachment-preview').count(), 1);
     if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, 'image-group.png'), animations: 'disabled' });
     assert.deepEqual(errors, []);
-    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow', 'retired history attribution', 'project creation and rename', 'project live events', 'per-project drafts and reply reset', 'scoped project broadcasts', 'late cross-project response isolation', 'project reload persistence', 'mobile project selector'] }));
+    console.log(JSON.stringify({ passed: true, desktopFeedHeight, checks: ['first-visit setup guide, step navigation, dismiss, finish, refresh/navigation persistence and manual reopen', 'compact layout', 'mention composer', 'operator send via keyboard', 'literal unsafe text', 'live reply', 'live acknowledgement', 'persistent image preview and full-size link', 'dark operator contrast', 'quoted original jump', 'reply draft/cancel/recipient validation', 'user reply metadata', 'older original and history cursor', 'successive mention completion', 'atomic multi-recipient send and deduplication', 'single grouped card and individual acknowledgements', 'batch follow-up reply links', 'per-recipient acknowledgement filtering', 'mobile multi-tag layout', 'Markdown table and escaped/code pipes', 'Markdown headings, emphasis, nested lists, quotes and fences', 'safe links and literal raw HTML', 'existing message Markdown without rewriting storage', 'operator Markdown compose and contrast', 'mobile Markdown layout', 'untagged room broadcast to main agents and subagents', 'broadcast grouped delivery and unread inboxes', 'malformed tags cannot broadcast', 'untagged reply preserves original recipients', 'search', 'pause/resume', 'mobile agent filter', 'resources drawer', 'session removal sibling controls', 'removal refusal preserves state', 'removal live snapshot and retained history', 'no page errors or horizontal overflow', 'retired history attribution', 'project creation and rename', 'project live events', 'per-project drafts and reply reset', 'scoped project broadcasts', 'late cross-project response isolation', 'project reload persistence', 'mobile project selector'] }));
   } finally {
     if (browser) await browser.close();
     fixture.kill('SIGTERM');

@@ -34,6 +34,10 @@ class BridgeState:
     def __init__(self, coord: Coordinator):
         self.coord = coord
         self.db = coord.db
+        self.policy_store = None
+        import socket
+        self.policy_host = socket.gethostname()
+        self.policy_project = str(coord.path.resolve())
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS bridge_bindings (
                 session_id TEXT PRIMARY KEY, thread_id TEXT UNIQUE,
@@ -57,6 +61,8 @@ class BridgeState:
         ''')
         if 'project_scope_worker' not in {row['name'] for row in self.db.execute('PRAGMA table_info(bridge_client_runtime)')}:
             self.db.execute('ALTER TABLE bridge_client_runtime ADD COLUMN project_scope_worker INTEGER NOT NULL DEFAULT 0')
+        if 'project_workspaces_worker' not in {row['name'] for row in self.db.execute('PRAGMA table_info(bridge_client_runtime)')}:
+            self.db.execute('ALTER TABLE bridge_client_runtime ADD COLUMN project_workspaces_worker INTEGER NOT NULL DEFAULT 0')
         from .session_reset import SessionResetState
         SessionResetState(coord)
         from .agent_control import AgentControlState
@@ -148,7 +154,9 @@ class BridgeState:
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))
             ORDER BY m.seq''')]
         from .root_orchestrator import projection
-        return [message for message in messages if not (projection(self.db, message['recipient_session']) or {}).get('paused')]
+        from .root_lifecycle import stopped
+        from .root_restart import held
+        return [message for message in messages if not held(self.db,message['recipient_session']) and not stopped(self.db,message['recipient_session']) and not (projection(self.db, message['recipient_session']) or {}).get('paused')]
 
     def still_unread(self, job_id):
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
@@ -185,6 +193,25 @@ class BridgeState:
     def connection_metadata(self):
         return {'database': str(self.coord.path.resolve())}
 
+    def policies(self):
+        if self.policy_store is None:
+            from .policy_store import PolicyStore
+            self.policy_store = PolicyStore(self.coord.path)
+        return self.policy_store
+
+    def policy_consumed(self, thread_id):
+        return self.policies().consumed(self.policy_host,thread_id)
+
+    def policy_offer(self, kind, client_id, thread_id, payload):
+        return self.policies().offer(self.policy_host,self.policy_project,kind,client_id,thread_id,payload)
+
+    def policy_pending(self):
+        bound={row['thread_id'] for row in self.db.execute('SELECT thread_id FROM bridge_bindings WHERE parent_session IS NULL')}
+        return [offer for offer in self.policies().pending(self.policy_host) if offer['thread'] in bound]
+
+    def policy_receipt(self, offer, turn_id):
+        return self.policies().receipt(self.policy_host,offer['thread'],offer['client_id'],offer['version'],turn_id)
+
     def prepare(self, thread_id, messages, payload):
         job_id = 'wake_' + uuid.uuid4().hex
         with self.coord.tx():
@@ -219,14 +246,22 @@ class BridgeState:
         jobs = [dict(r) for r in self.db.execute("""SELECT j.* FROM bridge_jobs j WHERE j.status NOT IN ('dispatched','cancelled')
             AND NOT (j.status='prepared' AND EXISTS (SELECT 1 FROM bridge_bindings b JOIN agent_controls c ON c.target_session=b.session_id WHERE b.thread_id=j.thread_id AND c.mode<>'running')) ORDER BY j.created_at""")]
         from .root_orchestrator import projection
+        from .root_restart import held
         def paused(job):
             row = self.db.execute('SELECT session_id FROM bridge_bindings WHERE thread_id=?', (job['thread_id'],)).fetchone()
-            return row and (projection(self.db, row['session_id']) or {}).get('paused')
-        return [job for job in jobs if not (job['status'] == 'prepared' and paused(job))]
+            return row and (held(self.db,row['session_id']) or (projection(self.db, row['session_id']) or {}).get('paused'))
+        from .root_lifecycle import stopped
+        return [job for job in jobs if not paused(job)
+                and not any(stopped(self.db,row['recipient_session']) for row in self.db.execute(
+                    'SELECT m.recipient_session FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.job_id=?', (job['id'],)))]
 
     def update(self, job_id, status, queue_id=None, error=None):
         def write():
             if status in ('adding','starting'):
+                from .root_lifecycle import stopped
+                if any(stopped(self.db,row['recipient_session']) for row in self.db.execute(
+                    'SELECT m.recipient_session FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.job_id=?', (job_id,))):
+                    raise CoordError('root stop-all barrier withheld native wake admission')
                 row = self.db.execute('SELECT b.session_id FROM bridge_jobs j JOIN bridge_bindings b ON b.thread_id=j.thread_id WHERE j.id=?', (job_id,)).fetchone()
                 if row: assert_agent_running(self.db, row['session_id'])
             self.db.execute('UPDATE bridge_jobs SET status=?,queue_id=COALESCE(?,queue_id),error=?,updated_at=? WHERE id=?',
@@ -248,16 +283,31 @@ class BridgeState:
             self.db.execute("UPDATE bridge_jobs SET status='prepared',queue_id=NULL,error=NULL,updated_at=? WHERE id=?", (time.time(), job_id))
         return self.job(job_id)
 
-    def heartbeat(self, server, pid, error=None, *, host_id=None, project_scope_worker=False):
+    def heartbeat(self, server, pid, error=None, *, host_id=None, project_scope_worker=False, project_workspaces_worker=False):
         if host_id is None:
             self.db.execute('INSERT OR REPLACE INTO bridge_runtime VALUES(1,?,?,?,?)', (server, pid, time.time(), error))
         else:
-            self.db.execute('INSERT OR REPLACE INTO bridge_client_runtime VALUES(?,?,?,?,?,?)',
-                            (host_id, server, pid, time.time(), error, int(project_scope_worker)))
+            self.db.execute('INSERT OR REPLACE INTO bridge_client_runtime(host_id,server,pid,heartbeat,error,project_scope_worker,project_workspaces_worker) VALUES(?,?,?,?,?,?,?)',
+                            (host_id, server, pid, time.time(), error, int(project_scope_worker), int(project_workspaces_worker)))
 
     def observe(self, thread_id, state, error=None):
         self.db.execute('INSERT OR REPLACE INTO bridge_observations VALUES(?,?,?,?)',
                         (thread_id, state, error, time.time()))
+
+    def supervisor_jobs(self):
+        from .supervisor import SupervisorState
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_session_hosts'").fetchone():
+            return []  # Legacy local dispatch has no authenticated host supervisor.
+        host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (self.coord.require_session(),)).fetchone()
+        return SupervisorState(self.coord).jobs(host['host_id']) if host else []
+
+    def supervisor_observe(self, job, report):
+        from .supervisor import SupervisorState
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_session_hosts'").fetchone():
+            raise CoordError('supervisor observation requires an authenticated host')
+        host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (self.coord.require_session(),)).fetchone()
+        if not host: raise CoordError('supervisor target has no authenticated host')
+        return SupervisorState(self.coord).observe(job, report, host['host_id'])
 
     def resolve_delivered(self, job_id, confirmed=False):
         if not confirmed:

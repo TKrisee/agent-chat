@@ -67,6 +67,20 @@ The generated server uses the existing loopback defaults. Remote access still
 requires the documented HTTPS proxy or SSH tunnel; service installation does
 not expose the HTTP port to the network.
 
+To stage bounded private server events, pass an explicit severity and absolute
+destination during installation:
+
+```sh
+agent-chat-service install --component server --no-start \
+  --db /absolute/state.sqlite3 --log-level INFO \
+  --log-file /absolute/private/server-events.jsonl
+```
+
+Logging defaults to `OFF` and does not inherit environment settings. The wrapper
+contains only the selected flags and writes fixed-schema owner-only events
+locally. Reinstall or perform the separately authorized server reload before an
+existing service uses changed logging configuration.
+
 ## Manage
 
 Each command accepts `--component server`, `--component client`, or the default

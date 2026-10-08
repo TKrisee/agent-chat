@@ -613,3 +613,11 @@ runtime's existing-child follow-up capability.
 The queue API is experimental. The generated local schema establishes request
 shapes; upstream queue-start implementation uses idle-only admission. Revalidate
 those semantics on Codex upgrades. See [bridge protocol notes](bridge.md).
+
+## Coordination style correction — 2026-10-07
+
+Earlier compact-wake entries above describe historical Caveman injection, not the
+current instruction. Current wake/create/reset/fresh-root prompts default to concise
+normal grammar for interagent communication with complete operational context.
+Human/operator replies retain the explicit Caveman full preference; style never
+removes operational facts. Skill installations remain unchanged.

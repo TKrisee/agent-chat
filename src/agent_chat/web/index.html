@@ -18,16 +18,11 @@
         <span class="brand-mark">ir<span>.</span></span>
         <span>AGENT CHAT<small>Agent workspace</small></span>
       </a>
-      <div class="project-controls">
-        <label class="sr-only" for="project-select">Project</label>
-        <div class="project-selection">
-          <select id="project-select" aria-label="Project" disabled><option value="default">Loading projects…</option></select>
-        </div>
-        <button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button>
-        <button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button>
-      </div>
       <div class="room-label">COMMUNICATIONS</div>
       <button class="room-button" id="root-conversation" type="button" hidden><span class="room-icon" aria-hidden="true">👑</span><span>Root orchestrator</span></button>
+      <!-- agent-chat:all-communication-menu -->
+      <div class="section-label project-nav-heading"><span>PROJECTS</span><div><button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button><button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button></div></div>
+      <nav id="project-list" class="project-nav-list" aria-label="Projects"></nav>
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
         <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
       </button>
@@ -40,17 +35,18 @@
       <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false"><span id="resources-button-label">Resources</span> <span id="mobile-resource-count">0</span></button></div>
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
-        <div class="conversation-actions">
-          <span class="weekly-usage" id="weekly-usage" role="status">Weekly usage unavailable</span>
-          <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
-          <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog"><span class="measurement-indicator" id="measurement-indicator" aria-hidden="true" hidden></span>Measure usage</button>
+        <div class="conversation-actions" aria-label="Conversation controls">
+          <div class="conversation-utilities" role="group" aria-label="Setup and usage controls">
+            <button class="quiet-button setup-button" id="setup-guide" type="button" aria-haspopup="dialog">Setup guide</button>
+            <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
+            <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog"><span class="measurement-indicator" id="measurement-indicator" aria-hidden="true" hidden></span>Measure usage</button>
+          </div>
           <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
         </div>
       </div>
       <div class="toolbar">
         <label class="search"><span aria-hidden="true">⌕</span><input type="search" id="search" placeholder="Search messages or agents…" aria-label="Search messages or agents"><kbd aria-hidden="true">/</kbd></label>
-        <button class="quiet-button recipient-filter" id="to-me-filter" type="button" aria-pressed="false" aria-controls="messages" title="Show messages directed at you">To me</button>
-        <label class="status-filter"><span class="sr-only">Acknowledgement filter</span><select id="ack-filter"><option value="all">All messages</option><option value="pending">Awaiting acknowledgement</option><option value="acknowledged">Acknowledged</option></select></label>
+        <fieldset class="feed-filters"><legend>Feed</legend><button class="quiet-button recipient-filter" id="to-me-filter" type="button" aria-pressed="false" aria-controls="messages" title="Show messages directed at you">To me</button><label class="status-filter"><span class="sr-only">Acknowledgement filter</span><select id="ack-filter"><option value="all">All messages</option><option value="pending">Awaiting acknowledgement</option><option value="acknowledged">Acknowledged</option></select></label></fieldset>
       </div>
       <div class="connection-notice" id="connection-notice" hidden>Connection interrupted. Reconnecting automatically… <button id="retry-button">Retry now</button></div>
       <div class="feed-wrap">
@@ -73,13 +69,15 @@
           <button class="cancel-reply" id="cancel-reply" type="button" aria-label="Cancel reply">×</button>
         </div>
         <div class="composer-images" id="composer-images" role="list" aria-label="File attachments" hidden></div>
-        <input id="image-input" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.mp4,.m4v,.mov,.webm,.txt,.md,.markdown,.json,.xml,.csv,.tsv,.log,.yaml,.yml,.toml" multiple hidden>
+        <input id="image-input" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.mp4,.m4v,.mov,.webm,.pdf,.txt,.md,.markdown,.json,.xml,.csv,.tsv,.log,.yaml,.yml,.toml" multiple hidden>
         <label class="sr-only" for="message-input">Your message</label>
         <div class="mention-list" id="mention-list" role="listbox" aria-label="Agent mentions" hidden></div>
         <div class="composer-input-row">
-          <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach files" title="Attach up to 50 supported files, 10 MiB each" disabled>Attach</button>
           <textarea id="message-input" placeholder="Message all agents, @tag recipients, or drop files…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
-          <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
+          <div class="composer-actions" role="group" aria-label="Message actions">
+            <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach files" title="Attach up to 50 supported files, 10 MiB each" disabled>＋ Attach</button>
+            <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
+          </div>
         </div>
         <span class="composer-status" id="composer-status" role="status" hidden></span>
       </form>
@@ -90,7 +88,14 @@
         <p class="root-kicker">PROJECT OVERVIEW</p>
         <h2 id="root-directory-title">Your projects</h2>
         <p class="root-description">Decisions here. Project work stays with each team.</p>
+        <button type="button" id="manage-root-workspaces" class="quiet-button">Edit workspace groups</button>
         <div id="root-projects"></div>
+      </section>
+      <section class="project-directory" id="project-directory" aria-labelledby="project-directory-title">
+        <p class="project-directory-kicker">PROJECT</p>
+        <h2 id="project-directory-title">Project workspaces</h2>
+        <ol class="project-directory-value" id="project-workspace-path" aria-live="polite"><li>Loading configured workspaces…</li></ol>
+        <button type="button" id="manage-project-workspaces" class="quiet-button">Edit workspace groups</button>
       </section>
       <div class="resource-summary"><span class="resource-summary-number" id="held-count">0</span><span>resources held<span id="waiting-count">No agents waiting</span></span></div>
       <nav class="resource-pages" aria-label="Resource pages">
@@ -108,14 +113,24 @@
       <label for="project-name">Project name</label>
       <input id="project-name" name="name" maxlength="80" required autocomplete="off">
       <div id="project-creation-scope">
-        <label for="project-workspace">Workspace on agent host</label>
-        <input id="project-workspace" name="workspace" maxlength="4096" placeholder="/absolute/path/to/project" autocomplete="off">
+        <label for="project-workspaces">Project workspaces on the agent host</label>
+        <textarea id="project-workspaces" name="workspaces" rows="4" placeholder="/absolute/canonical/primary-directory&#10;/absolute/canonical/related-directory" autocomplete="off"></textarea>
+        <p class="project-scope-help">Enter one canonical absolute directory per line. The first is the primary workspace; each line grants access to only that directory.</p>
         <label for="project-instructions">Project instructions</label>
         <textarea id="project-instructions" name="instructions" rows="5" maxlength="59000" placeholder="Describe the goal, scope and constraints for this project's orchestrator."></textarea>
-        <p class="project-scope-help">Provide both to let your root orchestrator start the project team. Leave blank to set up later.</p>
+        <p class="project-scope-help">Provide workspaces and instructions to let your root orchestrator start the project team. Leave blank to set up later.</p>
       </div>
       <p id="project-error" class="composer-status error" role="alert" hidden></p>
       <div class="project-dialog-actions"><button type="button" id="cancel-project" class="quiet-button">Cancel</button><button type="submit" id="save-project" class="send-button">Create project</button></div>
+    </form>
+  </dialog>
+  <dialog id="workspace-groups-dialog" aria-labelledby="workspace-groups-title">
+    <form id="workspace-groups-form">
+      <h2 id="workspace-groups-title">Project workspace groups</h2>
+        <p class="project-scope-help">Enter one canonical absolute directory per line. The first is primary. Leave a project blank to keep its saved assignment unchanged. Saving updates project setup only; change a running team from the root overview after reviewing and confirming the workspace update.</p>
+      <div id="workspace-groups-list"></div>
+      <p id="workspace-groups-error" class="composer-status error" role="alert" hidden></p>
+      <div class="project-dialog-actions"><button type="button" id="cancel-workspace-groups" class="quiet-button">Cancel</button><button type="submit" id="save-workspace-groups" class="send-button">Save workspace groups</button></div>
     </form>
   </dialog>
   <dialog id="measurement-dialog" aria-labelledby="measurement-dialog-title">
@@ -183,6 +198,23 @@
       <p id="reset-error" class="composer-status error" role="alert" hidden></p>
       <div class="usage-dialog-actions"><button id="cancel-reset-request" class="quiet-button" type="button" hidden>Cancel pending reset</button><span class="usage-actions-spacer"></span><button id="submit-reset" class="send-button" type="submit">Start fresh conversation</button></div>
     </form>
+  </dialog>
+  <dialog id="setup-dialog" aria-labelledby="setup-title" aria-describedby="setup-progress">
+    <section class="setup-guide-panel">
+      <header class="usage-dialog-heading"><div><p class="usage-kicker">GET STARTED</p><h2 id="setup-title">Set up Agent chat</h2></div><button id="dismiss-setup" class="quiet-button usage-close" type="button" aria-label="Dismiss setup guide">×</button></header>
+      <p class="setup-intro">Agent chat is a local browser room for talking to already-connected agents. A bridge is the local program that connects this room to Codex. Finish this guide when the bridge is connected and a message to a visible agent appears in the feed.</p>
+      <ol class="setup-steps" id="setup-steps">
+        <li><strong>Install the tools in the Agent chat checkout</strong><span>On the machine where you will run agents, install Python 3.10+ and <code>jq</code> with that machine’s supported package manager. If Homebrew is already installed on macOS, <code>brew install python jq</code> does that; on Debian/Ubuntu use <code>sudo apt-get install python3 python3-venv python3-pip jq procps</code>. Then open a terminal in your Agent chat checkout: <code>cd /absolute/path/to/agent-chat</code> chooses that folder; <code>python3 -m venv .venv</code> creates an isolated Python environment; <code>. .venv/bin/activate</code> selects it for this terminal; <code>python -m pip install .</code> installs Agent chat; and <code>agent-chat-client --help</code> confirms the client is ready. Keep this terminal open for the next steps.</span></li>
+        <li><strong>Onboard Codex before connecting a bridge</strong><span>Start with <a href="https://developers.openai.com/learn/developers-codex-plugin" target="_blank" rel="noopener noreferrer">OpenAI’s Codex onboarding</a>. For newcomers, it directs macOS and Windows users to the ChatGPT desktop app and the Codex quickstart: sign in, choose a project, and send a first message. A signed-in Codex session with that first response in the chosen project is the success indicator. Codex handles its own authentication; Agent chat does not select providers or models and never stores Codex credentials in this browser or local storage. Continue only after Codex can open that local session.</span></li>
+        <li><strong>Start the local chat server and open the browser</strong><span>On the machine that stores shared chat data, run <code>agent-chat-server --db /absolute/path/to/state.sqlite3</code>. This starts the browser room and HTTP API; the default local address is <code>http://127.0.0.1:8765</code>. Open that address in a browser, sign in as <code>operator</code>, and use the privately supplied Agent chat API token as the password. A loaded room is success; leave the server terminal running and configure the workspace connection next.</span></li>
+        <li><strong>Configure and start the workspace bridge</strong><span>In the activated checkout terminal on the workspace machine, set Agent chat’s connection variables: <code>export AGENT_CHAT_SERVER=http://127.0.0.1:8765</code>, <code>export AGENT_CHAT_API_TOKEN=YOUR_PRIVATE_TOKEN</code>, <code>export AGENT_CHAT_PROJECT=default</code>, <code>export AGENT_CHAT_ROOT=/absolute/path/to/your-project</code>, then <code>unset AGENT_CHAT_DB</code>. Replace only the non-secret placeholder with the token provided privately; these variables authenticate Agent chat and do not sign in to a model provider. Run <code>agent-chat-client doctor --bridge</code> to check the connection, then <code>agent-chat-client bridge</code> to start it. Continue when it prints <code>ready</code> and the sidebar says the wake bridge is connected.</span></li>
+        <li><strong>Understand and prepare the neutral root</strong><span>A neutral root is a dedicated folder outside project workspaces. Root is the one Codex conversation that coordinates project teams. <code>AGENTS.md</code> is the instruction file that an agent reads in its workspace. In the neutral-root folder, run <code>agent-chat-root-guidance --workspace /absolute/neutral-root --install</code>; it creates a baseline only when <code>AGENTS.md</code> is absent and preserves an existing developer file. This install does not start, create, or enroll any agent. An authorized administrator must prepare and enroll root or another agent before messaging. If no connected agent is visible in the sidebar, stop here and ask that administrator for help; do not try to create one from this guide.</span></li>
+        <li><strong>Optional: change an existing agent’s model or reasoning</strong><span>This is administration, not normal setup, and it is separate from Codex authentication. Only an authorized owner of an existing main agent should use the named bounded workflow in <code>docs/agents.md</code>, “Change a main agent’s model on the same thread,” after the agent is idle with no active turn, queued input, or open guard. That workflow supplies the complete exact agent, bound thread, requested model, reasoning effort, and request-ID sequence plus its status readback. Leave this step for the existing agent owner; it is not part of first-time authentication or messaging.</span></li>
+        <li><strong>Verify the connection and send a message</strong><span>Once an administrator has made a connected agent visible, select it in the sidebar and check its current settings. Send a short message; success is that the message appears in the feed while the bridge remains connected. Use <code>@agent</code> only to choose recipients, replies keep their recipients, and Attach stays beside Send.</span></li>
+      </ol>
+      <p class="setup-progress" id="setup-progress" role="status"></p>
+      <footer class="usage-dialog-actions"><button id="setup-back" class="quiet-button" type="button">Back</button><span class="usage-actions-spacer"></span><button id="setup-next" class="send-button" type="button">Next</button></footer>
+    </section>
   </dialog>
   <dialog id="media-dialog" aria-labelledby="media-title" aria-describedby="media-description">
     <header class="media-heading">

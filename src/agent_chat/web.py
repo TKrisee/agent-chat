@@ -28,12 +28,16 @@ from .measurement import MeasurementStore
 from .session_models import SessionModels
 from .measurement_pause import request_pauses
 
-from .auth import authorized, validate_config, origin
+from .auth import authorized, validate_config, origin, proxy_networks, RequestOrigins
+from .app_logging import LoggingConfig, configure, new_correlation_id
 
 HERE = Path(__file__).resolve().parent
 STATIC = {
     '/': ('index.html', 'text/html; charset=utf-8'),
     '/root': ('index.html', 'text/html; charset=utf-8'),
+    '/communications': ('communication-view.html', 'text/html; charset=utf-8'),
+    '/communication-view.js': ('communication-view.js', 'application/javascript; charset=utf-8'),
+    '/communication-view.css': ('communication-view.css', 'text/css; charset=utf-8'),
     '/markdown.js': ('markdown.js', 'application/javascript; charset=utf-8'),
     '/app.js': ('app.js', 'application/javascript; charset=utf-8'),
     '/style.css': ('style.css', 'text/css; charset=utf-8'),
@@ -101,7 +105,9 @@ def service_notice_ids(db, ids):
 
 
 def message_rows(rows, agents, db, project_operator=None):
-    items = [dict(row, sender_agent=agents.get(row['sender_session']),
+    operators = {row['session_id'] for row in db.execute('SELECT session_id FROM operator_identities')}
+    items = [dict(row, sender_role='human_operator' if row['sender_session'] in operators else 'agent',
+                  recipient_role='human_operator' if row['recipient_session'] in operators else 'agent', sender_agent=agents.get(row['sender_session']),
                   recipient_agent=agents.get(row['recipient_session']), attachments=[],
                   reply_to=None, reply_preview=None, batch_id=None, deliveries=[]) for row in rows]
     if not items:
@@ -109,8 +115,13 @@ def message_rows(rows, agents, db, project_operator=None):
     by_message = {item['id']: item for item in items}
     marks = ','.join('?' for _ in by_message)
     notices = service_notice_ids(db, by_message)
+    origins = set()
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_message_origins'").fetchone():
+        origins = {row['message_id'] for row in db.execute(
+            f'SELECT message_id FROM operator_message_origins WHERE message_id IN ({marks})',list(by_message))}
     for item in items:
         item['service_notice'] = item['id'] in notices
+        item['instruction_origin'] = 'authenticated_operator_ui' if item['id'] in origins else 'agent_message'
     if attachment_table(db):
         for row in db.execute(f'SELECT id,message_id,name,mime,size FROM attachments WHERE message_id IN ({marks}) ORDER BY rowid', list(by_message)):
             by_message[row['message_id']]['attachments'].append({
@@ -322,6 +333,7 @@ def operator_session(db_path):
         coord = Coordinator(db_path, sid)
         try:
             info = coord.register('operator')
+            coord.db.execute('INSERT OR IGNORE INTO operator_identities VALUES(?)', (info['session'],))
         finally:
             coord.close()
         if not stored:
@@ -342,15 +354,26 @@ class WebServer(http.server.ThreadingHTTPServer):
         socketserver.TCPServer.server_bind(self)
         self.server_name, self.server_port = self.server_address[:2]
 
-    def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None, sessions_root=None):
+    def __init__(self, address, handler, db_path, web_root, api_token=None, public_url=None, sessions_root=None,
+                 trusted_proxies=(), inbox_diagnostics=None, logging_config=None):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.web_root = Path(web_root).resolve()
         self.stop_event = threading.Event()
         self.csrf_token = secrets.token_urlsafe(32)
         self.api_token = api_token
+        self.inbox_diagnostics = None
+        self.logging = configure(logging_config or LoggingConfig())
+        self.log = self.logging.logger('agent_chat.web')
+        self.server_log = self.logging.logger('agent_chat.server')
+        self.coordinator_log = self.logging.logger('agent_chat.coordinator')
+        self.log.event('startup')
+        if inbox_diagnostics:
+            from .inbox_diagnostics import InboxDiagnostics
+            self.inbox_diagnostics = InboxDiagnostics(inbox_diagnostics)
         self.listen_host = address[0]
         self.address_family = socket.AF_INET6 if ':' in address[0] else socket.AF_INET
         self.public_url = validate_config(address[0], api_token, public_url)
+        self.trusted_proxies = proxy_networks(trusted_proxies, api_token, self.public_url)
         self.bridge_manager = None
         self.usage = UsageStore(self.db_path)
         self.measurements = None
@@ -362,6 +385,7 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.project_lock = threading.RLock()
         super().__init__(address, handler)
         try:
+            self.request_origins = RequestOrigins(address[0], self.server_port, self.public_url, self.trusted_proxies)
             self.sender_session = operator_session(self.db_path)
             if api_token:
                 from .bridge_lease import BridgeManager
@@ -369,6 +393,7 @@ class WebServer(http.server.ThreadingHTTPServer):
             self.measurements = MeasurementStore(self.db_path, sessions_root=sessions_root, usage_store=self.usage,
                                                  pause_callback=self.pause_measured_agents)
             if self.bridge_manager:
+                self.bridge_manager.roots = self.roots
                 self.bridge_manager.measurements = self.measurements
             self.session_models = SessionModels(self.measurements.sessions_root)
             self.roots.sync()
@@ -416,10 +441,15 @@ class WebServer(http.server.ThreadingHTTPServer):
                     from .bridge_lease import BridgeManager
                     manager = BridgeManager(path, usage_store=self.usage)
                     manager.measurements, manager.project_id = self.measurements, item['id']
+                    manager.roots = self.roots
                 self.project_contexts[item['id']] = (path, sender, manager)
             return self.project_contexts[item['id']]
 
     def server_close(self):
+        self.log.event('shutdown')
+        self.logging.close()
+        if self.inbox_diagnostics:
+            self.inbox_diagnostics.close()
         if self.measurements:
             self.measurements.close()
         for _, _, manager in self.project_contexts.values():
@@ -440,18 +470,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(10)
+        self._inbox_trace = None
+        self._log_id = new_correlation_id()
+        self._request_started = False
+        self._request_terminal = False
+
+    def _event(self, event, *, level='INFO', error=None, category=None):
+        if error is not None:
+            self.server.log.error(event, error, correlation_id=self._log_id)
+        else:
+            self.server.log.event(event, level=level, correlation_id=self._log_id,
+                                  error_category=category)
+
+    def _finish_request(self, *, error=None, rejected=False):
+        if not self._request_started or self._request_terminal:
+            return
+        self._request_terminal = True
+        if rejected:
+            self._event('request_rejected', level='WARNING', category='authentication')
+        elif error is None:
+            self._event('request_complete')
+        else:
+            from .app_logging import error_category
+            self._event('request_complete', level='ERROR', category=error_category(error))
 
     def log_message(self, *args):
         pass
 
     def trusted(self):
-        expected = self.server.origin
-        hosts = self.headers.get_all('Host', [])
-        try:
-            return (len(hosts) == 1 and origin(urlsplit(expected).scheme + '://' + hosts[0]) == expected and
-                    (self.headers.get('Origin') is None or origin(self.headers['Origin']) == expected))
-        except ValueError:
-            return False
+        return self.server.request_origins.trusted(self.headers, self.client_address[0])
 
     def authenticate(self, bearer_only=False):
         if authorized(self.headers.get('Authorization', ''), self.server.api_token, bearer_only):
@@ -485,23 +532,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return value
 
     def respond(self, code, raw, mime, *, download_name=None, extra_headers=None):
-        self.send_response(code)
-        self.send_header('Content-Type', mime)
-        self.send_header('Content-Length', str(len(raw)))
-        self.send_header('Cache-Control', 'no-store')
-        self.send_header('X-Content-Type-Options', 'nosniff')
-        self.send_header('Content-Security-Policy', "default-src 'none'; sandbox" if download_name is not None else CSP)
-        if download_name is not None:
-            self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(download_name, safe=''))
-        for name, value in (extra_headers or {}).items():
-            self.send_header(name, value)
-        self.send_header('Connection', 'close')
-        self.end_headers()
-        self.close_connection = True
+        trace = self._inbox_trace
+        if trace: trace.mark('response', 'start')
         try:
-            self.wfile.write(raw)
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
+            self.send_response(code)
+            self.send_header('Content-Type', mime)
+            self.send_header('Content-Length', str(len(raw)))
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Content-Security-Policy', "default-src 'none'; sandbox" if download_name is not None else CSP)
+            if download_name is not None:
+                self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + quote(download_name, safe=''))
+            for name, value in (extra_headers or {}).items():
+                self.send_header(name, value)
+            self.send_header('Connection', 'close')
+            self.end_headers()
+            self.close_connection = True
+            try:
+                self.wfile.write(raw)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                if trace: trace.mark('response', 'end', 'error')
+                self._finish_request(error=TimeoutError())
+            else:
+                if trace: trace.mark('response', 'end')
+                self._finish_request()
+        except BaseException:
+            if trace: trace.mark('response', 'end', 'error')
+            self._finish_request(error=RuntimeError())
+            raise
 
     def respond_video(self, content, mime):
         headers = {'Accept-Ranges': 'bytes'}
@@ -597,7 +655,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 paging[name] = int(values[0])
             if not 1 <= paging['resource_limit'] <= 200:
                 raise ValueError('Resource page limit must be from 1 to 200')
-        return dict(snapshot(self.db_path, operator=self.sender_session, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.server.projects.get(self.project['id']), projects=self.server.listed_projects(), root_orchestrator=self.root_summary())
+        return dict(snapshot(self.db_path, operator=self.sender_session, usage_store=self.server.usage, session_models=self.server.session_models, **paging), project=self.selected_project(), projects=self.server.listed_projects(), root_orchestrator=self.root_summary())
+
+    def selected_project(self):
+        project = dict(self.project)
+        for configured in self.server.roots.status().get('projects', []):
+            if configured['project_id'] == project['id'] and configured.get('cwd'):
+                project['cwd'] = configured['cwd']
+                break
+        return project
 
     def root_summary(self):
         root = self.server.roots.config()
@@ -616,9 +682,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             root_view = url.path.startswith('/api/root/') and url.path != '/api/root/rpc'
             root = self.select_root_home() if root_view else None
-            if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view:
+            if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view and not url.path.startswith('/api/communications'):
                 self.select_project()
-            if url.path == '/api/projects':
+            if url.path in ('/api/communications','/api/communications/message'):
+                from .communication_view import CommunicationView
+                params = parse_qs(url.query,keep_blank_values=True)
+                allowed = {'project','id'} if url.path.endswith('/message') else {'project','agent','q','before','limit'}
+                if set(params)-allowed or any(len(value)!=1 for value in params.values()):
+                    raise ValueError('invalid communication query parameters')
+                values = {key:value[0] for key,value in params.items()}
+                view = CommunicationView(self.server.projects)
+                self.project = {'id':'default'}  # Aggregate rows carry their own source project.
+                if url.path.endswith('/message'):
+                    if set(values)!={'project','id'}: raise ValueError('project and message ID required')
+                    self.json(200,view.message(values['project'],values['id']))
+                else:
+                    raw_limit=values.pop('limit','50')
+                    if not raw_limit.isascii() or not raw_limit.isdigit(): raise ValueError('invalid communication limit')
+                    self.json(200,view.page(limit=int(raw_limit),**values))
+            elif url.path == '/api/projects':
                 self.json(200, {'projects': self.server.listed_projects(), 'project': self.project})
             elif url.path == '/api/root':
                 self.json(200, self.server.roots.status())
@@ -630,7 +712,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(200, self.root_snapshot() if root_view else self.project_snapshot())
             elif url.path in ('/api/config','/api/root/config'):
                 self.json(200, {'sender': {'id': self.sender_session, 'agent': 'operator'},
-                                'csrf_token': self.server.csrf_token, 'project': self.project,
+                                'csrf_token': self.server.csrf_token, 'project': self.selected_project(),
                                 'projects': self.server.listed_projects(), 'root_orchestrator': self.root_summary()})
             elif url.path in ('/api/messages','/api/root/messages'):
                 params = parse_qs(url.query, keep_blank_values=True)
@@ -711,27 +793,54 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if path.parent != self.server.web_root or not path.is_file():
                     self.json(404, {'error': 'Not found'})
                     return
-                self.respond(200, path.read_bytes(), spec[1])
+                raw = path.read_bytes()
+                if spec[0] == 'index.html':
+                    raw = raw.replace(b'<!-- agent-chat:all-communication-menu -->',
+                        b'<a class="room-button" id="all-communication-view" href="/communications"><span class="room-icon" aria-hidden="true">&#9678;</span><span>All communication</span></a>')
+                self.respond(200, raw, spec[1])
         except (ValueError, sqlite3.Error, RuntimeError, OSError) as error:
             self.json(400, {'error': str(error)})
 
     def do_POST(self):
+        self._request_started = True
+        self._event('request_start')
+        handler_wall, handler_monotonic = time.time(), time.monotonic()
         if not self.trusted():
+            self._finish_request(rejected=True)
             self.json(403, {'error': 'Untrusted host or origin'})
             return
         path = urlsplit(self.path).path
         machine_api = path in ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc', '/api/usage/rpc', '/api/root/rpc')
         if not self.authenticate(bearer_only=machine_api):
+            self._finish_request(rejected=True)
             return
+        timeline = []
+        if path == '/api/coord' and self.server.inbox_diagnostics:
+            timeline.append(('handler', 'start', 'ok', handler_wall, handler_monotonic))
         try:
             if path not in ('/api/usage', '/api/usage/rpc'):
+                if timeline: timeline.append(('project', 'start', 'ok', time.time(), time.monotonic()))
                 self.select_project()
+                if timeline: timeline.append(('project', 'end', 'ok', time.time(), time.monotonic()))
         except (CoordError, ValueError, sqlite3.Error, OSError) as error:
+            self._event('operation_failed', error=error)
+            self._finish_request(error=error)
             self.json(400, {'error': str(error)})
             return
         if machine_api:
+            trace = None
             try:
+                self._event('operation_start')
+                if timeline: timeline.append(('body', 'start', 'ok', time.time(), time.monotonic()))
                 data = self.read_json(MAX_COORD_REQUEST_BYTES if path == '/api/coord' else 1024 * 1024)
+                if timeline: timeline.append(('body', 'end', 'ok', time.time(), time.monotonic()))
+                if path == '/api/coord' and data.get('op') == 'inbox' and self.server.inbox_diagnostics:
+                    from .inbox_diagnostics import TRACE_HEADER
+                    trace = self.server.inbox_diagnostics.trace(
+                        self.headers.get_all(TRACE_HEADER), timeline,
+                        started_wall=handler_wall, started_monotonic=handler_monotonic)
+                    self._inbox_trace = trace
+                    if trace: trace.mark('dispatch', 'start')
                 if path == '/api/usage/rpc':
                     self.json(200, self.usage_action(data, machine=True))
                     return
@@ -743,28 +852,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 if path == '/api/coord':
                     from .remote_service import dispatch
+                    self.server.coordinator_log.event('operation_start', correlation_id=self._log_id)
                     coord = Coordinator(self.db_path)
                     coord.session = None
                     coord.context_size = lambda value: len(json.dumps(
                         self.scoped(value), ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
                     try:
-                        with self.server.measurements.lock if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume', 'session-reset-revalidate') else contextlib.nullcontext():
-                            if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume', 'session-reset-revalidate') and self.server.measurements.status(self.project['id'])['active']:
+                        with self.server.measurements.lock if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume', 'agent-model', 'supervisor-configure', 'session-reset-revalidate') else contextlib.nullcontext():
+                            if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume', 'agent-model', 'supervisor-configure', 'session-reset-revalidate') and self.server.measurements.status(self.project['id'])['active']:
                                 raise CoordError('finish the active project measurement before resetting a conversation')
-                            result = dispatch(coord, data, bridge_manager=self.bridge_manager)
+                            result = dispatch(coord, data, bridge_manager=self.bridge_manager,
+                                              inbox_diagnostics=trace, canonical_project=self.project['id'])
                     finally:
                         coord.close()
+                    if trace: trace.mark('dispatch', 'end')
+                    self.server.coordinator_log.event('operation_complete', correlation_id=self._log_id)
+                    self._event('operation_complete')
                 else:
                     result = {'result': self.bridge_manager.dispatch(data)}
                 self.json(200, result)
             except (CoordError, ValueError, TypeError, KeyError, sqlite3.Error, OSError) as error:
+                if path == '/api/coord':
+                    self.server.coordinator_log.error('operation_failed', error, correlation_id=self._log_id)
+                self._event('operation_failed', error=error)
+                self._finish_request(error=error)
+                if trace: trace.mark('dispatch', 'end', 'error')
                 self.json(400, {'error': str(error)})
+            finally:
+                self._inbox_trace = None
             return
-        if path not in ('/api/messages', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/usage', '/api/measurements'):
+        if path not in ('/api/messages', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch', '/api/root/workspaces', '/api/root/provision', '/api/root/fresh-start', '/api/usage', '/api/measurements'):
+            self._finish_request(rejected=True)
             self.json(404, {'error': 'Not found'})
             return
         csrf = self.headers.get('X-Agent-Chat-CSRF', '')
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
+            self._finish_request(rejected=True)
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
             return
         if path == '/api/measurements':
@@ -792,11 +915,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
             return
-        if path in ('/api/projects', '/api/projects/rename'):
+        if path == '/api/root/fresh-start':
+            try:
+                data=self.read_json(512 * 1024)
+                if not isinstance(data,dict) or set(data)!={'expected_thread','prompt','request_id','confirm'}:
+                    raise CoordError('invalid protected root fresh-start fields')
+                from .root_restart import RootRestart
+                with self.server.root_lock:
+                    root=self.server.roots.config()
+                    if not root: raise CoordError('enroll the root before fresh-start')
+                    result=RootRestart(self.server.roots).request(root['home_project'],root['home_session'],root['host_id'],data['expected_thread'],data['prompt'],data['request_id'],data['confirm'],operator=True)
+                self.json(200,result)
+            except (CoordError,ValueError,TypeError,sqlite3.Error,OSError) as error:
+                self.json(400,{'error':str(error)})
+            return
+        if path in ('/api/root/workspaces', '/api/root/provision'):
+            try:
+                data = self.read_json(512 * 1024)
+                result = self.browser_root_action(data, 'reconfigure-workspaces' if path == '/api/root/workspaces' else 'provision')
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
+            return
+        if path in ('/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch'):
             try:
                 # Escaped JSON can be larger than the validated UTF-8 assignment.
-                data = self.read_json(512 * 1024 if path == '/api/projects' else 65536)
-                result = self.project_action(dict(data, op='create' if path == '/api/projects' else 'rename'))
+                data = self.read_json(65536 if path == '/api/projects/rename' else 512 * 1024)
+                operation = {'/api/projects': 'create', '/api/projects/rename': 'rename', '/api/projects/workspaces': 'configure-workspaces', '/api/projects/workspaces-batch': 'configure-workspaces-batch'}[path]
+                result = self.project_action(dict(data, op=operation))
                 self.json(200, result)
             except (CoordError, ValueError, TypeError, sqlite3.Error, OSError) as error:
                 self.json(400, {'error': str(error)})
@@ -883,6 +1029,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 upload_paths = self.write_uploads(directory, attachments or [])
                 coord = Coordinator(self.db_path, self.sender_session)
                 try:
+                    coord._operator_message_origin = True
                     sent = (coord.send_group_prepared(recipient, body.strip(), coord._prepare_attachments(upload_paths), reply_to)
                             if is_many else coord.send(recipient, body.strip(), attachments=upload_paths, reply_to=reply_to))
                 finally:
@@ -959,11 +1106,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def project_action(self, data):
         op = data.get('op')
+        if op == 'move-history':
+            return self.move_history(data)
         if op == 'list' and set(data) == {'op'}:
             return {'projects': self.server.listed_projects()}
-        if op == 'create' and {'op', 'name'} <= set(data) <= {'op', 'name', 'workspace', 'instructions'}:
-            item = self.server.projects.create(data['name'], data.get('workspace'), data.get('instructions'))
+        if op == 'create' and {'op', 'name'} <= set(data) <= {'op', 'name', 'workspace', 'workspaces', 'instructions'}:
+            item = self.server.projects.create(data['name'], data.get('workspace'), data.get('instructions'), workspaces=data.get('workspaces'))
             self.server.project_context(item['id'])
+        elif op == 'configure-workspaces' and set(data) == {'op', 'id', 'workspaces'}:
+            item = self.server.projects.configure_workspaces(data['id'], data['workspaces'])
+        elif op == 'configure-workspaces-batch' and set(data) == {'op', 'assignments'}:
+            items = self.server.projects.configure_workspaces_batch(data['assignments'])
+            return {'projects': self.server.listed_projects(), 'configured_projects': [{key: value for key, value in item.items() if key != 'instructions'} for item in items]}
         elif op == 'rename' and set(data) == {'op', 'id', 'name'}:
             item = self.server.projects.rename(data['id'], data['name'])
         else:
@@ -972,22 +1126,120 @@ class Handler(http.server.BaseHTTPRequestHandler):
         public['has_instructions'] = bool(item.get('instructions'))
         return {'project': public, 'projects': self.server.listed_projects()}
 
+    def move_history(self, data):
+        from .history_move import HistoryMove
+        from .core import assert_agent_running
+        fields = {'op','source_project','source_session','request_id','expected_count','expected_digest',
+                  'confirm','session','host_id','token'}
+        if set(data) != fields or not isinstance(data['confirm'],bool):
+            raise CoordError('invalid history move request')
+        if any(not isinstance(data[key],str) or not data[key] or len(data[key]) > 256
+               for key in ('source_project','source_session','request_id','session','host_id')):
+            raise CoordError('history move requires exact project, session, host and request identities')
+        source_project = data['source_project']
+        with self.server.root_lock, self.server.measurements.lock:
+            if any(self.server.measurements.status(project)['active'] for project in (source_project,self.project['id'])):
+                raise CoordError('finish source and destination project measurements before moving history')
+            with contextlib.closing(Coordinator(self.db_path, data['session'])) as coord:
+                db = coord.db
+                if not db.execute('SELECT 1 FROM project_orchestrators WHERE session_id=?', (data['session'],)).fetchone():
+                    raise CoordError('only the designated destination project orchestrator may move history')
+                if not db.execute('SELECT 1 FROM remote_session_hosts WHERE session_id=? AND host_id=?',
+                                  (data['session'],data['host_id'])).fetchone():
+                    raise CoordError('history move must use the destination orchestrator own host')
+                assert_agent_running(db,data['session'])
+                resource = 'history-move:' + source_project + ':' + data['source_session']
+                if data['confirm']:
+                    if (isinstance(data['expected_count'],bool) or not isinstance(data['expected_count'],int)
+                            or data['expected_count'] < 1 or not isinstance(data['expected_digest'],str)
+                            or len(data['expected_digest']) != 64
+                            or any(c not in '0123456789abcdef' for c in data['expected_digest'])):
+                        raise CoordError('confirm the exact positive count and SHA-256 digest from preview')
+                    reservation = coord.check(resource,data['token'],require_fresh=False)
+                    if not db.execute('''SELECT 1 FROM remote_guarded_runs WHERE resource=? AND session_id=?
+                            AND host_id=? AND reservation_id=? AND local_pid>0 AND closed_at IS NULL''',
+                            (resource,data['session'],data['host_id'],reservation['reservation_id'])).fetchone():
+                        raise CoordError('confirm history moves through a guarded run for the exact history resource')
+            def authorize_locked(db):
+                if not db.execute('SELECT 1 FROM project_orchestrators WHERE session_id=?', (data['session'],)).fetchone():
+                    raise CoordError('destination orchestrator designation changed')
+                if not db.execute('SELECT 1 FROM remote_session_hosts WHERE session_id=? AND host_id=?',
+                                  (data['session'],data['host_id'])).fetchone():
+                    raise CoordError('destination orchestrator host changed')
+                assert_agent_running(db,data['session'])
+                held = db.execute('SELECT * FROM resources WHERE name=?', (resource,)).fetchone()
+                if (not held or held['owner_session'] != data['session'] or Coordinator._state(held) != 'owned'
+                        or not isinstance(data['token'],str)
+                        or not secrets.compare_digest(held['token'] or '',data['token'])):
+                    raise CoordError('history reservation changed or expired before mutation')
+                if not db.execute('''SELECT 1 FROM remote_guarded_runs WHERE resource=? AND session_id=?
+                        AND host_id=? AND reservation_id=? AND local_pid>0 AND closed_at IS NULL''',
+                        (resource,data['session'],data['host_id'],held['reservation_id'])).fetchone():
+                    raise CoordError('history guarded execution changed before mutation')
+            source_path, source_operator, _ = self.server.project_context(source_project)
+            move = HistoryMove(source_path,self.db_path,source_project,self.project['id'],
+                               data['source_session'],data['session'],source_operator,self.sender_session)
+            result = (move.execute(data['request_id'],data['expected_count'],data['expected_digest'],authorize_locked)
+                      if data['confirm'] else move.preview(data['request_id']))
+            return dict(result,resource=resource)
+
+    def browser_root_action(self, data, operation):
+        fields = ({'project','expected_thread','workspaces','prompt','request_id','confirm'}
+                  if operation == 'reconfigure-workspaces' else {'project','agent','request_id','confirm','model','effort'})
+        if not isinstance(data, dict) or set(data) != fields:
+            raise CoordError('invalid browser root workspace operation')
+        with self.server.root_lock, self.server.measurements.lock:
+            root = self.server.roots.config()
+            if not root:
+                raise CoordError('enroll an existing authorized root before project setup')
+            args = (root['home_project'], root['home_session'], root['host_id'])
+            self.server.roots.authorize(*args)
+            if self.server.measurements.status(data['project'])['active']:
+                raise CoordError('finish the active target project measurement before orchestration setup')
+            if operation == 'reconfigure-workspaces':
+                return self.server.roots.reconfigure_workspaces(*args, data['project'], data['expected_thread'], data['workspaces'], data['prompt'], data['request_id'], data['confirm'])
+            return self.server.roots.provision(*args, data['project'], data['agent'], data['request_id'], data['confirm'], data['model'], data['effort'])
+
     def root_action(self, data):
         if not isinstance(data, dict) or set(data) != {'op','session','host_id','params'} or not isinstance(data['params'], dict):
             raise CoordError('invalid root orchestrator request')
         op, params = data['op'], data['params']
         fields = {
+            'fresh-start': {'expected_thread','prompt','request_id','confirm'}, 'fresh-status': {'request_id'},
+            'team-reset-preview': {'project','message_ids'},
+            'team-reset': {'project','message_ids','request_id','expected_digest','confirm'},
+            'team-reset-status': {'project','request_id'},
+            'delegate-management': {'project','po','target','expected_thread','expected_host','request_id','confirm'},
             'enroll': {'expected_thread','confirm'}, 'status': set(), 'route': {'project'},
+            'stop-all': {'request_id','confirm'}, 'resume-all': {'request_id','confirm'}, 'stop-status': {'request_id'},
             'configure': {'project','agent','cwd','prompt','request_id','confirm','model','effort'},
             'provision': {'project','agent','request_id','confirm','model','effort'},
             'adopt': {'project','target','expected_thread','cwd','confirm'}, 'detach': {'confirm'}, 'resume-routing': {'confirm'},
             'retry-setup': {'project','request_id','confirm'},
+            'reconfigure-workspaces': {'project','expected_thread','workspaces','prompt','request_id','confirm'},
         }
-        if op not in fields or set(params) != fields[op]:
+        optional = {'workspaces'} if op in ('configure', 'adopt') else set()
+        if op not in fields or not fields[op] <= set(params) <= fields[op] | optional:
             raise CoordError('invalid root orchestrator operation or fields')
         roots = self.server.roots
         args = (self.project['id'], data['session'], data['host_id'])
         with self.server.root_lock, self.server.measurements.lock:
+            if op in ('team-reset-preview','team-reset','team-reset-status'):
+                from .root_team_reset import RootTeamReset
+                reset = RootTeamReset(roots)
+                if op == 'team-reset-preview':
+                    return reset.preview(*args,params['project'],params['message_ids'])
+                if op == 'team-reset-status':
+                    return reset.status(*args,params['project'],params['request_id'])
+                return reset.apply(*args,params['project'],params['message_ids'],params['request_id'],params['expected_digest'],params['confirm'])
+            if op in ('fresh-start','fresh-status'):
+                from .root_restart import RootRestart
+                restart = RootRestart(roots)
+                if op == 'fresh-status':
+                    return restart.authorize_status(*args,params['request_id'])
+                return restart.request(*args,params['expected_thread'],params['prompt'],params['request_id'],params['confirm'])
+            if op in ('stop-all','resume-all','stop-status'):
+                return roots.team_lifecycle(*args,op,params['request_id'],params.get('confirm',True))
             if op == 'enroll':
                 if self.server.measurements.status(self.project['id'])['active']:
                     raise CoordError('finish the active project measurement before root enrollment')
@@ -997,16 +1249,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 roots.sync()
                 return roots.status()
             if op == 'route': return roots.route(*args, params['project'])
+            if op == 'delegate-management':
+                return roots.delegate_management(*args,params['project'],params['po'],params['target'],params['expected_thread'],params['expected_host'],params['request_id'],params['confirm'])
             if op == 'detach': return roots.detach(*args, params['confirm'])
             if op == 'resume-routing': return roots.resume_routing(*args, params['confirm'])
             if self.server.measurements.status(params['project'])['active']:
                 raise CoordError('finish the active target project measurement before orchestration setup')
             if op == 'retry-setup': return roots.retry_setup(*args, params['project'], params['request_id'], params['confirm'])
+            if op == 'reconfigure-workspaces':
+                return roots.reconfigure_workspaces(*args, params['project'], params['expected_thread'], params['workspaces'], params['prompt'], params['request_id'], params['confirm'])
             if op == 'provision':
                 return roots.provision(*args, params['project'], params['agent'], params['request_id'], params['confirm'], params['model'], params['effort'])
             if op == 'configure':
-                return roots.configure(*args, params['project'], params['agent'], params['cwd'], params['prompt'], params['request_id'], params['confirm'], params['model'], params['effort'])
-            return roots.adopt(*args, params['project'], params['target'], params['expected_thread'], params['cwd'], params['confirm'])
+                return roots.configure(*args, params['project'], params['agent'], params['cwd'], params['prompt'], params['request_id'], params['confirm'], params['model'], params['effort'], workspaces=params.get('workspaces'))
+            return roots.adopt(*args, params['project'], params['target'], params['expected_thread'], params['cwd'], params['confirm'], workspaces=params.get('workspaces'))
 
     def usage_action(self, data, machine):
         if not isinstance(data, dict) or not isinstance(data.get('op'), str):
@@ -1056,7 +1312,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_token=None, public_url=None, sessions_root=None):
+def create_server(db_path, port=8765, web_root=None, *, host='127.0.0.1', api_token=None, public_url=None, sessions_root=None,
+                  trusted_proxies=(), inbox_diagnostics=None, logging_config=None):
     with reader(db_path):
         pass
-    return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url, sessions_root)
+    return WebServer((host, port), Handler, db_path, web_root or HERE / 'web', api_token, public_url, sessions_root,
+                     trusted_proxies, inbox_diagnostics, logging_config)

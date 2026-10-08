@@ -21,7 +21,8 @@ def _string(value: Any, name: str, required: bool = True) -> str | None:
     return value
 
 
-def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
+def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None, inbox_diagnostics=None,
+             canonical_project=None) -> dict:
     """Execute one explicitly supported coordinator action.
 
     The request session is assigned to the Coordinator directly; server process
@@ -57,20 +58,29 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         else:
             coord.db.commit()
     else:
-        with coord.tx():
+        # Remote inbox host binding is a real BEGIN IMMEDIATE acquisition before
+        # the inbox query's own transaction.  Trace it separately so a lock wait
+        # is not misattributed to later held inbox work.
+        with coord.tx(observer=inbox_diagnostics if op == 'inbox' else None):
             _schema(coord)
             _bind_host(coord, session, host_id, op)
     # Keep this list auditable.  Do not replace it with getattr.
     if op == "register": return coord.register(_string(params.get("agent"), "agent"))
     if op == "rename": return coord.rename(_string(params.get("agent"), "agent"))
     if op == "status": return coord.status(params.get("mine", False), params.get("resources"))
-    if op == "inbox": return coord.inbox(bool(params.get("all", False)))
+    if op == "inbox": return coord.inbox(bool(params.get("all", False)), observer=inbox_diagnostics)
+    if op == "policy":
+        from .communication import current_policy
+        return current_policy()
     if op == "context": return coord.context(params.get("limit", 20), params.get("max_bytes", 12288),
                                                params.get("cursor"), params.get("message_ids"), params.get("resources"),
                                                params.get("resource_cursor"))
     if op == "message": return coord.message(_string(params.get("id"), "id"))
     if op == "acknowledge": return coord.acknowledge(_string(params.get("id"), "id"))
-    if op == "request": return coord.request(_string(params.get("resource"), "resource"), params.get("minutes"))
+    if op == "request":
+        def record_pending(db, acquired):
+            db.execute("INSERT INTO remote_reservation_outcomes (reservation_id,resource,owner_session,host_id,state,created_at) VALUES(?,?,?,?,?,?)", (acquired["reservation_id"], acquired["name"], session, host_id, "pending", time.time()))
+        return coord.request(_string(params.get("resource"), "resource"), params.get("minutes"), record_pending)
     if op == "cancel": return coord.cancel(_string(params.get("resource"), "resource"))
     if op == "check": return coord.check(_string(params.get("resource"), "resource"), _string(params.get("token"), "token"))
     if op == "block": return coord.block(_string(params.get("resource"), "resource"), _string(params.get("reason"), "reason"))
@@ -98,12 +108,40 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
             raise CoordError("to must be a list of recipient strings")
         return {"messages": coord.send_many(targets, _string(params.get("body"), "body", False) or "", params.get("reply_to"))}
     if op == "deregister": return coord.remove_session(coord.require_session())
+    if op == 'admin-recover':
+        from .agent_control import AdminRecoveryState
+        allowed = {'project', 'resource', 'reservation_id', 'owner_session', 'request_id',
+                   'operator', 'reason', 'evidence'}
+        if set(params) != allowed:
+            raise CoordError('admin-recover requires the exact project, target, audit, and evidence fields')
+        return AdminRecoveryState(coord).recover(project=params.get('project'), canonical_project=canonical_project,
+            resource=params.get('resource'), reservation_id=params.get('reservation_id'),
+            owner_session=params.get('owner_session'), request_id=params.get('request_id'),
+            operator=params.get('operator'), reason=params.get('reason'), evidence=params.get('evidence'),
+            host_id=host_id)
     if op == "remove-session": return coord.remove_session(_string(params.get("id"), "id"))
-    if op in ('agent-stop','agent-resume','agent-status','agents'):
+    if op in ('supervisor-configure','supervisor-status'):
+        from .bridge_state import BridgeState
+        from .supervisor import SupervisorState
+        BridgeState(coord); supervisor=SupervisorState(coord)
+        if op == 'supervisor-configure':
+            if set(params) not in ({'enabled'}, {'recovery_enabled'}):
+                raise CoordError('supervisor-configure accepts exactly one of enabled or recovery_enabled')
+            if not isinstance(next(iter(params.values())), bool):
+                raise CoordError('supervisor-configure setting must be boolean')
+            if 'recovery_enabled' in params:
+                return supervisor._configure_recovery(params['recovery_enabled'])
+            return supervisor.configure(params['enabled'])
+        if set(params) - {'to'}: raise CoordError('supervisor-status accepts only optional to')
+        return supervisor.status(params.get('to'))
+    if op in ('agent-stop','agent-resume','agent-model','agent-model-resolve','agent-status','agents'):
         from .bridge_state import BridgeState
         from .agent_control import AgentControlState
         BridgeState(coord)
         controls = AgentControlState(coord)
+        if op == 'agent-model-resolve':
+            return controls.resolve_unchanged(params.get('request_id'), params.get('expected_thread'),
+                                              params.get('resolution_id'), params.get('confirm'))
         if op == 'agents':
             rows = controls.roster()
             from .root_orchestrator import projection
@@ -117,7 +155,10 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
             if params.get('refresh'):
                 refresh = controls.request(target, params.get('expected_thread'), 'inspect', params.get('request_id'), True)
             return dict(controls.status(target), refresh=refresh)
-        return controls.request(target, params.get('expected_thread'), op.removeprefix('agent-'), params.get('request_id'), params.get('confirm'), params.get('interrupt',False))
+        return controls.request(target, params.get('expected_thread'), op.removeprefix('agent-'), params.get('request_id'),
+                                params.get('confirm'), params.get('interrupt',False), model=params.get('model'),
+                                reasoning_effort=params.get('reasoning_effort'),
+                                allow_cold_resume=params.get('allow_cold_resume', False))
     if op.startswith('session-reset') or op == 'agent-create':
         from .bridge_state import BridgeState
         from .session_reset import SessionResetState
@@ -141,7 +182,8 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
                 reasoning_effort=params.get('reasoning_effort'), cwd=params.get('cwd'))
         if op == 'session-reset':
             return resets.request(_string(params.get('to') or session, 'to'), params.get('expected_thread'),
-                                  params.get('prompt'), params.get('request_id'), params.get('confirm'))
+                                  params.get('prompt'), params.get('request_id'), params.get('confirm'),
+                                  model=params.get('model'), reasoning_effort=params.get('reasoning_effort'))
     if op in ("bind", "unbind", "bridge-status", "bridge-retry", "bridge-resolve"):
         from .bridge_state import BridgeState
         state = BridgeState(coord)
@@ -162,12 +204,32 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None) -> dict:
         resource = resource_name(_string(params.get("resource"), "resource"))
         with coord.tx() as db:
             r = coord._row(db, resource)
+            if not r or r["owner_session"] != session:
+                raise CoordError("reservation proof requires its owning session")
             owner = db.execute("SELECT host_id FROM remote_session_hosts WHERE session_id=?", (r["owner_session"],)).fetchone() if r else None
             if not owner or owner["host_id"] != host_id:
                 raise CoordError("reservation proof requires its owning host")
             runs = [dict(row) for row in db.execute("SELECT run_id,local_pid,started_at,closed_at FROM remote_guarded_runs WHERE reservation_id=?", (r["reservation_id"],))]
             return {"reservation_id": r["reservation_id"], "runs": runs}
+    if op == "reservation-result":
+        resource = resource_name(_string(params.get("resource"), "resource"))
+        reservation_id = _string(params.get("reservation_id"), "reservation_id")
+        with coord.tx() as db:
+            outcome = db.execute("SELECT state,action,receipt_sha256,evidence_sha256,cleared_at FROM remote_reservation_outcomes WHERE reservation_id=? AND resource=? AND owner_session=? AND host_id=?", (reservation_id, resource, session, host_id)).fetchone()
+            if not outcome:
+                return {"state": "unknown"}
+            if outcome["state"] == "pending":
+                retained = coord.retained_reservation_result(db, resource, reservation_id)
+                if retained["state"] == "unknown": return retained
+                return {"state": "pending", "resource": resource, "reservation_id": reservation_id, "receipt_backed_clear": False}
+            if outcome["state"] == "cleared":
+                return {"state": "cleared", "resource": resource, "reservation_id": reservation_id, "action": outcome["action"], "receipt_sha256": outcome["receipt_sha256"], "evidence_sha256": outcome["evidence_sha256"], "recorded_at": outcome["cleared_at"], "receipt_backed_clear": True}
+            return {"state": "unknown"}
+    if op in ('producer-establish', 'producer-close', 'producer-status'):
+        from .lifecycle_producer import dispatch as producer_dispatch
+        return producer_dispatch(coord, session, host_id, op, params)
     if op == "begin-guard": return _begin_guard(coord, session, host_id, params)
+    if op == "begin-guard-batch": return _begin_guard_batch(coord, session, host_id, params)
     if op == "attach-guard-pid": return _attach_guard_pid(coord, session, host_id, params)
     if op == "guard-pulse": return _guard_pulse(coord, session, host_id, params)
     if op == "close-guard": return _close_guard(coord, session, host_id, params)
@@ -221,9 +283,16 @@ def _schema(coord: Coordinator) -> None:
     coord.db.execute("CREATE TABLE IF NOT EXISTS remote_session_hosts (session_id TEXT PRIMARY KEY, host_id TEXT NOT NULL, registered_at REAL NOT NULL, last_seen_at REAL NOT NULL)")
     coord.db.execute("CREATE TABLE IF NOT EXISTS remote_guarded_runs (run_id TEXT PRIMARY KEY, resource TEXT NOT NULL, reservation_id TEXT NOT NULL, session_id TEXT NOT NULL, host_id TEXT NOT NULL, local_pid INTEGER NOT NULL, started_at REAL NOT NULL, closed_at REAL, close_evidence_sha256 TEXT)")
     coord.db.execute("CREATE TABLE IF NOT EXISTS remote_restoration_runs (run_id TEXT PRIMARY KEY, deadline REAL NOT NULL)")
+    coord.db.execute("CREATE TABLE IF NOT EXISTS remote_guard_batches (run_id TEXT PRIMARY KEY, batch_id TEXT NOT NULL)")
+    coord.db.execute("CREATE TABLE IF NOT EXISTS remote_reservation_outcomes (reservation_id TEXT PRIMARY KEY, resource TEXT NOT NULL, owner_session TEXT NOT NULL, host_id TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('pending','cleared')), action TEXT, receipt_sha256 TEXT, evidence_sha256 TEXT, created_at REAL NOT NULL, cleared_at REAL, CHECK((state='pending' AND action IS NULL AND receipt_sha256 IS NULL AND evidence_sha256 IS NULL AND cleared_at IS NULL) OR (state='cleared' AND action IN ('release','recover') AND receipt_sha256 IS NOT NULL AND evidence_sha256 IS NOT NULL AND cleared_at IS NOT NULL)))")
 
 
 def _bind_host(coord: Coordinator, session: str, host: str, op: str) -> None:
+    from .root_team_reset import quarantined
+    if quarantined(coord.db,session=session):
+        raise CoordError('session is quarantined by team reset; old credentials cannot control current work')
+    if coord.db.execute('SELECT 1 FROM retired_sessions WHERE id=?',(session,)).fetchone():
+        raise CoordError('session is retired; old credentials cannot control the current project')
     """Pin a remote identity before an operation can mention local PIDs/proofs."""
     row = coord.db.execute("SELECT host_id FROM remote_session_hosts WHERE session_id=?", (session,)).fetchone()
     if row and row["host_id"] != host:
@@ -242,7 +311,77 @@ def _bind_host(coord: Coordinator, session: str, host: str, op: str) -> None:
     coord.db.execute("INSERT INTO remote_session_hosts VALUES(?,?,?,?)", (session, host, time.time(), time.time()))
 
 
+def _begin_guard_batch(coord: Coordinator, session: str, host: str, p: dict) -> dict:
+    from .root_lifecycle import stopped
+    if stopped(coord.db,session):
+        raise CoordError('root stop-all barrier withheld new guarded work')
+    """Admit a bounded same-caller set before any launcher can be activated."""
+    if set(p) - {'tuples', 'restore', 'max_seconds'}:
+        raise CoordError('invalid batch admission parameters')
+    tuples = p.get('tuples')
+    restore = p.get('restore', False)
+    if not isinstance(tuples, list) or not 1 <= len(tuples) <= 42 or type(restore) is not bool:
+        raise CoordError('invalid batch admission')
+    budget = p.get('max_seconds', 120)
+    if restore:
+        if type(budget) is not int or not 1 <= budget <= 900:
+            raise CoordError('invalid batch restoration budget')
+    elif 'max_seconds' in p:
+        raise CoordError('batch restoration budget requires restoration mode')
+    prepared, seen = [], set()
+    for item in tuples:
+        if not isinstance(item, dict) or set(item) != {'resource', 'session_id', 'host_id', 'reservation_id', 'token'}:
+            raise CoordError('invalid batch admission tuple')
+        if any(not isinstance(item[key], str) or not item[key] for key in item):
+            raise CoordError('invalid batch admission tuple')
+        if item['session_id'] != session or item['host_id'] != host:
+            raise CoordError('batch admission requires the authenticated caller host session')
+        resource = coord.resource_name(item['resource'])
+        if resource != item['resource'] or resource in seen:
+            raise CoordError('batch admission requires distinct exact resources')
+        seen.add(resource)
+        prepared.append(item)
+    from .core import assert_agent_running
+    from .root_orchestrator import projection
+    with coord.tx() as db:
+        coord._fresh(db, session)
+        if projection(db, session):
+            raise CoordError('global root cannot admit resource work')
+        assert_agent_running(db, session, cleanup=True)
+        pinned = db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (session,)).fetchone()
+        if not pinned or pinned['host_id'] != host:
+            raise CoordError('batch admission requires the authenticated caller host session')
+        rows = []
+        for item in prepared:
+            row = coord._verify_owner(db, item['resource'], session, item['token'], restore)
+            if row['reservation_id'] != item['reservation_id']:
+                raise CoordError('batch admission reservation changed')
+            if restore:
+                if coord._state(row) != 'stale':
+                    raise CoordError('batch restoration requires stale reservations')
+                if db.execute('SELECT 1 FROM remote_guarded_runs WHERE reservation_id=? AND closed_at IS NULL',
+                              (row['reservation_id'],)).fetchone():
+                    raise CoordError('close existing guarded runs before batch restoration')
+            rows.append(row)
+        # No row or association is created until the final tuple is validated.
+        batch_id = 'remote_batch_' + secrets.token_hex(16)
+        admissions, started = [], time.time()
+        for row in rows:
+            run_id = 'remote_run_' + secrets.token_hex(16)
+            db.execute('INSERT INTO remote_guarded_runs VALUES(?,?,?,?,?,?,?,?,?)',
+                       (run_id, row['name'], row['reservation_id'], session, host, 0, started, None, None))
+            db.execute('INSERT INTO remote_guard_batches VALUES(?,?)', (run_id, batch_id))
+            if restore:
+                db.execute('INSERT INTO remote_restoration_runs VALUES(?,?)', (run_id, started + budget))
+            admissions.append({'resource': row['name'], 'reservation_id': row['reservation_id'],
+                               'run_id': run_id, 'host_id': host})
+    return {'batch_id': batch_id, 'admissions': admissions}
+
+
 def _begin_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:
+    from .root_lifecycle import stopped
+    if stopped(coord.db,session):
+        raise CoordError('root stop-all barrier withheld new guarded work')
     resource, token = _string(p.get("resource"), "resource"), _string(p.get("token"), "token")
     restore = p.get("restore", False)
     if not isinstance(restore, bool): raise CoordError("restore must be a boolean")
@@ -347,6 +486,8 @@ def _remote_clear(coord: Coordinator, session: str, host: str, p: dict, action: 
         r = coord._row(db, resource)
         if not r or not r["owner_session"]:
             raise CoordError("resource is not held")
+        if r["owner_session"] != session:
+            raise CoordError("reservation proof requires its owning session")
         owner_host = db.execute("SELECT host_id FROM remote_session_hosts WHERE session_id=?", (r["owner_session"],)).fetchone()
         if not owner_host or owner_host["host_id"] != host:
             raise CoordError("cannot release or recover a reservation without the owning host's proof")
@@ -373,6 +514,14 @@ def _remote_clear(coord: Coordinator, session: str, host: str, p: dict, action: 
         digest = hashlib.sha256(canonical.encode()).hexdigest()
         if db.execute("SELECT 1 FROM receipts WHERE reservation_id=? OR receipt_sha256=?", (r["reservation_id"], digest)).fetchone():
             raise CoordError("receipt has already been used")
-        db.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?)", (r["reservation_id"], digest, hashlib.sha256(evidence_bytes).hexdigest(), canonical, action, time.time()))
+        evidence_digest = hashlib.sha256(evidence_bytes).hexdigest()
+        recorded_at = time.time()
+        db.execute("INSERT INTO receipts VALUES(?,?,?,?,?,?)", (r["reservation_id"], digest, evidence_digest, canonical, action, recorded_at))
+        outcome = db.execute("SELECT resource,owner_session,host_id,state FROM remote_reservation_outcomes WHERE reservation_id=?", (r["reservation_id"],)).fetchone()
+        if outcome:
+            if (outcome["resource"], outcome["owner_session"], outcome["host_id"], outcome["state"]) != (resource, session, host, "pending"):
+                raise CoordError("remote reservation outcome is inconsistent")
+            if db.execute("UPDATE remote_reservation_outcomes SET state='cleared',action=?,receipt_sha256=?,evidence_sha256=?,cleared_at=? WHERE reservation_id=? AND state='pending'", (action, digest, evidence_digest, recorded_at, r["reservation_id"])).rowcount != 1:
+                raise CoordError("remote reservation outcome could not be committed")
         db.execute("UPDATE resources SET owner_session=NULL,reservation_id=NULL,token=NULL,granted_at=NULL,deadline=NULL,stale=0,reason=NULL WHERE name=?", (resource,))
     return {"resource": resource, "released" if action == "release" else "recovered": True}

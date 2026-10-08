@@ -26,6 +26,8 @@ class SessionResetState:
             if column not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
                 self.db.execute(f'ALTER TABLE session_resets ADD COLUMN {column} TEXT')
 
+        self.db.execute('CREATE TABLE IF NOT EXISTS session_reset_workspaces (request_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(request_id,position))')
+
         if 'workspace_revalidated' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
             self.db.execute('ALTER TABLE session_resets ADD COLUMN workspace_revalidated INTEGER NOT NULL DEFAULT 0')
         if 'project_scope' not in {row['name'] for row in self.db.execute('PRAGMA table_info(session_resets)')}:
@@ -41,7 +43,32 @@ class SessionResetState:
         row = self.db.execute('SELECT * FROM session_resets WHERE id=?', (job_id,)).fetchone()
         if not row:
             raise CoordError('unknown fresh-session reset request')
-        return dict(row, target_agent=self.target(row['target_session'])['agent'])
+        members = [item['path'] for item in self.db.execute('SELECT path FROM session_reset_workspaces WHERE request_id=? ORDER BY position', (job_id,))]
+        return dict(row, target_agent=self.target(row['target_session'])['agent'],
+                    requested_workspaces=members or ([row['requested_cwd']] if row['requested_cwd'] else []))
+
+    def save_workspaces(self, request_id, members):
+        self.db.executemany('INSERT INTO session_reset_workspaces VALUES(?,?,?)',
+                           [(request_id, index, member) for index, member in enumerate(members)])
+
+    def requires_workspace_worker(self, job):
+        if job.get('project_scope') and (job.get('kind') != 'create' or len(job.get('requested_workspaces') or []) > 1):
+            return True
+        if job.get('kind') != 'reset':
+            return False
+        # Ordinary resets preserve their existing native roots. Legacy workers
+        # must also be withheld when those roots were observed or provisioned.
+        observed = self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_control_workspace_roots'").fetchone()
+        if observed and self.db.execute('SELECT COUNT(*) FROM agent_control_workspace_roots w '
+                'JOIN agent_control_observations o ON o.target_session=w.target_session '
+                'WHERE w.target_session=? AND o.thread_id=?',
+                (job['target_session'], job['old_thread_id'])).fetchone()[0] > 1:
+            return True
+        return bool(self.db.execute('SELECT 1 FROM session_resets r '
+                'JOIN session_reset_workspaces w ON w.request_id=r.id '
+                'WHERE r.target_session=? AND r.new_thread_id=? AND r.project_scope=1 '
+                'GROUP BY r.id HAVING COUNT(*)>1',
+                (job['target_session'], job['old_thread_id'])).fetchone())
 
     @staticmethod
     def public(job):
@@ -50,7 +77,7 @@ class SessionResetState:
     def status(self, name):
         target = self.target(name)
         binding = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (target['id'],)).fetchone()
-        jobs = [self.public(dict(row)) for row in self.db.execute(
+        jobs = [self.public(self.job(row['id'])) for row in self.db.execute(
             'SELECT * FROM session_resets WHERE target_session=? ORDER BY created_at DESC LIMIT 10', (target['id'],))]
         return dict(target, thread_id=binding['thread_id'] if binding else None, resets=jobs)
 
@@ -69,12 +96,29 @@ class SessionResetState:
         if self.db.execute("SELECT 1 FROM bridge_jobs WHERE thread_id=? AND status NOT IN ('dispatched','cancelled')", (old_thread,)).fetchone():
             raise CoordError('resolve pending or uncertain wakes before resetting')
 
-    def request(self, name, old_thread, prompt, request_id, confirmed, *, human=False):
+    def request(self, name, old_thread, prompt, request_id, confirmed, *, human=False, project_scope=False, workspaces=None, model=None, reasoning_effort=None):
         caller = self.coord.require_session()
         target = self.target(name)['id']
         from .root_orchestrator import assert_local_lifecycle, assert_management_target
         assert_local_lifecycle(self.db, target)
         assert_management_target(self.db, caller, target)
+        members = []
+        if project_scope:
+            from .projects import Projects
+            from .root_orchestrator import projection
+            if not projection(self.db, caller):
+                raise CoordError('project workspace reconfiguration requires the authorized root projection')
+            members = Projects.workspace_list(workspaces)
+        elif workspaces is not None:
+            raise CoordError('explicit workspace reset requires supported root reconfiguration')
+        if (model is None) != (reasoning_effort is None):
+            raise CoordError('root workspace reconfiguration requires model and reasoning effort together')
+        if model is not None:
+            if not project_scope:
+                raise CoordError('model override requires supported root workspace reconfiguration')
+            for value, label, limit in ((model, 'model', 128), (reasoning_effort, 'reasoning effort', 32)):
+                if not isinstance(value, str) or not value.strip() or len(value) > limit:
+                    raise CoordError(f'reconfiguration {label} must be a nonempty bounded string')
         try:
             request_id = str(uuid.UUID(request_id))
         except (ValueError, TypeError, AttributeError):
@@ -86,9 +130,9 @@ class SessionResetState:
         with self.coord.tx():
             existing = self.db.execute('SELECT * FROM session_resets WHERE id=?', (request_id,)).fetchone()
             if existing:
-                if existing['kind'] != 'reset' or (existing['requester_session'], existing['target_session'], existing['old_thread_id'], existing['prompt']) != (caller, target, old_thread, prompt):
+                if existing['kind'] != 'reset' or (existing['requester_session'], existing['target_session'], existing['old_thread_id'], existing['prompt'], existing['project_scope'], existing['requested_model'], existing['requested_effort'], self.job(request_id)['requested_workspaces']) != (caller, target, old_thread, prompt, int(project_scope), model, reasoning_effort, members):
                     raise CoordError('reset retry payload differs from the original')
-                return self.public(dict(existing))
+                return self.public(self.job(request_id))
             if not human:
                 self.coord._fresh(self.db, caller)
             assert_reset_unlocked(self.db, target)
@@ -99,12 +143,30 @@ class SessionResetState:
             now = time.time()
             self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)',
                 (request_id, caller, target, host['host_id'], old_thread, prompt, 'pending', now, now))
+            if project_scope:
+                self.db.execute('UPDATE session_resets SET project_scope=1,requested_cwd=?,requested_model=?,requested_effort=? WHERE id=?', (members[0], model, reasoning_effort, request_id))
+                self.save_workspaces(request_id, members)
         return self.public(self.job(request_id))
 
-    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False, model=None, reasoning_effort=None, cwd=None, project_scope=False, project_orchestrator=False):
+    def create(self, agent, template_thread, prompt, request_id, confirmed, *, template_session=None, human=False, model=None, reasoning_effort=None, cwd=None, project_scope=False, project_orchestrator=False, workspaces=None):
+        from .root_team_reset import assert_ready
+        assert_ready(self.db)
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_team_stops'").fetchone() and self.db.execute('SELECT 1 FROM root_team_stops WHERE active=1').fetchone():
+            raise CoordError('root stop-all barrier is active; agent creation is withheld until explicit resume')
         caller = self.coord.require_session()
         template = self.target(template_session or caller)['id']
         from .root_orchestrator import projection
+        members = []
+        if workspaces is not None:
+            from .projects import Projects
+            if not project_scope:
+                raise CoordError('explicit project member grants require supported root configuration')
+            members = Projects.workspace_list(workspaces)
+            if cwd is not None and cwd != members[0]:
+                raise CoordError('cwd must equal the first project workspace')
+            cwd = members[0]
+        elif cwd:
+            members = [cwd]
         root = projection(self.db, template)
         if root:
             if not project_orchestrator:
@@ -133,9 +195,9 @@ class SessionResetState:
         with self.coord.tx():
             existing = self.db.execute('SELECT * FROM session_resets WHERE id=?', (request_id,)).fetchone()
             if existing:
-                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent'], existing['requested_model'], existing['requested_effort'], existing['requested_cwd'], existing['project_scope']) != ('create', caller, template_thread, prompt, agent, model, reasoning_effort, cwd, int(project_scope)):
+                if (existing['kind'], existing['requester_session'], existing['old_thread_id'], existing['prompt'], self.target(existing['target_session'])['agent'], existing['requested_model'], existing['requested_effort'], existing['requested_cwd'], existing['project_scope']) != ('create', caller, template_thread, prompt, agent, model, reasoning_effort, cwd, int(project_scope)) or self.job(request_id)['requested_workspaces'] != members:
                     raise CoordError('creation retry payload differs from the original')
-                return self.public(dict(existing))
+                return self.public(self.job(request_id))
             if not human:
                 self.coord._fresh(self.db, caller)
             assert_reset_unlocked(self.db, template)
@@ -152,6 +214,7 @@ class SessionResetState:
             self.db.execute('INSERT INTO remote_session_hosts VALUES(?,?,?,?)', (target, host['host_id'], now, now))
             self.db.execute('INSERT INTO session_resets(id,requester_session,target_session,host_id,old_thread_id,prompt,status,created_at,updated_at,kind,requested_model,requested_effort,requested_cwd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
                 (request_id, caller, target, host['host_id'], template_thread, prompt, 'pending', now, now, 'create', model, reasoning_effort, cwd))
+            self.save_workspaces(request_id, members)
             if project_scope:
                 self.db.execute('UPDATE session_resets SET project_scope=1 WHERE id=?', (request_id,))
             if project_orchestrator:
@@ -162,10 +225,26 @@ class SessionResetState:
         job = self.job(job_id)
         caller = self.coord.require_session()
         from .root_orchestrator import assert_management_target
-        assert_management_target(self.db, caller, job['target_session'])
         host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (caller,)).fetchone()
         if caller != job['requester_session'] or not host or host['host_id'] != job['host_id']:
             raise CoordError('only the original requester on the creation host may revalidate settings')
+        target_host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (job['target_session'],)).fetchone()
+        if not target_host or target_host['host_id'] != job['host_id']:
+            raise CoordError('creation candidate host differs from the original requester')
+        bound = self.db.execute('SELECT 1 FROM bridge_bindings WHERE session_id=? OR thread_id=?',
+                                (job['target_session'], job['new_thread_id'])).fetchone()
+        if bound:
+            # Preserve the ordinary lifecycle route after a candidate acquires a
+            # binding; the unbound exception below never becomes a generic
+            # parent-null management bypass.
+            assert_management_target(self.db, caller, job['target_session'])
+        elif job['kind'] != 'create' or job.get('project_scope'):
+            raise CoordError('unbound revalidation is limited to the original non-project-scope creation candidate')
+        elif (self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_orchestrators'").fetchone()
+              and not self.db.execute('SELECT 1 FROM project_orchestrators WHERE session_id=?', (caller,)).fetchone()):
+            raise CoordError('unbound revalidation requires the original project orchestrator')
+        if job.get('project_scope'):
+            raise CoordError('explicit project workspace settings require exact native readback; named-profile reclassification is withheld')
         if job['kind'] != 'create' or not job['requested_cwd']:
             raise CoordError('workspace revalidation requires an explicit-workspace agent creation')
         if not job['workspace_revalidated'] and (job['status'] != 'created' or not job['new_thread_id'] or job['queue_id'] or not job['new_settings_digest']):
@@ -233,9 +312,11 @@ class SessionResetState:
             self.db.execute("UPDATE session_resets SET status='cancelled',updated_at=? WHERE id=?", (time.time(), job_id))
         return self.public(self.job(job_id))
 
-    def jobs(self, host, project_scope=False):
-        return [self.job(row['id']) for row in self.db.execute(
+    def jobs(self, host, project_scope=False, project_workspaces=False):
+        jobs = [self.job(row['id']) for row in self.db.execute(
             "SELECT r.* FROM session_resets r WHERE r.host_id=? AND (r.project_scope=0 OR ?) AND r.status NOT IN ('completed','cancelled','failed') AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=r.target_session AND c.mode<>'running') ORDER BY r.created_at", (host, int(project_scope)))]
+        from .root_lifecycle import stopped
+        return [job for job in jobs if not stopped(self.db, job['target_session']) and (project_workspaces or not self.requires_workspace_worker(job))]
 
     def update(self, job_id, expected, status, **values):
         transitions = {
@@ -251,6 +332,9 @@ class SessionResetState:
             job = self.job(job_id)
             if job['status'] != expected:
                 raise CoordError('reset state changed; inspect current request before continuing')
+            if (expected,status) in (('pending','creating'),('created','ready'),('ready','adding'),('queued','starting')):
+                from .core import assert_agent_running
+                assert_agent_running(self.db, job['target_session'])
             if status == 'creating' or (status == 'ready' and expected == 'created'):
                 if job['kind'] == 'reset':
                     self.clean(job['target_session'], job['old_thread_id'])

@@ -12,6 +12,8 @@ import subprocess
 import sys
 import shlex
 
+from .app_logging import LoggingConfig, configure, new_correlation_id
+
 
 LABEL = "com.agent-chat"
 COMPONENTS = ("server", "client")
@@ -110,7 +112,12 @@ class ServiceManager:
         if component == "server":
             if args.token_file:
                 lines.extend(["AGENT_CHAT_API_TOKEN=$(cat -- " + _quote(token) + ")", "export AGENT_CHAT_API_TOKEN"])
-            lines.append("exec " + " ".join(_quote(x) for x in (self.python, self.server_bin, "--db", args.db)))
+            command = [self.python, self.server_bin, "--db", args.db]
+            if getattr(args, 'inbox_diagnostics', None):
+                command.extend(["--inbox-diagnostics", args.inbox_diagnostics])
+            if getattr(args, 'log_level', 'OFF') != 'OFF':
+                command.extend(["--log-level", args.log_level, "--log-file", args.log_file])
+            lines.append("exec " + " ".join(_quote(x) for x in command))
         else:
             lines.extend([
                 "AGENT_CHAT_API_TOKEN=$(cat -- " + _quote(token) + ")",
@@ -279,21 +286,40 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--codex-bin", default=shutil.which("codex") or "codex")
     p.add_argument("--codex-server", default="ws://127.0.0.1:4500")
     p.add_argument("--token-file")
+    p.add_argument("--inbox-diagnostics")
+    p.add_argument("--log-level", choices=("OFF", "ERROR", "WARNING", "INFO", "DEBUG"), default="OFF")
+    p.add_argument("--log-file")
     p.add_argument("--project")
     return p
 
 
 def _main(argv=None) -> int:
     args = parser().parse_args(argv)
+    if args.log_level != 'OFF' and not args.log_file:
+        raise ServiceError('--log-file is required when --log-level is enabled')
+    if args.log_level != 'OFF' and args.log_file and not Path(args.log_file).expanduser().is_absolute():
+        raise ServiceError('--log-file must be an absolute path')
+    logging_runtime = configure(LoggingConfig(level=args.log_level,
+                                               path=args.log_file if args.log_level != 'OFF' else None))
+    service_log = logging_runtime.logger('agent_chat.service')
+    correlation_id = new_correlation_id()
+    service_log.event('operation_start', correlation_id=correlation_id)
     for name in ("db", "project_root", "state_dir", "token_file"):
         if getattr(args, name, None): setattr(args, name, _absolute(getattr(args, name)))
-    if args.action == "install" and args.component in ("client", "all"):
-        codex = shutil.which(args.codex_bin) if not Path(args.codex_bin).is_absolute() else args.codex_bin
-        if not codex: raise ServiceError("cannot find codex; pass --codex-bin with an absolute path")
-        args.codex_bin = _absolute(codex)
-    manager = ServiceManager()
-    getattr(manager, args.action)(args if args.action == "install" else args.component)
-    return 0
+    try:
+        if args.action == "install" and args.component in ("client", "all"):
+            codex = shutil.which(args.codex_bin) if not Path(args.codex_bin).is_absolute() else args.codex_bin
+            if not codex: raise ServiceError("cannot find codex; pass --codex-bin with an absolute path")
+            args.codex_bin = _absolute(codex)
+        manager = ServiceManager()
+        getattr(manager, args.action)(args if args.action == "install" else args.component)
+        service_log.event('operation_complete', correlation_id=correlation_id)
+        return 0
+    except BaseException as error:
+        service_log.error('operation_failed', error, correlation_id=correlation_id)
+        raise
+    finally:
+        logging_runtime.close()
 
 
 def main(argv=None) -> int:

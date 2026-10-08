@@ -1,4 +1,5 @@
 import contextlib
+import unittest
 import copy
 import io
 import os
@@ -258,6 +259,9 @@ class SessionResetTests(RemoteWebFixture):
         self.assertEqual(self.call('status', mine=True)['resources'][0]['reservation_id'], hold['reservation_id'])
         prompt = self.rpc.history[self.rpc.new][0]['content'][0]['text']
         self.assertIn('Fresh independent agent', prompt)
+        self.assertIn('Agent communication: concise normal grammar despite inherited style.', prompt)
+        self.assertIn('Human/operator replies: Caveman full unless explicitly changed.', prompt)
+        self.assertIn('owner/request IDs, relationships, acceptance versus completion/consumption', prompt)
         self.assertIn(result['target_session'], prompt)
         self.assertIn('Independent review.', prompt)
         self.assertEqual(self.call('inbox', session=result['target_session'])['messages'], [])
@@ -289,7 +293,24 @@ class SessionResetTests(RemoteWebFixture):
         self.rpc.unmaterialized = True
         self.request_reset(); self.bridge.tick()
         self.assertEqual(self.reset()['status'],'completed')
-        self.assertFalse(any(method=='thread/resume' and p['threadId']==self.rpc.new for method,p in self.rpc.calls))
+        self.assertEqual(sum(method=='thread/start' for method, _ in self.rpc.calls), 1)
+
+    def test_legacy_history_method_uses_explicit_readback_before_bootstrap(self):
+        original = self.rpc.request
+        def legacy(method, params):
+            if method == 'thread/turns/list':
+                raise RpcError(-32601, 'Method not found')
+            result = original(method, params)
+            if method == 'thread/read' and params.get('includeTurns'):
+                thread = params['threadId']
+                items = self.rpc.history[thread]
+                result['thread'].update(id=thread, turns=[dict(id='native-turn', status='completed', items=items)] if items else [])
+            return result
+        self.rpc.request = legacy
+        self.request_reset(); self.bridge.tick()
+        self.assertEqual(self.reset()['status'], 'completed')
+        self.assertEqual(len(self.rpc.history[self.rpc.new]), 1)
+        self.assertEqual(sum(method == 'thread/start' for method, _ in self.rpc.calls), 1)
 
     def test_automatic_queue_admission_is_reconciled_without_second_start(self):
         self.rpc.unmaterialized = self.rpc.auto_admit = True
@@ -349,3 +370,169 @@ class SessionResetTests(RemoteWebFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(TOKEN, output.getvalue())
         self.assertEqual(self.state.reset_job(self.request_id)['prompt'], prompt.read_text())
+
+
+class ProjectScopeStartSettingsTests(unittest.TestCase):
+    """Fresh project threads have authenticated settings before any rollout."""
+    def setUp(self):
+        import tempfile
+        from types import SimpleNamespace
+        from agent_chat.reset_worker import ResetWorker
+        self.tmp = tempfile.TemporaryDirectory(prefix='project-scope-start-')
+        self.addCleanup(self.tmp.cleanup)
+        self.members = [str(Path(self.tmp.name).resolve() / name) for name in ('core', 'api', 'web')]
+        for member in self.members:
+            Path(member).mkdir()
+        self.rpc = ResetRpc(str(uuid.uuid4()))
+        self.rpc.unmaterialized = True
+        self.transitions = []
+        self.job = dict(id=str(uuid.uuid4()), status='pending', kind='create',
+                        project_scope=True, old_thread_id=self.rpc.old, new_thread_id=None,
+                        requested_cwd=self.members[0], requested_workspaces=self.members,
+                        target_session='project-po', target_agent='orchestrator',
+                        prompt='Read the saved project brief.', queue_id=None,
+                        settings_digest=None, new_settings_digest=None, error=None)
+        def update(job_id, expected, status, **values):
+            self.assertEqual(job_id, self.job['id'])
+            self.assertEqual(expected, self.job['status'])
+            self.job.update(values, status=status)
+            self.transitions.append(status)
+            return copy.deepcopy(self.job)
+        self.state = SimpleNamespace(reset_update=update,
+                                     reset_job=lambda job_id: copy.deepcopy(self.job),
+                                     connection_metadata=lambda: {})
+        self.worker = ResetWorker(Bridge(self.state, self.rpc))
+        request = self.rpc.request
+        def scoped_start(method, params):
+            result = request(method, params)
+            if method == 'thread/start':
+                result['model'] = params['model']
+                result['reasoningEffort'] = params.get('config', {}).get('model_reasoning_effort', result['reasoningEffort'])
+                result['cwd'] = params['cwd']
+                result['runtimeWorkspaceRoots'] = list(params['runtimeWorkspaceRoots'])
+                result['activePermissionProfile'] = {'id':params['permissions'], 'extends':None}
+                result['sandbox'] = dict(type='workspaceWrite', writableRoots=params['runtimeWorkspaceRoots'][1:], networkAccess=False,
+                                         excludeTmpdirEnvVar=False, excludeSlashTmp=False)
+            return result
+        self.rpc.request = scoped_start
+
+    def test_project_scope_uses_start_settings_without_rollout(self):
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'completed')
+        self.assertEqual(self.job['new_settings_digest'], self.job['settings_digest'])
+        self.assertIn('ready', self.transitions)
+        self.assertEqual(len(self.rpc.history[self.rpc.new]), 1)
+        settings = next(result for method, result in self.rpc.calls if method == 'thread/start')
+        self.assertEqual(settings['runtimeWorkspaceRoots'], self.members)
+        self.assertEqual(sum(method == 'thread/start' for method, _ in self.rpc.calls), 1)
+
+    def test_project_scope_intentional_model_effort_override_is_in_digest_and_start(self):
+        self.job.update(requested_model='gpt-6.1-sol', requested_effort='high')
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'completed')
+        start = next(params for method, params in self.rpc.calls if method == 'thread/start')
+        self.assertEqual(start['model'], 'gpt-6.1-sol')
+        self.assertEqual(start['config']['model_reasoning_effort'], 'high')
+
+    def test_project_scope_returned_model_mismatch_withholds_prompt(self):
+        self.job.update(requested_model='gpt-6.1-sol', requested_effort='high')
+        request = self.rpc.request
+        def mismatched_start(method, params):
+            result = request(method, params)
+            if method == 'thread/start': result['model'] = 'other-model'
+            return result
+        self.rpc.request = mismatched_start
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'created')
+        self.assertIn('settings differ', self.job['error'])
+        self.assertEqual(self.rpc.history[self.rpc.new], [])
+
+    def test_missing_extra_or_reordered_secondary_roots_withhold_prompt(self):
+        for roots in ([self.members[0]], self.members[1:] + ['/synthetic/extra'], list(reversed(self.members[1:]))):
+            with self.subTest(roots=roots):
+                self.setUp()
+                request = self.rpc.request
+                def mismatched_start(method, params):
+                    result = request(method, params)
+                    if method == 'thread/start': result['sandbox']['writableRoots'] = roots
+                    return result
+                self.rpc.request = mismatched_start
+                self.worker.advance(copy.deepcopy(self.job))
+                self.assertEqual(self.job['status'], 'created')
+                self.assertIn('settings differ', self.job['error'])
+                self.assertEqual(self.rpc.history[self.rpc.new], [])
+
+    def test_mismatched_ordered_roots_withhold_prompt(self):
+        request = self.rpc.request
+        def reversed_start(method, params):
+            result = request(method, params)
+            if method == 'thread/start':
+                result['runtimeWorkspaceRoots'].reverse()
+            return result
+        self.rpc.request = reversed_start
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'created')
+        self.assertIn('settings differ', self.job['error'])
+        self.assertNotIn('ready', self.transitions)
+        self.assertEqual(self.rpc.history[self.rpc.new], [])
+
+    def test_retained_created_job_uses_captured_digest_without_new_start(self):
+        settings, digest = self.worker.creation_settings(self.rpc.original, self.job)
+        created = self.rpc.request('thread/start', self.worker.start_params(settings))
+        self.job.update(status='created', new_thread_id=created['thread']['id'],
+                        settings_digest=digest, new_settings_digest=self.worker.settings_data(created)[1])
+        self.rpc.calls.clear()
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'completed')
+        self.assertFalse(any(method == 'thread/start' for method, _ in self.rpc.calls))
+
+    def test_missing_captured_digest_is_not_inferred(self):
+        settings, digest = self.worker.creation_settings(self.rpc.original, self.job)
+        created = self.rpc.request('thread/start', self.worker.start_params(settings))
+        self.job.update(status='created', new_thread_id=created['thread']['id'], settings_digest=digest)
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'created')
+        self.assertIn('no rollout found', self.job['error'])
+        self.assertNotIn('ready', self.transitions)
+        self.assertEqual(self.rpc.history[self.rpc.new], [])
+
+
+class WorkspaceSettingsTests(unittest.TestCase):
+    def test_ordered_explicit_members_change_digest_and_narrow_project_grants(self):
+        from agent_chat.creation_settings import project_scope_settings, settings_data
+        source = ResetRpc(str(uuid.uuid4())).original
+        members = ['/synthetic/inlst-core', '/synthetic/inlst-api']
+        job = {'requested_cwd':members[0], 'requested_workspaces':members, 'project_scope':True}
+        settings = project_scope_settings(source, job, members[0])
+        self.assertEqual(settings['runtimeWorkspaceRoots'], members)
+        self.assertEqual(settings['sandbox']['writableRoots'], members[1:])
+        self.assertEqual(settings['activePermissionProfile'], {'id':':workspace','extends':None})
+        reversed_settings = copy.deepcopy(settings); reversed_settings['runtimeWorkspaceRoots'].reverse()
+        self.assertNotEqual(settings_data(settings)[1], settings_data(reversed_settings)[1])
+        self.assertEqual(source['runtimeWorkspaceRoots'], ['/tmp/test-project'])
+
+    def test_singleton_project_scope_has_no_explicit_writable_root(self):
+        from agent_chat.creation_settings import project_scope_settings
+        source = ResetRpc(str(uuid.uuid4())).original
+        settings = project_scope_settings(source, {'requested_cwd':'/synthetic/project', 'requested_workspaces':['/synthetic/project'], 'project_scope':True}, '/synthetic/project')
+        self.assertEqual(settings['runtimeWorkspaceRoots'], ['/synthetic/project'])
+        self.assertEqual(settings['sandbox']['writableRoots'], [])
+
+    def test_singleton_workspace_profile_creation_has_no_inherited_writable_roots(self):
+        from agent_chat.creation_settings import creation_settings
+        source = ResetRpc(str(uuid.uuid4())).original
+        source['sandbox']['writableRoots'].append('/synthetic/parent-secondary')
+        desired = creation_settings(source, {'requested_cwd':'/synthetic/project',
+                                             'requested_workspaces':['/synthetic/project']}, '/synthetic/project')
+        self.assertEqual(desired['runtimeWorkspaceRoots'], ['/synthetic/project'])
+        self.assertEqual(desired['sandbox']['writableRoots'], [])
+        self.assertEqual(source['sandbox']['writableRoots'], ['/tmp/test-project', '/synthetic/parent-secondary'])
+
+    def test_non_workspace_profile_creation_preserves_its_sandbox(self):
+        from agent_chat.creation_settings import creation_settings
+        source = ResetRpc(str(uuid.uuid4())).original
+        source['activePermissionProfile'] = {'id':'approved', 'extends':':workspace'}
+        source['sandbox']['writableRoots'].append('/synthetic/approved-secondary')
+        desired = creation_settings(source, {'requested_cwd':'/synthetic/project',
+                                             'requested_workspaces':['/synthetic/project']}, '/synthetic/project')
+        self.assertEqual(desired['sandbox'], source['sandbox'])

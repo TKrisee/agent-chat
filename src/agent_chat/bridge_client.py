@@ -32,6 +32,13 @@ class RemoteBridgeState:
     def call(self, op, **params):
         return self.client.call('/api/bridge/rpc', dict(self.identity, op=op, params=params))['result']
 
+    def policy_consumed(self, thread_id):
+        from .communication import policy_version
+        return self.call('policy-consumed',thread_id=thread_id,version=policy_version())['consumed']
+    def policy_offer(self, kind, client_id, thread_id, payload):
+        return self.call('policy-offer',kind=kind,client_id=client_id,thread_id=thread_id,payload=payload)
+    def policy_pending(self): return self.call('policy-pending')
+    def policy_receipt(self, offer, turn_id): return self.call('policy-receipt',offer=offer,turn_id=turn_id)
     def pending(self): return self.call('pending')
     def jobs(self): return self.call('jobs')
     def job(self, job_id): return self.call('job', job_id=job_id)
@@ -47,21 +54,27 @@ class RemoteBridgeState:
     def observe(self, thread_id, state, error=None):
         return self.call('observe', thread_id=thread_id, state=state, error=error)
     def heartbeat(self, server, pid, error=None):
-        return self.call('heartbeat', server=server, pid=pid, error=error, capabilities=['project-scope-v1'])
+        return self.call('heartbeat', server=server, pid=pid, error=error, capabilities=['project-scope-v1', 'project-workspaces-v1'])
+    def root_fresh_jobs(self): return self.call('root-fresh-jobs')
+    def root_fresh_job(self, job_id): return self.call('root-fresh-job', job_id=job_id)
+    def root_fresh_update(self, job_id, expected, status, **values):
+        return self.call('root-fresh-update', job_id=job_id, expected=expected, status=status, **values)
     def control_jobs(self): return self.call('control-jobs')
     def control_job(self, job_id): return self.call('control-job', job_id=job_id)
     def control_update(self, job_id, expected, status, **values):
         return self.call('control-update', job_id=job_id, expected=expected, status=status, **values)
+    def supervisor_jobs(self): return self.call('supervisor-jobs')
+    def supervisor_observe(self, job, report): return self.call('supervisor-observe', job=job, report=report)
     def reset_jobs(self):
-        jobs = self.call('reset-jobs', capabilities=['project-scope-v1'])
+        jobs = self.call('reset-jobs', capabilities=['project-scope-v1', 'project-workspaces-v1'])
         self.scoped_resets.update(job['id'] for job in jobs if job.get('project_scope'))
         return jobs
     def reset_job(self, job_id):
-        job = self.call('reset-job', job_id=job_id, capabilities=['project-scope-v1'])
+        job = self.call('reset-job', job_id=job_id, capabilities=['project-scope-v1', 'project-workspaces-v1'])
         if job.get('project_scope'): self.scoped_resets.add(job_id)
         return job
     def reset_update(self, job_id, expected, status, **values):
-        if job_id in self.scoped_resets: values['capabilities'] = ['project-scope-v1']
+        if job_id in self.scoped_resets: values['capabilities'] = ['project-scope-v1', 'project-workspaces-v1']
         return self.call('reset-update', job_id=job_id, expected=expected, status=status, **values)
 
 

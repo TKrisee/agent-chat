@@ -51,6 +51,8 @@ finally:test.tearDown();empty.tearDown()
     await page.goto(url+'/?project='+project);
     const agent=name=>page.getByRole('button',{name:'Show conversations with '+name,exact:true});
     await agent('orchestrator').waitFor();
+    await page.locator('#project-directory').waitFor({state:'visible'});
+    assert.match(await page.locator('#project-workspace-path').textContent(), /project-a$/);
     assert.deepEqual(await page.locator('.agent-name').allTextContents(),['root','orchestrator']);
     assert.equal(await agent('root').locator('.agent-orchestrator').getAttribute('aria-label'),'Root orchestrator');
     assert.equal(await agent('orchestrator').locator('.agent-orchestrator').getAttribute('aria-label'),'Orchestrator');
@@ -70,6 +72,9 @@ finally:test.tearDown();empty.tearDown()
     assert.equal(await noticeCard.evaluate(card=>card.classList.contains('own')),false);
     await page.getByRole('button',{name:'Show original message from Service notice',exact:true}).waitFor();
     await page.locator('#root-projects').getByRole('heading',{name:'Project A',exact:true}).waitFor();
+    const rootProjectCard=page.locator('.root-project').filter({has:page.getByRole('heading',{name:'Project A',exact:true})});
+    await rootProjectCard.getByText('Working directory',{exact:true}).waitFor();
+    assert.match(await rootProjectCard.locator('.root-project-directory-value').textContent(), /project-a$/);
     assert(await page.locator('#create-agent').isHidden());
     await page.locator('#message-input').fill('Coordinate both projects; report decisions only.');
     await page.locator('#send-button').click();
@@ -127,6 +132,8 @@ finally:test.tearDown();empty.tearDown()
     await page.waitForFunction(()=>document.querySelector('#sidebar').getBoundingClientRect().right<=1);
     await page.screenshot({path:'/private/tmp/chat-maintainer-root-mobile.png'});
     await page.locator('#resources-toggle').click();
+    await rootProjectCard.getByText('Working directory',{exact:true}).waitFor();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth), true, 'Root project directories fit the narrow sidebar');
     await page.getByRole('button',{name:'Open project Project A',exact:true}).click();
     await page.waitForURL('**/?project='+project);
     assert.equal(await page.locator('#message-input').inputValue(),'Project-only draft');

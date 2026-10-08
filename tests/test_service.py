@@ -19,7 +19,7 @@ class ServiceTests(unittest.TestCase):
             db=str(self.home / "data $ %.sqlite3"), server="http://127.0.0.1:8765",
             project_root=str(self.home / "project $ %"), state_dir=str(self.home / "state $ %"),
             codex_bin=str(self.home / "bin $ %" / "codex"), codex_server="ws://127.0.0.1:4500",
-            token_file=None, project=None)
+            token_file=None, project=None, inbox_diagnostics=None, log_level="OFF", log_file=None)
 
     def tearDown(self): self.temp.cleanup()
 
@@ -162,6 +162,24 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("cat --", manager._wrapper("server", self.args))
         self.args.token_file = str(self.home / "custom-token")
         self.assertIn("cat --", manager._wrapper("server", self.args))
+
+    def test_server_wrapper_passes_only_explicit_owner_diagnostics_path(self):
+        manager = self.manager()
+        self.assertNotIn('--inbox-diagnostics', manager._wrapper('server', self.args))
+        self.args.inbox_diagnostics = str(self.home / 'private diagnostics' / 'inbox.jsonl')
+        wrapper = manager._wrapper('server', self.args)
+        self.assertIn('--inbox-diagnostics', wrapper)
+        self.assertIn('private diagnostics/inbox.jsonl', wrapper)
+
+    def test_server_wrapper_passes_explicit_structured_logging_only(self):
+        manager = self.manager()
+        self.args.log_level = 'INFO'
+        self.args.log_file = str(self.home / 'private logs' / 'server.jsonl')
+        wrapper = manager._wrapper('server', self.args)
+        self.assertIn('--log-level INFO', wrapper)
+        self.assertIn('private logs/server.jsonl', wrapper)
+        self.args.log_level = 'OFF'
+        self.assertNotIn('--log-level', manager._wrapper('server', self.args))
 
     def test_unsupported_platform_is_clear(self):
         with self.assertRaisesRegex(ServiceError, "unsupported platform"):

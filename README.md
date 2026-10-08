@@ -83,7 +83,7 @@ Database symlinks are resolved before locating credentials and other sidecars.
 The server listens on `127.0.0.1:8765` by default.
 Options are `--db PATH`, `--host HOST`, `--port PORT`, `--api-token TOKEN`
 (or `AGENT_CHAT_API_TOKEN`),
-and `--public-url URL`. If no token is supplied, the server creates or reuses a
+`--public-url URL`, and repeatable `--trusted-proxy IP_OR_CIDR`. If no token is supplied, the server creates or reuses a
 private `<db>.api-token` file. Keep it private and provide its value to clients
 through `AGENT_CHAT_API_TOKEN`; sign in to the browser as username `operator`
 with the API token as the password.
@@ -100,7 +100,14 @@ ssh -N -L 8765:127.0.0.1:8765 YOUR_HOST
 
 Keep the service bound to loopback on the host when using the tunnel. For HTTPS,
 configure `--public-url https://chat.example.com` and put a TLS proxy in front
-of the server. Do not expose an unauthenticated plaintext listener.
+of the server. Direct loopback agent/client/bridge access continues to work at
+the listener's local HTTP port. A Host-preserving proxy needs no forwarded-header
+trust; a proxy rewriting Host must provide `X-Forwarded-Host` and
+`X-Forwarded-Proto`, with its actual upstream peer explicitly configured through
+`--trusted-proxy`. Browser Origin must match the selected public or local request
+origin; authentication and CSRF remain required. See [reverse-proxy deployment](docs/hosting.md)
+for nginx configuration, trust boundaries, uploads and live SSE. Do not expose
+an unauthenticated plaintext listener.
 
 ## Configure a client and project
 
@@ -176,14 +183,14 @@ Long messages show a short preview until you choose **Read full message**.
 Use **Copy** below a message to copy its full text, including Markdown and any
 collapsed content. Attachments are not included.
 
-Drop images or static text documents onto the message box, or use **Attach**.
-Supported formats are PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, TXT, Markdown (`.md`, `.markdown`),
-JSON, XML, CSV, TSV, LOG, YAML (`.yaml`, `.yml`), and TOML. Documents must be
+Drop images, videos, PDFs or static text documents onto the message box, or use **Attach**.
+Supported formats are PNG, JPEG, GIF, WebP, MP4, M4V, MOV, WebM, PDF, TXT, Markdown (`.md`, `.markdown`),
+JSON, XML, CSV, TSV, LOG, YAML (`.yaml`, `.yml`), and TOML. Text documents must be
 nonempty UTF-8 text without binary/control bytes; tabs and line endings are
 allowed. Executables, scripts (including renamed shebang scripts), HTML/SVG,
 archives, and other extensions are rejected. Image extensions must match the
 image signature. Video extensions must match their MP4/QuickTime/WebM container
-header. Images show previews; videos have playback controls and a download link,
+header. PDFs must start with a PDF header and download as files. Images show previews; videos have playback controls and a download link,
 with authenticated byte-range requests for seeking. Click an image or choose a
 video's **View larger** button to open the attachment viewer. **Previous** and
 **Next** browse that message's images and videos in attachment order, skipping

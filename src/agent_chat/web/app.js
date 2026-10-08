@@ -9,7 +9,8 @@ const MAX_FILES = 50;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'm4v', 'mov', 'webm']);
-const DOCUMENT_EXTENSIONS = new Set(['txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
+const DOCUMENT_EXTENSIONS = new Set(['pdf', 'txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
+const SETUP_STORAGE_KEY = 'agent-chat.setup-guide.v1';
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
 let mediaViewer = null;
@@ -20,7 +21,7 @@ const state = {
   hasOlder: false, source: null, newCount: 0, config: null, sending: false,
   mentionOptions: [], mentionIndex: 0, reply: null, originals: new Map(), highlighted: null,
   project: new URL(location.href).searchParams.get('project') || 'default', epoch: 0,
-  projects: [], drafts: new Map(), busy: false,
+  projects: [], drafts: new Map(), busy: false, rootOverviewData: null, rootWorkspaceRequests: new Map(),
   hasNewer: false, historyLoaded: false, loadingHistory: false,
   historyDirection: null, historyError: null, scrollTop: 0,
   viewGeneration: 0, viewLoading: false,
@@ -37,6 +38,59 @@ function node(tag, className, text) {
   if (className) el.className = className;
   if (text !== undefined) el.textContent = text;
   return el;
+}
+
+function workspaceLines(value) {
+  return typeof value === 'string'
+    ? value.split('\n').map(path => path.trim()).filter(Boolean)
+    : [];
+}
+
+function workspaceMembers(item, keys = ['workspaces', 'workspace', 'cwd', 'creation_workspace']) {
+  for (const key of keys) {
+    const value = item?.[key];
+    if (Array.isArray(value)) return value.filter(path => typeof path === 'string' && path);
+    if (typeof value === 'string' && value) return [value];
+  }
+  return [];
+}
+
+function sameWorkspaceMembers(left, right) {
+  return left.length === right.length && left.every((path, index) => path === right[index]);
+}
+
+function fillWorkspaceList(list, members, emptyLabel) {
+  list.replaceChildren();
+  if (!members.length) {
+    list.append(node('li', '', emptyLabel));
+    list.classList.add('unavailable');
+    return;
+  }
+  list.classList.remove('unavailable');
+  for (const member of members) list.append(node('li', '', member));
+}
+
+let setupStep = 0;
+function renderSetupGuide() {
+  const steps = [...$('setup-steps').children];
+  steps.forEach((step, index) => {
+    step.hidden = index !== setupStep;
+    step.toggleAttribute('aria-current', index === setupStep);
+  });
+  $('setup-progress').textContent = `Step ${setupStep + 1} of ${steps.length}`;
+  $('setup-back').disabled = setupStep === 0;
+  $('setup-next').textContent = setupStep === steps.length - 1 ? 'Finish' : 'Next';
+}
+function openSetupGuide() {
+  const dialog = $('setup-dialog');
+  if (dialog.open) return;
+  setupStep = 0;
+  renderSetupGuide();
+  dialog.showModal();
+}
+function dismissSetupGuide() {
+  localStorage.setItem(SETUP_STORAGE_KEY, 'complete');
+  if ($('setup-dialog').open) $('setup-dialog').close();
 }
 
 function agentLabel(id, fallback) {
@@ -81,10 +135,6 @@ function renderUsage(usage) {
   state.usage = usage || null;
   const label = usageStatus();
   $('usage-label').textContent = label;
-  $('weekly-usage').textContent = usage?.remaining_percent == null
-    ? 'Weekly usage unavailable' : `${Math.round(usage.remaining_percent)}% weekly left`;
-  $('weekly-usage').title = usage?.remaining_percent == null
-    ? 'Remaining weekly usage is unknown' : `${Math.round(usage.remaining_percent)}% remaining. ${usageReset()}`;
   $('usage-button').classList.toggle('paused', Boolean(usage?.enabled && (usage.paused || usage.blocked || usage.remaining_percent == null)));
   $('usage-button').classList.toggle('enabled', Boolean(usage?.enabled && !(usage.paused || usage.blocked || usage.remaining_percent == null)));
   $('usage-button').title = usage?.reason || (usage?.enabled ? usageReset() : 'Configure a global weekly usage reserve');
@@ -789,7 +839,7 @@ function addImages(files) {
   for (const file of files) {
     const extension = fileExtension(file.name);
     if (!IMAGE_EXTENSIONS.has(extension) && !VIDEO_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
-      composerStatus('Choose a supported image, video or text file.', true); return;
+      composerStatus('Choose a supported image, video, PDF or text file.', true); return;
     }
     if (!file.size || file.size > MAX_FILE_BYTES) {
       composerStatus('Each file must be nonempty and no larger than 10 MiB.', true); return;
@@ -1513,16 +1563,117 @@ function projectControls() {
   const disabled = state.busy || state.sending;
   if ($('root-conversation')) $('root-conversation').disabled = disabled || !state.config;
   $('measurement-button').disabled = disabled || !state.config;
-  $('project-select').disabled = disabled;
+  for (const button of $('project-list').querySelectorAll('button')) button.disabled = disabled;
   $('new-project').disabled = disabled || !state.config;
   $('rename-project').disabled = disabled || !state.config;
+  for (const id of ['manage-project-workspaces', 'manage-root-workspaces']) {
+    if ($(id)) $(id).disabled = disabled || !state.config;
+  }
   $('attach-button').disabled = disabled || !state.config || (state.rootView && !state.root);
   $('image-input').disabled = disabled || !state.config || (state.rootView && !state.root);
   for (const button of $('composer-images').querySelectorAll('button')) button.disabled = disabled;
 }
 
+function openWorkspaceGroups() {
+  const projects = state.projects.filter(project => project.id !== 'default');
+  const list = $('workspace-groups-list');
+  list.replaceChildren();
+  if (!projects.length) {
+    list.append(node('p', 'project-scope-help', 'Create a project before configuring its workspaces.'));
+  }
+  for (const project of projects) {
+    const section = node('section', 'workspace-group-entry');
+    const label = node('label', '', `${project.name} workspaces`);
+    const area = node('textarea', '', undefined);
+    area.rows = 3;
+    area.maxLength = 4096 * 32;
+    area.dataset.projectId = project.id;
+    area.setAttribute('aria-label', `${project.name} workspaces, one directory per line`);
+    area.placeholder = '/absolute/canonical/primary-directory\n/absolute/canonical/related-directory';
+    area.value = workspaceMembers(project).join('\n');
+    section.append(label, area);
+    list.append(section);
+  }
+  $('workspace-groups-error').textContent = '';
+  $('workspace-groups-error').hidden = true;
+  $('workspace-groups-dialog').showModal();
+}
+
+async function postProjectJSON(path, payload) {
+  const body = JSON.stringify(payload);
+  const submit = () => fetchJSON(path, {
+    method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token }, body,
+  });
+  try { return await submit(); }
+  catch (error) {
+    if (error.status !== 403) throw error;
+    state.config = await fetchJSON('/api/config');
+    renderProjects(state.config);
+    return submit();
+  }
+}
+
+async function reconfigureProjectWorkspaces(project) {
+  const previous = project.reconfiguration;
+  const continuing = previous && !['completed', 'failed', 'cancelled'].includes(previous.status);
+  const workspaces = continuing ? previous.requested_workspaces : workspaceMembers(project, ['creation_workspaces', 'creation_workspace', 'workspace']);
+  const expectedThread = continuing ? (previous.old_thread_id || project.orchestrator?.thread_id) : project.orchestrator?.thread_id;
+  if (!state.root || !workspaces.length || !expectedThread) return;
+  if (continuing && previous.prompt && previous.prompt !== 'Continue the existing project work with this saved workspace assignment. Read the current project checkpoint before proceeding. Keep the existing project identity, inbox, queue, and ownership intact.') {
+    composerStatus('This workspace update uses a different saved prompt. Reconcile it through the root controls before continuing.', true); return;
+  }
+  const paths = workspaces.map(path => `• ${path}`).join('\n');
+  const action = continuing ? 'Continue' : 'Apply';
+  if (!confirm(`${action} these saved workspaces for ${project.name} using a fresh conversation?\n\n${paths}\n\nThe current workspace assignment remains active until the new settings are verified. The project identity, inbox, and queue stay with the same orchestrator.`)) {
+    state.rootWorkspaceRequests.delete(project.project_id); return;
+  }
+  const prompt = 'Continue the existing project work with this saved workspace assignment. Read the current project checkpoint before proceeding. Keep the existing project identity, inbox, queue, and ownership intact.';
+  let payload = state.rootWorkspaceRequests.get(project.project_id);
+  if (!payload) {
+    payload = { project: project.project_id, expected_thread: expectedThread, workspaces, prompt, request_id: continuing ? previous.id : crypto.randomUUID(), confirm: true };
+    state.rootWorkspaceRequests.set(project.project_id, payload);
+  }
+  state.busy = true; projectControls();
+  try {
+    const result = await postProjectJSON('/api/root/workspaces', payload);
+    project.reconfiguration = result.reconfiguration || result;
+    if (['completed', 'failed', 'cancelled'].includes(project.reconfiguration.status)) state.rootWorkspaceRequests.delete(project.project_id);
+    if (state.rootOverviewData) {
+      state.rootOverviewData.projects = state.rootOverviewData.projects.map(item => item.project_id === project.project_id ? project : item);
+      state.rootOverviewKey = null;
+      renderProjects({ root_orchestrator: state.root, root_overview: state.rootOverviewData, projects: state.projects, project: state.config?.project });
+    }
+  } catch (error) { composerStatus(error.message, true); }
+  finally { state.busy = false; projectControls(); }
+}
+
+async function provisionRootProject(project) {
+  if (!confirm(`Provision the root orchestrator for ${project.name}? It will use the saved ordered workspace group.`)) {
+    state.rootWorkspaceRequests.delete(`provision:${project.project_id}`); return;
+  }
+  let payload = state.rootWorkspaceRequests.get(`provision:${project.project_id}`);
+  if (!payload) {
+    payload = { project: project.project_id, agent: 'orchestrator', request_id: crypto.randomUUID(), confirm: true, model: null, effort: null };
+    state.rootWorkspaceRequests.set(`provision:${project.project_id}`, payload);
+  }
+  state.busy = true; projectControls();
+  try {
+    const result = await postProjectJSON('/api/root/provision', payload);
+    if (result?.status && ['completed', 'failed', 'cancelled'].includes(result.status)) state.rootWorkspaceRequests.delete(`provision:${project.project_id}`);
+    state.config = await fetchJSON('/api/config');
+    renderProjects(state.config);
+  } catch (error) { composerStatus(error.message, true); }
+  finally { state.busy = false; projectControls(); }
+}
+
 function renderProjects(data) {
   if ('root_orchestrator' in data) state.root = data.root_orchestrator;
+  if ('root_overview' in data) {
+    state.rootOverviewData = data.root_overview;
+    for (const project of data.root_overview?.projects || []) {
+      if (['completed', 'failed', 'cancelled'].includes(project.reconfiguration?.status)) state.rootWorkspaceRequests.delete(project.project_id);
+    }
+  }
   if (state.rootView) state.selected = state.root?.home_session || null;
   document.body.classList.toggle('root-screen', state.rootView);
   if ($('resources-button-label')) $('resources-button-label').textContent = state.rootView ? 'Projects' : 'Resources';
@@ -1530,6 +1681,11 @@ function renderProjects(data) {
   document.title = state.rootView ? 'Root orchestrator · Agent chat' : 'Agent room · Agent chat';
   $('message-input').placeholder = state.rootView ? 'Message your root orchestrator…' : 'Message all agents, @tag recipients, or drop files…';
   if ($('root-directory')) $('root-directory').hidden = !state.rootView;
+  if ($('project-directory')) {
+    $('project-directory').hidden = state.rootView;
+    const workspaces = workspaceMembers(data.project);
+    fillWorkspaceList($('project-workspace-path'), workspaces, 'No workspace is configured for this project.');
+  }
   if (state.rootView && data.root_overview && $('root-projects')) {
     const key = JSON.stringify(data.root_overview);
     if (state.rootOverviewKey !== key) {
@@ -1537,10 +1693,46 @@ function renderProjects(data) {
       const cards = (data.root_overview.projects || []).map(project => {
         const card = node('article', 'root-project');
         card.append(node('h3', '', project.name), node('p', 'root-project-state', project.setup.replaceAll('_', ' ')));
+        const currentWorkspaces = workspaceMembers(project, ['workspaces', 'cwd']);
+        const savedWorkspaces = workspaceMembers(project, ['creation_workspaces', 'creation_workspace', 'workspace']);
+        const directory = node('div', 'root-project-directory');
+        directory.append(node('span', 'root-project-directory-label', 'Currently in use'));
+        const currentList = node('ol', 'root-project-directory-value');
+        fillWorkspaceList(currentList, currentWorkspaces, 'Not configured');
+        directory.append(currentList);
+        const savedDirectory = node('div', 'root-project-directory');
+        savedDirectory.append(node('span', 'root-project-directory-label', 'Saved for setup'));
+        const savedList = node('ol', 'root-project-directory-value');
+        fillWorkspaceList(savedList, savedWorkspaces, 'Not configured');
+        savedDirectory.append(savedList);
+        card.append(directory);
+        card.append(savedDirectory);
         if (project.agent) card.append(node('p', '', `${project.agent}${project.model ? ` · ${project.model}` : ''}`));
         if (project.error) card.append(node('p', 'root-project-error', project.error));
+        if (project.reconfiguration) {
+          const update = project.reconfiguration;
+          card.append(node('p', 'root-project-state', `Workspace update: ${String(update.status || 'pending').replaceAll('_', ' ')}`));
+          if (update.error) card.append(node('p', 'root-project-error', update.error));
+        }
+        card.append(node('p', 'root-project-note', 'Completed workspace updates become current when this overview refreshes.'));
         const bridge = project.bridge;
         if (!bridge?.recent || !bridge.project_scope_worker) card.append(node('p', 'root-project-error', !bridge?.recent ? 'Wake bridge unavailable' : 'Project creation awaits bridge activation'));
+        const update = project.reconfiguration;
+        if (project.setup === 'ready_to_provision' && bridge?.recent && bridge.project_scope_worker && bridge.project_workspaces_worker) {
+          const provision = node('button', 'quiet-button', 'Provision root orchestrator');
+          provision.type = 'button'; provision.disabled = state.busy || state.sending;
+          provision.addEventListener('click', () => provisionRootProject(project));
+          card.append(provision);
+        }
+        const updatePending = update && !['completed', 'failed', 'cancelled'].includes(update.status);
+        const savedDiffers = savedWorkspaces.length && !sameWorkspaceMembers(currentWorkspaces, savedWorkspaces);
+        if (project.orchestrator?.thread_id && (savedDiffers || updatePending)) {
+          const apply = node('button', 'quiet-button', updatePending ? 'Continue workspace update' : 'Apply saved workspaces');
+          apply.type = 'button';
+          apply.disabled = state.busy || state.sending || !bridge?.recent || !bridge.project_workspaces_worker;
+          apply.addEventListener('click', () => reconfigureProjectWorkspaces(project));
+          card.append(apply);
+        }
         const open = node('button', 'quiet-button', 'Open project');
         open.type = 'button'; open.setAttribute('aria-label', `Open project ${project.name}`);
         open.addEventListener('click', () => switchProject(project.project_id));
@@ -1556,18 +1748,18 @@ function renderProjects(data) {
   }
   if (!data.projects) return;
   state.projects = data.projects;
-  const select = $('project-select');
-  const choices = data.projects.map(project => [project.id, project.name]);
-  if (state.rootView) choices.unshift(['', '']);
-  if (JSON.stringify([...select.options].map(o => [o.value, o.text])) !== JSON.stringify(choices)) {
-    select.replaceChildren(...choices.map(([id, label]) => {
-      const option = new Option(label, id);
-      option.disabled = !id;
-      return option;
-    }));
-  }
-  select.value = state.rootView ? '' : state.project;
-  select.setAttribute('aria-label', state.rootView ? 'Root chat active; select a project' : 'Project');
+  const projectButtons = data.projects.map(project => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.className = 'room-button project-nav-button';
+    button.dataset.projectId = project.id;
+    button.textContent = project.name;
+    const selected = !state.rootView && project.id === state.project;
+    button.classList.toggle('selected', selected);
+    button.setAttribute('aria-current', selected ? 'page' : 'false');
+    button.addEventListener('click', () => switchProject(project.id));
+    return button;
+  });
+  $('project-list').replaceChildren(...projectButtons);
   const measuring = !!data.projects.find(p => p.id === state.project)?.measurement_running;
   $('measurement-indicator').hidden = !measuring;
   $('measurement-button').setAttribute('aria-label', measuring ? 'Measure usage (active)' : 'Measure usage');
@@ -1594,6 +1786,7 @@ async function connect() {
     state.config = await fetchJSON('/api/config');
     if (state.rootView) state.project = state.config.project.id;
     renderProjects(state.config);
+    if (!state.rootView && !localStorage.getItem(SETUP_STORAGE_KEY)) openSetupGuide();
     applySnapshot(await fetchJSON(resourceSnapshotURL()));
     $('message-input').disabled = state.rootView && !state.root;
     $('send-button').disabled = state.rootView && !state.root;
@@ -1653,9 +1846,6 @@ $('root-conversation')?.addEventListener('click', async () => {
   await switchProject(root.home_project, true);
 });
 
-$('project-select').addEventListener('change', event => {
-  if (event.target.value) switchProject(event.target.value);
-});
 $('usage-button').addEventListener('click', () => {
   state.usageDialogDirty = false;
   usageError();
@@ -1714,7 +1904,7 @@ for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
     $('project-name').value = rename ? state.projects.find(p => p.id === state.project).name : '';
     if ($('project-creation-scope')) {
       $('project-creation-scope').hidden = rename;
-      $('project-workspace').value = '';
+      $('project-workspaces').value = '';
       $('project-instructions').value = '';
     }
     $('project-error').textContent = '';
@@ -1723,6 +1913,34 @@ for (const [id, rename] of [['new-project', false], ['rename-project', true]]) {
   });
 }
 $('cancel-project').addEventListener('click', () => $('project-dialog').close());
+$('manage-project-workspaces').addEventListener('click', openWorkspaceGroups);
+$('manage-root-workspaces').addEventListener('click', openWorkspaceGroups);
+$('cancel-workspace-groups').addEventListener('click', () => $('workspace-groups-dialog').close());
+$('workspace-groups-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  if (state.busy) return;
+  const assignments = [...$('workspace-groups-list').querySelectorAll('textarea[data-project-id]')]
+    .map(area => ({ id: area.dataset.projectId, workspaces: workspaceLines(area.value) }))
+    .filter(item => item.workspaces.length);
+  if (!assignments.length) {
+    $('workspace-groups-error').textContent = 'Enter at least one workspace for a project. Blank project groups are left unchanged.';
+    $('workspace-groups-error').hidden = false;
+    return;
+  }
+  $('workspace-groups-error').textContent = '';
+  $('workspace-groups-error').hidden = true;
+  state.busy = true; projectControls(); $('save-workspace-groups').disabled = true;
+  try {
+    await postProjectJSON('/api/projects/workspaces-batch', { assignments });
+    $('workspace-groups-dialog').close();
+    state.config = await fetchJSON('/api/config');
+    renderProjects(state.config);
+    applySnapshot(await fetchJSON(resourceSnapshotURL()));
+  } catch (error) {
+    $('workspace-groups-error').textContent = error.message;
+    $('workspace-groups-error').hidden = false;
+  } finally { state.busy = false; projectControls(); $('save-workspace-groups').disabled = false; }
+});
 $('project-form').addEventListener('submit', async event => {
   event.preventDefault();
   if (state.busy) return;
@@ -1734,22 +1952,10 @@ $('project-form').addEventListener('submit', async event => {
   state.busy = true; projectControls(); $('save-project').disabled = true;
   try {
     const path = rename ? '/api/projects/rename' : '/api/projects';
-    const scope = !rename && $('project-workspace') &&
-      ($('project-workspace').value.trim() || $('project-instructions').value.trim())
-      ? {workspace:$('project-workspace').value, instructions:$('project-instructions').value} : {};
-    const body = JSON.stringify({ name: $('project-name').value, ...(rename ? { id: state.project } : scope) });
-    const submit = () => fetchJSON(path, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token }, body,
-    });
-    let result;
-    try {
-      result = await submit();
-    } catch (error) {
-      if (error.status !== 403) throw error;
-      state.config = await fetchJSON('/api/config');
-      renderProjects(state.config);
-      result = await submit();
-    }
+    const workspaces = workspaceLines($('project-workspaces').value);
+    const scope = !rename && (workspaces.length || $('project-instructions').value.trim())
+      ? { ...(workspaces.length ? { workspaces } : {}), instructions:$('project-instructions').value } : {};
+    const result = await postProjectJSON(path, { name: $('project-name').value, ...(rename ? { id: state.project } : scope) });
     $('project-dialog').close();
     state.busy = false;
     if (rename) applySnapshot(await fetchJSON(resourceSnapshotURL())); else switchProject(result.project.id);
@@ -1757,6 +1963,11 @@ $('project-form').addEventListener('submit', async event => {
   finally { state.busy = false; projectControls(); $('save-project').disabled = false; $('save-project').textContent = saveLabel; }
 });
 $('all-conversations').addEventListener('click', () => selectAgent(null));
+$('setup-guide').addEventListener('click', openSetupGuide);
+$('dismiss-setup').addEventListener('click', dismissSetupGuide);
+$('setup-back').addEventListener('click', () => { setupStep = Math.max(0, setupStep - 1); renderSetupGuide(); });
+$('setup-next').addEventListener('click', () => { if (setupStep === $('setup-steps').children.length - 1) dismissSetupGuide(); else { setupStep += 1; renderSetupGuide(); } });
+$('setup-dialog').addEventListener('cancel', () => localStorage.setItem(SETUP_STORAGE_KEY, 'complete'));
 $('search').addEventListener('input', (event) => { state.query = event.target.value.toLowerCase(); renderMessages(true); });
 $('ack-filter').addEventListener('change', (event) => { state.ack = event.target.value; renderMessages(true); });
 $('to-me-filter').addEventListener('click', () => { state.toMe = !state.toMe; loadConversationView(); });

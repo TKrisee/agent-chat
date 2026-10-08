@@ -11,6 +11,7 @@ import sys
 import threading
 
 from .core import CoordError, Coordinator
+from .app_logging import LoggingConfig
 from .web import create_server
 
 
@@ -47,12 +48,23 @@ def main(argv=None):
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--api-token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
     parser.add_argument('--public-url', help='External HTTP(S) origin; required when binding beyond loopback')
+    parser.add_argument('--trusted-proxy', action='append', default=[], metavar='IP_OR_CIDR',
+                        help='Trust X-Forwarded-Host/Proto only from this proxy IP/network; repeatable')
     parser.add_argument('--codex-sessions', default=os.environ.get('AGENT_CHAT_CODEX_SESSIONS_DIR'),
                         help='Local Codex sessions directory for timed usage measurements (default: ~/.codex/sessions)')
+    parser.add_argument('--inbox-diagnostics', metavar='PATH',
+                        help='Owner-only five-minute JSONL timing sink for explicitly traced inbox requests')
+    parser.add_argument('--log-level', choices=('OFF', 'ERROR', 'WARNING', 'INFO', 'DEBUG'), default='OFF')
+    parser.add_argument('--log-file', metavar='ABSOLUTE_PATH',
+                        help='Owner-only structured event log; required when --log-level is enabled')
     args = parser.parse_args(argv)
     if not 0 <= args.port <= 65535:
         parser.error('--port must be between 0 and 65535')
     args.db = str(Path(args.db).expanduser().resolve())
+    if args.log_level != 'OFF' and not args.log_file:
+        parser.error('--log-file is required when --log-level is enabled')
+    if args.log_level != 'OFF' and args.log_file and not Path(args.log_file).expanduser().is_absolute():
+        parser.error('--log-file must be an absolute path')
 
     server = None
     previous = {}
@@ -68,7 +80,12 @@ def main(argv=None):
         # Bootstrap the database before WebServer creates its operator session.
         Coordinator(args.db).close()
         server = create_server(args.db, port=args.port, host=args.host,
-                               api_token=args.api_token, public_url=args.public_url, sessions_root=args.codex_sessions)
+                               api_token=args.api_token, public_url=args.public_url, sessions_root=args.codex_sessions,
+                               trusted_proxies=args.trusted_proxy, inbox_diagnostics=args.inbox_diagnostics,
+                               logging_config=LoggingConfig(level=args.log_level,
+                                                            path=(str(Path(args.log_file).expanduser())
+                                                                  if args.log_level != 'OFF' and args.log_file else None)))
+        server.server_log.event('startup')
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, shutdown)
         print(server.origin + '/', flush=True)
@@ -78,6 +95,7 @@ def main(argv=None):
         return 2
     finally:
         if server:
+            server.server_log.event('shutdown')
             server.stop_event.set()
             server.server_close()
         for sig, handler in previous.items():
