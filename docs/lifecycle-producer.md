@@ -24,10 +24,13 @@ file selected only in the launcher's environment:
 
 ```sh
 AGENT_CHAT_PRODUCER_CAPABILITY_FILE=/private/admin/trusted-launcher.capability \
-  agent-chat-client run file:src/example.py -- python task.py
+  agent-chat-client run --capability-file /private/owner/reservation.json \
+    --reservation-id EXACT_RID file:src/example.py -- python task.py
 ```
 
-Use the normal explicit server, project, session, host and reservation credentials.
+Use the normal explicit server, project, session and host. Supply the reservation
+capability previously captured by `request --capability-file` and its exact RID;
+this is separate from the producer capability selected in the environment.
 The launcher removes the producer file selection from the command's environment.
 Before attaching a PID or allowing command execution, it calls `producer-establish`
 and receives a server-minted execution instance. After observing the leader's exit

@@ -45,7 +45,7 @@ def turns_page(rpc, params):
     if params.get('itemsView', 'summary') == 'summary':
         # Our workers consume only IDs/status and user-message client IDs. Keep
         # tool outputs and message bodies out of their summary evidence.
-        selected = [dict(id=turn['id'], status=turn['status'], items=[
+        selected = [dict(id=turn['id'], status=turn['status'], error=turn.get('error'), items=[
             {key: item[key] for key in ('id', 'type', 'clientId') if key in item}
             for item in turn['items']]) for turn in selected]
     elif params.get('itemsView') == 'notLoaded':

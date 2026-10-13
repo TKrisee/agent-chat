@@ -66,7 +66,17 @@ class BridgeState:
         from .session_reset import SessionResetState
         SessionResetState(coord)
         from .agent_control import AgentControlState
-        AgentControlState(coord)
+        self.controls = AgentControlState(coord)
+        from .capacity_recovery import CapacityState
+        self.capacity = CapacityState(self)
+
+    def capacity_targets(self): return self.capacity.targets()
+    def capacity_jobs(self): return self.capacity.rows()
+    def capacity_gate(self, session_id, thread_id): return self.capacity.gate(session_id, thread_id)
+    def capacity_schedule(self, session_id, thread_id, turn_id, now, settings_digest, model, reasoning_effort, owner):
+        return self.capacity.schedule(session_id, thread_id, turn_id, now, settings_digest, model, reasoning_effort, owner)
+    def capacity_update(self, job_id, expected, status, now, **values):
+        return self.capacity.update(job_id, expected, status, now, **values)
 
     def resolve(self, session_id):
         """Return the root thread and explicit descendant route, or no binding."""
@@ -142,11 +152,15 @@ class BridgeState:
         return {'unbound': True}
 
     def pending(self):
+        # Do not replay ACKed history from before the provenance migration boundary.
         messages = [dict(r) for r in self.db.execute('''
             SELECT m.id,m.recipient_session FROM messages m
             LEFT JOIN bridge_deliveries d ON d.message_id=m.id
             WHERE m.sender_session<>m.recipient_session
-              AND m.acked_at IS NULL AND d.message_id IS NULL
+              AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
+                  AND r.reader_session=m.recipient_session
+                  AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
+              AND d.message_id IS NULL
               AND NOT EXISTS (SELECT 1 FROM session_resets r WHERE r.target_session=m.recipient_session
                   AND r.status NOT IN ('completed','cancelled','failed'))
               AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=m.recipient_session AND c.mode<>'running')
@@ -161,7 +175,9 @@ class BridgeState:
     def still_unread(self, job_id):
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
             JOIN messages m ON m.id=d.message_id
-            WHERE d.job_id=? AND m.acked_at IS NULL
+            WHERE d.job_id=? AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
+                AND r.reader_session=m.recipient_session
+                AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
               AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=m.recipient_session AND c.mode<>'running')
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id)) LIMIT 1''', (job_id,)).fetchone())
@@ -174,7 +190,10 @@ class BridgeState:
         """
         result = []
         for message_id in message_ids:
-            row = self.db.execute('''SELECT * FROM messages WHERE id=? AND acked_at IS NULL
+            row = self.db.execute('''SELECT * FROM messages WHERE id=?
+                AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id
+                    AND r.reader_session=messages.recipient_session
+                    AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (messages.acked_at IS NOT NULL AND messages.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
                 AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=messages.id)
                      OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=messages.id))''',
                                   (message_id,)).fetchone()
@@ -217,12 +236,15 @@ class BridgeState:
         with self.coord.tx():
             live = []
             for message in messages:
-                row = self.db.execute('SELECT acked_at,recipient_session,sender_session FROM messages WHERE id=?', (message['id'],)).fetchone()
+                row = self.db.execute('''SELECT recipient_session,sender_session FROM messages WHERE id=?
+                    AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id
+                        AND r.reader_session=messages.recipient_session
+                        AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (messages.acked_at IS NOT NULL AND messages.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))''', (message['id'],)).fetchone()
                 from .session_reset import assert_reset_unlocked
                 assert_reset_unlocked(self.db, message['recipient_session'])
                 assert_agent_running(self.db, message['recipient_session'])
                 route = self.resolve(message['recipient_session'])
-                if (row and row['acked_at'] is None and row['recipient_session'] == message['recipient_session']
+                if (row and row['recipient_session'] == message['recipient_session']
                         and row['sender_session'] != row['recipient_session'] and route and route['thread_id'] == thread_id
                         and not self.db.execute('SELECT 1 FROM bridge_deliveries WHERE message_id=?', (message['id'],)).fetchone()
                         and (not self.db.execute('SELECT 1 FROM message_batches WHERE message_id=?', (message['id'],)).fetchone()
@@ -234,13 +256,30 @@ class BridgeState:
             self.db.execute('INSERT INTO bridge_jobs VALUES(?,?,?,?,?,?,?,?)',
                             (job_id, thread_id, payload, 'prepared', None, None, time.time(), time.time()))
             self.db.executemany('INSERT INTO bridge_deliveries VALUES(?,?)', [(m['id'], job_id) for m in live])
+            # Claim selection only with genuine managed input; never manufacture
+            # a turn to change defaults. One request remains tied to one wake UUID.
+            selection = self.db.execute('''SELECT r.id FROM agent_control_requests r
+                JOIN bridge_bindings b ON b.session_id=r.target_session
+                WHERE r.model_route='ordinary_input' AND r.status IN ('pending','waiting')
+                  AND r.native_input_job_id IS NULL AND r.thread_id=? AND b.thread_id=r.thread_id
+                ORDER BY r.created_at LIMIT 1''', (thread_id,)).fetchone()
+            if selection:
+                self.db.execute('UPDATE agent_control_requests SET native_input_job_id=? WHERE id=?',
+                                (job_id, selection['id']))
         return self.job(job_id)
 
     def job(self, job_id):
         row = self.db.execute('SELECT * FROM bridge_jobs WHERE id=?', (job_id,)).fetchone()
         if not row:
             raise CoordError('unknown bridge job')
-        return dict(row)
+        result = dict(row)
+        selection = self.db.execute('SELECT id FROM agent_control_requests WHERE native_input_job_id=?', (job_id,)).fetchone()
+        if selection:
+            control = self.controls.job(selection['id'])
+            result['model_request_id'] = control['id']
+            if control['status'] != 'failed' or result['status'] == 'failed':
+                result['model_control'] = control
+        return result
 
     def jobs(self):
         jobs = [dict(r) for r in self.db.execute("""SELECT j.* FROM bridge_jobs j WHERE j.status NOT IN ('dispatched','cancelled')
@@ -251,7 +290,7 @@ class BridgeState:
             row = self.db.execute('SELECT session_id FROM bridge_bindings WHERE thread_id=?', (job['thread_id'],)).fetchone()
             return row and (held(self.db,row['session_id']) or (projection(self.db, row['session_id']) or {}).get('paused'))
         from .root_lifecycle import stopped
-        return [job for job in jobs if not paused(job)
+        return [self.job(job['id']) for job in jobs if not paused(job)
                 and not any(stopped(self.db,row['recipient_session']) for row in self.db.execute(
                     'SELECT m.recipient_session FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.job_id=?', (job['id'],)))]
 
@@ -266,6 +305,19 @@ class BridgeState:
                 if row: assert_agent_running(self.db, row['session_id'])
             self.db.execute('UPDATE bridge_jobs SET status=?,queue_id=COALESCE(?,queue_id),error=?,updated_at=? WHERE id=?',
                             (status, queue_id, error, time.time(), job_id))
+            job = self.job(job_id)
+            selection = job.get('model_control')
+            if selection and status == 'starting':
+                if not self.still_unread(job_id):
+                    raise CoordError('ordinary model input was consumed before submission')
+                self.controls.update(selection['id'], selection['status'], 'submitting',
+                    input_job_id=job_id, direct_input=True)
+            elif selection and status in ('uncertain','failed') and selection['status'] == 'submitting':
+                self.controls.update(selection['id'], selection['status'], status,
+                    input_job_id=job_id, error=error)
+            elif selection and status == 'cancelled' and selection['status'] in ('pending','waiting'):
+                self.controls.update(selection['id'], selection['status'], 'failed', input_job_id=job_id,
+                    error='Original associated input consumed before native submission; no replacement input or model replay.')
         if self.db.in_transaction: write()
         else:
             with self.coord.tx(): write()
@@ -280,6 +332,9 @@ class BridgeState:
                 raise CoordError('only a session bound to this route can retry its job')
             if job['status'] not in ('uncertain', 'failed'):
                 raise CoordError('only uncertain or failed jobs can be explicitly retried')
+            selection = job.get('model_control')
+            if selection and not (job['status'] == 'failed' and selection['status'] == 'failed'):
+                raise CoordError('ordinary model input cannot be replayed; inspect original request and native input evidence')
             self.db.execute("UPDATE bridge_jobs SET status='prepared',queue_id=NULL,error=NULL,updated_at=? WHERE id=?", (time.time(), job_id))
         return self.job(job_id)
 
@@ -328,17 +383,18 @@ class BridgeState:
             return {'runtime': runtime_snapshot(self.db),
                     'bindings': [dict(r) for r in self.db.execute('SELECT * FROM bridge_bindings ORDER BY updated_at')],
                     'threads': [dict(r) for r in self.db.execute('SELECT * FROM bridge_observations ORDER BY checked_at DESC')],
-                    'jobs': [dict(r) for r in self.db.execute('SELECT id,thread_id,status,queue_id,error,created_at,updated_at FROM bridge_jobs ORDER BY created_at DESC LIMIT 100')]}
+                    'jobs': [dict(r) for r in self.db.execute('SELECT id,thread_id,status,queue_id,error,created_at,updated_at FROM bridge_jobs ORDER BY created_at DESC LIMIT 100')],
+                    'capacity_recoveries': [dict(r) for r in self.db.execute('SELECT * FROM bridge_capacity_recoveries ORDER BY updated_at DESC LIMIT 100')]}
 
         caller = self.coord.require_session()
         binding = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (caller,)).fetchone()
         if not binding:
             return {'runtime': runtime_snapshot(self.db), 'bindings': [], 'threads': [],
-                    'jobs': [], 'jobs_has_more': False}
+                    'jobs': [], 'jobs_has_more': False, 'capacity_recoveries': []}
         route = self.resolve(caller)
         if not route:
             return {'runtime': runtime_snapshot(self.db), 'bindings': [dict(binding)], 'threads': [],
-                    'jobs': [], 'jobs_has_more': False}
+                    'jobs': [], 'jobs_has_more': False, 'capacity_recoveries': []}
         thread_id = route['thread_id']
         jobs = [dict(r) for r in self.db.execute('''
             SELECT id,thread_id,status,queue_id,error,created_at,updated_at
@@ -347,4 +403,5 @@ class BridgeState:
         return {'runtime': runtime_snapshot(self.db), 'bindings': [dict(binding)],
                 'threads': [dict(r) for r in self.db.execute(
                     'SELECT * FROM bridge_observations WHERE thread_id=?', (thread_id,))],
-                'jobs': jobs[:10], 'jobs_has_more': len(jobs) > 10}
+                'jobs': jobs[:10], 'jobs_has_more': len(jobs) > 10,
+                'capacity_recoveries': [dict(r) for r in self.db.execute('SELECT * FROM bridge_capacity_recoveries WHERE thread_id=? ORDER BY updated_at DESC LIMIT 10', (thread_id,))]}

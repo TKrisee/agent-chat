@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import base64
+import copy
+from collections import deque
 import hashlib
 import json
 import math
 import os
+import select
 import socket
 import struct
 import time
@@ -45,6 +48,10 @@ class RpcClient:
         self._host, self._port, self._target = self._parse_endpoint()
         self._sock: socket.socket | None = None
         self._next_id = 1
+        self.initialize_response: Any = None
+        self._notifications = deque(maxlen=1024)
+        self._notification_sequence = 0
+        self._notification_floor = 0
 
     def __enter__(self) -> "RpcClient":
         return self.connect()
@@ -56,6 +63,9 @@ class RpcClient:
         if self._sock is not None:
             return self
         host, port, target = self._host, self._port, self._target
+        self.initialize_response = None
+        self._notifications.clear()
+        self._notification_floor = self._notification_sequence
         try:
             addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
             if not addresses or any(not self._is_loopback(a[4][0]) for a in addresses):
@@ -92,7 +102,7 @@ class RpcClient:
             except OSError:
                 pass
 
-    def request(self, method: str, params: Any = None) -> Any:
+    def request(self, method: str, params: Any = None, *, deadline: float | None = None) -> Any:
         if self._sock is None:
             raise TransportError("not connected")
         request_id = self._next_id
@@ -100,7 +110,7 @@ class RpcClient:
         message: dict[str, Any] = {"id": request_id, "method": method}
         if params is not None:
             message["params"] = params
-        deadline = time.monotonic() + self.timeout
+        deadline = time.monotonic() + self.timeout if deadline is None else deadline
         try:
             self._send_json(message, deadline)
             while True:
@@ -109,6 +119,9 @@ class RpcClient:
                     continue
                 if "method" in response and "id" in response:
                     self._reject_server_request(response, deadline)
+                    continue
+                if "method" in response:
+                    self._record_notification(response)
                     continue
                 if response.get("id") != request_id:
                     continue
@@ -125,11 +138,57 @@ class RpcClient:
                 self._sock.settimeout(self.timeout)
 
     def _initialize(self) -> None:
-        self.request("initialize", {
+        self.initialize_response = self.request("initialize", {
             "clientInfo": {"name": "agent_chat_bridge", "version": "0.1.0"},
             "capabilities": {"experimentalApi": True},
         })
         self._send_json({"method": "initialized", "params": {}})
+
+    def _record_notification(self, message: dict[str, Any]) -> None:
+        if len(self._notifications) == self._notifications.maxlen:
+            self._notification_floor = self._notifications[0][0]
+        self._notification_sequence += 1
+        self._notifications.append((self._notification_sequence, copy.deepcopy(message)))
+
+    def notifications_since(self, boundary: int) -> list[tuple[int, dict[str, Any]]]:
+        """Raw observations in receive order; a dropped window is uncertainty."""
+        if not isinstance(boundary, int) or boundary < self._notification_floor or boundary > self._notification_sequence:
+            raise TransportError("notification observation boundary is unavailable")
+        return copy.deepcopy([item for item in self._notifications if item[0] > boundary])
+
+    def _observe_message(self, deadline: float) -> None:
+        message = self._receive_json(deadline)
+        if message is None:
+            return
+        if "method" in message and "id" in message:
+            self._reject_server_request(message, deadline)
+        elif "method" in message:
+            self._record_notification(message)
+        else:
+            raise TransportError("unexpected response outside an RPC request")
+
+    def notification_boundary(self, *, deadline: float) -> int:
+        """Drain already-readable wire data before recording a dispatch boundary.
+
+        This is a receive boundary, not proof of native request causality. A
+        concurrent event arriving afterward still needs conflict validation.
+        """
+        if self._sock is None:
+            raise TransportError("not connected")
+        try:
+            while select.select([self._sock], [], [], 0)[0]:
+                self._observe_message(deadline)
+            self._set_deadline(deadline)
+            return self._notification_sequence
+        except OSError as exc:
+            raise TransportError(str(exc)) from exc
+
+    def next_notification(self, boundary: int, *, deadline: float) -> tuple[int, dict[str, Any]]:
+        while True:
+            available = self.notifications_since(boundary)
+            if available:
+                return available[0]
+            self._observe_message(deadline)
 
     def _parse_endpoint(self) -> tuple[str, int, str]:
         try:

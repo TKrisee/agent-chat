@@ -14,6 +14,48 @@ from agent_chat.bridge import Bridge, exclusive_bridge
 from agent_chat.bridge_state import BridgeState
 from agent_chat.core import CoordError, Coordinator
 from agent_chat.rpc import RpcError, TransportError, RpcClient
+from test_agent_model import OrdinaryModelInputTests
+
+
+class OrdinaryBridgeBoundaryTests(unittest.TestCase):
+    # Real isolated HTTP/coordinator fixture; no native service is contacted.
+    setUp = OrdinaryModelInputTests.setUp
+    tearDown = OrdinaryModelInputTests.tearDown
+    start = OrdinaryModelInputTests.start
+    stop = OrdinaryModelInputTests.stop
+    call = OrdinaryModelInputTests.call
+    change = OrdinaryModelInputTests.change
+    status = OrdinaryModelInputTests.status
+
+    def test_consumed_associated_input_never_gets_replaced_or_dummy_turned(self):
+        request = self.change()
+        message = self.call('send', session='b', to='worker', body='consumed original input')['id']
+        pending = self.state.pending()
+        job = self.state.prepare(self.target_thread, pending, self.bridge.payload(self.target_thread, pending))
+        self.call('message', id=message)
+        self.bridge.advance(job)
+        status = self.status()['requests'][0]
+        self.assertEqual((status['id'], status['status'], status['native_input_job_id']),
+                         (request['id'], 'failed', job['id']))
+        self.assertEqual(self.rpc.inputs, [])
+        self.call('send', session='b', to='worker', body='later unrelated input')
+        self.bridge.tick()
+        self.assertEqual(self.rpc.inputs, [])
+
+    def test_open_guard_withholds_native_input_and_preserves_atomic_pending_job(self):
+        claim = self.call('request', resource='file:neutral-model-guard', minutes=2)
+        self.call('begin-guard', resource=claim['resource'], token=claim['token'], pid=0)
+        request = self.change()
+        self.call('send', session='b', to='worker', body='guarded original input')
+        with self.assertRaises(CoordError):
+            self.bridge.tick()
+        self.assertEqual(self.rpc.inputs, [])
+        status = self.status()['requests'][0]
+        self.assertEqual((status['id'], status['status']), (request['id'], 'waiting'))
+        job = self.state.jobs()[0]
+        self.assertEqual(job['status'], 'prepared')
+        self.assertEqual(status['native_input_job_id'], job['id'])
+        self.assertEqual(self.status()['admission'], 'running')
 
 
 class FakeRpc:
@@ -159,10 +201,16 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.count('thread/queue/start'), 1)
 
     def test_acknowledged_and_self_messages_do_not_wake(self):
-        self.agent.acknowledge(self.send())
+        first = self.send()
+        self.agent.acknowledge(first)
         other = self.coord('other', 'other')
-        self.agent.acknowledge(self.send(sender=other))
+        second = self.send(sender=other)
+        self.agent.acknowledge(second)
         self_message = self.send(sender=self.agent)
+        # An ACK has not consumed either recipient message; both are still
+        # routeable until the exact recipient performs a genuine full read.
+        self.assertEqual({item['id'] for item in self.state.pending()}, {first, second})
+        self.agent.message(first); self.agent.message(second)
         self.assertEqual(self.state.pending(), [])
         self.assertIsNone(self.state.prepare(
             self.thread, [{'id': self_message, 'recipient_session': 'worker'}], 'ignored'))
@@ -197,8 +245,8 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(self.state.prepare(
             self.thread, [{'id': message, 'recipient_session': 'other'}], 'wrong recipient'))
         self.agent.acknowledge(message)
-        self.assertIsNone(self.state.prepare(self.thread, pending, 'already acknowledged'))
-        self.assertEqual(self.state.jobs(), [])
+        self.assertIsNotNone(self.state.prepare(self.thread, pending, 'acknowledged but unread'))
+        self.assertEqual(len(self.state.jobs()), 1)
 
     def test_busy_unloaded_and_noninput_threads_wait_then_wake(self):
         self.send()
@@ -523,16 +571,16 @@ class BridgeTests(unittest.TestCase):
             self.state.unbind()
         self.assertEqual(self.state.bind(thread_id=self.thread)['thread_id'], self.thread)
 
-    def test_ack_during_wait_cancels_own_queue_without_model_turn(self):
+    def test_ack_during_wait_preserves_unconsumed_queue_for_delivery(self):
         message = self.send()
         self.rpc.busy_start = True
         self.bridge.tick()
         self.agent.acknowledge(message)
         self.rpc.busy_start = False
         self.bridge.tick()
-        self.assertEqual(self.job()['status'], 'cancelled')
-        self.assertEqual(self.rpc.entries, [])
-        self.assertEqual(self.count('thread/queue/start'), 1)  # first attempt was rejected busy
+        self.assertEqual(self.job()['status'], 'dispatched')
+        self.assertNotEqual(self.rpc.history, [])
+        self.assertEqual(self.count('thread/queue/start'), 2)  # first attempt was rejected busy
 
     def test_peer_wake_does_not_depend_on_sender_label_or_web_identity(self):
         peer = self.coord('web_operator_peer', 'operator')

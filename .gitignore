@@ -16,3 +16,19 @@ node_modules/
 *.bridge.lock
 *.sqlite3-journal
 *.api-token
+
+# Local task snapshots and copied worktrees.
+/.delivery-priority-readonly-*/
+/.explicit-message-purpose-*/
+/.guidance-*/
+/.lease-maintenance-*/
+/.message-consumption-*/
+/.multi-root-model-contract-*/
+/.native-thread-model-ordinary-*/
+/.operator-message-ui-*/
+/.ownership-disposition-*/
+/.privacy-*/
+/.purge-*/
+/.root-local-control-adapter-*/
+/.vm-provider-source-*/
+/.vm-whole-guest-protocol-*/

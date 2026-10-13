@@ -30,7 +30,9 @@ class CoordTests(unittest.TestCase):
         self.db = self.root / 'state.sqlite3'
         self.env = os.environ.copy()
         self.env.pop('AGENT_CHAT_TOKEN', None)
-        self.env.update(AGENT_CHAT_DB=str(self.db), AGENT_CHAT_SESSION='a')
+        self.env.pop('AGENT_CHAT_SERVER', None)
+        self.env.update(AGENT_CHAT_DB=str(self.db), AGENT_CHAT_SESSION='a',
+                        AGENT_CHAT_STATE_DIR=str(self.root / 'client-state'))
         self.cli('register', '--agent', 'alpha')
         self.cli('register', '--agent', 'beta', session='b')
 
@@ -128,6 +130,13 @@ class CoordTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         for _ in range(2):
             self.cli('acknowledge', message)
+        # ACK is routing/reporting bookkeeping, not recipient-body evidence.
+        self.assertEqual([item['id'] for item in self.cli('inbox')[1]['messages']], [message])
+        direct = agent_chat.core.Coordinator(self.db, 'a')
+        try:
+            direct.message(message)
+        finally:
+            direct.close()
         self.assertEqual(self.cli('inbox')[1]['messages'], [])
         self.assertIsNotNone(self.cli('inbox', '--all')[1]['messages'][0]['acked_at'])
         failed, _ = self.cli('inbox', '--agent', 'beta', check=False)
@@ -160,15 +169,25 @@ class CoordTests(unittest.TestCase):
         self.assertEqual(self.cli('cancel', 'shared', session='c')[1]['cancelled'], False)
 
     def test_inbox_fence_rechecks_before_ownership_mutation(self):
-        self.send()
+        first_message = self.send()
         failed, _ = self.cli('request', 'shared', '--minutes', '5', check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.cli('inbox')
+        reader = agent_chat.core.Coordinator(self.db, 'a')
+        try:
+            reader.message(first_message)
+        finally:
+            reader.close()
         claim = self.request()
-        self.send()
+        second_message = self.send()
         failed, _ = self.cli('check', 'shared', token=claim['token'], check=False)
         self.assertNotEqual(failed.returncode, 0)
         self.cli('inbox')
+        reader = agent_chat.core.Coordinator(self.db, 'a')
+        try:
+            reader.message(second_message)
+        finally:
+            reader.close()
         self.cli('check', 'shared', token=claim['token'])
 
     def test_eight_simultaneous_processes_create_one_owner_and_seven_waiters(self):
@@ -300,6 +319,13 @@ class CoordTests(unittest.TestCase):
         inbox = self.cli('inbox')[1]['messages']
         self.assertEqual(inbox[0]['id'], message)
         self.assertIsNone(inbox[0]['acked_at'])
+        checker = agent_chat.core.Coordinator(self.db, 'a')
+        try:
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'read your inbox'):
+                checker.check(claim['resource'], claim['token'])
+            checker.message(message)
+        finally:
+            checker.close()
         self.release(claim)
 
     def test_guard_pulse_survives_message_delivered_after_its_inbox_read(self):
@@ -327,6 +353,9 @@ class CoordTests(unittest.TestCase):
                     with self.assertRaisesRegex(agent_chat.core.CoordError, 'read your inbox'):
                         checker.check('shared', claim['token'])
                     checker.inbox()
+                    with self.assertRaisesRegex(agent_chat.core.CoordError, 'read your inbox'):
+                        checker.check('shared', claim['token'])
+                    checker.message(message[0])
                     self.assertEqual(checker.check('shared', claim['token'])['state'], 'owned')
                 finally:
                     checker.close()
@@ -449,6 +478,335 @@ class CoordTests(unittest.TestCase):
         status = self.cli('status')[1]
         shared = next(r for r in status['resources'] if r['resource'] == 'shared')
         self.assertEqual(shared['queue'], [])
+
+
+class LeaseRenewalTests(unittest.TestCase):
+    """Explicit owner renewal through isolated production coordinator APIs."""
+
+    def setUp(self):
+        from agent_chat.core import Coordinator
+        from agent_chat.remote_service import dispatch
+        self.dispatch = dispatch
+        self.temporary = tempfile.TemporaryDirectory(prefix='lease-renewal-0061-')
+        self.addCleanup(self.temporary.cleanup)
+        self.database = Path(self.temporary.name) / 'state.sqlite3'
+        self.now = time.time()
+        clock = mock.patch('agent_chat.core._now', side_effect=lambda: self.now)
+        clock.start(); self.addCleanup(clock.stop)
+        self.coord = Coordinator(self.database, 'owner')
+        self.addCleanup(lambda: self.coord.close())
+        self.call('register', agent='owner')
+        self.coord.context()
+        self.claim = self.call('request', resource='lease', minutes=5)
+
+    def call(self, operation, **params):
+        return self.dispatch(self.coord, dict(op=operation, session='owner', host_id='fixture-host', params=params))
+
+    def renew(self, minutes=1, **changes):
+        params = dict(resource='lease', minutes=minutes, reservation_id=self.claim['reservation_id'],
+                      token=self.claim['token'])
+        params.update(changes)
+        return self.call('renew', **params)
+
+    def snapshot(self):
+        return (tuple(self.coord.db.execute('SELECT * FROM resources WHERE name=?', ('lease',)).fetchone()),
+                [tuple(row) for row in self.coord.db.execute('SELECT * FROM reservation_renewals')],
+                [tuple(row) for row in self.coord.db.execute('SELECT * FROM resource_queue ORDER BY seq')],
+                [tuple(row) for row in self.coord.db.execute('SELECT * FROM remote_guarded_runs')])
+
+    def assert_expiry_only(self, before):
+        after = self.snapshot()
+        self.assertEqual(after[0][:6], before[0][:6])
+        self.assertEqual(after[0][6], 1)
+        self.assertEqual(after[0][7:], before[0][7:])
+        self.assertEqual(after[1:], before[1:])
+
+    def test_extension_preserves_original_grant_and_pulse_does_not_renew(self):
+        before = self.snapshot()[0]
+        guard = self.call('begin-guard', resource='lease', token=self.claim['token'])
+        pulse = self.call('guard-pulse', run_id=guard['run_id'], token=self.claim['token'])
+        self.assertEqual(pulse['deadline'], self.claim['deadline'])
+        self.assertEqual(self.coord.db.execute('SELECT COUNT(*) FROM reservation_renewals').fetchone()[0], 0)
+        renewed = self.renew(2)
+        after = self.snapshot()[0]
+        self.assertEqual(renewed['deadline'], self.claim['deadline'] + 120)
+        self.assertEqual(renewed['reservation_id'], self.claim['reservation_id'])
+        self.assertEqual(renewed['token'], self.claim['token'])
+        self.assertEqual(after[:5], before[:5])
+        self.assertEqual(after[6:], before[6:])
+        self.assertEqual(renewed['renewal_count'], 1)
+        self.assertIsNone(self.coord.db.execute('SELECT closed_at FROM remote_guarded_runs').fetchone()[0])
+
+    def test_invalid_amount_early_expired_and_wrong_tuple_leave_lease_unchanged(self):
+        for amount in (0, .5, 31, True, float('nan'), float('inf'), None):
+            before = self.snapshot()
+            with self.subTest(amount=amount), self.assertRaises(agent_chat.core.CoordError):
+                self.renew(amount)
+            self.assertEqual(self.snapshot(), before)
+        for changes in (dict(reservation_id='different'), dict(token='different')):
+            before = self.snapshot()
+            with self.assertRaises(agent_chat.core.CoordError):
+                self.renew(**changes)
+            self.assertEqual(self.snapshot(), before)
+        self.now = self.claim['deadline'] - 601
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, '10 minutes'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.now = self.claim['deadline']
+        before = self.snapshot()
+        with self.assertRaises(agent_chat.core.CoordError):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.now += 1
+        with self.assertRaises(agent_chat.core.CoordError):
+            self.renew()
+        self.assert_expiry_only(before)
+
+    def test_fifo_refusal_preserves_all_claimants_and_budget(self):
+        from agent_chat.core import Coordinator
+        for session in ('second', 'third'):
+            other = Coordinator(self.database, session)
+            try:
+                self.dispatch(other, dict(op='register', session=session, host_id='fixture-host', params=dict(agent=session)))
+                other.context()
+                result = self.dispatch(other, dict(op='request', session=session, host_id='fixture-host',
+                                                   params=dict(resource='lease', minutes=5)))
+                self.assertEqual(result['state'], 'queued')
+            finally:
+                other.close()
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'FIFO'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual([row[2] for row in before[2]], ['second', 'third'])
+
+    def test_ordinary_request_still_latches_expiry_after_renewal_refusal(self):
+        self.now = self.claim['deadline'] + 1
+        before = self.snapshot()
+        with self.assertRaises(agent_chat.core.CoordError):
+            self.renew()
+        self.assert_expiry_only(before)
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.call('request', resource='lease', minutes=5)
+        self.assertEqual(self.coord.db.execute("SELECT stale FROM resources WHERE name='lease'").fetchone()[0], 1)
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        self.assertEqual(self.coord.db.execute('SELECT COUNT(*) FROM reservation_renewals').fetchone()[0], 0)
+
+    def test_expired_renewal_refusal_cannot_revive_after_clock_rollback(self):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] + 1
+        with self.assertRaises(agent_chat.core.CoordError):
+            self.renew()
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        after = self.snapshot()
+        self.assertEqual(after[0][:6], before[0][:6])
+        self.assertEqual(after[0][6], 1)
+        self.assertEqual(after[0][7:], before[0][7:])
+        self.assertEqual(after[1:], before[1:])
+
+    def test_mid_transaction_expiry_refusal_cannot_revive_after_clock_rollback(self):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] - 1
+        original_row = self.coord._row
+
+        def crossing_row(db, resource):
+            self.now = self.claim['deadline'] + 1
+            return original_row(db, resource)
+
+        with mock.patch.object(self.coord, '_row', side_effect=crossing_row):
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+                self.renew()
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        self.assert_expiry_only(before)
+
+    def test_expiry_after_owner_check_is_latched_before_refusal(self):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] - 1
+        original_verify = self.coord._verify_owner
+
+        def crossing_verify(*args, **kwargs):
+            row = original_verify(*args, **kwargs)
+            self.now = self.claim['deadline'] + 1
+            return row
+
+        with mock.patch.object(self.coord, '_verify_owner', side_effect=crossing_verify):
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'unexpired'):
+                self.renew()
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        self.assert_expiry_only(before)
+
+    def test_state_first_expiry_refusal_cannot_revive_after_clock_rollback(self):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] - 1
+        original_state = self.coord._state
+
+        def crossing_state(row):
+            self.now = self.claim['deadline'] + 1
+            return original_state(row)
+
+        with mock.patch.object(self.coord, '_state', side_effect=crossing_state):
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+                self.renew()
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        self.assert_expiry_only(before)
+
+    def test_request_state_first_expiry_cannot_revive_after_clock_rollback(self):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] - 1
+        original_state = self.coord._state
+
+        def crossing_state(row):
+            self.now = self.claim['deadline'] + 1
+            return original_state(row)
+
+        with mock.patch.object(self.coord, '_state', side_effect=crossing_state):
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+                self.coord.request('lease', 5)
+        self.now = self.claim['deadline'] - 1
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.coord.request('lease', 5)
+        self.assert_expiry_only(before)
+
+    def test_status_state_first_expiry_cannot_revive_after_clock_rollback(self):
+        self.assert_status_first_expiry_latched(direct=False)
+
+    def test_resource_status_first_expiry_cannot_revive_after_clock_rollback(self):
+        self.assert_status_first_expiry_latched(direct=True)
+
+    def assert_status_first_expiry_latched(self, *, direct):
+        before = self.snapshot()
+        self.now = self.claim['deadline'] - 1
+        original_state = self.coord._state
+
+        def crossing_state(row):
+            self.now = self.claim['deadline'] + 1
+            state = original_state(row)
+            # The legitimate observation must survive even an immediate
+            # rollback before the reporting transaction commits.
+            self.now = self.claim['deadline'] - 1
+            return state
+
+        with mock.patch.object(self.coord, '_state', side_effect=crossing_state):
+            if direct:
+                with self.coord.tx() as db:
+                    row = db.execute("SELECT * FROM resources WHERE name='lease'").fetchone()
+                    observed = self.coord._resource_status(db, row)
+            else:
+                observed = self.coord.status(resources=['lease'])['resources'][0]
+        self.assertEqual(observed['state'], 'stale')
+        self.assertEqual(self.coord.status(resources=['lease'])['resources'][0]['state'], 'stale')
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.coord.request('lease', 5)
+        self.assert_expiry_only(before)
+
+    def test_full_budget_survives_restart_and_same_rid_request(self):
+        from agent_chat.core import Coordinator
+        for count in range(1, 5):
+            self.now = self.claim['deadline'] - 300
+            result = self.renew(30)
+            self.assertEqual((result['renewal_count'], result['renewal_minutes']), (count, count * 30))
+            self.claim = result
+            self.coord.close()
+            self.coord = Coordinator(self.database, 'owner')
+            self.assertEqual(self.call('request', resource='lease', minutes=5)['reservation_id'], self.claim['reservation_id'])
+        self.now = self.claim['deadline'] - 300
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'budget'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_stopped_retired_quarantined_and_global_root_are_ineligible(self):
+        from agent_chat.bridge_state import BridgeState
+        import uuid
+        thread = str(uuid.uuid4())
+        BridgeState(self.coord).bind(thread)
+        self.coord.context(limit=100, max_bytes=100000)
+        self.call('agent-stop', expected_thread=thread, request_id=str(uuid.uuid4()), confirm=True)
+        # Fixture admission after its worker reaches stopped; no native turn
+        # or control worker is run by this renewal harness.
+        self.coord.db.execute("UPDATE agent_controls SET mode='stopped' WHERE target_session='owner'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'admission is stopped'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.coord.db.execute("UPDATE agent_controls SET mode='running' WHERE target_session='owner'")
+        with mock.patch('agent_chat.root_team_reset.quarantined', return_value=True):
+            before = self.snapshot()
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'quarantined'):
+                self.renew()
+            self.assertEqual(self.snapshot(), before)
+        with mock.patch('agent_chat.root_orchestrator.projection', return_value={'paused': False}):
+            before = self.snapshot()
+            with self.assertRaisesRegex(agent_chat.core.CoordError, 'global root is control-only'):
+                self.renew()
+            self.assertEqual(self.snapshot(), before)
+        self.coord.db.execute("INSERT INTO retired_sessions SELECT id,agent,registered_at,? FROM sessions WHERE id='owner'",
+                              (self.now,))
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'deregistered'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_latched_stale_and_unregistered_host_cannot_extend(self):
+        self.coord.db.execute("UPDATE resources SET stale=1 WHERE name='lease'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'stale'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.coord.db.execute("UPDATE resources SET stale=0 WHERE name='lease'")
+        self.coord.db.execute("DELETE FROM remote_session_hosts WHERE session_id='owner'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'legacy session'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unread_changed_host_and_unbound_or_conflicting_guards_refuse(self):
+        from agent_chat.core import Coordinator
+        other = Coordinator(self.database, 'sender')
+        try:
+            self.dispatch(other, dict(op='register', session='sender', host_id='sender-host', params=dict(agent='sender')))
+            other.context()
+            other.send('owner', 'Read the changed synthetic instruction')
+        finally:
+            other.close()
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'read your inbox'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.coord.context(limit=100, max_bytes=100000)
+        self.coord.db.execute("UPDATE remote_session_hosts SET host_id='changed-host' WHERE session_id='owner'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'different remote host'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.coord.db.execute("UPDATE remote_session_hosts SET host_id='fixture-host' WHERE session_id='owner'")
+        self.coord.db.execute('INSERT INTO guarded_runs VALUES(?,?,?,?,?,?,?,?)',
+            ('synthetic-unbound', 'lease', self.claim['reservation_id'], 'owner', 0, None, self.now, None))
+        before = self.snapshot()
+        with self.assertRaisesRegex(agent_chat.core.CoordError, 'unbound local'):
+            self.renew()
+        self.assertEqual(self.snapshot(), before)
+        self.coord.db.execute('DELETE FROM guarded_runs WHERE run_id=?', ('synthetic-unbound',))
+        guard = self.call('begin-guard', resource='lease', token=self.claim['token'])
+        original = dict(self.coord.db.execute('SELECT * FROM remote_guarded_runs WHERE run_id=?', (guard['run_id'],)).fetchone())
+        for field in ('resource', 'reservation_id', 'session_id', 'host_id'):
+            self.coord.db.execute('UPDATE remote_guarded_runs SET ' + field + '=? WHERE run_id=?', ('conflicting', guard['run_id']))
+            before = self.snapshot()
+            with self.subTest(field=field), self.assertRaisesRegex(agent_chat.core.CoordError, 'conflicting'):
+                self.renew()
+            self.assertEqual(self.snapshot(), before)
+            self.coord.db.execute('UPDATE remote_guarded_runs SET ' + field + '=? WHERE run_id=?', (original[field], guard['run_id']))
 
 
 if __name__ == '__main__':

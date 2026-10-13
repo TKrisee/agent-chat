@@ -16,6 +16,7 @@ dependencies = []
 agent-chat-server = "agent_chat.server:main"
 agent-chat-client = "agent_chat.cli:entrypoint"
 agent-chat-service = "agent_chat.service:main"
+agent-chat-ownership-disposition = "agent_chat.ownership_disposition:main"
 agent-chat-root-guidance = "agent_chat.root_guidance:main"
 agent-chat-project-guidance = "agent_chat.project_guidance:main"
 

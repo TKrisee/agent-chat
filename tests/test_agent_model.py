@@ -2,13 +2,18 @@
 import contextlib
 import copy
 import io
+import json
 import os
 import subprocess
+import time
 import uuid
+import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from agent_chat import cli
 from agent_chat.bridge import Bridge
+from agent_chat.bridge_state import BridgeState
 from agent_chat.bridge_client import RemoteBridgeState
 from agent_chat.agent_control import AgentControlState
 from agent_chat.core import CoordError, Coordinator
@@ -99,6 +104,306 @@ class ModelRpc(ControlRpc):
         return super().request(method, params)
 
 
+class _SyntheticSettingsState:
+    """Declared application-state fixture, never production anchor authority."""
+    def __init__(self, job):
+        self.job = copy.deepcopy(job)
+        self.evidence = None
+
+    def control_job(self, request):
+        assert request == self.job['id']
+        return copy.deepcopy(self.job)
+
+    def control_update(self, request, expected, status, **values):
+        assert request == self.job['id'] and self.job['status'] == expected
+        if expected == 'pending' and status == 'changing':
+            assert values['direct_input'] is True and values['observation']['state'] == 'idle'
+            assert values['observation']['queue_count'] == 0 and values['observation']['turn_id'] is None
+            assert values['observation']['permissions']['runtimeWorkspaceRoots'] == values['baseline_settings']['runtimeWorkspaceRoots']
+        self.job['status'] = status
+        for key, value in values.items():
+            if key in ('baseline_settings', 'native_response'):
+                self.job[key + '_json'] = json.dumps(value)
+                if key == 'native_response': self.evidence = copy.deepcopy(value)
+            else:
+                self.job[key] = copy.deepcopy(value)
+        return self.control_job(request)
+
+
+class _SyntheticSettingsRpc:
+    """Exact public field names, explicitly synthetic runtime/serialization."""
+    def __init__(self, thread, timing='before'):
+        self.thread, self.timing, self.timeout = thread, timing, .2
+        self.initialize_response = dict(userAgent='fixture-originator/0.161.0 (fixture-os) (agent_chat_bridge; 0.1.0)',
+            codexHome='/fixture/private', platformFamily='unix', platformOs='fixture')
+        self.settings = dict(thread={'id': thread}, model='gpt-6-luna', reasoningEffort='low',
+            cwd='/fixture/a', runtimeWorkspaceRoots=['/fixture/a', '/fixture/b'], modelProvider='openai',
+            disabledPluginIds=[], approvalPolicy={'granular': {'future': [True, None]}},
+            approvalsReviewer='auto_review', sandbox={'type': 'workspaceWrite', 'unknown': {'keep': [None]}},
+            activePermissionProfile={'id': ':workspace', 'extends': None}, serviceTier=None,
+            collaborationMode={'mode': 'default', 'settings': {'model': 'gpt-6-luna',
+                'reasoning_effort': 'low', 'developer_instructions': None, 'unknown': [True, None]}},
+            multiAgentMode='explicitRequestOnly', futureAuthoritative={'unknown': [None, True]})
+        self.calls, self.notifications, self.pending = [], [], []
+        self.sequence = 0
+        self.payloads = []
+        self.event_factory = lambda event: [event]
+        self.readback_effect = lambda rpc: None
+        self.wait_error = None
+        self.ack_error = None
+        self.ack_value = {}
+        self.native_state = 'idle'
+
+    def event(self):
+        value = {key: copy.deepcopy(item) for key, item in self.settings.items()
+                 if key not in ('thread', 'runtimeWorkspaceRoots', 'reasoningEffort')}
+        value['sandboxPolicy'] = value.pop('sandbox')
+        value.update(effort=self.settings['reasoningEffort'], summary=None, personality=None)
+        return dict(method='thread/settings/updated', params=dict(threadId=self.thread, threadSettings=value))
+
+    def record(self, event):
+        self.sequence += 1
+        self.notifications.append((self.sequence, copy.deepcopy(event)))
+
+    def notification_boundary(self, *, deadline):
+        return self.sequence
+
+    def notifications_since(self, boundary):
+        return copy.deepcopy([item for item in self.notifications if item[0] > boundary])
+
+    def next_notification(self, boundary, *, deadline):
+        if self.wait_error: raise TransportError(self.wait_error)
+        if self.pending: self.record(self.pending.pop(0))
+        available = self.notifications_since(boundary)
+        if not available: raise TransportError('declared fixture notification timeout')
+        return available[0]
+
+    def request(self, method, params, *, deadline=None):
+        self.calls.append((method, copy.deepcopy(params), deadline))
+        if method == 'thread/read':
+            return {'thread': dict(id=self.thread, status={'type': self.native_state}, canAcceptDirectInput=True)}
+        if method == 'model/list':
+            return {'data': [dict(model='gpt-6.1-sol', supportedReasoningEfforts=[{'reasoningEffort': 'high'}])]}
+        if method == 'thread/resume':
+            if self.payloads: self.readback_effect(self)
+            return copy.deepcopy(self.settings)
+        if method == 'thread/settings/update':
+            self.payloads.append(copy.deepcopy(params))
+            if self.ack_error: raise TransportError(self.ack_error)
+            self.settings.update(model=params['model'], reasoningEffort=params['effort'])
+            self.settings['collaborationMode']['settings'].update(model=params['model'], reasoning_effort=params['effort'])
+            events = self.event_factory(self.event())
+            if self.timing == 'before':
+                for event in events: self.record(event)
+            else:
+                self.pending.extend(events)
+            return copy.deepcopy(self.ack_value)
+        raise AssertionError(method)
+
+
+class _SyntheticAnchoredWorker(ControlWorker):
+    def _experimental_originator(self):
+        return 'fixture-originator'  # Declared fixture input, not runtime attestation.
+
+
+class ObservedSettingsWorkflowTests(unittest.TestCase):
+    def fixture(self, timing='before', production=False):
+        thread = str(uuid.uuid4())
+        job = dict(id=str(uuid.uuid4()), action='model', status='pending', thread_id=thread,
+                   requested_model='gpt-6.1-sol', requested_effort='high', allow_cold_resume=False,
+                   ownership={'open_guards': []}, host_id='fixture-host', target_session='fixture-session')
+        state, rpc = _SyntheticSettingsState(job), _SyntheticSettingsRpc(thread, timing)
+        bridge = SimpleNamespace(state=state, rpc=rpc, queue=lambda _: [])
+        worker = (ControlWorker if production else _SyntheticAnchoredWorker)(bridge)
+        return worker, state, rpc, job
+
+    def test_production_anchor_is_unavailable_and_never_dispatches(self):
+        worker, state, rpc, job = self.fixture(production=True)
+        with self.assertRaisesRegex(CoordError, 'trusted runtime originator unavailable'):
+            worker._experimental_settings_update(job)
+        self.assertEqual(rpc.calls, [])
+        worker.advance(job)
+        self.assertEqual(state.job['status'], 'failed')
+        self.assertEqual(rpc.calls, [])
+
+    def test_missing_malformed_wrong_anchor_and_unsupported_version_stop_before_mutation(self):
+        for raw in (None, [], {}, dict(userAgent=3), dict(codexHome='relative'),
+                    dict(platformFamily=None), dict(platformOs=False),
+                    dict(userAgent='agent_chat_bridge/0.161.0 (fixture)'),
+                    dict(userAgent='fixture-originator/0.160.0 (fixture)'),
+                    dict(userAgent='untrusted/0.161.0 (fixture) (fixture-originator/0.161.0 (suffix))'),
+                    dict(userAgent='fixture-originator/0.161.0-extra (fixture)')):
+            worker, state, rpc, job = self.fixture()
+            rpc.initialize_response = raw if not isinstance(raw, dict) else dict(rpc.initialize_response, **raw)
+            if raw == {}: rpc.initialize_response = {}
+            with self.subTest(raw=raw), self.assertRaises(CoordError): worker._experimental_settings_update(job)
+            self.assertEqual(rpc.payloads, [])
+            self.assertEqual(state.job['status'], 'pending')
+
+    def test_before_and_after_ack_sparse_update_full_event_and_separate_roots(self):
+        for timing in ('before', 'after'):
+            worker, state, rpc, job = self.fixture(timing)
+            result = worker._experimental_settings_update(job)
+            self.assertEqual(result['status'], 'completed')
+            self.assertEqual(rpc.payloads, [dict(threadId=job['thread_id'], model='gpt-6.1-sol', effort='high')])
+            self.assertEqual(state.evidence['ack'], {})
+            self.assertEqual(state.evidence['selected_post'], dict(summary=None, personality=None))
+            self.assertIn('unobserved', state.evidence['selected_before'])
+            self.assertNotIn('runtimeWorkspaceRoots', state.evidence['settings_event']['params']['threadSettings'])
+            self.assertEqual(state.job['observed_settings']['runtimeWorkspaceRoots'], ['/fixture/a', '/fixture/b'])
+            self.assertEqual(state.job['observation']['model'], 'gpt-6.1-sol')
+            self.assertEqual(state.job['observation']['reasoning_effort'], 'high')
+            self.assertEqual(len({deadline for _, _, deadline in rpc.calls}), 1)
+            with self.assertRaisesRegex(CoordError, 'replay'): worker._experimental_settings_update(state.control_job(job['id']))
+            self.assertEqual(len(rpc.payloads), 1)
+
+    def test_stale_and_unrelated_events_are_preserved_but_cannot_complete(self):
+        worker, state, rpc, job = self.fixture('after')
+        stale = rpc.event()
+        rpc.record(stale)
+        def events(fresh):
+            unrelated = copy.deepcopy(fresh); unrelated['params']['threadId'] = 'other-thread'
+            return [unrelated, fresh]
+        rpc.event_factory = events
+        worker._experimental_settings_update(job)
+        self.assertEqual(len(rpc.notifications), 3)
+        self.assertEqual(state.evidence['settings_event']['params']['threadId'], job['thread_id'])
+        worker, state, rpc, job = self.fixture('after')
+        rpc.record(rpc.event())
+        rpc.event_factory = lambda _: []
+        with self.assertRaisesRegex(CoordError, 'ambiguous'): worker._experimental_settings_update(job)
+        self.assertEqual(state.job['status'], 'uncertain')
+
+    def test_conflicting_malformed_and_opaque_missing_null_scalar_changes_are_ambiguous(self):
+        def changed(event, scenario):
+            value = copy.deepcopy(event)
+            settings = value['params']['threadSettings']
+            if scenario == 'model': settings['model'] = 'conflict'
+            elif scenario == 'identity': value['params'].pop('threadId')
+            elif scenario == 'missing': settings.pop('serviceTier')
+            elif scenario == 'null': settings['approvalPolicy']['granular']['newMember'] = None
+            elif scenario == 'scalar': settings['approvalPolicy']['granular']['future'][0] = 1
+            elif scenario == 'nested': settings['sandboxPolicy']['unknown']['keep'] = []
+            return value
+        for scenario in ('model', 'identity', 'missing', 'null', 'scalar', 'nested'):
+            worker, state, rpc, job = self.fixture()
+            rpc.event_factory = lambda event, scenario=scenario: [changed(event, scenario), event]
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(CoordError, 'ambiguous'):
+                worker._experimental_settings_update(job)
+            self.assertEqual(state.job['status'], 'uncertain')
+            self.assertEqual(len(rpc.payloads), 1)
+
+    def test_changed_unknown_authoritative_event_cannot_be_erased_by_matching_readback(self):
+        self.assert_unknown_event_refused(omitted=False)
+
+    def test_omitted_unknown_authoritative_event_cannot_be_erased_by_matching_readback(self):
+        self.assert_unknown_event_refused(omitted=True)
+
+    def assert_unknown_event_refused(self, *, omitted):
+        for timing in ('before', 'after'):
+            worker, state, rpc, job = self.fixture(timing)
+            # Available authoritative opaque baseline; the event gets its own
+            # copy, so fresh readback retains the exact expected complete value.
+            rpc.settings['futureAuthoritative']['nullable'] = None
+
+            def conflict(event):
+                settings = event['params']['threadSettings']
+                if omitted:
+                    settings.pop('futureAuthoritative')
+                else:
+                    settings['futureAuthoritative'].pop('nullable')
+                    settings['futureAuthoritative']['unknown'][1] = 1
+                return [event]
+
+            rpc.event_factory = conflict
+            with self.subTest(timing=timing), self.assertRaisesRegex(CoordError, 'ambiguous'):
+                worker._experimental_settings_update(job)
+            self.assertEqual(state.job['status'], 'uncertain')
+            expected = worker.expected_settings(state.control_job(job['id']))
+            matching = rpc.request('thread/resume', {'threadId': job['thread_id'], 'excludeTurns': True})
+            self.assertEqual(worker.configuration(matching, job['thread_id']), expected)
+            worker.advance_model(state.control_job(job['id']))
+            self.assertEqual(state.job['status'], 'uncertain')
+            self.assertEqual(len(rpc.payloads), 1)
+
+    def test_post_event_roots_unknown_settings_binding_admission_and_late_conflict(self):
+        for scenario in ('roots', 'unknown', 'binding', 'active', 'late-conflict'):
+            worker, state, rpc, job = self.fixture()
+            def effect(rpc, scenario=scenario):
+                if scenario == 'roots': rpc.settings['runtimeWorkspaceRoots'].reverse()
+                elif scenario == 'unknown': rpc.settings['futureAuthoritative']['unknown'].append('changed')
+                elif scenario == 'binding': state.job['host_id'] = 'changed-host'
+                elif scenario == 'active': rpc.native_state = 'active'
+                else:
+                    conflict = rpc.event(); conflict['params']['threadSettings']['effort'] = 'low'; rpc.record(conflict)
+            rpc.readback_effect = effect
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(CoordError, 'ambiguous'):
+                worker._experimental_settings_update(job)
+            self.assertEqual(state.job['status'], 'uncertain')
+
+    def test_timeout_disconnect_missing_ack_and_malformed_ack_never_replay(self):
+        for scenario in ('timeout', 'disconnect', 'missing-ack', 'malformed-ack'):
+            worker, state, rpc, job = self.fixture('after')
+            if scenario == 'missing-ack': rpc.ack_error = 'fixture lost acknowledgement'
+            elif scenario == 'malformed-ack': rpc.ack_value = None
+            else: rpc.wait_error = 'fixture ' + scenario
+            with self.subTest(scenario=scenario), self.assertRaisesRegex(CoordError, 'ambiguous'):
+                worker._experimental_settings_update(job)
+            self.assertEqual(state.job['status'], 'uncertain')
+            worker.advance_model(state.control_job(job['id']))
+            self.assertEqual(len(rpc.payloads), 1)
+
+    def test_unloaded_queue_guard_and_missing_roots_refuse_without_update(self):
+        for scenario in ('unloaded', 'queue', 'guard', 'roots'):
+            worker, state, rpc, job = self.fixture()
+            if scenario == 'unloaded': rpc.native_state = 'notLoaded'
+            elif scenario == 'queue': worker.bridge.queue = lambda _: ['preserved-input']
+            elif scenario == 'guard': job['ownership']['open_guards'] = ['preserved-guard']; state.job = copy.deepcopy(job)
+            else: rpc.settings.pop('runtimeWorkspaceRoots')
+            with self.subTest(scenario=scenario), self.assertRaises(CoordError): worker._experimental_settings_update(job)
+            self.assertEqual(rpc.payloads, [])
+            self.assertFalse(any(method == 'thread/unsubscribe' for method, _, _ in rpc.calls))
+            if scenario == 'unloaded': self.assertFalse(any(method == 'thread/resume' for method, _, _ in rpc.calls))
+
+    def test_ordinary_inspection_does_not_require_experimental_anchor(self):
+        worker, state, rpc, job = self.fixture(production=True)
+        job['action'] = 'inspect'; state.job = copy.deepcopy(job)
+        worker.advance(job)
+        self.assertEqual(state.job['status'], 'completed')
+        self.assertEqual(rpc.payloads, [])
+
+    def test_complete_synthetic_websocket_worker_flow_uses_real_capture_transport(self):
+        from agent_chat.rpc import RpcClient
+        from test_rpc import FakeServer, _frame, _initialize, _send
+        _, state, native_fixture, job = self.fixture()
+
+        def handler(sock):
+            _initialize(sock, native_fixture.initialize_response)
+            while True:
+                opcode, _, body = _frame(sock)
+                if opcode == 8: return
+                request = json.loads(body)  # Synthetic application protocol endpoint.
+                previous = native_fixture.sequence
+                result = native_fixture.request(request['method'], request.get('params', {}), deadline=time.monotonic() + 2)
+                for _, event in native_fixture.notifications_since(previous):
+                    _send(sock, 1, json.dumps(event).encode())
+                _send(sock, 1, json.dumps(dict(id=request['id'], result=result)).encode())
+
+        server = FakeServer(handler)
+        print('synthetic_ws_thread_start ident=' + str(server.thread.ident))
+        try:
+            with RpcClient(server.endpoint) as rpc:
+                worker = _SyntheticAnchoredWorker(SimpleNamespace(state=state, rpc=rpc, queue=lambda _: []))
+                worker._experimental_settings_update(job)
+                self.assertEqual(state.job['status'], 'completed')
+                self.assertEqual(native_fixture.payloads, [dict(threadId=job['thread_id'], model='gpt-6.1-sol', effort='high')])
+                self.assertEqual(state.evidence['selected_post'], dict(summary=None, personality=None))
+        finally:
+            server.join()
+        self.assertFalse(server.thread.is_alive())
+        print('synthetic_ws_thread_joined ident=' + str(server.thread.ident))
+
+
 class AgentModelTests(RemoteWebFixture):
     def setUp(self):
         super().setUp()
@@ -167,7 +472,8 @@ class AgentModelTests(RemoteWebFixture):
     def test_cold_resume_requires_explicit_opt_in_before_unsubscribe(self):
         self.change(allow_cold_resume=False)
         self.advance()
-        self.assertEqual(self.status()['requests'][0]['status'], 'failed')
+        self.assertEqual(self.status()['requests'][0]['status'], 'waiting')
+        self.assertEqual(self.status()['admission'], 'running')
         self.assertFalse(any(method == 'thread/unsubscribe' for method, _ in self.rpc.calls))
         self.assertEqual(self.rpc.mutations, [])
 
@@ -540,6 +846,251 @@ class AgentModelTests(RemoteWebFixture):
 import test_root_orchestrator as _root_tests
 from pathlib import Path
 from agent_chat.remote import HttpClient
+
+
+class OrdinaryTurnRpc(ModelRpc):
+    """Neutral ordinary-turn fixture; no native/model authority outside tests."""
+    def __init__(self, thread):
+        super().__init__(thread)
+        self.inputs = []
+        self.failure = None
+        self.race = False
+        self.settings.update(runtimeWorkspaceRoots=['/neutral/a', '/neutral/b', '/neutral/c'],
+                             opaque={'ordered': [3, None, {'future': True}]}, summary=None, personality='neutral')
+
+    def request(self, method, params):
+        if method == 'thread/turns/list':
+            self.calls.append((method, copy.deepcopy(params)))
+            return {'data': [{'id': 'neutral-history', 'status': 'completed',
+                              'items': copy.deepcopy(self.history[self.old])}], 'nextCursor': None}
+        if method == 'turn/start':
+            self.calls.append((method, copy.deepcopy(params)))
+            if self.failure == 'reject':
+                raise RpcError(-32602, 'neutral explicit refusal')
+            if self.failure == 'before':
+                raise TransportError('neutral lost response before effect')
+            self.inputs.append(copy.deepcopy(params))
+            self.settings['model'] = params.get('model', self.settings['model'])
+            self.settings['reasoningEffort'] = params.get('effort', self.settings['reasoningEffort'])
+            self.history[self.old].append({'type': 'userMessage', 'clientId': params['clientUserMessageId'],
+                                           'content': params['input']})
+            self.status[self.old] = 'active'
+            result = {'turn': {'id': 'ordinary-'+str(uuid.uuid4()),
+                               'status': 'interrupted' if self.race else 'inProgress'}}
+            if self.failure == 'wrong-response':
+                result['threadId'] = 'different-thread'
+            if self.failure == 'after':
+                raise TransportError('neutral lost response after effect')
+            return result
+        return super().request(method, params)
+
+
+class OrdinaryModelInputTests(RemoteWebFixture):
+    def setUp(self):
+        RemoteWebFixture.setUp(self)
+        self.call('register', agent='worker')
+        self.call('register', session='b', agent='orchestrator')
+        self.target_thread = str(uuid.uuid4())
+        self.call('bind', thread=self.target_thread)
+        self.identity = dict(owner='ordinary-model-fixture', secret='x'*40, host_id='mac')
+        self.state = RemoteBridgeState(self.client, self.url, self.identity)
+        self.state.call('acquire')
+        self.rpc = OrdinaryTurnRpc(self.target_thread)
+        self.bridge = Bridge(self.state, self.rpc)
+
+    def change(self, **values):
+        values.setdefault('allow_cold_resume', False)
+        values.setdefault('model', 'gpt-6.1-sol')
+        return AgentModelTests.change(self, **values)
+
+    status = AgentModelTests.status
+    advance = AgentModelTests.advance
+
+    def test_ordinary_request_keeps_admission_and_waits_for_genuine_input(self):
+        self.rpc.status[self.target_thread] = 'active'
+        request = self.change()
+        self.assertEqual(self.status()['admission'], 'running')
+        self.advance()
+        self.assertEqual(self.status()['requests'][0]['status'], 'waiting')
+        self.assertEqual(self.rpc.inputs, [])
+        self.assertFalse(any(method in ('thread/resume', 'thread/unsubscribe', 'thread/settings/update')
+                             for method, _ in self.rpc.calls))
+        self.assertEqual(request['requested_model'], 'gpt-6.1-sol')
+
+    def test_genuine_input_bears_model_once_and_next_input_is_unforced(self):
+        original = copy.deepcopy(self.rpc.settings)
+        request = self.change()
+        message = self.call('send', session='b', to='worker', body='neutral genuine input')['id']
+        self.bridge.tick()
+        self.assertEqual(len(self.rpc.inputs), 1)
+        params = self.rpc.inputs[0]
+        self.assertEqual(set(params), {'threadId', 'clientUserMessageId', 'input', 'model', 'effort'})
+        self.assertEqual((params['threadId'], params['model'], params['effort']),
+                         (self.target_thread, 'gpt-6.1-sol', 'high'))
+        self.assertIn(message, params['input'][0]['text'])
+        status = self.status()['requests'][0]
+        self.assertEqual(status['native_input_state'], 'accepted')
+        self.assertEqual(status['status'], 'completed')
+        self.assertFalse(status['observed_defaults_verified'])
+        self.assertEqual(status['id'], request['id'])
+        self.assertEqual(status['native_input_job_id'], params['clientUserMessageId'])
+        self.assertIsNone(status['observed_settings_json'])
+        for key in ('runtimeWorkspaceRoots', 'opaque', 'summary', 'personality', 'activePermissionProfile', 'sandbox'):
+            self.assertEqual(self.rpc.settings[key], original[key], key)
+        self.call('message', id=message)
+        self.rpc.status[self.target_thread] = 'idle'
+        self.call('send', session='b', to='worker', body='later genuine input')
+        self.bridge.tick()
+        self.assertEqual(sum(method == 'turn/start' for method, _ in self.rpc.calls), 1)
+        self.assertFalse(any('model' in params or 'effort' in params
+                             for method, params in self.rpc.calls if method == 'thread/queue/add'))
+
+    def test_busy_and_native_queue_stage_original_order_without_steering(self):
+        request = self.change()
+        self.rpc.status[self.target_thread] = 'active'
+        first = self.call('send', session='b', to='worker', body='first original input')['id']
+        second = self.call('send', session='b', to='worker', body='second original input')['id']
+        self.bridge.tick()
+        self.assertEqual(self.rpc.inputs, [])
+        self.rpc.status[self.target_thread] = 'idle'
+        existing = {'id': 'native-other', 'clientUserMessageId': 'native-external'}
+        self.rpc.queues[self.target_thread] = [existing]
+        self.bridge.tick()
+        self.assertEqual(self.rpc.queues[self.target_thread], [existing])
+        self.assertEqual(self.rpc.inputs, [])
+        self.rpc.queues[self.target_thread] = []
+        self.bridge.tick()
+        text = self.rpc.inputs[0]['input'][0]['text']
+        self.assertLess(text.index(first), text.index(second))
+        self.assertEqual(self.status()['requests'][0]['id'], request['id'])
+
+    def test_duplicate_uuid_and_conflicting_requests_do_not_replace_selection(self):
+        request = self.change()
+        self.assertEqual(self.change(request_id=request['id'])['id'], request['id'])
+        with self.assertRaises(RemoteCoordError):
+            self.change(request_id=request['id'], reasoning_effort='low')
+        with self.assertRaises(RemoteCoordError):
+            self.change()
+        self.call('send', session='b', to='worker', body='single genuine input')
+        self.bridge.tick()
+        self.assertEqual(self.change(request_id=request['id'])['native_input_state'], 'accepted')
+        self.bridge.tick()
+        self.assertEqual(len(self.rpc.inputs), 1)
+
+        self.assertEqual(self.change()['status'], 'pending')
+
+    def test_lost_before_response_survives_server_restart_without_replay(self):
+        request = self.change()
+        self.call('send', session='b', to='worker', body='original uncertain input')
+        self.rpc.failure = 'before'
+        with self.assertRaises(TransportError):
+            self.bridge.tick()
+        self.assertEqual(self.status()['requests'][0]['status'], 'uncertain')
+        self.stop()
+        self.start()
+        self.state = RemoteBridgeState(self.client, self.url, self.identity)
+        self.state.call('acquire')
+        self.bridge = Bridge(self.state, self.rpc)
+        self.rpc.failure = None
+        self.rpc.history[self.target_thread].append({'type': 'userMessage', 'clientId': 'unrelated-old-input', 'content': []})
+        self.bridge.tick()
+        status = self.status()['requests'][0]
+        self.assertEqual((status['id'], status['status']), (request['id'], 'uncertain'))
+        self.assertEqual(sum(method == 'turn/start' for method, _ in self.rpc.calls), 1)
+        job = self.state.jobs()[0]
+        coord = Coordinator(self.db, 'a')
+        try:
+            with self.assertRaises(CoordError):
+                BridgeState(coord).retry(job['id'], confirmed=True)
+        finally:
+            coord.close()
+
+    def test_lost_after_response_reconciles_only_original_positive_input(self):
+        self.change()
+        self.call('send', session='b', to='worker', body='correlated input')
+        self.rpc.failure = 'after'
+        with self.assertRaises(TransportError):
+            self.bridge.tick()
+        self.rpc.failure = None
+        self.bridge = Bridge(self.state, self.rpc)
+        self.bridge.tick()
+        status = self.status()['requests'][0]
+        self.assertEqual(status['native_input_state'], 'accepted')
+        self.assertEqual(status['native_input_evidence'], 'history_client_id')
+        self.assertIsNone(status['native_response_json'])
+        self.assertIsNone(status['observed_settings_json'])
+        self.assertEqual(len(self.rpc.inputs), 1)
+
+    def test_explicit_refusal_retains_input_then_explicit_retry_is_unforced(self):
+        request = self.change()
+        self.call('send', session='b', to='worker', body='refused genuine input')
+        self.rpc.failure = 'reject'
+        self.bridge.tick()
+        self.assertEqual(self.status()['requests'][0]['status'], 'failed')
+        self.assertEqual(self.status()['admission'], 'running')
+        job = self.state.jobs()[0]
+        self.bridge.tick()
+        self.assertEqual(sum(method == 'turn/start' for method, _ in self.rpc.calls), 1)
+        coord = Coordinator(self.db, 'a')
+        try:
+            BridgeState(coord).retry(job['id'], confirmed=True)
+        finally:
+            coord.close()
+        self.rpc.failure = None
+        self.bridge.tick()
+        self.assertEqual(sum(method == 'turn/start' for method, _ in self.rpc.calls), 1)
+        self.assertFalse(any('model' in p or 'effort' in p for m, p in self.rpc.calls if m == 'thread/queue/add'))
+        self.assertEqual(self.status()['requests'][0]['native_input_job_id'], job['id'])
+        self.assertEqual(self.status()['requests'][0]['id'], request['id'])
+
+    def test_four_ordered_roots_and_opaque_nulls_are_never_overridden(self):
+        self.rpc.settings['runtimeWorkspaceRoots'] = ['/neutral/C', '/neutral/A/../A', '/neutral/B ', '/neutral/D']
+        self.rpc.settings['opaque']['future'] = {'summary': None, 'personality': ['untouched', False]}
+        original = copy.deepcopy(self.rpc.settings)
+        self.change()
+        self.call('send', session='b', to='worker', body='four roots neutral input')
+        self.bridge.tick()
+        for key, value in original.items():
+            if key not in ('model', 'reasoningEffort'):
+                self.assertEqual(self.rpc.settings[key], value, key)
+        self.assertEqual(set(self.rpc.inputs[0]), {'threadId', 'clientUserMessageId', 'input', 'model', 'effort'})
+
+    def test_external_start_or_steer_interruption_is_not_defaults_proof(self):
+        self.change()
+        self.call('send', session='b', to='worker', body='external race neutral input')
+        self.rpc.race = True
+        self.bridge.tick()
+        status = self.status()['requests'][0]
+        self.assertEqual(status['native_input_state'], 'accepted')
+        self.assertIn('interrupted', status['native_response_json'])
+        self.assertIsNone(status['observed_settings_json'])
+        self.assertIn('not verified', status['error'])
+
+    def test_changed_host_before_original_input_is_withheld(self):
+        self.change()
+        self.call('send', session='b', to='worker', body='host-bound input')
+        messages = self.state.pending()
+        job = self.state.prepare(self.target_thread, messages, self.bridge.payload(self.target_thread, messages))
+        coord = Coordinator(self.db)
+        try:
+            with coord.tx():
+                coord.db.execute('UPDATE remote_session_hosts SET host_id=? WHERE session_id=?', ('other-host', 'a'))
+        finally:
+            coord.close()
+        with self.assertRaises(CoordError):
+            self.bridge.advance(job)
+        self.assertEqual(self.rpc.inputs, [])
+
+    def test_wrong_response_is_uncertain_not_success_or_replay(self):
+        self.change()
+        self.call('send', session='b', to='worker', body='mismatched response input')
+        self.rpc.failure = 'wrong-response'
+        with self.assertRaises(CoordError):
+            self.bridge.tick()
+        status = self.status()['requests'][0]
+        self.assertEqual(status['status'], 'uncertain')
+        self.assertIsNone(status['native_response_json'])
+        self.assertEqual(len(self.rpc.inputs), 1)
 
 
 class ScopedModelRpc(_root_tests.ScopedRpc):

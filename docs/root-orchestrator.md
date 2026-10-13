@@ -378,6 +378,102 @@ of claiming every native process is closed. Use explicit resume with the matchin
 stop UUID; it removes only that operation's barrier, without enabling supervision
 or overriding a previously stopped/otherwise restricted admission policy.
 
+## Reduced, nonmutating Root readiness read
+
+The shared API bearer does **not** permit broad `root status`, enrollment,
+orchestration writes, or lifecycle changes. Its additional `root readiness` read
+requires the canonical enrolled home project/session, an explicit owning host and
+expected bound Root thread, and explicit existing Root-enrolled target IDs:
+
+```sh
+agent-chat-client --server https://coordinator.example --project default --session CANONICAL_ROOT_SESSION root readiness --host-id ENROLLED_HOST_ID --expected-thread BOUND_ROOT_THREAD_ID --project-id TARGET_PROJECT_ID --project-id ANOTHER_TARGET_PROJECT_ID
+```
+
+This is a syntax template, not authority or an instruction to use another
+identity. The existing shared bearer supplies machine-level read authority only
+for this bounded nonsecret, explicitly selected, nonmutating projection. The
+named session is **UNVERIFIED** as the bearer-holder's identity: canonical IDs
+are selectors whose correspondence to stored records is checked, not caller
+attestation, native control authority or permission to act on a target. The
+server verifies directory ownership, registration, Root projection, native
+thread binding, owning host and a matching stored observation no older than 120
+seconds (future/unverifiable observations are rejected). The command does not
+generate an implicit host identity or refresh that observation. Missing or wrong
+required records, unknown/unrelated targets, duplicate/empty/malformed target
+lists, extra fields and mixed/write requests are rejected. There is no wildcard
+discovery. Up to 64 explicitly selected targets retain request order.
+
+The configured coordinator's legitimate local operator can instead select the
+same bounded cohort through the existing explicit same-UID `root-local`
+transport, without a network token or borrowed agent identity:
+
+```sh
+agent-chat-client root-local --home-project OWN_CANONICAL_HOME_PROJECT \
+  --home-session OWN_CANONICAL_ROOT_SESSION --host-id OWN_ENROLLED_HOST \
+  readiness --expected-thread OWN_BOUND_ROOT_THREAD --project-id TARGET_PROJECT_ID
+```
+
+Repeat `--project-id` for each explicit target. This method checks the configured
+provider, wrapper, executable, canonical master and registry ownership against
+both actual process UIDs, and verifies existing canonical registration/binding
+and project lineage. These are the existing local transport trust checks; the
+named session remains a selector, with `named_session_authentication: UNVERIFIED`.
+It returns exactly the same `machine_read` projection and freshness/cohort limits.
+Missing required records fail closed. It does not initialize schema, synchronize
+registrations, resolve routes, create missing databases, refresh observations or
+use HTTP. The local `status` and `route` methods remain separate operations;
+`status` synchronizes records and is not a nonmutating readiness prerequisite.
+There is no automatic local fallback after a network rejection. Use only the
+legitimate configured operator's own canonical selectors; this syntax does not
+authorize a worker to impersonate Root. The same-UID trust does not isolate a
+hostile process already running as that OS user.
+
+The exact shared-bearer wire request is `POST /api/root/rpc`, scoped by the
+canonical home project's normal project selector, with fields only `op`,
+`session`, `host_id`, and `params`. For `op: "readiness"`, `params` has exactly
+`projects` (the explicit unique ID list) and `expected_thread`. Existing exact
+`fresh-status`/`stop-status` requests retain their original contracts; broad
+status remains denied.
+
+Rejected `root in PROJECT readiness` and incomplete readiness invocations are
+validated before implicit host setup; they create no client host state. Metadata
+selection itself opens the existing registry read-only, including when it is
+missing or disappears immediately before open; it never creates a replacement.
+Ordinary project selection and valid non-readiness CLI host behavior are unchanged.
+
+The response states `authority.scope: "machine_read"` and
+`authority.named_session_authentication: "UNVERIFIED"`. `caller.record_match`
+means only the required canonical stored records matched, not authentication of
+the bearer-holder as that session. This read-authority choice does not extend
+to any write, lifecycle, resource, model or consequential-control operation.
+The remaining response contains only caller project/session/thread/host and its
+actual stored observation time, plus selected project IDs, matching directory
+Root SID, registration/routing/setup readiness with bounded reasons, designated
+PO SID and verified registration/thread/host binding, and the exact host's bridge
+coverage state/reason/actual heartbeat time. Registration/PO readiness describes
+persisted registration and binding checks, **not** native idle state, empty queues,
+guard/process closure, safe restart or model-default verification. Absent setup,
+PO, database or coverage records are reported as not-ready/unknown with bounded
+reasons; no missing store or schema is created or repaired. Unavailable observation
+timestamps stay null, not the request time. Coverage is healthy/stale/unhealthy/
+unknown from the selected host's stored record; even a recent healthy record is
+not an activation prerequisite check. The current records do not attest a safe
+native endpoint identity, so `native_endpoint_identity` is null with
+`endpoint_reason: "native_endpoint_not_verified"`; no stored server string is
+silently reinterpreted or disclosed as that identity.
+
+No project names, workspace/private paths, instructions, history/task bodies,
+model/effort/protected snapshots, credentials, capabilities or resource/queue
+contents are returned. The projection uses read-only existing database
+transactions rather than `Coordinator` schema initialization, `roots.sync()`,
+broad status/reconfiguration reconciliation, setup/routing updates or lifecycle
+operations. Reads across project databases are not a cross-project/native atomic
+snapshot and cannot fence later external changes. Each affected owner still needs
+its own current intake, admission, queue, guard, candidate/recovery and process
+checks before consequential action. Installing/loading this source and any later
+Root-owned runtime control require separate current authority; a synthetic or
+source-level success is not loaded-service readiness.
+
 ## Fresh root conversation with a boot prompt
 
 Use a dedicated root fresh-start request rather than detaching the global root or

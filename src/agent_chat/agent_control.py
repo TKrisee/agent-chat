@@ -3,14 +3,17 @@ import json
 import hashlib
 import time
 import uuid
+import contextlib
 
 from .core import CoordError
 from .session_reset import SessionResetState
 
 
 class AgentControlState:
-    def __init__(self, coord):
+    def __init__(self, coord, sessions_root=None):
         self.coord, self.db = coord, coord.db
+        from .compaction import counter
+        self.compactions = counter(sessions_root)
         self.db.executescript('''
             CREATE TABLE IF NOT EXISTS agent_controls (
                 target_session TEXT PRIMARY KEY, mode TEXT NOT NULL, updated_at REAL NOT NULL);
@@ -33,6 +36,7 @@ class AgentControlState:
             ('allow_cold_resume', 'INTEGER NOT NULL DEFAULT 0'), ('native_response_json', 'TEXT'),
             ('resolution_id', 'TEXT'), ('resolution_actor', 'TEXT'), ('resolved_at', 'REAL'),
             ('resolution_evidence_json', 'TEXT'), ('uncertainty_provenance', 'TEXT'),
+            ('model_route', 'TEXT'), ('native_input_job_id', 'TEXT'), ('native_input_evidence', 'TEXT'),
         ):
             if column not in columns:
                 self.db.execute(f'ALTER TABLE agent_control_requests ADD COLUMN {column} {definition}')
@@ -51,7 +55,15 @@ class AgentControlState:
         row = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
         if not row: raise CoordError('unknown agent control request')
         from .root_lifecycle import stopped
-        return dict(row, root_team_barrier_active=stopped(self.db,row['target_session']))
+        return self.public_request(dict(row, root_team_barrier_active=stopped(self.db,row['target_session'])))
+
+    @staticmethod
+    def public_request(row):
+        result = dict(row)
+        if result.get('model_route') == 'ordinary_input':
+            result['native_input_state'] = 'accepted' if result['status'] == 'completed' else result['status']
+            result['observed_defaults_verified'] = False
+        return result
 
     @staticmethod
     def _requested_setting(value, name):
@@ -117,7 +129,7 @@ class AgentControlState:
                         bool(existing['interrupt']), existing.get('requested_model'), existing.get('requested_effort'), bool(existing.get('allow_cold_resume'))) != (
                             caller, target, thread, action, interrupt, model, reasoning_effort, allow_cold_resume):
                     raise CoordError('agent control retry payload differs from the original')
-                return dict(existing)
+                return self.public_request(existing)
             self.coord._fresh(self.db, caller)
             binding = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (target,)).fetchone()
             if not binding or not binding['thread_id'] or binding['thread_id'] != thread:
@@ -139,13 +151,18 @@ class AgentControlState:
             prior_mode = (self.db.execute('SELECT mode FROM agent_controls WHERE target_session=?', (target,)).fetchone() or {'mode':'running'})['mode']
             if action == 'model' and prior_mode not in ('running', 'stopped'):
                 raise CoordError('model transition requires a stable running or stopped admission mode')
+            ordinary = action == 'model' and not allow_cold_resume
+            if ordinary and prior_mode != 'running':
+                raise CoordError('ordinary model input requires running admission; explicitly resume first')
             self.db.execute('''INSERT INTO agent_control_requests(
                     id,requester_session,target_session,host_id,thread_id,action,interrupt,status,turn_id,error,
                     created_at,updated_at,requested_model,requested_effort,previous_admission_mode,allow_cold_resume)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 (request_id, caller, target, host['host_id'], thread, action, int(interrupt), 'pending', None, None,
                  now, now, model, reasoning_effort, prior_mode, int(allow_cold_resume)))
-            if action in ('stop', 'model'):
+            if ordinary:
+                self.db.execute("UPDATE agent_control_requests SET model_route='ordinary_input' WHERE id=?", (request_id,))
+            if action == 'stop' or (action == 'model' and not ordinary):
                 self.db.execute("INSERT INTO agent_controls VALUES(?,'stopping',?) ON CONFLICT(target_session) DO UPDATE SET mode='stopping',updated_at=excluded.updated_at", (target, now))
         return self.job(request_id)
 
@@ -174,17 +191,17 @@ class AgentControlState:
                                (target['id'],)).fetchone()
                 if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_session_hosts'").fetchone() else None)
         thread = binding['thread_id'] if binding else None
-        requests = [dict(row) for row in self.db.execute('SELECT * FROM agent_control_requests WHERE target_session=? ORDER BY created_at DESC LIMIT 10', (target['id'],))]
+        requests = [self.public_request(row) for row in self.db.execute('SELECT * FROM agent_control_requests WHERE target_session=? ORDER BY created_at DESC LIMIT 10', (target['id'],))]
         wakes = [dict(row) for row in self.db.execute("SELECT id,status,queue_id,error FROM bridge_jobs WHERE thread_id=? AND status NOT IN ('dispatched','cancelled') ORDER BY created_at", (thread,))]
         from .management import manager
         return dict(target, host_id=host['host_id'] if host else None, host_record=dict(host) if host else None,
-                    manager_session=manager(self.db,target['id']), thread_id=thread, parent_session=binding['parent_session'] if binding else None,
+                    manager_session=manager(self.db,target['id']), thread_id=thread, compaction_count=self.compactions.count(thread), parent_session=binding['parent_session'] if binding else None,
                     admission=mode['mode'] if mode else 'running', observation=dict(observation, workspaces=self.observed_workspaces(self.db, target['id'], observation['cwd'])) if observation else None,
                     requests=requests, wakes=wakes, ownership=self.ownership(target['id']))
 
     def roster(self):
         from .management import manager
-        return [dict(manager_session=manager(self.db,row['id']), id=row['id'], agent=row['agent'], thread_id=row['thread_id'], parent_session=row['parent_session'],
+        return [dict(manager_session=manager(self.db,row['id']), id=row['id'], agent=row['agent'], thread_id=row['thread_id'], compaction_count=self.compactions.count(row['thread_id']), parent_session=row['parent_session'],
                      admission=row['mode'] or 'running', state=row['state'], checked_at=row['checked_at'])
                 for row in self.db.execute('''SELECT s.id,s.agent,b.thread_id,b.parent_session,c.mode,o.state,o.checked_at
                     FROM sessions s LEFT JOIN bridge_bindings b ON b.session_id=s.id
@@ -199,13 +216,14 @@ class AgentControlState:
             if not stopped(self.db, row['target_session'])]
 
     def update(self, request_id, expected, status, *, turn_id=None, error=None, observation=None,
-               baseline_settings=None, observed_settings=None, direct_input=None, native_response=None, resolution_evidence=None):
+               baseline_settings=None, observed_settings=None, direct_input=None, native_response=None, resolution_evidence=None,
+               input_job_id=None, input_evidence=None):
         from .root_lifecycle import job as team_job, update as team_update
         if team_job(self.db, request_id):
             return team_update(self.coord, request_id, expected, status, turn_id=turn_id, error=error, observation=observation)
-        if status not in ('waiting','interrupting','changing','uncertain','completed','failed','resolved_unchanged'):
+        if status not in ('waiting','interrupting','changing','submitting','uncertain','completed','failed','resolved_unchanged'):
             raise CoordError('invalid agent control status')
-        with self.coord.tx():
+        with contextlib.nullcontext() if self.db.in_transaction else self.coord.tx():
             job = self.job(request_id)
             if job['status'] != expected: raise CoordError('agent control changed; inspect its current request')
             if job.get('root_team_barrier_active') and ((job['action']=='model' and expected=='pending' and status=='changing') or job['action']=='resume'):
@@ -226,7 +244,42 @@ class AgentControlState:
                 raise CoordError('cannot replace an unresolved interrupt turn')
             if status == 'interrupting' and (job['action'] != 'stop' or not job['interrupt'] or not turn_id):
                 raise CoordError('interrupt requires an explicit stop and exact turn')
-            if job['action'] == 'model':
+            ordinary = job['action'] == 'model' and job.get('model_route') == 'ordinary_input'
+            if ordinary:
+                transitions = {'pending': {'waiting', 'submitting', 'failed'},
+                               'waiting': {'waiting', 'submitting', 'failed'},
+                               'submitting': {'completed', 'uncertain', 'failed'},
+                               'uncertain': {'uncertain', 'completed'}}
+                if status not in transitions.get(expected, set()):
+                    raise CoordError('invalid ordinary model-input transition')
+                if any(value is not None for value in (baseline_settings, observed_settings, resolution_evidence)):
+                    raise CoordError('ordinary turn acceptance is not exact settings readback')
+                if input_job_id is not None and input_job_id != job.get('native_input_job_id'):
+                    raise CoordError('ordinary model input differs from the immutable associated job')
+                if status in ('submitting', 'completed') and (input_job_id is None or not job.get('native_input_job_id')):
+                    raise CoordError('ordinary model outcome requires its original genuine input UUID')
+                if status == 'submitting':
+                    if job.get('root_team_barrier_active'):
+                        raise CoordError('root stop-all barrier withheld ordinary model input')
+                    wake = self.db.execute('SELECT * FROM bridge_jobs WHERE id=?', (job.get('native_input_job_id'),)).fetchone()
+                    mode = (self.db.execute('SELECT mode FROM agent_controls WHERE target_session=?', (job['target_session'],)).fetchone() or {'mode':'running'})['mode']
+                    if (not wake or wake['thread_id'] != job['thread_id'] or wake['status'] != 'starting'
+                            or mode != 'running' or direct_input is not True):
+                        raise CoordError('ordinary model submission requires the exact admitted genuine input')
+                    if self.ownership(job['target_session'])['open_guards']:
+                        raise CoordError('ordinary model input withheld while guarded work is open')
+                if status == 'completed':
+                    if input_evidence == 'rpc_ack':
+                        turn = native_response.get('turn') if isinstance(native_response, dict) else None
+                        if (not isinstance(turn, dict) or not isinstance(turn.get('id'), str) or not turn['id']
+                                or turn_id != turn['id'] or not isinstance(turn.get('status'), str)
+                                or native_response.get('threadId', job['thread_id']) != job['thread_id']):
+                            raise CoordError('ordinary model acceptance requires an actual matching turn response')
+                    elif input_evidence != 'history_client_id' or native_response is not None:
+                        raise CoordError('ordinary model acceptance requires positive original input evidence')
+                elif native_response is not None or input_evidence is not None:
+                    raise CoordError('ordinary model response evidence is only accepted at its outcome')
+            elif job['action'] == 'model':
                 transitions = {
                     'pending': {'changing', 'failed'}, 'changing': {'changing', 'uncertain', 'completed', 'failed'},
                     'uncertain': {'uncertain', 'completed', 'failed'},
@@ -285,6 +338,8 @@ class AgentControlState:
                     expected_settings['collaborationMode']['settings']['reasoning_effort'] = job['requested_effort']
                     if self._configuration(json.loads(observed_settings), job['thread_id']) != expected_settings:
                         raise CoordError('model completion settings do not match the requested target and preserved baseline')
+            elif status == 'submitting' or input_job_id is not None or input_evidence is not None:
+                raise CoordError('ordinary input state does not apply to this action')
             elif baseline_settings is not None:
                 raise CoordError('model baseline does not apply to this action')
             elif observed_settings is not None:
@@ -307,17 +362,18 @@ class AgentControlState:
                 self.db.execute("UPDATE agent_controls SET mode='stopped',updated_at=? WHERE target_session=?", (time.time(), job['target_session']))
             if status == 'completed' and job['action'] == 'resume':
                 self.db.execute("INSERT INTO agent_controls VALUES(?,'running',?) ON CONFLICT(target_session) DO UPDATE SET mode='running',updated_at=excluded.updated_at", (job['target_session'], time.time()))
-            if job['action'] == 'model' and status in ('completed', 'failed', 'resolved_unchanged'):
+            if job['action'] == 'model' and not ordinary and status in ('completed', 'failed', 'resolved_unchanged'):
                 prior = job.get('previous_admission_mode')
                 if prior not in ('running', 'stopped'):
                     raise CoordError('model transition has no stable prior admission mode')
                 self.db.execute("INSERT INTO agent_controls VALUES(?,?,?) ON CONFLICT(target_session) DO UPDATE SET mode=excluded.mode,updated_at=excluded.updated_at", (job['target_session'], prior, time.time()))
             self.db.execute('''UPDATE agent_control_requests
                 SET status=?,turn_id=COALESCE(?,turn_id),error=?,baseline_settings_json=COALESCE(?,baseline_settings_json),
-                    observed_settings_json=COALESCE(?,observed_settings_json),native_response_json=COALESCE(?,native_response_json),resolution_evidence_json=COALESCE(?,resolution_evidence_json),resolved_at=CASE WHEN ?='resolved_unchanged' THEN ? ELSE resolved_at END,updated_at=? WHERE id=?''',
+                    observed_settings_json=COALESCE(?,observed_settings_json),native_response_json=COALESCE(?,native_response_json),resolution_evidence_json=COALESCE(?,resolution_evidence_json),native_input_evidence=COALESCE(?,native_input_evidence),resolved_at=CASE WHEN ?='resolved_unchanged' THEN ? ELSE resolved_at END,updated_at=? WHERE id=?''',
                 (status, turn_id, error, baseline_settings, observed_settings,
                  json.dumps(native_response, sort_keys=True) if native_response is not None else None,
                  json.dumps(resolution_evidence, sort_keys=True) if resolution_evidence is not None else None,
+                 input_evidence,
                  status, time.time(), time.time(), request_id))
         return self.job(request_id)
 

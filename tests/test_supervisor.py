@@ -90,7 +90,7 @@ class SupervisorWorkflowTests(RemoteWebFixture):
         return self.call('supervisor-configure', session='b', enabled=enabled)
 
     def recovery_consent(self, enabled=True):
-        self.call('inbox', session='b', all=True)
+        self.call('context', session='b')
         return self.call('supervisor-configure', session='b', recovery_enabled=enabled)
 
     def recovery_policy(self):

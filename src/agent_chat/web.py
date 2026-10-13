@@ -35,7 +35,7 @@ HERE = Path(__file__).resolve().parent
 STATIC = {
     '/': ('index.html', 'text/html; charset=utf-8'),
     '/root': ('index.html', 'text/html; charset=utf-8'),
-    '/communications': ('communication-view.html', 'text/html; charset=utf-8'),
+    '/communications': ('index.html', 'text/html; charset=utf-8'),
     '/communication-view.js': ('communication-view.js', 'application/javascript; charset=utf-8'),
     '/communication-view.css': ('communication-view.css', 'text/css; charset=utf-8'),
     '/markdown.js': ('markdown.js', 'application/javascript; charset=utf-8'),
@@ -163,6 +163,13 @@ def message_rows(rows, agents, db, project_operator=None):
                 })
             for row in memberships:
                 by_message[row['message_id']].update(batch_id=row['batch_id'], deliveries=deliveries[row['batch_id']])
+    for item in items:
+        candidates = item['deliveries'] or [item]
+        incoming = next((copy for copy in candidates if copy['recipient_session'] == project_operator
+                         and item['sender_session'] != project_operator), None)
+        item['operator_ack'] = ({'id': incoming['id'], 'recipient_session': project_operator,
+                                 'acked_at': incoming['acked_at']}
+                                if incoming else None)
     return items
 
 
@@ -515,6 +522,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(raw)
         return False
 
+    def operator_browser_channel(self):
+        # Existing Basic UI enrollment contract only; never promote machine
+        # bearer/quoted IDs to a named operator or borrow an agent recipient.
+        return bool(self.server.api_token and self.headers.get('Authorization', '').startswith('Basic ')
+                    and authorized(self.headers.get('Authorization', ''), self.server.api_token))
+
+    def operator_ack_rows(self, message_id=None, root_view=False):
+        with reader(self.db_path) as db:
+            if not db.execute('SELECT 1 FROM operator_identities WHERE session_id=?', (self.sender_session,)).fetchone():
+                raise CoordError('current operator enrollment is unavailable')
+            if root_view:
+                root = self.server.roots.config()
+                if not root or root['home_project'] != self.project['id']:
+                    raise CoordError('current Root conversation is unavailable')
+                condition = '(m.sender_session=? AND m.recipient_session=?)'
+                arguments = [root['home_session'], self.sender_session]
+            else:
+                condition, arguments = project_message_filter(db, self.sender_session)
+                arguments = list(arguments)
+            condition += ' AND m.recipient_session=? AND m.sender_session<>?'
+            arguments.extend((self.sender_session, self.sender_session))
+            if message_id is None:
+                condition += ' AND m.acked_at IS NULL'
+            else:
+                condition += ' AND m.id=?'; arguments.append(message_id)
+            return list(db.execute('SELECT m.id,m.acked_at FROM messages m WHERE '+condition+' ORDER BY m.seq', arguments))
+
+    def select_existing_operator_context(self, root_view=False):
+        # Planning or rejecting an ACK must not create an operator identity,
+        # sidecar, project store or bridge manager as a side effect.
+        if root_view:
+            root = self.server.roots.config()
+            if not root: raise CoordError('current Root conversation is unavailable')
+            self.project = {'id': root['home_project']}
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if set(query) - {'project'} or query.get('project', [self.project['id']]) != [self.project['id']]:
+                raise CoordError('choose exactly the current Root project')
+        else:
+            self.select_project(metadata_only=True)
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if set(query) - {'project'}: raise CoordError('invalid operator ACK context')
+        if self.project['id'] == 'default':
+            current = (self.server.db_path, self.server.sender_session, self.server.bridge_manager)
+        else:
+            with self.server.project_lock:
+                current = self.server.project_contexts.get(self.project['id'])
+        if not current:
+            raise CoordError('operator context is not established; open the legitimate project context first')
+        self.db_path, self.sender_session, self.bridge_manager = current
+
     def read_json(self, limit=65536):
         if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1:
             raise ValueError('one Content-Length header is required; chunked requests are unsupported')
@@ -592,15 +649,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
         headers['Content-Range'] = f'bytes {start}-{end}/{len(content)}'
         self.respond(206, content[start:end+1], mime, extra_headers=headers)
 
-    def select_project(self):
+    def select_project(self, *, metadata_only=False):
         query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
         values = query.get('project', [])
         headers = self.headers.get_all('X-Agent-Chat-Project', [])
         if len(values) > 1 or len(headers) > 1 or (values and headers and values[0] != headers[0]):
             raise CoordError('choose exactly one project')
         project = (values or headers or ['default'])[0]
-        self.project = self.server.projects.get(project)
-        self.db_path, self.sender_session, self.bridge_manager = self.server.project_context(project)
+        if metadata_only:
+            if not isinstance(project, str) or not project:
+                raise CoordError('project ID is required')
+            try:
+                with self.server.roots._readiness_db(self.server.projects.path) as db:
+                    row = db.execute('SELECT id FROM projects WHERE id=?', (project,)).fetchone()
+            except (sqlite3.Error, OSError):
+                raise CoordError('readiness project registry is unavailable or unsupported') from None
+            if not row:
+                raise CoordError('unknown project; select an existing project or create one explicitly')
+            self.project = dict(row)
+        else:
+            self.project = self.server.projects.get(project)
+            self.db_path, self.sender_session, self.bridge_manager = self.server.project_context(project)
 
     def select_root_home(self):
         root = self.server.roots.config()
@@ -681,13 +750,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         try:
             root_view = url.path.startswith('/api/root/') and url.path != '/api/root/rpc'
-            root = self.select_root_home() if root_view else None
-            if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view and not url.path.startswith('/api/communications'):
+            ack_plan = url.path in ('/api/messages/ack-plan','/api/root/messages/ack-plan')
+            if ack_plan:
+                if not self.operator_browser_channel():
+                    self.json(403, {'error': 'authenticated operator browser channel required'}); return
+                self.select_existing_operator_context(root_view)
+            root = self.select_root_home() if root_view and not ack_plan else None
+            if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view and not ack_plan and not url.path.startswith(('/api/communications', '/api/attachment-gallery')):
                 self.select_project()
-            if url.path in ('/api/communications','/api/communications/message'):
+            if url.path in ('/api/attachment-gallery', '/api/root/attachment-gallery'):
+                from .attachment_gallery import AttachmentGallery
+                params = parse_qs(url.query, keep_blank_values=True)
+                if set(params) - {'project', 'q', 'before', 'limit'} or any(len(value) != 1 for value in params.values()):
+                    raise ValueError('invalid attachment query parameters')
+                values = {key: value[0] for key, value in params.items()}
+                raw_limit = values.pop('limit', '48')
+                if not raw_limit.isascii() or not raw_limit.isdigit():
+                    raise ValueError('invalid attachment limit')
+                self.project = {'id': 'default'}  # File URLs carry their source project.
+                if root_view and not root:
+                    self.json(200, dict(attachments=[], has_more=False, next_cursor=None, projects=[], partial=False, errors=[]))
+                else:
+                    scope = (root['home_project'], root['home_session'], self.sender_session) if root_view else None
+                    self.json(200, AttachmentGallery(self.server.projects).page(limit=int(raw_limit), root=scope, **values))
+            elif url.path in ('/api/communications','/api/communications/message'):
                 from .communication_view import CommunicationView
                 params = parse_qs(url.query,keep_blank_values=True)
-                allowed = {'project','id'} if url.path.endswith('/message') else {'project','agent','q','before','limit'}
+                allowed = {'project','id'} if url.path.endswith('/message') else {'project','agent','q','before','after','limit'}
                 if set(params)-allowed or any(len(value)!=1 for value in params.values()):
                     raise ValueError('invalid communication query parameters')
                 values = {key:value[0] for key,value in params.items()}
@@ -710,8 +799,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(200, self.server.measurement_models(self.server.measurements.status(self.project['id'])))
             elif url.path in ('/api/snapshot','/api/root/snapshot'):
                 self.json(200, self.root_snapshot() if root_view else self.project_snapshot())
+            elif url.path in ('/api/messages/ack-plan','/api/root/messages/ack-plan'):
+                if not self.operator_browser_channel():
+                    self.json(403, {'error': 'authenticated operator browser channel required'}); return
+                rows = self.operator_ack_rows(root_view=root_view)
+                self.json(200, dict(version=1, observed_at=time.time(), project_id=self.project['id'], recipient_session=self.sender_session,
+                                    ids=[row['id'] for row in rows], count=len(rows), effect='ACK_ONLY',
+                                    execution='REVIEW_EXACT_IDS_THEN_INDIVIDUAL_IDEMPOTENT_ACK', read_only=True))
             elif url.path in ('/api/config','/api/root/config'):
                 self.json(200, {'sender': {'id': self.sender_session, 'agent': 'operator'},
+                                'operator_ack_enabled': self.operator_browser_channel(),
                                 'csrf_token': self.server.csrf_token, 'project': self.selected_project(),
                                 'projects': self.server.listed_projects(), 'root_orchestrator': self.root_summary()})
             elif url.path in ('/api/messages','/api/root/messages'):
@@ -764,8 +861,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(404, {'error': 'Not found'})
                 else:
                     self.json(200, item)
-            elif url.path.startswith('/api/attachments/'):
-                attachment_id = url.path.removeprefix('/api/attachments/')
+            elif url.path.startswith(('/api/attachments/', '/api/gallery-attachments/', '/api/root/gallery-attachments/')):
+                attachment_id = url.path.rsplit('/', 1)[1]
+                gallery_file = '/gallery-attachments/' in url.path
                 if set(parse_qs(url.query)) - {'project'} or not attachment_id.startswith('attachment_') or '/' in attachment_id:
                     self.json(404, {'error': 'Not found'})
                     return
@@ -773,7 +871,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     if not attachment_table(db):
                         self.json(404, {'error': 'Not found'})
                         return
-                    item = db.execute('SELECT name,mime,content FROM attachments WHERE id=?', (attachment_id,)).fetchone()
+                    if gallery_file:
+                        if root_view:
+                            condition = '((m.sender_session=? AND m.recipient_session=?) OR (m.sender_session=? AND m.recipient_session=?))'
+                            args = (root['home_session'], self.sender_session, self.sender_session, root['home_session']) if root else (None,) * 4
+                            if batch_table(db):
+                                condition += ' AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)'
+                        else:
+                            from .communication_view import CommunicationView
+                            condition, args, _ = CommunicationView.private_filter(db)
+                        item = db.execute('SELECT a.name,a.mime,a.content FROM attachments a JOIN messages m ON m.id=a.message_id '
+                                          'WHERE a.id=? AND (' + condition + ')', (attachment_id, *args)).fetchone()
+                    else:
+                        item = db.execute('SELECT name,mime,content FROM attachments WHERE id=?', (attachment_id,)).fetchone()
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                     return
@@ -817,10 +927,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         timeline = []
         if path == '/api/coord' and self.server.inbox_diagnostics:
             timeline.append(('handler', 'start', 'ok', handler_wall, handler_monotonic))
+        if path in ('/api/messages/ack','/api/root/messages/ack') and not self.operator_browser_channel():
+            self.json(403, {'error': 'authenticated operator browser channel required'}); return
         try:
-            if path not in ('/api/usage', '/api/usage/rpc'):
+            if path not in ('/api/usage', '/api/usage/rpc', '/api/coord'):
                 if timeline: timeline.append(('project', 'start', 'ok', time.time(), time.monotonic()))
-                self.select_project()
+                if path in ('/api/messages/ack','/api/root/messages/ack'): self.select_existing_operator_context(path.startswith('/api/root/'))
+                else: self.select_project(metadata_only=path == '/api/root/rpc')
                 if timeline: timeline.append(('project', 'end', 'ok', time.time(), time.monotonic()))
         except (CoordError, ValueError, sqlite3.Error, OSError) as error:
             self._event('operation_failed', error=error)
@@ -834,6 +947,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if timeline: timeline.append(('body', 'start', 'ok', time.time(), time.monotonic()))
                 data = self.read_json(MAX_COORD_REQUEST_BYTES if path == '/api/coord' else 1024 * 1024)
                 if timeline: timeline.append(('body', 'end', 'ok', time.time(), time.monotonic()))
+                if path == '/api/coord':
+                    if timeline: timeline.append(('project', 'start', 'ok', time.time(), time.monotonic()))
+                    attachment_read = data.get('op') == 'attachment-download'
+                    self.select_project(metadata_only=attachment_read)
+                    if (attachment_read and isinstance(data.get('params'), dict)
+                            and data['params'].get('source_project') == self.project['id']):
+                        # Preserve the existing direct-home coordinator path.
+                        self.select_project()
+                    if timeline: timeline.append(('project', 'end', 'ok', time.time(), time.monotonic()))
                 if path == '/api/coord' and data.get('op') == 'inbox' and self.server.inbox_diagnostics:
                     from .inbox_diagnostics import TRACE_HEADER
                     trace = self.server.inbox_diagnostics.trace(
@@ -848,11 +970,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(200, self.project_action(data))
                     return
                 if path == '/api/root/rpc':
-                    self.json(200, self.root_action(data))
+                    self.json(200, self.shared_bearer_root_action(data))
                     return
                 if path == '/api/coord':
-                    from .remote_service import dispatch
+                    from .remote_service import dispatch, managed_operator_attachment
                     self.server.coordinator_log.event('operation_start', correlation_id=self._log_id)
+                    if attachment_read and (not isinstance(data.get('params'), dict)
+                                            or data['params'].get('source_project') != self.project['id']):
+                        result = managed_operator_attachment(data, self.project['id'], self.server.roots)
+                        self.server.coordinator_log.event('operation_complete', correlation_id=self._log_id)
+                        self._event('operation_complete')
+                        self.json(200, self.scoped(result))
+                        return
                     coord = Coordinator(self.db_path)
                     coord.session = None
                     coord.context_size = lambda value: len(json.dumps(
@@ -862,7 +991,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             if data.get('op') in ('session-reset', 'agent-create', 'agent-stop', 'agent-resume', 'agent-model', 'supervisor-configure', 'session-reset-revalidate') and self.server.measurements.status(self.project['id'])['active']:
                                 raise CoordError('finish the active project measurement before resetting a conversation')
                             result = dispatch(coord, data, bridge_manager=self.bridge_manager,
-                                              inbox_diagnostics=trace, canonical_project=self.project['id'])
+                                              inbox_diagnostics=trace, canonical_project=self.project['id'],
+                                              roots=self.server.roots)
                     finally:
                         coord.close()
                     if trace: trace.mark('dispatch', 'end')
@@ -881,7 +1011,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             finally:
                 self._inbox_trace = None
             return
-        if path not in ('/api/messages', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch', '/api/root/workspaces', '/api/root/provision', '/api/root/fresh-start', '/api/usage', '/api/measurements'):
+        if path not in ('/api/messages', '/api/messages/ack', '/api/root/messages/ack', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch', '/api/root/workspaces', '/api/root/provision', '/api/root/fresh-start', '/api/usage', '/api/measurements'):
             self._finish_request(rejected=True)
             self.json(404, {'error': 'Not found'})
             return
@@ -889,6 +1019,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self._finish_request(rejected=True)
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
+            return
+        if path in ('/api/messages/ack', '/api/root/messages/ack'):
+            try:
+                data = self.read_json(2048)
+                if not isinstance(data, dict) or set(data) != {'id'} or not isinstance(data['id'], str) or not 1 <= len(data['id']) <= 512:
+                    raise ValueError('one exact message ID is required')
+                if not self.operator_ack_rows(data['id'], root_view=path.startswith('/api/root/')):
+                    self.json(404, {'error': 'received operator message unavailable in this context'}); return
+                # Recheck exact recipient under Coordinator's atomic ACK-only
+                # transaction. Neither message/full-context reading nor _fresh
+                # is invoked; ACK never creates durable consumption evidence.
+                with contextlib.closing(Coordinator(self.db_path, self.sender_session)) as coord:
+                    result = coord.acknowledge(data['id'])
+                self.json(200, dict(result, project_id=self.project['id']))
+            except (CoordError, ValueError, sqlite3.Error, OSError) as error:
+                self.json(400, {'error': str(error)})
             return
         if path == '/api/measurements':
             try:
@@ -1199,6 +1345,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if operation == 'reconfigure-workspaces':
                 return self.server.roots.reconfigure_workspaces(*args, data['project'], data['expected_thread'], data['workspaces'], data['prompt'], data['request_id'], data['confirm'])
             return self.server.roots.provision(*args, data['project'], data['agent'], data['request_id'], data['confirm'], data['model'], data['effort'])
+
+    def shared_bearer_root_action(self, data):
+        """Expose only exact, owner-bound Root RPC status readbacks to the shared API token."""
+        fields = {
+            'readiness': {'projects', 'expected_thread'},
+            'fresh-status': {'request_id'},
+            'stop-status': {'request_id'},
+        }
+        if (not isinstance(data, dict) or set(data) != {'op', 'session', 'host_id', 'params'}
+                or not all(isinstance(data.get(key), str) and data[key] for key in ('op', 'session', 'host_id'))
+                or not isinstance(data.get('params'), dict)):
+            raise CoordError('invalid shared-bearer root readback request')
+        op, params = data['op'], data['params']
+        if op not in fields or set(params) != fields[op]:
+            raise CoordError('shared bearer permits only exact root status readbacks')
+        if ('request_id' in params and
+                (not isinstance(params['request_id'], str) or not params['request_id'])):
+            raise CoordError('invalid shared-bearer root readback request')
+        if op == 'readiness':
+            with self.server.root_lock:
+                return self.server.roots.readiness(self.project['id'], data['session'], data['host_id'],
+                                                   params['projects'], params['expected_thread'])
+        return self.root_action(data)
 
     def root_action(self, data):
         if not isinstance(data, dict) or set(data) != {'op','session','host_id','params'} or not isinstance(data['params'], dict):

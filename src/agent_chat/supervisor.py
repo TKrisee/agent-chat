@@ -164,10 +164,14 @@ class SupervisorState:
         return None
 
     def _wake_summary(self, thread_id, target):
+        # Use the same migration archive boundary as ordinary bridge delivery.
         rows = [row['status'] for row in self.db.execute(
             "SELECT status FROM bridge_jobs WHERE thread_id=? AND status NOT IN ('dispatched','cancelled')", (thread_id,))]
-        unread = self.db.execute('''SELECT COUNT(*) FROM messages m WHERE m.recipient_session=? AND m.acked_at IS NULL
+        unread = self.db.execute('''SELECT COUNT(*) FROM messages m WHERE m.recipient_session=?
             AND m.sender_session<>m.recipient_session
+            AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
+                AND r.reader_session=m.recipient_session
+                AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
             AND NOT EXISTS (SELECT 1 FROM bridge_deliveries d WHERE d.message_id=m.id)
             AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                  OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))''', (target,)).fetchone()[0]
@@ -243,7 +247,10 @@ class SupervisorState:
                                (policy['owner_session'], policy['target_session'], route['generation'])).fetchall()
         for row in rows:
             message_id = row['message_id']
-            deleted = self.db.execute('''DELETE FROM messages WHERE id=? AND sender_session=? AND recipient_session=? AND acked_at IS NULL
+            deleted = self.db.execute('''DELETE FROM messages WHERE id=? AND sender_session=? AND recipient_session=?
+                AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id
+                    AND r.reader_session=messages.recipient_session
+                    AND r.provenance IN ('recipient_full_message','recipient_context_full'))
                 AND NOT EXISTS (SELECT 1 FROM bridge_deliveries WHERE message_id=messages.id)
                 AND NOT EXISTS (SELECT 1 FROM message_batches WHERE message_id=messages.id)''',
                                       (message_id, SYSTEM_SENDER, policy['owner_session']))
@@ -253,7 +260,10 @@ class SupervisorState:
     def _withdraw_revoked(self, owner, target):
         """Revoke only this service's unsent notices, never prepared native input."""
         for row in self.db.execute('SELECT message_id FROM supervisor_incidents WHERE owner_session=? AND target_session=? AND message_id IS NOT NULL', (owner, target)):
-            self.db.execute('''DELETE FROM messages WHERE id=? AND sender_session=? AND recipient_session=? AND acked_at IS NULL
+            self.db.execute('''DELETE FROM messages WHERE id=? AND sender_session=? AND recipient_session=?
+                AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id
+                    AND r.reader_session=messages.recipient_session
+                    AND r.provenance IN ('recipient_full_message','recipient_context_full'))
                 AND NOT EXISTS (SELECT 1 FROM bridge_deliveries WHERE message_id=messages.id)
                 AND NOT EXISTS (SELECT 1 FROM message_batches WHERE message_id=messages.id)''',
                             (row['message_id'], SYSTEM_SENDER, owner))
@@ -512,7 +522,9 @@ class SupervisorState:
     def _recovery_delivery_eligible(self, message_id, target):
         return bool(self.db.execute('''SELECT 1 FROM messages m
             WHERE m.id=? AND m.recipient_session=? AND m.sender_session<>m.recipient_session
-              AND m.acked_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
+                  AND r.reader_session=m.recipient_session
+                  AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))''',
                                    (message_id, target)).fetchone())
@@ -553,7 +565,10 @@ class SupervisorState:
             message_ids, wake_id = [row['id'] for row in rows], wake['id']
         else:
             rows = self.db.execute('''SELECT m.id FROM messages m
-                WHERE m.recipient_session=? AND m.acked_at IS NULL AND m.sender_session<>m.recipient_session
+                WHERE m.recipient_session=? AND m.sender_session<>m.recipient_session
+                AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
+                    AND r.reader_session=m.recipient_session
+                    AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))
                 AND NOT EXISTS (SELECT 1 FROM bridge_deliveries d WHERE d.message_id=m.id)
                 AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                      OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id))

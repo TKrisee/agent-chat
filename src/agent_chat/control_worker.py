@@ -1,6 +1,9 @@
 """Observe and control only the exact main turn on the existing app-server."""
 import copy
 import json
+import os
+import re
+import time
 
 from .core import CoordError
 from .rpc import RpcError, TransportError
@@ -59,11 +62,11 @@ class ControlWorker:
                      queue_count=len(self.bridge.queue(job['thread_id']),), model=thread.get('model'), cwd=thread.get('cwd')),
                 thread.get('canAcceptDirectInput') is True)
 
-    def supported_model(self, job):
+    def supported_model(self, job, *, deadline=None):
         matches, cursor = [], None
         for _ in range(10):
             params = {} if cursor is None else {'cursor':cursor}
-            listed = self.rpc.request('model/list', params)
+            listed = self.rpc.request('model/list', params, **({} if deadline is None else {'deadline': deadline}))
             models = listed.get('models', listed.get('data')) if isinstance(listed, dict) else None
             if not isinstance(models, list):
                 raise CoordError('app-server model/list response is invalid; model transition withheld')
@@ -113,6 +116,141 @@ class ControlWorker:
     @classmethod
     def settings_match(cls, job, settings, *, target=True):
         return cls.configuration(settings, job['thread_id']) == cls.expected_settings(job, target=target)
+
+    def _experimental_originator(self):
+        # No independently trustworthy runtime attestation exists. This is not
+        # a caller option; declared test subclasses supply fixture authority only.
+        return None
+
+    def _experimental_runtime_version(self):
+        originator = self._experimental_originator()
+        if not isinstance(originator, str) or not originator:
+            raise CoordError('Experimental settings update withheld: independently trusted runtime originator unavailable.')
+        response = getattr(self.rpc, 'initialize_response', None)
+        fields = ('userAgent', 'codexHome', 'platformFamily', 'platformOs')
+        if not isinstance(response, dict) or any(not isinstance(response.get(key), str) or not response[key] for key in fields):
+            raise CoordError('Experimental settings update withheld: raw initialize response is missing or malformed.')
+        if not os.path.isabs(response['codexHome']):
+            raise CoordError('Experimental settings update withheld: initialize codexHome is not an absolute path.')
+        # Match only the independently trusted prefix, never clientInfo, a
+        # suffix substring, binary/source lineage or an inferred client name.
+        if re.match(r'\A' + re.escape(originator) + r'/0\.161\.0 \(', response['userAgent']) is None:
+            raise CoordError('Experimental settings update withheld: exact anchored 0.161.0 runtime version unverified.')
+
+    @staticmethod
+    def _opaque_equal(left, right):
+        # Object member order is immaterial; array order, unknown members,
+        # absent/null and JSON scalar types are not normalized or coerced.
+        return json.dumps(left, sort_keys=True, separators=(',', ':'), allow_nan=False) == json.dumps(
+            right, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+    def _experimental_admission(self, job, deadline):
+        thread = self.rpc.request('thread/read', {'threadId': job['thread_id'], 'includeTurns': False}, deadline=deadline)['thread']
+        if (thread.get('id') != job['thread_id'] or thread.get('status', {}).get('type') != 'idle'
+                or thread.get('canAcceptDirectInput') is not True or self.bridge.queue(job['thread_id'])):
+            raise CoordError('Experimental settings update requires the exact already-loaded idle/direct-ready thread with an empty queue.')
+        return dict(state='idle', turn_id=None, queue_count=0)
+
+    @staticmethod
+    def _experimental_observation(admission, settings):
+        admission.update(model=settings.get('model'), reasoning_effort=settings.get('reasoningEffort'),
+                         cwd=settings.get('cwd'), permissions={key: settings.get(key) for key in
+                         ('sandbox', 'approvalPolicy', 'approvalsReviewer', 'activePermissionProfile', 'runtimeWorkspaceRoots')})
+        return admission
+
+    def _experimental_events(self, boundary, job, expected):
+        event = None
+        required = ('disabledPluginIds', 'cwd', 'approvalPolicy', 'approvalsReviewer', 'sandboxPolicy',
+                    'activePermissionProfile', 'model', 'modelProvider', 'serviceTier', 'effort', 'summary',
+                    'collaborationMode', 'multiAgentMode', 'personality')
+        for _, notice in self.rpc.notifications_since(boundary):
+            if notice.get('method') != 'thread/settings/updated':
+                continue
+            params = notice.get('params')
+            if not isinstance(params, dict) or not isinstance(params.get('threadId'), str):
+                raise CoordError('Ambiguous settings event: missing exact thread identity.')
+            if params['threadId'] != job['thread_id']:
+                continue
+            settings = params.get('threadSettings')
+            if not isinstance(settings, dict) or any(key not in settings for key in required):
+                raise CoordError('Ambiguous settings event: incomplete public ThreadSettings object.')
+            if settings['model'] != job['requested_model'] or settings['effort'] != job['requested_effort']:
+                raise CoordError('Ambiguous settings event: conflicting model/effort observation.')
+            for key, value in expected.items():
+                public_key = {'sandbox': 'sandboxPolicy', 'reasoningEffort': 'effort'}.get(key, key)
+                # Roots have a separate authoritative readback; selected
+                # before-values are unobserved. Every other available value,
+                # including unknown top-level members, must match this event.
+                if public_key not in ('model', 'effort', 'summary', 'personality', 'runtimeWorkspaceRoots'):
+                    if public_key not in settings or not self._opaque_equal(value, settings[public_key]):
+                        raise CoordError('Ambiguous settings event: protected complete value missing or changed: ' + public_key)
+            if event is not None and not self._opaque_equal(event['params']['threadSettings'], settings):
+                raise CoordError('Ambiguous settings event: competing same-thread settings observations.')
+            event = notice
+        return event
+
+    def _experimental_settings_update(self, job):
+        """Observed-state protocol; production remains closed without attestation.
+
+        The native notification has no intent/request ID. This does not certify
+        unique causality; it requires serialization, a receive boundary, ACK,
+        applicable observed post-state and separate fresh roots readback.
+        """
+        self._experimental_runtime_version()  # Before any native request.
+        if job['status'] != 'pending' or job.get('resolution_id'):
+            raise CoordError('Experimental settings update cannot replay an existing mutation boundary.')
+        deadline = time.monotonic() + self.rpc.timeout
+        current = self.state.control_job(job['id'])
+        if not self._opaque_equal(current, job) or job['ownership']['open_guards']:
+            raise CoordError('Experimental settings update admission/binding/intent or guard state changed.')
+        self._experimental_admission(job, deadline)
+        baseline = self.rpc.request('thread/resume', {'threadId': job['thread_id'], 'excludeTurns': True}, deadline=deadline)
+        before = self.configuration(baseline, job['thread_id'])
+        roots = before.get('runtimeWorkspaceRoots')
+        if not isinstance(roots, list) or not roots or any(not isinstance(root, str) for root in roots):
+            raise CoordError('Experimental settings update lacks authoritative ordered runtime roots.')
+        self.supported_model(job, deadline=deadline)
+        admission = self._experimental_admission(job, deadline)
+        recheck = self.rpc.request('thread/resume', {'threadId': job['thread_id'], 'excludeTurns': True}, deadline=deadline)
+        if (not self._opaque_equal(self.configuration(recheck, job['thread_id']), before)
+                or not self._opaque_equal(self.state.control_job(job['id']), current)):
+            raise CoordError('Experimental settings update baseline/admission/binding changed before dispatch.')
+        boundary = self.rpc.notification_boundary(deadline=deadline)
+        expected = self.expected_settings(dict(job, baseline_settings_json=json.dumps(baseline)))
+        job = self.update(job, 'changing', baseline_settings=baseline, direct_input=True,
+                          observation=self._experimental_observation(admission, recheck),
+                          error='Experimental model mutation boundary recorded; no automatic replay.')
+        try:
+            ack = self.rpc.request('thread/settings/update', {'threadId': job['thread_id'],
+                                   'model': job['requested_model'], 'effort': job['requested_effort']}, deadline=deadline)
+            if not isinstance(ack, dict) or ack != {}:
+                raise CoordError('Ambiguous settings update: malformed empty acknowledgement.')
+            job = self.update(self.state.control_job(job['id']), 'changing', native_response={'ack': ack},
+                              error='RPC acknowledgement is queued submission, not settings completion.')
+            frozen = copy.deepcopy(self.state.control_job(job['id']))
+            cursor = boundary
+            event = self._experimental_events(boundary, job, expected)
+            while event is None:
+                cursor, _ = self.rpc.next_notification(cursor, deadline=deadline)
+                event = self._experimental_events(boundary, job, expected)
+            readback = self.rpc.request('thread/resume', {'threadId': job['thread_id'], 'excludeTurns': True}, deadline=deadline)
+            admission = self._experimental_admission(job, deadline)
+            self.rpc.notification_boundary(deadline=deadline)  # Retain/read all already-buffered conflicts.
+            event = self._experimental_events(boundary, job, expected)
+            if (not self._opaque_equal(self.configuration(readback, job['thread_id']), expected)
+                    or not self._opaque_equal(self.state.control_job(job['id']), frozen)):
+                raise CoordError('Ambiguous settings update: fresh protected settings/ordered roots or admission/binding changed.')
+            evidence = {'ack': ack, 'settings_event': event,
+                        'selected_before': 'unobserved; exact-version sparse-omission preservation only',
+                        'selected_post': {key: event['params']['threadSettings'][key] for key in ('summary', 'personality')},
+                        'correlation': 'post-boundary same-thread observed state; no native request/intent ID'}
+            return self.update(self.state.control_job(job['id']), 'completed', observed_settings=readback,
+                               observation=self._experimental_observation(admission, readback),
+                               native_response=evidence, error=None)
+        except (RpcError, TransportError, CoordError, KeyError, TypeError, ValueError) as error:
+            self.update(self.state.control_job(job['id']), 'uncertain',
+                        error='Experimental settings outcome ambiguous; no retry or rollback: ' + str(error))
+            raise CoordError('Experimental settings outcome ambiguous; no retry or rollback: ' + str(error)) from error
 
     def reconcile_model(self, job, error=None):
         try:
@@ -178,8 +316,21 @@ class ControlWorker:
                     error='Model intent explicitly abandoned; the historical mutation outcome remains unknown.')
 
     def advance_model(self, job):
+        if job.get('model_route') == 'ordinary_input':
+            if job['status'] in ('submitting', 'uncertain'):
+                return  # The original wake reconciles positive input evidence.
+            observation, direct = self.passive_observe(job)
+            self.update(job, 'waiting', observation=observation,
+                        error='Selection staged for one genuine managed input; known busy/queued input waits without steering. Native defaults are not yet observed.')
+            return
         if job.get('resolution_id') and job['status'] in ('changing', 'uncertain'):
             self.resolve_unchanged(job)
+            return
+        if not job.get('allow_cold_resume'):
+            if job['status'] in ('changing', 'uncertain'):
+                self.update(job, 'uncertain', error='Experimental settings outcome lacks complete observed-event proof; no automatic replay or convenient readback completion.')
+                return
+            self._experimental_settings_update(job)
             return
         if job['status'] in ('changing', 'uncertain'):
             self.reconcile_model(job)
@@ -296,6 +447,11 @@ class ControlWorker:
             current = self.state.control_job(job['id'])
             if current['status'] not in ('completed','failed','cancelled'):
                 if current['action'] == 'model':
+                    if current.get('model_route') == 'ordinary_input':
+                        if current['status'] in ('pending','waiting'):
+                            self.update(current, 'waiting', error='Ordinary model input staged; passive admission unavailable: ' + str(error))
+                        if isinstance(error, TransportError): raise
+                        return
                     if current['status'] in ('changing', 'uncertain'):
                         self.reconcile_model(current, error)
                     else:

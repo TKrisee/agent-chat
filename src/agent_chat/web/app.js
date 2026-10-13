@@ -354,8 +354,12 @@ function closePanels() {
   $('resources-toggle').setAttribute('aria-expanded', 'false');
 }
 
-function selectAgent(id) {
-  if (state.rootView) return;
+async function selectAgent(id) {
+  if (state.rootView) await switchProject(state.project, false);
+  if (communication.active) {
+    hideCommunication();
+    const url = new URL(location.href); url.pathname = '/'; history.pushState(null, '', url);
+  }
   state.selected = id;
   if (id && id !== state.config?.sender.id) {
     const session = mentionSessions().find((item) => item.id === id);
@@ -372,8 +376,8 @@ function renderAgents() {
     .sort((a, b) => Number(!!b.is_root_orchestrator) - Number(!!a.is_root_orchestrator) || a.agent.localeCompare(b.agent) || a.registered_at - b.registered_at);
   $('agent-count').textContent = sessions.length;
   $('all-count').textContent = state.snapshot.total_messages.toLocaleString();
-  $('all-conversations').classList.toggle('selected', !state.selected);
-  $('all-conversations').setAttribute('aria-pressed', String(!state.selected));
+  $('all-conversations').classList.toggle('selected', !state.selected && !communication.active);
+  $('all-conversations').setAttribute('aria-pressed', String(!state.selected && !communication.active));
   const visible = new Set(sessions.map(session => session.id));
   // Existing coordinators expose recent creation jobs but lack the role flag.
   const mains = new Set(sessions.filter(session => session.thread_id && !session.parent_session).map(session => session.id));
@@ -406,11 +410,11 @@ function renderAgents() {
     const isSubagent = Boolean(session.parent_session);
     const controls = node('div', 'agent-controls');
     controls.style.marginLeft = `${Math.min(depth, 4) * 14}px`;
-    const button = node('button', `agent-button${isSubagent ? ' subagent' : ''}${state.selected === session.id ? ' selected' : ''}`);
+    const button = node('button', `agent-button${isSubagent ? ' subagent' : ''}${state.selected === session.id && !state.rootView && !communication.active ? ' selected' : ''}`);
     button.type = 'button';
     button.title = `${session.agent}\n${session.id}`;
     button.setAttribute('aria-label', `Show conversations with ${session.agent}`);
-    button.setAttribute('aria-pressed', String(state.selected === session.id));
+    button.setAttribute('aria-pressed', String(state.selected === session.id && !state.rootView && !communication.active));
     const label = node('span', 'agent-label');
     const nameRow = node('span', 'agent-name-row');
     nameRow.append(node('span', 'agent-name', session.agent));
@@ -960,7 +964,7 @@ function renderMediaViewer() {
 
 function openMediaViewer(message, attachment, opener) {
   const items = message.attachments.filter(item => IMAGE_MIMES.has(item.mime) || VIDEO_MIMES.has(item.mime))
-    .map(item => ({ ...item, url: projectURL(`/api/attachments/${encodeURIComponent(item.id)}`) }));
+    .map(item => ({ ...item, url: item.galleryURL || projectURL(`/api/attachments/${encodeURIComponent(item.id)}`) }));
   const index = items.findIndex(item => item.id === attachment.id);
   if (index < 0) return;
   for (const video of $('messages').querySelectorAll('video')) video.pause();
@@ -1099,6 +1103,8 @@ function messageCard(message, videos) {
   const receipt = node('span', acknowledged ? 'acknowledged' : 'pending',
     acknowledged ? '✓ Acknowledged' : '· Awaiting acknowledgement');
   if (acknowledged) receipt.title = new Date(message.acked_at * 1000).toLocaleString();
+  const ackAction = operatorAckButton(message);
+  if (ackAction) meta.append(ackAction);
   const actions = node('span', 'message-actions');
   if (message.body) {
     const copy = node('button', 'copy-message', 'Copy');
@@ -1153,32 +1159,70 @@ function messageCard(message, videos) {
   return article;
 }
 
-function feedAnchor() {
-  const feed = $('feed');
+function feedAnchor(feed = $('feed'), messages = $('messages'), visible = card => state.messages.has(card.dataset.messageId)) {
   const top = feed.getBoundingClientRect().top;
-  const card = [...$('messages').querySelectorAll('.message')].find(card =>
-    state.messages.has(card.dataset.messageId) && card.getBoundingClientRect().bottom > top
+  const card = [...messages.querySelectorAll('.message')].find(card =>
+    visible(card) && card.getBoundingClientRect().bottom > top
     && card.getBoundingClientRect().top < top + feed.clientHeight);
   return { id: card?.id, batch: card?.dataset.batchId,
     offset: card ? card.getBoundingClientRect().top - top : 0, top: feed.scrollTop };
 }
 
-function renderHistoryStatus() {
-  $('feed').setAttribute('aria-busy', String(state.loadingHistory));
-  $('show-latest').disabled = state.loadingHistory;
-  $('show-latest').hidden = !state.historyLoaded && !state.originals.size && !state.hasNewer;
-  $('message-window').textContent = state.historyLoaded ? `${state.messages.size} messages loaded` : state.hasOlder ? `Latest ${state.messages.size} messages` : '';
+function restoreFeedAnchor(feed, messages, anchor) {
+  const card = (anchor.id && document.getElementById(anchor.id))
+    || (anchor.batch && [...messages.querySelectorAll('.message')].find(card => card.dataset.batchId === anchor.batch));
+  feed.scrollTop = card ? feed.scrollTop + card.getBoundingClientRect().top - feed.getBoundingClientRect().top - anchor.offset : anchor.top;
+}
+
+function renderFeedHistory(view, prefix = '') {
+  const elements = prefix ? {feed:'communication-feed',latest:'communication-show-latest',window:'communication-status',newMessages:'communication-new-messages'}
+    : {feed:'feed',latest:'show-latest',window:'message-window',newMessages:'new-messages'};
+  $(elements.feed).setAttribute('aria-busy', String(view.loadingHistory));
+  $(elements.latest).disabled = view.loadingHistory;
+  $(elements.latest).hidden = !view.historyLoaded && !view.originals?.size && !view.hasNewer;
+  $(elements.window).textContent = view.historyLoaded ? `${view.messages.size} messages loaded` : view.hasOlder ? `Latest ${view.messages.size} messages` : '';
   for (const direction of ['older', 'newer']) {
-    const edge = $('history-' + direction);
-    const available = direction === 'older' ? state.hasOlder : state.hasNewer;
+    const edge = $(prefix + 'history-' + direction);
+    const available = direction === 'older' ? view.hasOlder : view.hasNewer;
     edge.hidden = !available;
-    edge.textContent = state.loadingHistory && state.historyDirection === direction
+    edge.textContent = view.loadingHistory && view.historyDirection === direction
       ? `Loading ${direction} messages…`
-      : state.historyError === direction ? `Could not load ${direction} messages. Scroll to retry.`
+      : view.historyError === direction ? `Could not load ${direction} messages. Scroll to retry.`
         : `Scroll ${direction === 'older' ? 'up' : 'down'} for ${direction} messages`;
   }
-  $('new-messages').hidden = state.newCount === 0;
-  $('new-messages').textContent = `${state.newCount} new · Back to latest`;
+  $(elements.newMessages).hidden = view.newCount === 0;
+  $(elements.newMessages).textContent = `${view.newCount} new · Back to latest`;
+}
+
+function renderHistoryStatus() { renderFeedHistory(state); }
+
+function historyWindow(messages, compare, newer) {
+  const rows = [...messages.values()].sort(compare);
+  return {trimmed:rows.length > MESSAGE_WINDOW_LIMIT, rows: newer ? rows.slice(-MESSAGE_WINDOW_LIMIT) : rows.slice(0,MESSAGE_WINDOW_LIMIT)};
+}
+
+function applyLiveFeed(view, incoming, {initial, following, hasOlder, key = item => item.id, compare = (a,b) => a.seq-b.seq, merge = (_old,item) => item}) {
+  const overlap = incoming.some(item => view.messages.has(key(item)));
+  const latest = [...view.messages.values()].sort(compare).at(-1);
+  const combined = new Map(view.messages);
+  for (const item of incoming) {
+    const id = key(item), updated = merge(view.messages.get(id),item);
+    combined.set(id,updated);
+    if (view.messages.has(id)) view.messages.set(id,updated);
+  }
+  if (initial || (!view.historyLoaded && following && (overlap || !view.messages.size))) {
+    view.messages = new Map(incoming.map(item => [key(item),combined.get(key(item))]));
+    view.hasOlder = hasOlder; view.hasNewer = false;
+  } else if (overlap && (following || (!view.historyLoaded && !view.loadingHistory && !view.hasNewer))) {
+    const window = historyWindow(combined,compare,true);
+    if (!following && window.trimmed) { view.historyLoaded = true; view.hasNewer = true; }
+    else {
+      if (window.trimmed) view.hasOlder = true;
+      view.messages = new Map(window.rows.map(item => [key(item),item]));
+    }
+  } else if (incoming.some(item => !latest || compare(item,latest)>0)) {
+    view.historyLoaded = true; view.hasNewer = true;
+  }
 }
 
 function renderMessages(forceBottom = false, anchor = feedAnchor()) {
@@ -1232,9 +1276,7 @@ function renderMessages(forceBottom = false, anchor = feedAnchor()) {
       $('new-messages').hidden = true;
     }
   } else {
-    const card = (anchor.id && document.getElementById(anchor.id))
-      || (anchor.batch && [...$('messages').querySelectorAll('.message')].find(card => card.dataset.batchId === anchor.batch));
-    feed.scrollTop = card ? feed.scrollTop + card.getBoundingClientRect().top - feed.getBoundingClientRect().top - anchor.offset : anchor.top;
+    restoreFeedAnchor(feed, $('messages'), anchor);
   }
   state.scrollTop = feed.scrollTop;
 }
@@ -1397,6 +1439,7 @@ function applySnapshot(data) {
   const labelsChanged = labels(data.sessions) !== labels(state.snapshot?.sessions);
   state.snapshot = data;
   if (state.selected || state.toMe) {
+    if (initial && state.rootView) state.hasOlder = data.history_truncated;
     const scoped = data.messages.filter(matchesConversation);
     const seen = new Set(previous.map((message) => message.batch_id || message.id));
     for (const message of scoped) {
@@ -1408,8 +1451,13 @@ function applySnapshot(data) {
       if (!state.messages.size || scoped.some((message) => state.messages.has(message.id))) {
         const combined = new Map([...state.messages, ...scoped.map((message) => [message.id, message])]);
         const rows = [...combined.values()].sort((a, b) => a.seq - b.seq);
-        if (rows.length > MESSAGE_WINDOW_LIMIT) state.hasOlder = true;
-        state.messages = new Map(rows.slice(-MESSAGE_WINDOW_LIMIT).map((message) => [message.id, message]));
+        if (state.rootView && (!following || communication.active) && rows.length > MESSAGE_WINDOW_LIMIT) {
+          // Keep the bounded window the operator is reading; newer pages remain available below.
+          state.historyLoaded = true; state.hasNewer = true;
+        } else {
+          if (rows.length > MESSAGE_WINDOW_LIMIT) state.hasOlder = true;
+          state.messages = new Map(rows.slice(-MESSAGE_WINDOW_LIMIT).map((message) => [message.id, message]));
+        }
       } else if (scoped.some((message) => message.seq > visibleMax)) {
         state.hasNewer = true;
       }
@@ -1429,26 +1477,7 @@ function applySnapshot(data) {
     seen.add(key);
     if (state.messages.has(message.id)) state.messages.set(message.id, message);
   }
-  if (initial || (!state.historyLoaded && following && (overlap || !state.messages.size))) {
-    state.messages = new Map(data.messages.map((message) => [message.id, message]));
-    state.hasOlder = data.history_truncated;
-    state.hasNewer = false;
-  } else if (overlap && (following || (!state.historyLoaded && !state.loadingHistory && !state.hasNewer))) {
-    const messages = new Map([...state.messages, ...data.messages.map(message => [message.id, message])]);
-    const rows = [...messages.values()].sort((a, b) => a.seq - b.seq);
-    if (!following && rows.length > MESSAGE_WINDOW_LIMIT) {
-      state.historyLoaded = true;
-      state.hasNewer = true;
-    } else {
-      if (rows.length > MESSAGE_WINDOW_LIMIT) state.hasOlder = true;
-      state.messages = new Map(rows.slice(-MESSAGE_WINDOW_LIMIT).map(message => [message.id, message]));
-    }
-  } else if (data.messages.some(message => message.seq > visibleMax)) {
-    // Keep a contiguous window while reading history, even if live traffic
-    // moves beyond the server's latest 50-message snapshot.
-    state.historyLoaded = true;
-    state.hasNewer = true;
-  }
+  applyLiveFeed(state, data.messages, {initial, following, hasOlder:data.history_truncated});
   pruneExpanded();
   renderAgents();
   if (initial || labelsChanged || oldVisible !== JSON.stringify([...state.messages.values()])) renderMessages(initial || (following && !state.hasNewer));
@@ -1492,9 +1521,7 @@ async function loadMessagePage(newer = false) {
     if (viewGeneration !== state.viewGeneration) return;
     const anchor = feedAnchor();
     const messages = new Map([...state.messages, ...result.messages.slice(0, MESSAGE_LIMIT).map(message => [message.id, message])]);
-    const rows = [...messages.values()].sort((a, b) => a.seq - b.seq);
-    const trimmed = rows.length > MESSAGE_WINDOW_LIMIT;
-    const retained = newer ? rows.slice(-MESSAGE_WINDOW_LIMIT) : rows.slice(0, MESSAGE_WINDOW_LIMIT);
+    const {trimmed,rows:retained} = historyWindow(messages,(a,b) => a.seq-b.seq,newer);
     // If the user moved to the opposite end during the request, avoid evicting
     // the message they are now reading. The next edge scroll can retry.
     if (anchor.id && !retained.some(message => `chat-${message.id}` === anchor.id || (anchor.batch && message.batch_id === anchor.batch))) return;
@@ -1523,16 +1550,35 @@ async function loadMessagePage(newer = false) {
   }
 }
 
-function loadAtScrollEdge(direction) {
-  if (state.loadingHistory || !state.config) return;
-  const feed = $('feed');
-  if (direction < 0 && feed.scrollTop < 180) loadMessagePage();
-  else if (direction > 0 && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 180) loadMessagePage(true);
+function loadAtScrollEdge(direction, feed = $('feed'), view = state, loadPage = loadMessagePage) {
+  if (view.loadingHistory || (view === state && !state.config)) return;
+  if (direction < 0 && feed.scrollTop < 180 && view.hasOlder) loadPage(false);
+  else if (direction > 0 && feed.scrollHeight - feed.scrollTop - feed.clientHeight < 180 && view.hasNewer) loadPage(true);
 }
 
-async function fetchJSON(url, options = {}) {
+function bindFeedEdges(feed, view, loadPage) {
+  const edge = direction => loadAtScrollEdge(direction,feed,view,loadPage);
+  feed.addEventListener('scroll', () => {
+    const top = feed.scrollTop, direction = top - view.scrollTop;
+    view.scrollTop = top; edge(direction);
+  }, {passive:true});
+  feed.addEventListener('wheel', event => edge(event.deltaY), {passive:true});
+  feed.addEventListener('keydown', event => {
+    if (event.target !== feed) return;
+    if (['ArrowUp','PageUp','Home'].includes(event.key)) edge(-1);
+    if (['ArrowDown','PageDown','End'].includes(event.key)) edge(1);
+  });
+  let touchY = null;
+  feed.addEventListener('touchstart', event => { touchY = event.touches[0]?.clientY; }, {passive:true});
+  feed.addEventListener('touchmove', event => {
+    const y = event.touches[0]?.clientY;
+    if (touchY != null && y != null && Math.abs(touchY-y)>30) { edge(touchY-y); touchY = y; }
+  }, {passive:true});
+}
+
+async function fetchJSON(url, options = {}, { projectScoped = true } = {}) {
   const epoch = state.epoch;
-  const response = await fetch(projectURL(url, options.method || 'GET'), { cache: 'no-store', ...options });
+  const response = await fetch(projectScoped ? projectURL(url, options.method || 'GET') : url, { cache: 'no-store', ...options });
   const data = await response.json();
   if (epoch !== state.epoch) throw new DOMException('Project changed', 'AbortError');
   if (!response.ok) {
@@ -1675,10 +1721,10 @@ function renderProjects(data) {
     }
   }
   if (state.rootView) state.selected = state.root?.home_session || null;
-  document.body.classList.toggle('root-screen', state.rootView);
+  document.body.classList.toggle('root-screen', state.rootView && !communication.active);
   if ($('resources-button-label')) $('resources-button-label').textContent = state.rootView ? 'Projects' : 'Resources';
   $('resources-panel').setAttribute('aria-label', state.rootView ? 'Project overview' : 'Shared resources');
-  document.title = state.rootView ? 'Root orchestrator · Agent chat' : 'Agent room · Agent chat';
+  document.title = communication.active ? 'All communication · Agent chat' : state.rootView ? 'Root orchestrator · Agent chat' : 'Agent room · Agent chat';
   $('message-input').placeholder = state.rootView ? 'Message your root orchestrator…' : 'Message all agents, @tag recipients, or drop files…';
   if ($('root-directory')) $('root-directory').hidden = !state.rootView;
   if ($('project-directory')) {
@@ -1743,17 +1789,17 @@ function renderProjects(data) {
   }
   if ($('root-conversation')) {
     $('root-conversation').hidden = !state.root && !state.rootView;
-    $('root-conversation').classList.toggle('selected', state.rootView);
+    $('root-conversation').classList.toggle('selected', state.rootView && !communication.active);
     $('root-conversation').disabled = state.busy || state.sending || !state.config;
   }
-  if (!data.projects) return;
+  if (!data.projects) { if (communication.active) communicationContext(); return; }
   state.projects = data.projects;
   const projectButtons = data.projects.map(project => {
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'room-button project-nav-button';
     button.dataset.projectId = project.id;
     button.textContent = project.name;
-    const selected = !state.rootView && project.id === state.project;
+    const selected = !communication.active && !state.rootView && project.id === state.project;
     button.classList.toggle('selected', selected);
     button.setAttribute('aria-current', selected ? 'page' : 'false');
     button.addEventListener('click', () => switchProject(project.id));
@@ -1765,6 +1811,7 @@ function renderProjects(data) {
   $('measurement-button').setAttribute('aria-label', measuring ? 'Measure usage (active)' : 'Measure usage');
   $('measurement-button').title = measuring ? 'Usage measurement is active' : 'Measure usage for this project';
   projectControls();
+  if (communication.active) communicationContext();
 }
 
 async function connect() {
@@ -1792,6 +1839,7 @@ async function connect() {
     $('send-button').disabled = state.rootView && !state.root;
     composerStatus('');
     startSnapshotSource(epoch);
+    if (location.pathname === '/communications') showCommunication(false);
   } catch (error) {
     if (epoch !== state.epoch) return;
     composerStatus(error.message + '. Reconnect to try again.', true);
@@ -1800,12 +1848,14 @@ async function connect() {
 }
 
 function switchProject(id, rootView = false) {
+  hideCommunication();
   if ($('reset-dialog').open) $('reset-dialog').close();
   if (state.busy || state.sending || (id === state.project && rootView === state.rootView)) return;
   if ($('media-dialog').open) {
     mediaViewer.opener = null;
     $('media-dialog').close();
   }
+  if ($('attachment-gallery').open) $('attachment-gallery').close();
   state.drafts.set(`${state.rootView ? 'root' : 'project'}:${state.project}`, { body: $('message-input').value, attachments: state.attachments });
   closeMeasurement();
   state.measurement = null;
@@ -1983,27 +2033,7 @@ $('pause-button').addEventListener('click', () => {
 });
 $('new-messages').addEventListener('click', showLatest);
 $('show-latest').addEventListener('click', showLatest);
-$('feed').addEventListener('scroll', () => {
-  const top = $('feed').scrollTop;
-  const direction = top - state.scrollTop;
-  state.scrollTop = top;
-  loadAtScrollEdge(direction);
-}, { passive: true });
-$('feed').addEventListener('wheel', event => loadAtScrollEdge(event.deltaY), { passive: true });
-$('feed').addEventListener('keydown', event => {
-  if (event.target !== $('feed')) return;
-  if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) loadAtScrollEdge(-1);
-  if (['ArrowDown', 'PageDown', 'End'].includes(event.key)) loadAtScrollEdge(1);
-});
-let feedTouchY = null;
-$('feed').addEventListener('touchstart', event => { feedTouchY = event.touches[0]?.clientY; }, { passive: true });
-$('feed').addEventListener('touchmove', event => {
-  const y = event.touches[0]?.clientY;
-  if (feedTouchY != null && y != null && Math.abs(feedTouchY - y) > 30) {
-    loadAtScrollEdge(feedTouchY - y);
-    feedTouchY = y;
-  }
-}, { passive: true });
+bindFeedEdges($('feed'), state, loadMessagePage);
 for (const [id, panel] of [['agents-toggle', 'sidebar'], ['resources-toggle', 'resources']]) {
   $(id).addEventListener('click', () => {
     const open = !document.body.classList.contains(`show-${panel}`);
@@ -2020,7 +2050,7 @@ document.addEventListener('keydown', (event) => {
   if ($('media-dialog').open) return;
   if (event.key === 'Escape') closePanels();
   if (event.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement.tagName)) {
-    event.preventDefault(); $('search').focus();
+    event.preventDefault(); $(communication.active ? 'communication-text' : 'search').focus();
   }
 });
 $('message-input').addEventListener('keydown', (event) => {
@@ -2131,6 +2161,383 @@ $('composer').addEventListener('submit', async (event) => {
 });
 $('resource-previous').addEventListener('click', () => changeResourcePage(-1));
 $('resource-next').addEventListener('click', () => changeResourcePage(1));
-setInterval(() => { if (!state.paused) updateResourceCountdowns(); }, 1000);
+setInterval(() => {
+  if (!state.paused) updateResourceCountdowns();
+  if (communication.active && !communication.updating) loadCommunication('update');
+}, 1000);
 window.addEventListener('beforeunload', () => state.source?.close());
 connect();
+
+
+// This history is independent of the conversation's loaded message window.
+const gallery = { items: [], cursor: null, request: 0, root: false, timer: null, selectedProject: '' };
+function renderGalleryItems(items) {
+  for (const attachment of items) {
+    const card = node('article', 'gallery-card');
+    const visual = node('button', 'gallery-preview');
+    visual.type = 'button';
+    visual.setAttribute('aria-label', `Open ${attachment.name}`);
+    if (IMAGE_MIMES.has(attachment.mime)) {
+      const image = node('img'); image.src = attachment.url; image.alt = attachment.name; image.loading = 'lazy';
+      visual.append(image);
+    } else if (VIDEO_MIMES.has(attachment.mime)) {
+      const video = node('video'); video.src = attachment.url; video.preload = 'metadata'; video.muted = true; video.playsInline = true;
+      visual.append(video, node('span', 'gallery-file-type', '▶ Video'));
+    } else visual.append(node('span', 'gallery-file-type', attachmentType(attachment)));
+    const media = IMAGE_MIMES.has(attachment.mime) || VIDEO_MIMES.has(attachment.mime);
+    visual.addEventListener('click', () => {
+      if (media) openMediaViewer({ attachments: gallery.items.map(item => ({ ...item, galleryURL: item.url })) }, attachment, visual);
+      else window.open(attachment.url, '_blank', 'noopener');
+    });
+    const name = node('a', 'gallery-file-name', attachment.name);
+    name.href = attachment.url; name.download = attachment.name; name.title = attachment.name;
+    const details = node('p', 'gallery-file-meta', `${attachment.project_name} · ${attachment.size >= 1048576 ? (attachment.size / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(attachment.size / 1024)) + ' KB'} · ${dateFormat.format(new Date(attachment.created_at * 1000))}`);
+    const download = attachmentDownload(attachment, 'quiet-button gallery-download', true);
+    card.append(visual, name, download, details); $('gallery-grid').append(card);
+  }
+}
+async function loadGallery(reset = true) {
+  const request = ++gallery.request;
+  if (reset) { gallery.items = []; gallery.cursor = null; $('gallery-grid').replaceChildren(); }
+  $('gallery-status').textContent = 'Loading attachments…';
+  $('gallery-more').disabled = true;
+  if (reset) $('gallery-more').hidden = true;
+  const query = new URLSearchParams();
+  if (!gallery.root && $('gallery-project').value) query.set('project', $('gallery-project').value);
+  if ($('gallery-search').value) query.set('q', $('gallery-search').value);
+  if (gallery.cursor) query.set('before', gallery.cursor);
+  const path = gallery.root ? '/api/root/attachment-gallery' : '/api/attachment-gallery';
+  try {
+    const result = await fetchUsage(`${path}?${query}`, { cache: 'no-store' });
+    if (request !== gallery.request || !$('attachment-gallery').open) return;
+    if (!gallery.root) fillGalleryProjects(result.projects);
+    gallery.items.push(...result.attachments); gallery.cursor = result.next_cursor;
+    renderGalleryItems(result.attachments);
+    $('gallery-more').hidden = !result.has_more;
+    $('gallery-status').textContent = gallery.items.length ? `${gallery.items.length} files${result.has_more ? ' · More available' : ''}` : 'No attachments found.';
+    if (result.partial) $('gallery-status').textContent += ' Some project attachments are unavailable. Refresh to retry.';
+  } catch (error) {
+    if (request !== gallery.request || !$('attachment-gallery').open) return;
+    $('gallery-status').textContent = `Could not load attachments. ${error.message}. Refresh to retry.`;
+  } finally {
+    if (request === gallery.request) $('gallery-more').disabled = false;
+  }
+}
+function fillGalleryProjects(projects) {
+  $('gallery-project').replaceChildren(new Option('All projects', ''));
+  for (const project of projects) $('gallery-project').append(new Option(project.name, project.id));
+  if (state.root) $('gallery-project').append(new Option('Private Root conversation', '__root__'));
+  if (![...$('gallery-project').options].some(option => option.value === gallery.selectedProject)) gallery.selectedProject = '';
+  $('gallery-project').value = gallery.selectedProject;
+}
+function selectGalleryScope() {
+  gallery.root = gallery.selectedProject === '__root__';
+  $('gallery-title').textContent = gallery.root ? 'Root attachments' : 'Attachments';
+  $('gallery-scope').textContent = gallery.root ? 'Files sent in your private Root conversation.' : 'Files sent in project rooms. Private Root attachments stay in Root.';
+}
+$('open-attachments').addEventListener('click', () => {
+  fillGalleryProjects(state.projects); selectGalleryScope(); $('gallery-search').value = '';
+  closePanels(); $('attachment-gallery').showModal(); loadGallery();
+});
+$('close-gallery').addEventListener('click', () => $('attachment-gallery').close());
+$('attachment-gallery').addEventListener('close', () => {
+  gallery.request++; clearTimeout(gallery.timer);
+  for (const video of $('gallery-grid').querySelectorAll('video')) video.pause();
+});
+$('gallery-project').addEventListener('change', () => {
+  gallery.selectedProject = $('gallery-project').value; selectGalleryScope(); loadGallery();
+});
+$('gallery-search').addEventListener('input', () => {
+  gallery.request++; clearTimeout(gallery.timer); gallery.timer = setTimeout(() => loadGallery(), 250);
+});
+$('gallery-refresh').addEventListener('click', () => loadGallery());
+$('gallery-more').addEventListener('click', () => loadGallery(false));
+
+// Aggregate navigation stays in this authenticated document; it does not
+// turn visibility into recipient authority or discard the current draft.
+const communication = {active:false, generation:0, messages:new Map(), busy:false, updating:false, expanded:new Set(),
+  hasOlder:false, hasNewer:false, historyLoaded:false, loadingHistory:false, historyDirection:null, historyError:null,
+  scrollTop:0, newCount:0, pollSeen:new Set(), get items() { return [...this.messages.values()]; }};
+function attachmentDownload(attachment, className, iconOnly = false) {
+  const link=node('a',className,iconOnly ? '' : `Download ${attachment.name}`);
+  const label = text => {
+    if (iconOnly) { link.setAttribute('aria-label',text); link.title=text; }
+    else (link.querySelector('.attachment-name') || link).textContent=text;
+  };
+  if (iconOnly) {
+    const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+    svg.setAttribute('viewBox','0 0 24 24');svg.setAttribute('width','18');svg.setAttribute('height','18');svg.setAttribute('aria-hidden','true');
+    const path=document.createElementNS(svg.namespaceURI,'path');
+    path.setAttribute('d','M12 3v12m-5-5 5 5 5-5M5 16v5h14v-5');
+    path.setAttribute('fill','none');path.setAttribute('stroke','currentColor');path.setAttribute('stroke-width','1.8');path.setAttribute('stroke-linecap','round');path.setAttribute('stroke-linejoin','round');
+    svg.append(path);link.append(svg);label(`Download ${attachment.name}`);
+  }
+  link.href=attachment.url;link.download=attachment.name;
+  link.addEventListener('click',async event=>{
+    event.preventDefault();if(link.getAttribute('aria-disabled')==='true')return;
+    const epoch=state.epoch;link.setAttribute('aria-disabled','true');
+    try {
+      const response=await fetch(attachment.url,{credentials:'same-origin',cache:'no-store'});
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
+      const bytes=await response.blob();if(epoch!==state.epoch)return;
+      const url=URL.createObjectURL(bytes),save=node('a');save.href=url;save.download=attachment.name;
+      document.body.append(save);save.click();save.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
+      label(`Download ${attachment.name}`);
+    }catch(error){if(epoch===state.epoch)label(`Retry download ${attachment.name}: ${error.message}`);}
+    finally{link.removeAttribute('aria-disabled');}
+  });return link;
+}
+function operatorAckButton(message, project = state.project, rootView = state.rootView) {
+  if (!state.config?.operator_ack_enabled) return null;
+  const action = message.operator_ack || (message.recipient_session === state.config.sender.id && message.sender_session !== state.config.sender.id
+    ? {id:message.id,acked_at:message.acked_at} : null);
+  if (!action || action.acked_at != null) return null;
+  const button = node('button','message-ack','Acknowledge');
+  button.title='Acknowledges only your received delivery; never another recipient or full-read consumption.';
+  if(message.deliveries?.length)button.textContent='Acknowledge your copy';
+  button.type='button';button.setAttribute('aria-label','Acknowledge message');
+  button.addEventListener('click',async()=>{
+    if(button.disabled)return;button.disabled=true;
+    const epoch=state.epoch, generation=communication.generation;
+    const endpoint = rootView ? '/api/root/messages/ack' : `/api/messages/ack?project=${encodeURIComponent(project)}`;
+    try {
+      await fetchJSON(endpoint,{method:'POST',headers:{'Content-Type':'application/json','X-Agent-Chat-CSRF':state.config.csrf_token},body:JSON.stringify({id:action.id})});
+      if(epoch!==state.epoch || generation!==communication.generation)return;
+      action.acked_at=Date.now()/1000;message.acked_at=action.acked_at;
+      button.textContent='Acknowledged';button.setAttribute('aria-label','Acknowledged');
+    } catch(error) {
+      if(epoch!==state.epoch || generation!==communication.generation)return;
+      button.disabled=false;button.textContent=`Retry acknowledgement: ${error.message}`;
+    }
+  });
+  return button;
+}
+function communicationURL() {
+  const url = new URL(location.href); url.pathname = '/communications'; return url;
+}
+function showCommunication(push = true) {
+  if (state.sending || state.busy) return;
+  communication.active = true; communication.generation++;
+  $('communication-panel').hidden = false;
+  document.querySelector('.main').classList.add('show-communication');
+  document.body.classList.add('communication-readonly');
+  document.body.classList.remove('root-screen');
+  $('composer').inert = true;
+  for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
+  closePanels(); renderAgents(); communicationContext();
+  document.title = 'All communication · Agent chat';
+  $('all-communication-view')?.classList.add('selected');
+  $('all-communication-view')?.setAttribute('aria-current', 'page');
+  $('root-conversation')?.classList.remove('selected');
+  for (const button of $('project-list').children) {
+    button.classList.remove('selected'); button.setAttribute('aria-current', 'false');
+  }
+  if (push && location.pathname !== '/communications') history.pushState({communication:true}, '', communicationURL());
+  loadCommunication('reset');
+}
+function hideCommunication() {
+  communication.active = false; communication.generation++; communication.busy = false; communication.updating = false;
+  $('communication-panel').hidden = true;
+  document.querySelector('.main').classList.remove('show-communication');
+  document.body.classList.remove('communication-readonly');
+  $('composer').inert = false;
+  $('all-communication-view')?.classList.remove('selected');
+  $('all-communication-view')?.removeAttribute('aria-current');
+  if (state.config) { renderProjects(state.config); renderAgents(); }
+}
+function communicationContext() {
+  const selected = $('communication-project').value;
+  const project = state.projects.find(item => item.id === selected);
+  $('communication-scope').textContent = project?.name || 'All projects';
+}
+async function communicationFullBody(message, generation) {
+  if (!message.body_truncated) return message.body;
+  const result = await fetchJSON('/api/communications/message?' + new URLSearchParams({project:message.project_id, id:message.id}), {}, {projectScoped:false});
+  if (generation !== communication.generation || !communication.active) return null;
+  message.body = result.message.body; message.body_truncated = false;
+  return message.body;
+}
+function renderCommunication() {
+  const fragment = document.createDocumentFragment();
+  let previousDate = '';
+  for (const message of communication.items) {
+    const key = message.project_id + ':' + message.id;
+    const date = new Date(message.created_at * 1000).toDateString();
+    if (date !== previousDate) fragment.append(node('div', 'date-divider', dateLabel(message.created_at)));
+    previousDate = date;
+    const own = message.sender_role === 'human_operator' && !message.service_notice;
+    const sender = message.service_notice ? 'Service notice' : own ? 'You' : message.sender_agent || message.sender_session;
+    const article = node('article', 'message communication-item' + (own ? ' own' : ''));
+    article.id = 'communication-' + key;
+    article.dataset.messageId = message.id; article.dataset.projectId = message.project_id;
+    article.append(avatar(sender));
+    const content = node('div', 'message-content'), meta = node('div', 'message-meta');
+    const time = node('time', 'message-time', timeFormat.format(new Date(message.created_at * 1000)));
+    time.dateTime = new Date(message.created_at * 1000).toISOString(); time.title = new Date(message.created_at * 1000).toLocaleString();
+    const operator = message.operator_ack?.recipient_session;
+    const recipients = messageDeliveries(message).map(item => operator && item.recipient_session === operator ? 'You' : item.recipient_agent || item.recipient_session).join(', ');
+    meta.append(node('span', 'sender-button', sender), node('span', 'recipient', recipients), time);
+    const card = node('div', 'message-card');
+    if (message.reply_preview) {
+      const quote = node('div', 'reply-quote');
+      quote.append(node('strong', '', `↩ ${message.reply_preview.sender_agent || 'Original message'}`), node('span', '', message.reply_preview.body));
+      card.append(quote);
+    }
+    const long = message.body_truncated || message.body.length > 900 || message.body.split('\n').length > 8;
+    const body = node('div', 'message-body markdown');
+    const renderBody = () => {
+      body.replaceChildren(CoordMarkdown.render(message.body));
+      body.classList.toggle('collapsed', long && !communication.expanded.has(key));
+    };
+    renderBody(); card.append(body);
+    if (long) {
+      const full = node('button', 'expand-message', communication.expanded.has(key) ? 'Show less' : 'Read full message');
+      full.type = 'button'; full.setAttribute('aria-expanded', String(communication.expanded.has(key)));
+      full.addEventListener('click', async () => {
+        const generation = communication.generation; full.disabled = true;
+        try {
+          if (await communicationFullBody(message, generation) === null) return;
+          if (communication.expanded.has(key)) communication.expanded.delete(key); else communication.expanded.add(key);
+          const anchor = communicationAnchor();
+          renderCommunication(); restoreFeedAnchor($('communication-feed'), $('communication-messages'), anchor);
+          communication.scrollTop = $('communication-feed').scrollTop;
+        } catch (error) {
+          if (generation === communication.generation) full.textContent = 'Retry full message: ' + error.message;
+        } finally { full.disabled = false; }
+      });
+      card.append(full);
+    }
+    if (message.attachments?.length) {
+      const files = node('div', 'message-attachments');
+      for (const attachment of message.attachments) {
+        const download = attachmentDownload(attachment, 'message-attachment');
+        download.setAttribute('aria-label', `Download ${attachment.name}`);
+        download.replaceChildren(node('span', 'attachment-document-type', attachment.name.split('.').pop().toUpperCase()),
+          node('span', 'attachment-name', `Download ${attachment.name}`));
+        files.append(download);
+      }
+      card.append(files);
+    }
+    const bottom = node('div', 'message-bottom');
+    const acked = message.operator_ack?.acked_at ?? message.acked_at;
+    bottom.append(node('span', acked != null ? 'acknowledged' : 'pending', acked != null ? '✓ Acknowledged' : '· Awaiting acknowledgement'));
+    const actions = node('span', 'message-actions'), copy = node('button', 'copy-message', 'Copy');
+    copy.type = 'button'; copy.setAttribute('aria-label', `Copy message from ${sender}`);
+    copy.addEventListener('click', async () => {
+      const generation = communication.generation; copy.disabled = true;
+      try {
+        const text = await communicationFullBody(message, generation);
+        if (text === null) return;
+        await copyMessageText(text);
+        if (generation === communication.generation) copy.textContent = 'Copied!';
+      } catch { if (generation === communication.generation) copy.textContent = 'Copy failed'; }
+      finally { copy.disabled = false; }
+    });
+    actions.append(node('span', 'message-id communication-project-label', message.project_name), copy, node('span', 'message-id', message.id.slice(-8)));
+    bottom.append(actions); content.append(meta, card, bottom); article.append(content); fragment.append(article);
+  }
+  $('communication-messages').replaceChildren(fragment);
+  $('communication-empty').hidden = communication.items.length > 0;
+}
+const communicationKey = item => item.project_id + ':' + item.id;
+function compareCommunication(a,b) {
+  const text = (left,right) => left < right ? -1 : left > right ? 1 : 0;
+  return a.created_at-b.created_at || text(a.project_id,b.project_id) || a.seq-b.seq || text(a.id,b.id);
+}
+function mergeCommunication(previous,item) {
+  if (!previous) return item;
+  const full = !previous.body_truncated && item.body_truncated ? previous.body : null;
+  Object.assign(previous,item);
+  if (full !== null) { previous.body = full; previous.body_truncated = false; }
+  return previous;
+}
+function communicationAnchor() {
+  return feedAnchor($('communication-feed'),$('communication-messages'),() => true);
+}
+function communicationHistoryStatus() {
+  renderFeedHistory(communication,'communication-');
+  if (!$('communication-status').textContent) $('communication-status').textContent = `${communication.messages.size} ${communication.messages.size === 1 ? 'message' : 'messages'}`;
+  if (communication.partial) $('communication-status').textContent += ' · Some projects unavailable';
+  if (communication.pollError) $('communication-status').textContent = 'Unavailable: ' + communication.pollError;
+}
+async function loadCommunication(mode = 'reset') {
+  if (!communication.active) return;
+  if (mode === 'update' ? communication.updating || (communication.loadingHistory && communication.historyDirection === 'reset') : communication.busy && mode !== 'reset') return;
+  if ((mode === 'older' && !communication.hasOlder) || (mode === 'newer' && !communication.hasNewer)) return;
+  if (mode === 'reset') { communication.generation++; communication.updating = false; }
+  const generation = communication.generation, feed = $('communication-feed');
+  const previous = JSON.stringify(communication.items);
+  const params = new URLSearchParams({limit:String(MESSAGE_LIMIT)});
+  if ($('communication-project').value) params.set('project',$('communication-project').value);
+  if ($('communication-text').value) params.set('q',$('communication-text').value);
+  if (mode === 'older') params.set('before',communication.items[0]?.history_cursor || communication.cursor);
+  if (mode === 'newer') params.set('after',communication.items.at(-1)?.history_cursor);
+  if (mode === 'update') communication.updating = true; else communication.busy = true;
+  if (mode !== 'update') { communication.loadingHistory = true; communication.historyDirection = mode; communication.historyError = null; }
+  communicationHistoryStatus();
+  try {
+    const result = await fetchJSON('/api/communications?' + params,{}, {projectScoped:false});
+    if (generation !== communication.generation || !communication.active) return;
+    const anchor = communicationAnchor();
+    const following = !communication.hasNewer && feed.scrollHeight-feed.scrollTop-feed.clientHeight < 90;
+    if (mode === 'reset') {
+      communication.messages.clear(); communication.expanded.clear();
+      communication.historyLoaded = false; communication.hasNewer = false; communication.newCount = 0;
+    }
+    if (mode === 'reset' || mode === 'update') {
+      const latest = communication.items.at(-1);
+      if (mode === 'update') communication.newCount += result.messages.filter(item =>
+        !communication.pollSeen.has(communicationKey(item)) && (!latest || compareCommunication(item,latest)>0)).length;
+      communication.pollSeen = new Set(result.messages.map(communicationKey));
+      applyLiveFeed(communication,result.messages,{initial:mode === 'reset',following,hasOlder:result.has_more,
+        key:communicationKey,compare:compareCommunication,merge:mergeCommunication});
+      if (mode === 'reset') communication.cursor = result.next_cursor;
+    } else {
+      const messages = new Map(communication.messages);
+      for (const item of result.messages) messages.set(communicationKey(item),mergeCommunication(messages.get(communicationKey(item)),item));
+      const window = historyWindow(messages,compareCommunication,mode === 'newer');
+      if (anchor.id && !window.rows.some(item => 'communication-' + communicationKey(item) === anchor.id)) return;
+      communication.messages = new Map(window.rows.map(item => [communicationKey(item),item]));
+      communication.historyLoaded = true;
+      if (mode === 'newer') { communication.hasNewer = result.has_more; if (window.trimmed) communication.hasOlder = true; }
+      else { communication.hasOlder = result.has_more; communication.cursor = result.next_cursor; if (window.trimmed) communication.hasNewer = true; }
+    }
+    for (const key of communication.expanded) if (!communication.messages.has(key)) communication.expanded.delete(key);
+    if ((mode === 'reset' || following || mode === 'newer') && !communication.hasNewer) communication.newCount = 0;
+    communication.partial = result.partial; communication.pollError = null;
+    const catalog = JSON.stringify(result.projects);
+    if (communication.catalog !== catalog) {
+      communication.catalog = catalog; const selected = $('communication-project').value;
+      $('communication-project').replaceChildren(new Option('All projects',''),...result.projects.map(item => new Option(item.name,item.id)));
+      $('communication-project').value = selected;
+    }
+    if (mode !== 'update' || previous !== JSON.stringify(communication.items)) {
+      renderCommunication();
+      if (mode === 'reset' || (mode === 'update' && following && !communication.hasNewer)) feed.scrollTop = feed.scrollHeight;
+      else restoreFeedAnchor(feed,$('communication-messages'),anchor);
+      communication.scrollTop = feed.scrollTop;
+    }
+    communicationContext();
+  } catch (error) {
+    if (generation === communication.generation && error.name !== 'AbortError') {
+      if (mode === 'older' || mode === 'newer') communication.historyError = mode;
+      else communication.pollError = error.message;
+    }
+  } finally {
+    if (generation === communication.generation) {
+      if (mode === 'update') communication.updating = false;
+      else { communication.busy = false; communication.loadingHistory = false; }
+      communicationHistoryStatus();
+    }
+  }
+}
+$('all-communication-view')?.addEventListener('click', event => { event.preventDefault(); showCommunication(); });
+$('communication-filters').addEventListener('submit', event => { event.preventDefault(); loadCommunication('reset'); });
+$('communication-project').addEventListener('change', () => loadCommunication('reset'));
+bindFeedEdges($('communication-feed'), communication, newer => loadCommunication(newer ? 'newer' : 'older'));
+$('communication-show-latest').addEventListener('click', () => loadCommunication('reset'));
+$('communication-new-messages').addEventListener('click', () => loadCommunication('reset'));
+$('all-conversations').addEventListener('click', () => {
+  if (communication.active) { hideCommunication(); const url = new URL(location.href); url.pathname = state.rootView ? '/root' : '/'; history.pushState(null, '', url); }
+});
+window.addEventListener('popstate', () => { if (location.pathname === '/communications') showCommunication(false); else hideCommunication(); });

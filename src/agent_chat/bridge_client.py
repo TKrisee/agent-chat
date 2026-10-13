@@ -53,6 +53,15 @@ class RemoteBridgeState:
         return self.call('update', job_id=job_id, status=status, queue_id=queue_id, error=error)
     def observe(self, thread_id, state, error=None):
         return self.call('observe', thread_id=thread_id, state=state, error=error)
+    def capacity_targets(self): return self.call('capacity-targets')
+    def capacity_jobs(self): return self.call('capacity-jobs')
+    def capacity_gate(self, session_id, thread_id):
+        return self.call('capacity-gate', session_id=session_id, thread_id=thread_id)
+    def capacity_schedule(self, session_id, thread_id, turn_id, now, settings_digest, model, reasoning_effort, owner):
+        return self.call('capacity-schedule', session_id=session_id, thread_id=thread_id, turn_id=turn_id, now=now,
+                         settings_digest=settings_digest, model=model, reasoning_effort=reasoning_effort, owner=owner)
+    def capacity_update(self, job_id, expected, status, now, **values):
+        return self.call('capacity-update', job_id=job_id, expected=expected, status=status, now=now, **values)
     def heartbeat(self, server, pid, error=None):
         return self.call('heartbeat', server=server, pid=pid, error=error, capabilities=['project-scope-v1', 'project-workspaces-v1'])
     def root_fresh_jobs(self): return self.call('root-fresh-jobs')

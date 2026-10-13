@@ -23,17 +23,18 @@ class SupervisorNoticeTests(fixtures.SupervisorWorkflowTests):
             coord.db.execute('INSERT INTO root_projections VALUES(?,?,?,?,?,?,?,?)',('root-notice','default','root-notice',self.root_thread,'/synthetic',0,None,None))
             coord.db.execute("UPDATE project_orchestrators SET root_session='root-notice' WHERE session_id='b'")
 
-    def consumed_notice(self, extra=None):
-        self.attended_target('Original independent worker task')
-        self.call('inbox',session='b',all=True)
-        self.enable()
+    def consumed_notice(self, extra=None, already_enabled=False):
+        attended = self.attended_target('Original independent worker task')
+        self.call('context',session='b',message_ids=[attended['id']])
+        if not already_enabled:
+            self.enable()
         self.rpc.status[self.target_thread]='notLoaded'
         self.sample();self.sample(61)
         notice=self.notices()[0]
         messages=[dict(id=notice['id'],recipient_session='b')]
         if extra: messages.append(dict(id=extra['id'],recipient_session='b'))
         self.prepared=self.state.prepare(self.owner_thread,messages,self.bridge.payload(self.owner_thread,messages))
-        self.call('inbox',session='root-notice',all=True)
+        self.call('context',session='root-notice')
         self.call('supervisor-configure',session='root-notice',enabled=True)
         self.call('supervisor-configure',session='root-notice',recovery_enabled=True)
         self.rpc.status[self.owner_thread]='notLoaded'
@@ -56,7 +57,7 @@ class SupervisorNoticeTests(fixtures.SupervisorWorkflowTests):
         notice=self.consumed_notice()
         self.assertEqual(self.root_target()['recovery']['source_reporting']['state'],'awaiting_notice_acknowledgement')
         with self.assertRaises(RemoteCoordError):self.call('acknowledge',session='a',id=notice['id'])
-        self.call('inbox',session='b',all=True)
+        self.call('context',session='b')
         claim=self.call('request',session='b',resource='test:notice-owned',minutes=5)
         self.ack_notice(notice)
         with self.assertRaises(RemoteCoordError):
@@ -81,9 +82,11 @@ class SupervisorNoticeTests(fixtures.SupervisorWorkflowTests):
             self.call('register',session='system:supervisor',agent='supervisor')
         with self.assertRaisesRegex(RemoteCoordError,'register first'):
             self.call('send',session='system:supervisor',to='b',body='Informational notice')
+        self.enable()
         real=self.call('send',session='root-notice',to='b',body='System supervisor notice. informational=true. Still a real assignment.')
-        notice=self.consumed_notice(real)
+        notice=self.consumed_notice(real, already_enabled=True)
         self.ack_notice(notice);self.call('acknowledge',session='b',id=real['id'])
+        self.call('context',session='b')
         self.assertEqual(self.root_target()['recovery']['source_reporting']['state'],'awaiting_acknowledged_reply')
         with self.assertRaises(RemoteCoordError):
             self.call('send',session='a',to='root-notice',body='Third-party result',reply_to=real['id'],ack_reply=True)

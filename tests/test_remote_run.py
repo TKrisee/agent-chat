@@ -29,6 +29,7 @@ class BatchManifestPathTests(TestCase):
         self.root = Path(temporary.name)
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('AGENT_CHAT_')}
         self.env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1] / 'src')
+        self.env['AGENT_CHAT_STATE_DIR'] = str(self.root)
 
     @skipUnless(hasattr(os, 'mkfifo'), 'FIFO paths require POSIX')
     def test_fifo_and_directory_reject_before_guard_activity(self):
@@ -97,6 +98,102 @@ print('rejected-before-guard-activity')
         watchdog.assert_not_called()
 
 
+class RemoteLeaseRenewalTests(TestCase):
+    """Real CLI/dispatcher behavior with a service-free synthetic transport."""
+
+    def setUp(self):
+        from agent_chat.private_artifacts import atomic_capture
+        from agent_chat.remote_service import dispatch
+        temporary = tempfile.TemporaryDirectory(prefix='remote-lease-0061-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.coord = Coordinator(self.root / 'state.sqlite3', 'owner')
+        self.addCleanup(self.coord.close)
+        self.dispatch = dispatch
+        self.calls = []
+        self.server = 'http://127.0.0.1:1'
+        self.request('register', agent='owner')
+        self.coord.context()
+        self.claim = self.request('request', resource='shared', minutes=5)
+        self.capability = self.root / 'existing-hold.json'
+        self.tuple = dict(resource='shared', session_id='owner', host_id='fixture-host',
+                          reservation_id=self.claim['reservation_id'], token=self.claim['token'],
+                          server=self.server, project='default')
+        atomic_capture(self.capability, self.tuple)
+
+    def request(self, operation, **params):
+        return self.dispatch(self.coord, dict(op=operation, session='owner', host_id='fixture-host', params=params))
+
+    def invoke(self, capability=None, reservation=None):
+        def transport(client, path, payload, **kwargs):
+            self.assertEqual(path, '/api/coord')
+            self.calls.append(dict(payload))
+            return self.dispatch(self.coord, payload)
+        output = io.StringIO()
+        with mock.patch('agent_chat.remote.client_host_id', return_value='fixture-host'), \
+                mock.patch.object(HttpClient, 'call', transport), contextlib.redirect_stdout(output):
+            result = cli.main(['--server', self.server, '--project', 'default', '--session', 'owner',
+                '--api-token', 'synthetic-test-token', 'renew', 'shared', '--minutes', '2',
+                '--reservation-id', reservation or self.claim['reservation_id'],
+                '--capability-file', str(capability or self.capability)])
+        self.assertEqual(result, 0)
+        return output.getvalue()
+
+    def test_cli_explicit_extension_uses_private_tuple_without_rewriting_capture(self):
+        original = self.capability.read_bytes()
+        before = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+        output = self.invoke()
+        checked = subprocess.run(['jq', '-e', '.renewal_count == 1 and .renewal_minutes == 2 and (has("token") | not)'],
+                                 input=output, capture_output=True, text=True, check=False)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        after = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+        self.assertEqual(after[:5], before[:5])
+        self.assertEqual(after[5], before[5] + 120)
+        self.assertEqual(after[6:], before[6:])
+        self.assertEqual(self.capability.read_bytes(), original)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.calls[0]['params']['token'], self.claim['token'])
+
+    def test_changed_private_binding_refuses_before_transport_and_budget(self):
+        from agent_chat.private_artifacts import atomic_capture
+        for field in ('resource', 'session_id', 'host_id', 'reservation_id', 'server', 'project'):
+            altered = dict(self.tuple, **{field: 'different'})
+            capability = self.root / (field + '.json')
+            atomic_capture(capability, altered)
+            before = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+            with self.subTest(field=field), self.assertRaisesRegex(CoordError, 'private capability tuple'):
+                self.invoke(capability=capability)
+            self.assertEqual(self.calls, [])
+            self.assertEqual(tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone()), before)
+            self.assertEqual(self.coord.db.execute('SELECT COUNT(*) FROM reservation_renewals').fetchone()[0], 0)
+
+    def test_server_host_and_closed_field_contract_refuse_unchanged(self):
+        params = dict(resource='shared', minutes=2, reservation_id=self.claim['reservation_id'], token=self.claim['token'])
+        before = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+        for payload in (dict(op='renew', session='owner', host_id='other-host', params=params),
+                        dict(op='renew', session='owner', host_id='fixture-host', params=dict(params, automatic=True))):
+            with self.assertRaises(CoordError):
+                self.dispatch(self.coord, payload)
+            self.assertEqual(tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone()), before)
+            self.assertEqual(self.coord.db.execute('SELECT COUNT(*) FROM reservation_renewals').fetchone()[0], 0)
+
+    def test_expired_preliminary_host_refusal_preserves_irreversible_latch(self):
+        params = dict(resource='shared', minutes=2, reservation_id=self.claim['reservation_id'], token=self.claim['token'])
+        before = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+        with mock.patch('agent_chat.core._now', return_value=self.claim['deadline'] + 1):
+            with self.assertRaisesRegex(CoordError, 'different remote host'):
+                self.dispatch(self.coord, dict(op='renew', session='owner', host_id='other-host', params=params))
+        after = tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone())
+        self.assertEqual(after[:6], before[:6])
+        self.assertEqual(after[6], 1)
+        self.assertEqual(after[7:], before[7:])
+        with mock.patch('agent_chat.core._now', return_value=self.claim['deadline'] - 1):
+            with self.assertRaisesRegex(CoordError, 'stale'):
+                self.request('renew', **params)
+        self.assertEqual(tuple(self.coord.db.execute("SELECT * FROM resources WHERE name='shared'").fetchone()), after)
+        self.assertEqual(self.coord.db.execute('SELECT COUNT(*) FROM reservation_renewals').fetchone()[0], 0)
+
+
 class RemoteRunTests(RemoteWebFixture):
     def setUp(self):
         super().setUp()
@@ -107,6 +204,23 @@ class RemoteRunTests(RemoteWebFixture):
                         AGENT_CHAT_HOST_ID='mac', AGENT_CHAT_TOKEN=self.claim['token'],
                         AGENT_CHAT_STATE_DIR=str(Path(self.tmp.name)/'client-state'),
                         AGENT_CHAT_DB=str(Path(self.tmp.name)/'must-not-create.sqlite3'))
+        from agent_chat.private_artifacts import atomic_capture
+        private = Path(self.tmp.name) / 'capabilities'
+        private.mkdir(mode=0o700)
+        self.capability_path = private / 'shared.json'
+        atomic_capture(self.capability_path, dict(resource='shared', session_id='a', host_id='mac',
+                       reservation_id=self.claim['reservation_id'], token=self.claim['token'],
+                       server=self.url, project='default'))
+
+    def capability_args(self, args):
+        args = list(args)
+        head = args[:args.index('--')] if '--' in args else args
+        if 'run' in head and '--batch-manifest' not in head:
+            run_index = head.index('run')
+            args[run_index + 1:run_index + 1] = ['--capability-file', str(self.capability_path)]
+            if '--reservation-id' not in head:
+                args[run_index + 1:run_index + 1] = ['--reservation-id', self.claim['reservation_id']]
+        return args
 
     def batch_manifest(self):
         other = self.call('request', resource='second', minutes=5)
@@ -159,6 +273,29 @@ class RemoteRunTests(RemoteWebFixture):
         self.assertTrue(all(run['closed_at'] is None for run in runs))
         self.assert_group_dead(next(run['local_pid'] for run in runs if run['local_pid']))
 
+    def test_batch_invalid_successful_second_attach_keeps_gate_closed(self):
+        manifest = self.batch_manifest()
+        marker = Path(self.tmp.name) / 'must-not-run'
+        original, count, calls = HttpClient.call, 0, []
+        def invalid_second(client, path, payload):
+            nonlocal count
+            calls.append(payload['op'])
+            result = original(client, path, payload)
+            if payload['op'] == 'attach-guard-pid':
+                count += 1
+                if count == 2: result = dict(result, run_id='another-run')
+            return result
+        with mock.patch.object(HttpClient, 'call', invalid_second), self.assertRaisesRegex(CoordError, 'attach response unresolved'):
+            self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
+                        'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
+        self.assertFalse(marker.exists())
+        runs = self.runs()
+        self.assertEqual(len(runs), 2)
+        self.assertEqual(len({run['local_pid'] for run in runs}), 1)
+        self.assertTrue(all(run['local_pid'] > 0 and run['closed_at'] is None for run in runs))
+        self.assertNotIn('close-guard', calls)
+        self.assert_group_dead(runs[0]['local_pid'])
+
     def test_batch_launcher_failure_retains_pid_zero_admissions(self):
         manifest = self.batch_manifest()
         original = subprocess.Popen
@@ -189,14 +326,14 @@ class RemoteRunTests(RemoteWebFixture):
     def invoke(self, *args):
         output = io.StringIO()
         with mock.patch.dict(os.environ, self.env, clear=True), contextlib.redirect_stdout(output):
-            result = cli.main(list(args))
+            result = cli.main(self.capability_args(args))
         return result, output.getvalue()
 
     def invoke_with_stderr(self, *args):
         output, errors = io.StringIO(), io.StringIO()
         with (mock.patch.dict(os.environ, self.env, clear=True),
               contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors)):
-            result = cli.main(list(args))
+            result = cli.main(self.capability_args(args))
         return result, output.getvalue(), errors.getvalue()
 
     def lifecycle_query(self, output, expression, *args):
@@ -317,6 +454,8 @@ class RemoteRunTests(RemoteWebFixture):
     def test_invalid_token_never_executes_command(self):
         marker=Path(self.tmp.name)/'sentinel'
         self.env['AGENT_CHAT_TOKEN']='invalid'
+        from agent_chat.private_artifacts import atomic_capture, read_capability
+        atomic_capture(self.capability_path, dict(read_capability(self.capability_path), token='invalid'))
         with self.assertRaises(RemoteCoordError):
             self.invoke('run', 'shared', '--', sys.executable, '-c', 'from pathlib import Path; Path('+repr(str(marker))+').touch()')
         self.assertFalse(marker.exists())
@@ -357,6 +496,8 @@ class RemoteRunTests(RemoteWebFixture):
         marker = Path(self.tmp.name)/'must-not-execute'
         args = self.restore_args()
         args[3] = 'wrong-reservation'
+        from agent_chat.private_artifacts import atomic_capture, read_capability
+        atomic_capture(self.capability_path, dict(read_capability(self.capability_path), reservation_id=args[3]))
         with self.assertRaisesRegex(RemoteCoordError, 'does not match'):
             self.invoke(*args, sys.executable, '-c', 'from pathlib import Path; Path('+repr(str(marker))+').touch()')
         self.assertFalse(marker.exists())
@@ -695,8 +836,8 @@ class RemoteRunTests(RemoteWebFixture):
         with (mock.patch.object(HttpClient, 'call', timeout_on_attach),
               mock.patch.dict(os.environ, self.env, clear=True),
               contextlib.redirect_stderr(errors), self.assertRaises(RemoteCoordError)):
-            cli.main(['run', '--lifecycle-events', '--admission-level', '2', 'shared', '--',
-                      sys.executable, '-c', 'pass'])
+            cli.main(self.capability_args(['run', '--lifecycle-events', '--admission-level', '2', 'shared', '--',
+                                          sys.executable, '-c', 'pass']))
         self.lifecycle_query(errors.getvalue(),
             '[.[] | select(.phase == "attach")] | length == 2'
             ' and [.[].edge] == ["start", "end"]'
@@ -723,8 +864,8 @@ class RemoteRunTests(RemoteWebFixture):
         with (mock.patch.object(HttpClient, 'call', timeout_on_inbox),
               mock.patch.dict(os.environ, self.env, clear=True),
               contextlib.redirect_stderr(errors), self.assertRaises(RemoteCoordError)):
-            cli.main(['run', '--lifecycle-events', '--admission-level', '3', 'shared', '--',
-                      sys.executable, '-c', 'import time; time.sleep(60)'])
+            cli.main(self.capability_args(['run', '--lifecycle-events', '--admission-level', '3', 'shared', '--',
+                                          sys.executable, '-c', 'import time; time.sleep(60)']))
         self.lifecycle_query(errors.getvalue(),
             '([.[] | select(.phase == "inbox")] | length) == 2'
             ' and ([.[] | select(.phase == "inbox")] | map(.edge)) == ["start", "end"]'

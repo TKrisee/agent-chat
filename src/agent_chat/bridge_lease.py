@@ -1,6 +1,7 @@
 """One durable dispatcher per client host and project."""
 import contextlib
 import hashlib
+import math
 import secrets
 import threading
 import time
@@ -178,7 +179,7 @@ class BridgeManager:
             if job['action'] == 'model':
                 allowed = {'job_id', 'expected', 'status', 'error', 'observation',
                            'baseline_settings', 'observed_settings', 'direct_input',
-                           'native_response', 'resolution_evidence'}
+                           'native_response', 'resolution_evidence', 'turn_id', 'input_job_id', 'input_evidence'}
                 if set(params) - allowed:
                     raise CoordError('invalid model-control host update')
             if job['action'] == 'resume' and params.get('status') == 'completed' and usage and usage['blocked']:
@@ -245,6 +246,61 @@ class BridgeManager:
             job = state.job(job_id)
             if not settlement: thread_allowed(job['thread_id'])
             return job
+
+        if op.startswith('capacity-'):
+            def capacity_owned(job):
+                assigned = c.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (job['session_id'],)).fetchone()
+                if not assigned or assigned['host_id'] != host:
+                    raise CoordError('capacity recovery belongs to another host')
+                reset_fence(session=job['session_id'], thread=job['thread_id'])
+                return job
+            if op == 'capacity-targets':
+                return [target for target in state.capacity_targets() if route_for(target['session_id'])]
+            if op == 'capacity-jobs':
+                result = []
+                for job in state.capacity_jobs():
+                    try: result.append(capacity_owned(job))
+                    except CoordError: continue
+                return result
+            if op in ('capacity-gate', 'capacity-schedule'):
+                session, thread = params.get('session_id'), params.get('thread_id')
+                if not isinstance(session, str) or not isinstance(thread, str):
+                    raise CoordError('invalid capacity recovery target')
+                capacity_owned(dict(session_id=session, thread_id=thread))
+                if usage and usage['blocked']:
+                    if op == 'capacity-gate': return usage['reason'] or 'weekly usage reserve is active'
+                    return None
+                if op == 'capacity-gate': return state.capacity_gate(session, thread)
+                thread_allowed(thread)
+                turn, now = params.get('turn_id'), params.get('now')
+                if not isinstance(turn, str) or not turn or len(turn) > 128 or not isinstance(now, (int, float)) or isinstance(now, bool) or not math.isfinite(now):
+                    raise CoordError('invalid capacity failure evidence')
+                digest, model, effort = params.get('settings_digest'), params.get('model'), params.get('reasoning_effort')
+                if not isinstance(digest, str) or len(digest) != 64 or not isinstance(model, str) or not model or len(model) > 128 or (effort is not None and (not isinstance(effort, str) or len(effort) > 128)):
+                    raise CoordError('invalid capacity configuration evidence')
+                return state.capacity_schedule(session, thread, turn, now, digest, model, effort, params.get('owner'))
+            if op == 'capacity-update':
+                job = capacity_owned(state.capacity.get(params.get('job_id')))
+                expected, status, now = params.get('expected'), params.get('status'), params.get('now')
+                values = {key:value for key,value in params.items() if key not in ('job_id','expected','status','now')}
+                if usage and usage['blocked'] and status in ('adding','starting'):
+                    raise CoordError(usage['reason'] or 'weekly usage reserve is active')
+                interrupt = status == 'cancelling' and str(values.get('native_proof', '')).startswith('interrupt_requested:')
+                native = status in ('adding','starting') or interrupt
+                phase = 'interrupting:' + str(values.get('retry_turn_id')) if interrupt else status + ':' + str(values.get('attempts', job['attempts']))
+                if native: handoff_begin(c.db, 'capacity', dict(job, target_session=job['session_id']), host, phase)
+                try: result = state.capacity_update(job['id'], expected, status, now, **values)
+                except BaseException:
+                    if native: handoff_settle(c.db, 'capacity', job['id'], host, 'rejected-before-dispatch')
+                    raise
+                if not native:
+                    proof = values.get('native_proof', '')
+                    settlement = ('cancelled_verified' if status == 'cancelled' and proof.startswith(('queue_deleted:', 'turn_observed:', 'turn_stopped:'))
+                                  else 'queued_verified' if status == 'queued' and proof.startswith('retained_queue:')
+                                  else 'turn_observed_verified' if status in ('retrying','pending','completed') and proof.startswith('turn_observed:') else status)
+                    handoff_settle(c.db, 'capacity', job['id'], host, settlement)
+                return result
+            raise CoordError('unknown capacity recovery operation')
 
         if op in ('policy-consumed','policy-offer','policy-pending','policy-receipt'):
             from .policy_store import PolicyStore

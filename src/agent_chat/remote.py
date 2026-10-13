@@ -1,6 +1,7 @@
 """Small, deliberately conservative HTTP transport for a remote coordinator."""
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import os
@@ -149,7 +150,7 @@ class HttpClient:
             self._event('operation_failed', level='ERROR', run_id=run_id,
                         inbox_trace_id=inbox_trace_id, error_category=category)
             raise wrapped from error
-        except (urllib.error.URLError, OSError, TimeoutError) as error:
+        except (urllib.error.URLError, http.client.HTTPException, OSError, TimeoutError) as error:
             wrapped = RemoteCoordError("remote coordinator is unavailable: " + str(error))
             logged_error = error.reason if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException) else error
             self._error('transport_failed', logged_error, run_id=run_id, inbox_trace_id=inbox_trace_id)

@@ -21,6 +21,7 @@
       <div class="room-label">COMMUNICATIONS</div>
       <button class="room-button" id="root-conversation" type="button" hidden><span class="room-icon" aria-hidden="true">👑</span><span>Root orchestrator</span></button>
       <!-- agent-chat:all-communication-menu -->
+      <button class="room-button" id="open-attachments" type="button"><span class="room-icon" aria-hidden="true">▧</span><span>Attachments</span></button>
       <div class="section-label project-nav-heading"><span>PROJECTS</span><div><button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button><button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button></div></div>
       <nav id="project-list" class="project-nav-list" aria-label="Projects"></nav>
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
@@ -33,6 +34,22 @@
 
     <main class="main">
       <div class="mobile-nav"><button class="quiet-button" id="agents-toggle" aria-controls="sidebar" aria-expanded="false">☰ Agents</button><button class="quiet-button" id="resources-toggle" aria-controls="resources-panel" aria-expanded="false"><span id="resources-button-label">Resources</span> <span id="mobile-resource-count">0</span></button></div>
+      <section id="communication-panel" class="communication-panel" hidden aria-label="All communication">
+        <header class="conversation-header"><h1>All communication</h1><div class="conversation-actions"><span class="message-window">Read only</span></div></header>
+        <form id="communication-filters" class="toolbar">
+          <label class="search"><span aria-hidden="true">⌕</span><input id="communication-text" type="search" placeholder="Search messages…" aria-label="Search all communication"><kbd aria-hidden="true">/</kbd></label>
+          <fieldset class="feed-filters"><legend>Project</legend><label class="status-filter"><span class="sr-only">Project</span><select id="communication-project"><option value="">All projects</option></select></label></fieldset>
+          <button class="quiet-button" type="submit">Apply</button>
+        </form>
+        <div class="feed-wrap"><section class="feed" id="communication-feed" aria-label="All communication messages" tabindex="0">
+          <div class="history-row"><span id="communication-status" class="message-window" role="status"></span><button id="communication-show-latest" type="button" class="quiet-button" hidden>Back to latest</button></div>
+          <div id="communication-history-older" class="history-edge" role="status" hidden></div>
+          <div id="communication-messages"></div>
+          <div class="empty-state" id="communication-empty" hidden><div class="empty-icon" aria-hidden="true">···</div><h3>No communications found</h3><p>Try another project or search.</p></div>
+          <div id="communication-history-newer" class="history-edge" role="status" hidden></div>
+        </section><button id="communication-new-messages" class="new-messages" type="button" hidden>New messages ↓</button></div>
+        <footer class="feed-footer"><span>Read only</span><span id="communication-scope">All projects</span></footer>
+      </section>
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
         <div class="conversation-actions" aria-label="Conversation controls">
@@ -232,6 +249,14 @@
       </div>
       <a id="open-media-tab" class="quiet-button" target="_blank" rel="noopener noreferrer">Open in new tab ↗</a>
     </footer>
+  </dialog>
+  <dialog id="attachment-gallery" aria-labelledby="gallery-title">
+    <header class="usage-dialog-heading"><h2 id="gallery-title">Attachments</h2><button id="close-gallery" class="quiet-button usage-close" type="button" aria-label="Close attachment gallery" autofocus>×</button></header>
+    <p id="gallery-scope">Files sent in project rooms. Private Root attachments stay in Root.</p>
+    <div class="gallery-controls"><label id="gallery-project-label">Project <select id="gallery-project"><option value="">All projects</option></select></label><label>File name <input id="gallery-search" type="search" placeholder="Search files" maxlength="256"></label><button id="gallery-refresh" class="quiet-button" type="button">Refresh</button></div>
+    <p id="gallery-status" role="status" aria-live="polite"></p>
+    <div id="gallery-grid" class="gallery-grid" aria-label="Sent attachments"></div>
+    <button id="gallery-more" class="quiet-button" type="button" hidden>Load more</button>
   </dialog>
   <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
 </body>

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import secrets
 from pathlib import Path
 import signal
 import subprocess
@@ -119,7 +120,8 @@ def main(argv=None):
 
 
 def _dispatch_main(remainder, args, server, globals_parser, runtime):
-    # Every public client command uses HTTP. No local database fallback.
+    # Ordinary client commands use HTTP, with no local database fallback.
+    # root-local is an explicit configured-app transport, never a fallback.
     # Flags without a command belong to the default bridge launcher. Keep
     # command-specific flags (including reservation --token) with their command.
     default_bridge = not remainder or (remainder[0].startswith('-') and remainder[0] not in ('-h', '--help'))
@@ -137,6 +139,9 @@ def _dispatch_main(remainder, args, server, globals_parser, runtime):
         return _project_main(remainder[1:], args, server, runtime)
     if remainder[0] == 'root':
         return _root_main(remainder[1:], args, server, runtime)
+    if remainder[0] == 'root-local':
+        from .root_local import main as root_local_main
+        return root_local_main(remainder[1:])
     if remainder[0] == 'doctor':
         from .doctor import main as doctor_main
         return doctor_main(remainder[1:], connection=args)
@@ -172,6 +177,91 @@ def _logged_call(logger, client, path, payload, *, inbox_trace_id=None):
     run_id = run_id or result.get('run_id')
     logger.event('operation_complete', run_id=run_id, inbox_trace_id=inbox_trace_id)
     return result
+
+
+def _publish_attachment_download(result, destination, source_project, attachment_id,
+                                 recipient_session, host_id, *, project=None, message_id=None):
+    expected = {"attachment_id", "message_id", "name", "mime", "size", "sha256",
+                "source_project", "content_base64", "project", "recipient_session", "host_id"}
+    if not isinstance(result, dict) or set(result) != expected:
+        raise core.CoordError("attachment download response fields are invalid")
+    if (result["source_project"] != source_project or result["project"] != (project or source_project)
+            or result["attachment_id"] != attachment_id
+            or (message_id is not None and result["message_id"] != message_id)
+            or result["recipient_session"] != recipient_session or result["host_id"] != host_id):
+        raise core.CoordError("attachment download response identity does not match the request")
+    if not isinstance(result["message_id"], str) or not result["message_id"].startswith("message_"):
+        raise core.CoordError("attachment download message metadata is invalid")
+    if not isinstance(result["name"], str) or not isinstance(result["mime"], str):
+        raise core.CoordError("attachment download metadata is invalid")
+    size = result["size"]
+    if isinstance(size, bool) or not isinstance(size, int) or not 0 < size <= core.MAX_ATTACHMENT_SIZE:
+        raise core.CoordError("attachment download size is invalid")
+    digest = result["sha256"]
+    if (not isinstance(digest, str) or len(digest) != 64
+            or any(char not in "0123456789abcdef" for char in digest)):
+        raise core.CoordError("attachment download hash is invalid")
+    if not isinstance(result["content_base64"], str):
+        raise core.CoordError("attachment download content is invalid")
+    try:
+        content = base64.b64decode(result["content_base64"], validate=True)
+    except ValueError as error:
+        raise core.CoordError("attachment download content is invalid") from error
+    if len(content) != size:
+        raise core.CoordError("attachment download size does not match its content")
+    if not secrets.compare_digest(hashlib.sha256(content).hexdigest(), digest):
+        raise core.CoordError("attachment download hash does not match its content")
+    name, mime, _ = core.Coordinator._prepare_attachment(result["name"], content)
+    if name != result["name"] or mime != result["mime"]:
+        raise core.CoordError("attachment download MIME metadata does not match its content")
+    path = Path(destination)
+    if not path.is_absolute() or path != Path(os.path.abspath(path)) or path.name in ("", ".", ".."):
+        raise core.CoordError("attachment destination must be a normalized absolute file path")
+    parent = path.parent
+    try:
+        if parent.resolve(strict=True) != parent:
+            raise core.CoordError("attachment destination must not traverse a symlink")
+        directory = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0))
+    except core.CoordError:
+        raise
+    except OSError as error:
+        raise core.CoordError("attachment destination directory is unavailable") from error
+    temporary = None
+    published = False
+    try:
+        import stat
+        if not stat.S_ISDIR(os.fstat(directory).st_mode):
+            raise core.CoordError("attachment destination parent is not a directory")
+        temporary = "." + path.name + ".agent-chat-" + secrets.token_hex(12)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, flags, 0o600, dir_fd=directory)
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            try: os.close(fd)
+            except OSError: pass
+            raise
+        try:
+            os.link(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory,
+                    follow_symlinks=False)
+            published = True
+            os.fsync(directory)
+        except FileExistsError as error:
+            raise core.CoordError("attachment destination already exists") from error
+        except OSError as error:
+            if published:
+                raise core.CoordError("attachment destination outcome is uncertain; stop and inspect it") from error
+            raise core.CoordError("attachment destination could not be published") from error
+    finally:
+        if temporary is not None:
+            try: os.unlink(temporary, dir_fd=directory)
+            except FileNotFoundError: pass
+        os.close(directory)
+    return {key: value for key, value in result.items() if key != "content_base64"} | {"path": str(path)}
 
 
 def _project_main(raw, args, server, runtime):
@@ -237,7 +327,7 @@ def _root_main(raw, args, server, runtime):
         raise core.CoordError('root commands require your canonical home --session')
     client = HttpClient(server, args.api_token, project=args.project,
                         logger=runtime.logger('agent_chat.remote'))
-    identity = dict(session=session, host_id=client_host_id())
+    identity = dict(session=session)
     if raw and raw[0] == 'in':
         if len(raw) < 3:
             raise core.CoordError('use root in PROJECT_ID COMMAND ...')
@@ -247,6 +337,7 @@ def _root_main(raw, args, server, runtime):
                    'remove-session','bridge-status','status','supervisor-configure','supervisor-status'}
         if raw[2] not in allowed:
             raise core.CoordError('root in accepts project-scoped messaging, readback and agent management only')
+        identity['host_id'] = client_host_id()
         route = _logged_call(runtime.logger('agent_chat.cli'), client,
                              '/api/root/rpc', dict(identity, op='route', params={'project':raw[1]}))
         routed = argparse.Namespace(session=route['session'], server=server, api_token=args.api_token,
@@ -278,6 +369,11 @@ def _root_main(raw, args, server, runtime):
     enroll = sub.add_parser('enroll', help='join every project with your one neutral main conversation')
     enroll.add_argument('--expected-thread', required=True); enroll.add_argument('--confirm', action='store_true')
     sub.add_parser('status', help='root directory and durable project onboarding state')
+    readiness = sub.add_parser('readiness', help='read only minimal existing enrollment/coverage for explicit targets')
+    readiness.add_argument('--host-id', required=True, help='exact enrolled caller/coverage host; not authority by itself')
+    readiness.add_argument('--expected-thread', required=True, help='exact currently bound canonical Root thread')
+    readiness.add_argument('--project-id', required=True, action='append', dest='projects',
+                           help='existing Root-enrolled target ID; repeat explicitly, never wildcard discovery')
     configure = sub.add_parser('configure', help='create one independent project orchestrator, with project-only workspace grants')
     configure.add_argument('--project-id', required=True, dest='project')
     configure.add_argument('--agent', default='orchestrator'); configure.add_argument('--cwd'); configure.add_argument('--workspace', dest='workspaces', action='append')
@@ -317,6 +413,10 @@ def _root_main(raw, args, server, runtime):
     retry.add_argument('--project-id', required=True, dest='project'); retry.add_argument('--request-id', required=True)
     retry.add_argument('--confirm', action='store_true')
     params = vars(parser.parse_args(raw)); op = params.pop('op')
+    if op == 'readiness':
+        identity['host_id'] = params.pop('host_id')
+    else:
+        identity['host_id'] = client_host_id()
     if op == 'delegate-management':
         params.pop('unbound')
     if 'prompt_file' in params:
@@ -342,9 +442,17 @@ def _remote_main(raw, global_args, server, runtime):
     x.add_argument('--message-id', action='append', dest='message_ids')
     x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('message', help='read one complete message from your own inbox'); x.add_argument('id')
+    x = sub.add_parser('attachment-download', help='download one canonical-home private attachment without overwriting a file')
+    x.add_argument('--source-project', required=True); x.add_argument('--attachment-id', required=True)
+    x.add_argument('--message-id', help='exact original operator message; required for managed-project downloads')
+    x.add_argument('--output', required=True)
     x = sub.add_parser('acknowledge'); x.add_argument('id')
     x = sub.add_parser('send'); x.add_argument('--to', action='append'); x.add_argument('--body-file', required=True); x.add_argument('--attach', action='append', default=[]); x.add_argument('--reply-to'); x.add_argument('--ack-reply', action='store_true')
     x = sub.add_parser('request'); x.add_argument('resource'); x.add_argument('--minutes', required=True, type=float)
+    x.add_argument('--capability-file', required=True, help='owner-only atomic reservation capability destination')
+    x = sub.add_parser('renew', help='explicitly extend your exact live reservation near its deadline')
+    x.add_argument('resource'); x.add_argument('--minutes', required=True, type=float)
+    x.add_argument('--reservation-id', required=True); x.add_argument('--capability-file', required=True)
     x = sub.add_parser('status'); x.add_argument('--mine', action='store_true'); x.add_argument('--resource', action='append', dest='resources')
     x = sub.add_parser('guard-status', help='read your exact reservation guards on their owning host')
     x.add_argument('resource'); x.add_argument('--reservation-id', required=True)
@@ -414,6 +522,8 @@ def _remote_main(raw, global_args, server, runtime):
     x = sub.add_parser('bridge-retry'); x.add_argument('job_id'); x.add_argument('--confirm-not-started', action='store_true')
     x = sub.add_parser('bridge-resolve'); x.add_argument('job_id'); x.add_argument('--confirm-delivered', action='store_true')
     x = sub.add_parser('run'); x.add_argument('resource'); x.add_argument('--token')
+    x.add_argument('--capability-file', help='private exact reservation tuple; requires --reservation-id')
+    x.add_argument('--process-evidence-file', help='new private journal for factual process and guard evidence')
     x.add_argument('--batch-manifest', help='private exact same-caller tuples; resource must be batch')
     x.add_argument('--restore', action='store_true', help='bounded same-owner stale reservation restoration only')
     x.add_argument('--reservation-id'); x.add_argument('--max-seconds', type=int)
@@ -432,6 +542,7 @@ def _remote_main(raw, global_args, server, runtime):
     if not session:
         raise core.CoordError('AGENT_CHAT_SESSION or --session is required in remote mode')
     params = vars(a).copy(); op = params.pop('op')
+    download_output = params.pop('output') if op == 'attachment-download' else None
     if op == 'bridge-status':
         params['mine'] = not params.pop('all')
     if 'token' in params and not params['token']:
@@ -450,14 +561,24 @@ def _remote_main(raw, global_args, server, runtime):
             raise core.CoordError('--reply-to requires an explicit --to recipient')
         params['to'] = targets[0] if targets and len(targets) == 1 else targets
         params['body'] = Path(params.pop('body_file')).read_text(encoding='utf-8')
+        raw_attachments = params.pop('attach')
+        if len(raw_attachments) > core.MAX_ATTACHMENTS:
+            raise core.CoordError(f'at most {core.MAX_ATTACHMENTS} attachments are allowed')
         attachments = []
-        for raw_path in params.pop('attach'):
+        for raw_path in raw_attachments:
             data = Path(raw_path).read_bytes()
+            if len(data) > core.MAX_ATTACHMENT_SIZE:
+                raise core.CoordError('attachment exceeds 10 MiB')
             attachments.append({'name': Path(raw_path).name, 'content_base64': base64.b64encode(data).decode('ascii')})
         params['attachments'] = attachments
     cli_logger = runtime.logger('agent_chat.cli')
     client = HttpClient(server, global_args.api_token, project=global_args.project,
                         logger=runtime.logger('agent_chat.remote'))
+    if op == 'attachment-download':
+        if params['source_project'] != client.project and not params.get('message_id'):
+            raise core.CoordError('managed-project attachment download requires the exact original message ID')
+        if params.get('message_id') is None:
+            params.pop('message_id', None)
     host = client_host_id()
     def call(operation, values, *, inbox_trace_id=None):
         payload = {'op': operation, 'session': session, 'host_id': host, 'params': values}
@@ -529,11 +650,35 @@ def _remote_main(raw, global_args, server, runtime):
         params['evidence_base64'] = base64.b64encode(evidence_path.read_bytes()).decode('ascii')
         if receipt['version'] == 2:
             params['process_evidence_base64'] = {str(pid): base64.b64encode(data).decode('ascii') for pid, data in reports.items()}
+    if op == 'renew':
+        from .private_artifacts import read_capability
+        capability = read_capability(params.pop('capability_file'))
+        expected = dict(resource=params['resource'], session_id=session, host_id=host,
+                        reservation_id=params['reservation_id'], server=server, project=client.project)
+        if any(capability[key] != value for key, value in expected.items()):
+            raise core.CoordError('private capability tuple does not match this renewal')
+        params['token'] = capability['token']
     if op == 'run':
         command = params.pop('command')
         if command and command[0] == '--': command = command[1:]
         if not command: raise core.CoordError('run requires a command after --')
         batch_path = params.pop('batch_manifest')
+        capability_path = params.pop('capability_file')
+        evidence_path = params.pop('process_evidence_file')
+        from .private_artifacts import read_capability, artifact_path, ProcessEvidence
+        if capability_path:
+            if batch_path or not params.get('reservation_id'):
+                raise core.CoordError('private capability requires a single exact --reservation-id')
+            capability = read_capability(capability_path)
+            expected = dict(resource=params['resource'], session_id=session, host_id=host,
+                            reservation_id=params['reservation_id'], server=server, project=client.project)
+            if any(capability[key] != value for key, value in expected.items()):
+                raise core.CoordError('private capability tuple does not match this request')
+            if params.get('token') and params['token'] != capability['token']:
+                raise core.CoordError('private capability conflicts with supplied token')
+            params['token'] = capability['token']
+        elif not batch_path:
+            raise core.CoordError('run requires --capability-file and exact --reservation-id')
         batch_tuples = None
         if batch_path:
             if params['resource'] != 'batch' or params.get('reservation_id'):
@@ -570,17 +715,33 @@ def _remote_main(raw, global_args, server, runtime):
         if lifecycle_enabled and (admission_level is None or admission_level < 0):
             raise core.CoordError('--lifecycle-events requires a zero-based --admission-level')
         lifecycle = _RunLifecycleEvents(lifecycle_enabled, admission_level, client.timeout)
+        evidence = ProcessEvidence(evidence_path or artifact_path('process-evidence', str(uuid.uuid4())),
+                                  runner_pid=os.getpid(), runner_pgid=os.getpgrp(),
+                                  session_id=session, host_id=host, server=server, project=client.project,
+                                  coverage='instrumented_process_group_only')
         def run_call(phase, operation, values):
+            evidence.record('guard_call_started', operation=operation,
+                            run_id=values.get('run_id'), resource=values.get('resource'),
+                            reservation_id=values.get('reservation_id'),
+                            evidence_sha256=values.get('evidence_sha256'))
             inbox_trace_id = str(uuid.uuid4()) if lifecycle.enabled and phase == 'inbox' else None
             lifecycle.emit(phase, 'start', 'started', inbox_trace_id=inbox_trace_id)
             try:
                 response = call(operation, values, inbox_trace_id=inbox_trace_id)
+                if operation == 'attach-guard-pid' and (
+                        response.get('attached') is not True or response.get('run_id') != values['run_id']):
+                    raise core.CoordError('guard attach response unresolved; preserve reservation')
             except BaseException as error:
                 lifecycle.emit(phase, 'end', _lifecycle_error_category(error), inbox_trace_id=inbox_trace_id)
+                evidence.record('guard_call_failed', operation=operation,
+                                run_id=values.get('run_id'), outcome=_lifecycle_error_category(error))
+                if phase == 'begin': evidence.close()
                 raise
             if phase == 'begin':
                 lifecycle.run_id = response.get('run_id')
             lifecycle.emit(phase, 'end', 'succeeded', inbox_trace_id=inbox_trace_id)
+            evidence.record('guard_call_succeeded', operation=operation,
+                            run_id=values.get('run_id') or response.get('run_id'))
             return response
         restoration_deadline = None
         if params.get('restore'):
@@ -605,7 +766,16 @@ def _remote_main(raw, global_args, server, runtime):
             guards = [(admission, item['token']) for admission, item in zip(admissions, batch_tuples)]
         else:
             run = run_call('begin', 'begin-guard', params)
+            if (run.get('reservation_id') != params['reservation_id'] or
+                    run.get('host_id') != host or not isinstance(run.get('run_id'), str)):
+                evidence.close()
+                raise core.CoordError('guard admission response unresolved; preserve reservation')
             guards = [(run, params.get('token'))]
+        evidence.record('admitted', reservations=[dict(resource=item['resource'],
+                        reservation_id=admission['reservation_id'], run_id=admission['run_id'])
+                        for admission, item in zip(admissions, batch_tuples)] if batch_tuples is not None
+                        else [dict(resource=params['resource'], reservation_id=run['reservation_id'],
+                                   run_id=run['run_id'])])
         producer_capability = None
         producer_instances = {}
         producer_path = os.environ.get('AGENT_CHAT_PRODUCER_CAPABILITY_FILE')
@@ -626,6 +796,19 @@ def _remote_main(raw, global_args, server, runtime):
         restoration_expired = threading.Event()
         lifecycle_lock = threading.RLock()
         group_closed = False
+        reaped = False
+        def cleanup_evidence(event, **facts):
+            # Retention failure must not prevent owned group cleanup. The
+            # failed journal still blocks every subsequent guard-close call.
+            try: evidence.record(event, **facts)
+            except core.CoordError:
+                if not evidence.failed: raise
+        def record_reap():
+            nonlocal reaped
+            if not reaped and proc.returncode is not None:
+                reaped = True
+                cleanup_evidence('leader_reaped', child_pid=proc.pid, child_pgid=proc.pid,
+                                returncode=proc.returncode)
         def expire_restoration():
             restoration_expired.set()
             # Socket reads may block the main thread. Stop only this run's
@@ -641,9 +824,11 @@ def _remote_main(raw, global_args, server, runtime):
             nonlocal group_closed
             if group_closed: return False
             proc.poll()  # reap an exited group leader before probing its group
+            record_reap()
             try: os.killpg(proc.pid, 0); return True
             except ProcessLookupError:
                 group_closed = True
+                cleanup_evidence('group_absent', child_pgid=proc.pid)
                 return False
             except PermissionError: return True
         def _stop_group():
@@ -711,6 +896,8 @@ def _remote_main(raw, global_args, server, runtime):
                 lifecycle.emit('launcher', 'end', _lifecycle_error_category(error))
                 raise
             lifecycle.launcher_pid = proc.pid
+            evidence.record('launcher_created', child_pid=proc.pid, child_pgid=proc.pid,
+                            gate_released=False)
             lifecycle.emit('launcher', 'end', 'launcher_created')
             report_received_interruption()
             if restoration_deadline is not None:
@@ -724,6 +911,7 @@ def _remote_main(raw, global_args, server, runtime):
             report_received_interruption()
             check_restoration_deadline()
             os.write(gate_write, b'G')
+            evidence.record('gate_released', child_pid=proc.pid, child_pgid=proc.pid)
             os.close(gate_write); gate_write = None
             lifecycle.emit('child_exit', 'start', 'started')
             report_received_interruption()
@@ -747,19 +935,21 @@ def _remote_main(raw, global_args, server, runtime):
             if restoration_timer is not None:
                 restoration_timer.cancel()
                 restoration_timer.join()
-            evidence = hashlib.sha256((str(proc.pid) + ':' + str(proc.returncode)).encode()).hexdigest()
+            close_hash = hashlib.sha256((str(proc.pid) + ':' + str(proc.returncode)).encode()).hexdigest()
             for admission, token in guards:
                 if producer_capability:
                     run_call('producer_close', 'producer-close', {
                         'capability': producer_capability, 'run_id': admission['run_id'],
                         'instance_id': producer_instances[admission['run_id']],
                         'pid': proc.pid, 'returncode': proc.returncode, 'group_closed': group_closed})
-                run_call('close', 'close-guard', {'run_id': admission['run_id'], 'token': token, 'evidence_sha256': evidence})
-        except BaseException:
+                run_call('close', 'close-guard', {'run_id': admission['run_id'], 'token': token, 'evidence_sha256': close_hash})
+        except BaseException as error:
             # A remote disconnect means the process must not continue without a
             # live reservation check.  The server keeps the run open for receipt
             # backed recovery; it never attempts to signal this client PID.
             stop_group()
+            cleanup_evidence('runner_failed', outcome=_lifecycle_error_category(error),
+                            guards_may_remain_open=True)
             raise
         finally:
             if restoration_timer is not None:
@@ -768,14 +958,18 @@ def _remote_main(raw, global_args, server, runtime):
             for fd in (gate_read, gate_write):
                 if fd is not None: os.close(fd)
             for sig, handler in old_handlers.items(): signal.signal(sig, handler)
-            if proc is not None: proc.wait()
+            if proc is not None:
+                proc.wait()
+                record_reap()
             if interrupted:
                 report_received_interruption()
                 lifecycle.emit('interruption', 'end', 'handled_interruption')
+            evidence.close()
         result = {'exit_code': proc.returncode, 'run_id': None if run is None else run['run_id']}
         if batch_tuples is not None:
             result = {'exit_code': proc.returncode, 'batch_id': batch['batch_id'],
                       'admissions': admissions, 'processes_closed': True, 'restored': False, 'released': False}
+        result['process_evidence_file'] = evidence.path
     elif op == 'guard-status':
         state = call('status', {'mine': True, 'resources': [params['resource']]})
         row = next((item for item in state['resources'] if item['resource'] == params['resource']), None)
@@ -788,8 +982,27 @@ def _remote_main(raw, global_args, server, runtime):
             raise core.CoordError('reservation changed while reading guard status')
         result = {'resource': params['resource'], 'reservation_id': context['reservation_id'],
                   'runs': context['runs']}
+    elif op == 'attachment-download':
+        result = _publish_attachment_download(call(op, params), download_output,
+                                              params['source_project'], params['attachment_id'], session, host,
+                                              project=client.project, message_id=params.get('message_id'))
+    elif op == 'request':
+        from .private_artifacts import atomic_capture, validate_destination
+        capture_path = params.pop('capability_file')
+        validate_destination(capture_path)
+        result = call(op, params)
+        if result.get('state') == 'owned':
+            if not all(isinstance(result.get(key), str) and result[key]
+                       for key in ('resource', 'reservation_id', 'token')):
+                raise core.CoordError('owned reservation capability is unresolved')
+            atomic_capture(capture_path, dict(resource=result['resource'], session_id=session,
+                           host_id=host, reservation_id=result['reservation_id'], token=result['token'],
+                           server=server, project=client.project))
+            result = dict(result, capability_file=capture_path)
+        result.pop('token', None)
     else:
         result = call(op, params)
+    result.pop('token', None)
     if op == 'context':
         print(json.dumps(result, sort_keys=True, ensure_ascii=False, separators=(',', ':')))
     else:

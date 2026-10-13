@@ -18,7 +18,9 @@ Modify only assigned paths/resources. Before shared mutation read complete conte
 and reserve every exact `file:<repo-relative-path>` and assigned shared validation/
 build resource; directory holds do not cover descendants. Proceed only on `owned`,
 not queued/blocked/stale. Execute shared changes/validation under the matching
-`agent-chat-client run RESOURCE -- COMMAND ...` guard and own private token.
+`agent-chat-client run --capability-file /absolute/private/hold.json
+--reservation-id EXACT_RID RESOURCE -- COMMAND ...` guard with your own captured
+private reservation capability and its exact reservation ID.
 Keep workfiles on the shared filesystem; chat/file payloads and agent agreement do
 not transfer ownership or bypass guards. Follow detailed restoration/receipt
 procedures only when this task actually needs them.

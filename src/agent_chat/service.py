@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import html
 import os
 from pathlib import Path
 import platform
 import plistlib
 import shutil
+import stat
 import subprocess
 import sys
 import shlex
@@ -22,6 +24,96 @@ LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/Launc
 
 class ServiceError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class InstalledServerConfig:
+    """The configured local server is the only authority for local administration."""
+    plist: Path
+    wrapper: Path
+    executable: Path
+    master: Path
+    working_directory: Path
+    uid: int
+    host: str
+    port: int
+
+
+# This is deliberately fixed source contract data, rather than CLI or environment
+# routing.  Tests replace the provider; production must validate the installed
+# files before a target database is selected.
+INSTALLED_SERVER_CONFIG = InstalledServerConfig(
+    plist=Path('/Users/kristoftischler/Library/LaunchAgents/com.agent-chat.server.plist'),
+    wrapper=Path('/Users/kristoftischler/.local/share/agent-chat/services/Agent Chat Server.app/Contents/MacOS/Agent Chat Server'),
+    executable=Path('/Users/kristoftischler/Work/agent-chat/bin/agent-chat-server'),
+    master=Path('/Users/kristoftischler/Work/agent-chat/.agent-chat/state.sqlite3'),
+    working_directory=Path('/Users/kristoftischler/Unity/into-the-rot'), uid=501,
+    host='127.0.0.1', port=8765)
+
+
+def _installed_server_config() -> InstalledServerConfig:
+    return INSTALLED_SERVER_CONFIG
+
+
+def _absolute_path(value: str | Path) -> Path:
+    return Path(os.path.abspath(os.path.expanduser(str(value))))
+
+
+def _trusted_regular_file(path: Path, *, description: str, uid: int) -> Path:
+    try:
+        info = path.lstat()
+    except OSError as error:
+        raise ServiceError(f'configured server {description} is missing or unsafe') from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_uid != uid:
+        raise ServiceError(f'configured server {description} is missing or unsafe')
+    return path
+
+
+def _command_option(command: list[str], option: str, *, default: str | None = None) -> str:
+    positions = [index for index, value in enumerate(command) if value == option]
+    if not positions:
+        if default is None:
+            raise ServiceError(f'configured server wrapper lacks {option}')
+        return default
+    if len(positions) != 1 or positions[0] + 1 >= len(command):
+        raise ServiceError(f'configured server wrapper has an invalid {option}')
+    return command[positions[0] + 1]
+
+
+def configured_server_database(plist_path: str | Path) -> Path:
+    """Validate the installed provider without evaluating its wrapper."""
+    config = _installed_server_config()
+    if _absolute_path(plist_path) != config.plist:
+        raise ServiceError('configured server plist is not the installed source')
+    plist_file = _trusted_regular_file(config.plist, description='plist', uid=config.uid)
+    try:
+        with plist_file.open('rb') as stream:
+            plist = plistlib.load(stream)
+    except (OSError, ValueError, plistlib.InvalidFileException) as error:
+        raise ServiceError('configured server plist is unreadable') from error
+    expected = {'Label': LABEL + '.server', 'AssociatedBundleIdentifiers': [LABEL + '.server'],
+                'WorkingDirectory': str(config.working_directory), 'RunAtLoad': True,
+                'KeepAlive': True, 'ThrottleInterval': 10}
+    if (not isinstance(plist, dict) or any(plist.get(key) != value for key, value in expected.items())
+            or plist.get('ProgramArguments') != [str(config.wrapper)]
+            or not isinstance(plist.get('EnvironmentVariables'), dict)
+            or any(key in plist['EnvironmentVariables'] for key in ('AGENT_CHAT_DB', 'AGENT_CHAT_PROJECT'))):
+        raise ServiceError('configured server plist has an unsupported shape')
+    wrapper = _trusted_regular_file(config.wrapper, description='wrapper', uid=config.uid)
+    try:
+        commands = [line[5:] for line in wrapper.read_text(encoding='utf-8').splitlines() if line.startswith('exec ')]
+        command = shlex.split(commands[0]) if len(commands) == 1 else []
+    except (OSError, ValueError) as error:
+        raise ServiceError('configured server wrapper is unreadable') from error
+    executable_positions = [i for i, value in enumerate(command) if value == str(config.executable)]
+    db_positions = [i for i, value in enumerate(command) if value == '--db']
+    if (len(executable_positions) != 1 or len(db_positions) != 1
+            or executable_positions[0] >= db_positions[0]
+            or _absolute_path(_command_option(command, '--db')) != config.master
+            or _command_option(command, '--host', default=config.host) != config.host
+            or _command_option(command, '--port', default=str(config.port)) != str(config.port)):
+        raise ServiceError('configured server wrapper lacks an exact server database binding')
+    return config.master.resolve()
 
 
 def _absolute_executable(name: str) -> str:

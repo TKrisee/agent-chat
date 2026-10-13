@@ -21,8 +21,19 @@ def _string(value: Any, name: str, required: bool = True) -> str | None:
     return value
 
 
+def managed_operator_attachment(body, canonical_project, roots):
+    """Cross-project read without constructing or migrating either coordinator."""
+    if (not isinstance(body, dict) or set(body) - {"op", "session", "host_id", "params"}
+            or body.get('op') != 'attachment-download' or not isinstance(body.get('params'), dict)
+            or body['params'].get('source_project') == canonical_project):
+        raise CoordError('invalid managed-project attachment request')
+    return _attachment_download(None, _string(body.get('session'), 'session'),
+                                _string(body.get('host_id'), 'host_id'), body['params'],
+                                canonical_project, roots)
+
+
 def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None, inbox_diagnostics=None,
-             canonical_project=None) -> dict:
+             canonical_project=None, roots=None) -> dict:
     """Execute one explicitly supported coordinator action.
 
     The request session is assigned to the Coordinator directly; server process
@@ -76,11 +87,19 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None, inbox_diagn
                                                params.get("cursor"), params.get("message_ids"), params.get("resources"),
                                                params.get("resource_cursor"))
     if op == "message": return coord.message(_string(params.get("id"), "id"))
+    if op == "attachment-download":
+        return _attachment_download(coord, session, host_id, params, canonical_project, roots)
     if op == "acknowledge": return coord.acknowledge(_string(params.get("id"), "id"))
     if op == "request":
         def record_pending(db, acquired):
             db.execute("INSERT INTO remote_reservation_outcomes (reservation_id,resource,owner_session,host_id,state,created_at) VALUES(?,?,?,?,?,?)", (acquired["reservation_id"], acquired["name"], session, host_id, "pending", time.time()))
         return coord.request(_string(params.get("resource"), "resource"), params.get("minutes"), record_pending)
+    if op == "renew":
+        if set(params) != {"resource", "minutes", "reservation_id", "token"}:
+            raise CoordError('invalid renewal parameters')
+        return coord.renew(_string(params.get("resource"), "resource"), params.get("minutes"),
+                           _string(params.get("reservation_id"), "reservation_id"),
+                           _string(params.get("token"), "token"), host_id=host_id)
     if op == "cancel": return coord.cancel(_string(params.get("resource"), "resource"))
     if op == "check": return coord.check(_string(params.get("resource"), "resource"), _string(params.get("token"), "token"))
     if op == "block": return coord.block(_string(params.get("resource"), "resource"), _string(params.get("reason"), "reason"))
@@ -138,7 +157,8 @@ def dispatch(coord: Coordinator, body: dict, *, bridge_manager=None, inbox_diagn
         from .bridge_state import BridgeState
         from .agent_control import AgentControlState
         BridgeState(coord)
-        controls = AgentControlState(coord)
+        measurements = getattr(bridge_manager, 'measurements', None)
+        controls = AgentControlState(coord, sessions_root=getattr(measurements, 'sessions_root', None))
         if op == 'agent-model-resolve':
             return controls.resolve_unchanged(params.get('request_id'), params.get('expected_thread'),
                                               params.get('resolution_id'), params.get('confirm'))
@@ -262,6 +282,37 @@ def _prepare_attachments(coord: Coordinator, attachments: Any) -> list[tuple[str
         except ValueError as error: raise CoordError("remote attachment is invalid base64") from error
         prepared.append(coord._prepare_attachment(item["name"], content))
     return prepared
+
+
+def _attachment_download(coord: Coordinator, session: str, host_id: str, params: dict,
+                         canonical_project: str | None, roots=None) -> dict:
+    if set(params) not in ({"source_project", "attachment_id"},
+                           {"source_project", "attachment_id", "message_id"}):
+        raise CoordError("attachment-download requires exact source_project, attachment_id and optional message_id fields")
+    source_project = _string(params.get("source_project"), "source_project")
+    attachment_id = _string(params.get("attachment_id"), "attachment_id")
+    message_id = _string(params["message_id"], "message_id") if "message_id" in params else None
+    if canonical_project != source_project:
+        if not roots or not message_id:
+            raise CoordError("managed-project attachment download requires trusted Root records and exact message ID")
+        item = roots.operator_attachment(canonical_project, session, host_id,
+                                         source_project, message_id, attachment_id)
+        content = item.pop("content")
+        return {**item, "source_project": source_project, "project": canonical_project,
+                "recipient_session": session, "host_id": host_id,
+                "content_base64": base64.b64encode(content).decode("ascii")}
+    from .root_orchestrator import projection
+    root = projection(coord.db, session)
+    if (not root or root["home_project"] != source_project
+            or root["home_session"] != session):
+        raise CoordError("attachment download requires root's own canonical home project and session")
+    item = coord.private_inbox_attachment(attachment_id, operator_sender=True)
+    if message_id is not None and item["message_id"] != message_id:
+        raise CoordError("attachment does not belong to the exact original message")
+    content = item.pop("content")
+    return {**item, "source_project": source_project, "project": canonical_project,
+            "recipient_session": session, "host_id": host_id,
+            "content_base64": base64.b64encode(content).decode("ascii")}
 
 
 def _send(coord: Coordinator, target: str, body: str, attachments: Any, reply_to: Any,
@@ -391,11 +442,16 @@ def _begin_guard(coord: Coordinator, session: str, host: str, p: dict) -> dict:
         budget = 120 if budget is None else budget
         if not isinstance(budget, int) or isinstance(budget, bool) or not 1 <= budget <= 900:
             raise CoordError("restoration max_seconds must be an integer from 1 to 900")
-    elif p.get("reservation_id") is not None or budget is not None:
-        raise CoordError("reservation_id and max_seconds require restoration mode")
+    elif budget is not None:
+        raise CoordError("max_seconds requires restoration mode")
+    else:
+        reservation_id = (None if p.get("reservation_id") is None else
+                          _string(p.get("reservation_id"), "reservation_id"))
     with coord.tx() as db:
         coord._fresh(db, session)
         r = coord._verify_owner(db, coord.resource_name(resource), session, token, restore)
+        if reservation_id is not None and r['reservation_id'] != reservation_id:
+            raise CoordError('guard reservation_id does not match')
         from .core import assert_agent_running
         assert_agent_running(db, session, cleanup=True)
         if restore:

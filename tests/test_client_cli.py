@@ -53,7 +53,14 @@ class ClientCliTests(RemoteWebFixture):
 
     def test_resource_token_flag_remains_separate_from_api_token(self):
         self.command('--session', 'a', 'register', '--agent', 'alpha')
-        claim = self.command('--session', 'a', 'request', 'shared', '--minutes', '1')
+        from agent_chat.private_artifacts import read_capability
+        private = Path(self.tmp.name) / 'capabilities'
+        private.mkdir(mode=0o700)
+        path = private / 'shared.json'
+        metadata = self.command('--session', 'a', 'request', 'shared', '--minutes', '1',
+                                '--capability-file', str(path))
+        self.assertNotIn('token', metadata)
+        claim = read_capability(path)
         result = self.command('--session', 'a', '--api-token', TOKEN,
                               'check', 'shared', '--token', claim['token'])
         self.assertEqual(result['state'], 'owned')

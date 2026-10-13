@@ -2,6 +2,7 @@ import base64
 import errno
 import hashlib
 import json
+import select
 import socket
 import struct
 import threading
@@ -88,12 +89,12 @@ class FakeServer:
             raise self.failure
 
 
-def _initialize(sock):
+def _initialize(sock, result=None):
     opcode, _, body = _frame(sock)
     assert opcode == 1
     message = json.loads(body)
     assert message["method"] == "initialize"
-    _send(sock, 1, json.dumps({"id": message["id"], "result": {}}).encode())
+    _send(sock, 1, json.dumps({"id": message["id"], "result": {} if result is None else result}).encode())
     assert json.loads(_frame(sock)[2])["method"] == "initialized"
 
 
@@ -128,6 +129,102 @@ class RpcClientTests(unittest.TestCase):
                 client.request("danger")
         self.assertEqual((raised.exception.code, raised.exception.data), (42, {"a": 1}))
         server.join()
+
+    def test_raw_initialize_and_notifications_before_and_after_ack_are_retained(self):
+        initialize = dict(userAgent='fixture-origin/0.161.0 (fixture-os) (agent_chat_bridge; 0.1.0)',
+                          codexHome='/fixture/private', platformFamily='unix', platformOs='fixture',
+                          unknown={'nested': [None, True]})
+        before = dict(method='thread/settings/updated', params=dict(threadId='fixture-thread',
+                      threadSettings={'model': 'gpt-6.1-sol', 'effort': 'high', 'unknown': [None]}))
+        after = dict(method='thread/settings/updated', params=dict(threadId='other-thread',
+                     threadSettings={'model': 'gpt-6-luna', 'effort': None}))
+
+        def handler(sock):
+            _initialize(sock, initialize)
+            request = json.loads(_frame(sock)[2])
+            _send(sock, 1, json.dumps(before).encode())
+            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
+            _send(sock, 1, json.dumps(after).encode())
+            _frame(sock)  # Client close; no listener remains after join.
+
+        server = FakeServer(handler)
+        with RpcClient(server.endpoint) as client:
+            self.assertEqual(client.initialize_response, initialize)
+            deadline = time.monotonic() + client.timeout
+            boundary = client.notification_boundary(deadline=deadline)
+            self.assertEqual(client.request('thread/settings/update', {}, deadline=deadline), {})
+            first, value = client.next_notification(boundary, deadline=deadline)
+            self.assertEqual(value, before)
+            _, value = client.next_notification(first, deadline=deadline)
+            self.assertEqual(value, after)
+            self.assertEqual([notice for _, notice in client.notifications_since(boundary)], [before, after])
+        server.join()
+
+    def test_pre_dispatch_boundary_excludes_stale_buffered_wire_notification(self):
+        sent = threading.Event()
+        stale = dict(method='thread/settings/updated', params=dict(threadId='fixture-thread', threadSettings={'model': 'old'}))
+        fresh = dict(method='thread/settings/updated', params=dict(threadId='fixture-thread', threadSettings={'model': 'new'}))
+
+        def handler(sock):
+            _initialize(sock)
+            _send(sock, 1, json.dumps(stale).encode())
+            sent.set()
+            request = json.loads(_frame(sock)[2])
+            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
+            _send(sock, 1, json.dumps(fresh).encode())
+            _frame(sock)
+
+        server = FakeServer(handler)
+        with RpcClient(server.endpoint) as client:
+            self.assertTrue(sent.wait(1))
+            # sendall completion is not a receive boundary (e.g. TCP buffering).
+            self.assertTrue(select.select([client._sock], [], [], 1)[0])
+            deadline = time.monotonic() + client.timeout
+            boundary = client.notification_boundary(deadline=deadline)
+            self.assertEqual([value for _, value in client.notifications_since(0)], [stale])
+            client.request('thread/settings/update', {}, deadline=deadline)
+            _, notice = client.next_notification(boundary, deadline=deadline)
+            self.assertEqual(notice, fresh)
+        server.join()
+
+    def test_ack_and_notification_wait_share_one_bounded_deadline(self):
+        def handler(sock):
+            _initialize(sock)
+            request = json.loads(_frame(sock)[2])
+            time.sleep(.10)
+            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
+            time.sleep(.50)
+
+        server = FakeServer(handler)
+        with RpcClient(server.endpoint, timeout=.40) as client:
+            started = time.monotonic()
+            deadline = started + client.timeout
+            boundary = client.notification_boundary(deadline=deadline)
+            client.request('thread/settings/update', {}, deadline=deadline)
+            with self.assertRaises(TransportError):
+                client.next_notification(boundary, deadline=deadline)
+            self.assertLess(time.monotonic() - started, .47)
+        server.join()
+
+    def test_disconnect_after_ack_and_lost_observation_window_are_uncertain(self):
+        def handler(sock):
+            _initialize(sock)
+            request = json.loads(_frame(sock)[2])
+            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
+
+        server = FakeServer(handler)
+        with RpcClient(server.endpoint) as client:
+            deadline = time.monotonic() + client.timeout
+            boundary = client.notification_boundary(deadline=deadline)
+            client.request('thread/settings/update', {}, deadline=deadline)
+            with self.assertRaises(TransportError):
+                client.next_notification(boundary, deadline=deadline)
+        server.join()
+        client = RpcClient('ws://127.0.0.1:1')
+        for number in range(1025):
+            client._record_notification(dict(method='notice', params={'number': number}))
+        with self.assertRaisesRegex(TransportError, 'boundary'):
+            client.notifications_since(0)
 
     def test_invalid_endpoints(self):
         for endpoint in ("http://127.0.0.1:9", "ws://example.com:9", "ws://127.0.0.1:9/a", "ws://127.0.0.1:9?x=1", "ws://user@127.0.0.1:9"):

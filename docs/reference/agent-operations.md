@@ -158,6 +158,131 @@ old group messages as new wake requests.
 Review files before sending; attachments are copied into SQLite. Browser reads
 do not acknowledge your inbox deliveries.
 
+Canonical root can transfer an operator attachment from its private home inbox
+through an explicit local file. Trusted-local application setup must first establish
+the legitimate canonical Root's own joined registrations and supply their exact
+project/session selectors. Use the attachment ID shown by normal home context or
+message readback, and choose a new absolute destination in a private directory:
+
+```sh
+agent-chat-client --project HOME_PROJECT --session OWN_HOME_ROOT_SESSION attachment-download \
+  --source-project HOME_PROJECT --attachment-id attachment_EXACT \
+  --output /absolute/private/new-file.png
+agent-chat-client --project DEST_PROJECT --session OWN_DEST_ROOT_SESSION send --to PROJECT_RECIPIENT \
+  --body-file /absolute/private/body.md --attach /absolute/private/new-file.png
+```
+
+The download route always requires root's own canonical home project, session and
+host. The existing direct operator-to-root home inbox route above remains supported.
+For an attachment originally sent by the authenticated operator to the exact
+designated PO of a currently Root-enrolled managed project, keep HOME selected and
+provide all three exact source identifiers:
+
+```sh
+agent-chat-client --project HOME_PROJECT --session OWN_HOME_ROOT_SESSION attachment-download \
+  --source-project ENROLLED_PROJECT --message-id message_EXACT_ORIGINAL \
+  --attachment-id attachment_EXACT --output /absolute/private/new-file.png
+```
+
+`--message-id` is mandatory for this managed-project route; it is optional for the
+compatible direct-home route and, when supplied, must also match there. The server
+checks its existing canonical Root owner/configuration, registration/binding/host,
+the source's current enrollment and matching Root projection, and the exact current
+designated PO's registered management association; retired/quarantined identities
+and unverifiable canonical bindings are refused. The attachment must belong to
+that exact original direct message and PO recipient, with an immutable
+`authenticated_operator_ui` origin tied to its operator sender. An operator-like
+name or identity alone, worker messages, group copies, arbitrary recipients,
+unmanaged projects and missing or unverifiable trusted associations are rejected.
+Supplied IDs are selectors, never authority. The response's `project` and
+`recipient_session` identify the requesting canonical HOME/Root, while
+`source_project` and `message_id` identify the original managed-project input; the
+client verifies these separately before publication. Neither success nor rejection
+acknowledges, forwards or alters the original source message or attachment.
+
+The cross-project lookup reads existing directory/home/source stores without
+initialization or migration; missing stores are not bootstrapped. It uses stored
+association snapshots and the local Root coordination lock, not a globally fenced
+cross-store transaction or a native freshness/lifecycle proof. Authentication is
+still the existing machine-bearer boundary: matching stored named-session/host
+records does not authenticate the caller as that named session. Named-caller
+authentication remains **UNVERIFIED**; do not treat this route as an identity grant
+or substitute another caller's credentials. Ordinary direct-home coordinator host
+bookkeeping is unchanged; the source-read nonmutation guarantee is not a claim
+that all ordinary caller-store bookkeeping is byte-identical.
+
+These ordinary coordinator calls do not enable shared-bearer
+Root RPC `route` or `enroll`, which remain denied. Do not derive authority from
+asserted selectors or borrow another registration; no client setup adapter is
+provided by this procedure. The client verifies the returned attachment ID, message ID,
+MIME type, size, SHA-256 digest, and content before publishing a mode `0600` file.
+The destination must be normalized, absolute, free of symlink traversal, and absent;
+publication is atomic and never overwrites an existing path. Redirects, partial
+responses, verification failures, and uncertain results stop before a normal send.
+The destination send retains the normal 50-file and 10 MiB-per-file limits and
+returns the existing send result. Never substitute a project, session, token, or ID
+when either step fails.
+
+## Operator ACK, All communication and attachment downloads
+
+In the authenticated operator browser, **Acknowledge** is available only for
+currently unacknowledged received deliveries belonging to that enrolled operator
+and permitted project/Root context. A group action acknowledges your exact copy,
+not other recipients. Repeated/already-acknowledged requests are idempotent.
+Message text, role, route, read provenance, inbox progress, tasks, resource holds,
+queues and guarded runs are unchanged. ACK is not full message consumption,
+task completion, process closure or an ownership/admission permission.
+
+The UI uses the existing configured Basic `operator` channel, enrolled
+server-owned recipient and trusted-origin/CSRF checks. Caller-supplied session or
+operator IDs and machine bearer requests cannot select the ACK recipient. This
+retains the existing shared-secret authentication limits: enrollment/Basic
+channel is not cryptographic named-person attestation. An unconfigured or
+unauthenticated browser cannot use the action. No canonical-Root download or
+agent inbox authority is borrowed.
+
+All communication opens within the app document, with app back/forward and
+current draft preserved. It remains an authorized aggregate: visibility of
+another recipient's messages is not permission to ACK them. Attachment links
+carry their actual source project and use existing authorized gallery access;
+private/unlinked/unavailable files stay denied. Each gallery item has an explicit
+Download control using its exact filename. Failed downloads show a retryable
+status rather than saving an error response as the named file. Download and
+navigation do not acknowledge or mark messages consumed.
+
+Historical incoming-only ACK is a separate finite operation, not a global clear:
+
+1. Establish the current enrolled operator using the supported authenticated app
+   context. Obtain `/api/config` (or `/api/root/config`) and its current CSRF token;
+   neither a supplied historical operator ID nor agent credentials establishes it.
+   ACK/plan requests never initialize a missing operator context: first open the
+   legitimate existing project through normal authenticated app setup. An
+   unopened/unavailable context refuses without creating identity/sidecar state.
+2. In that context, read `/api/messages/ack-plan?project=EXACT_PROJECT` (or
+   `/api/root/messages/ack-plan` for the current private Root conversation). This
+   nonmutating versioned plan contains `project_id`, `recipient_session`,
+   `observed_at`, exact ordered `ids`, `count`, `read_only:true` and `effect:ACK_ONLY`.
+   It selects currently unacknowledged incoming permitted messages only, never
+   outgoing messages, another recipient's inbox or newly arrived future input.
+3. Retain/review that exact response, context, count and effect through the
+   designated affected review before actual bulk execution. JSON inspection uses
+   jq, for example `jq -e '.version == 1 and .read_only and .effect == "ACK_ONLY"
+   and .count == (.ids | length)' plan.json`. Production counts are UNKNOWN until
+   this authenticated read; synthetic test counts are not production evidence.
+4. After review/current authentic context, POST each **exact retained ID**, once,
+   to `/api/messages/ack?project=EXACT_PROJECT` (or `/api/root/messages/ack`), body
+   `{"id":"EXACT_REVIEWED_ID"}`, through that same operator browser with
+   `X-Agent-Chat-CSRF` from current config. No recipient/session field is accepted.
+   Record actual per-ID outcomes; already ACKed is normal, missing/changed or
+   denied context stops dependent actions. Never re-select a broader/new plan or
+   sweep arrivals implicitly; uncertain results reconcile by rereading exact
+   message/plan ACK state before another legitimate idempotent request.
+
+The prototype exercises only disposable authenticated UI/API stores. Source
+acceptance, Root-owned runtime activation, actual production selection/review
+and finite operator execution are separate. No production bulk action, actual
+credentials/history export or loaded service authorization follows from tests.
+
 ## Resources and validation
 
 The browser resource sidebar shows 50 exact resources per page, with live held
@@ -194,13 +319,45 @@ and request IDs. Root delegates project cleanup through the PO, and the PO deleg
 the bounded repository action to a worker under the local-work hygiene rule above.
 
 The assigned worker performing shared technical work reserves exact resources
-with `request RESOURCE --minutes N`; proceed only on
-`owned`. Export its session-bound token as `AGENT_CHAT_TOKEN`, then run shared
-validation through `run RESOURCE -- COMMAND ...`. Directory names do not lock
+with `request RESOURCE --minutes N --capability-file /absolute/private/hold.json`;
+proceed only on `owned`. The private parent directory must have mode `0700`.
+Retain the exact reservation ID from sanitized stdout and run shared validation
+through `run --capability-file /absolute/private/hold.json
+--reservation-id EXACT_RID RESOURCE -- COMMAND ...`. Directory names do not lock
 descendants. Queue order, stale holds and existing ownership remain authoritative.
 Messages, bindings and resource locks are project-scoped. Reserve a physically
 shared resource in the same project on every machine; locks in different
 projects do not conflict. A queued request is not permission to start work.
+
+An eligible registered owner may explicitly extend the SAME reservation when
+it is still unexpired and has at most 10 minutes remaining:
+
+```sh
+agent-chat-client renew EXACT_RESOURCE --reservation-id EXACT_EXISTING_RID \
+  --capability-file /absolute/private/existing-hold.json --minutes 5
+```
+
+Each extension adds 1–30 minutes to the existing deadline. The coordinator
+durably permits at most four successful extensions and 120 cumulative extra
+minutes per reservation ID, including after restart. Refusals do not extend the
+deadline or change the original grant tuple, FIFO order, renewal budget or
+private capture. Ordinary truthful expiry observation may irreversibly latch
+stale from 0 to 1, including expiry first observed during a refused transaction;
+transaction rollback and later wall-clock rollback cannot undo that observation.
+Re-requesting an owned reservation
+does not reset its budget. The original owner, token, reservation ID, grant time,
+and private capture are retained; renewal does not overwrite the capability file.
+It is not automatic, and a lost response must be inspected through status rather
+than blindly repeated: a repeated renewal is a separate budget-consuming action.
+
+The ordinary current-input, registered host, private tuple, admission and
+lifecycle checks still apply. Global Root cannot renew work reservations. ANY
+queued FIFO claimant blocks renewal. Open remote guards are allowed only when
+every relevant guard has this exact resource, reservation, owner and current
+registered host. Conflicting guards and local guards without host binding
+refuse renewal. Stopped, retired and quarantined sessions also refuse it.
+Guard pulses never extend a deadline. Renewal cannot revive a stale hold,
+close a guard, prove process closure, or replace receipt-backed cleanup.
 
 An expired owner may need to read back or restore agreed state before it can
 truthfully close its hold. For a reviewed restoration command, the HTTP client
@@ -209,10 +366,13 @@ supports a bounded same-owner exception:
 ```sh
 agent-chat-client context
 agent-chat-client run --restore --reservation-id EXACT_HELD_RESERVATION \
+  --capability-file /absolute/private/existing-hold.json \
   --max-seconds 120 validation-clone -- COMMAND ...
 ```
 
-Supply the existing owner's session, host state and private `AGENT_CHAT_TOKEN`.
+Supply the existing owner's session, host state and previously captured private
+capability file for that exact reservation. This does not authorize recovery of
+a missing stale capability.
 The exact reservation must be stale. The server records restoration mode and a
 separate deadline on the new run; attach and pulse recheck owner, token, host,
 reservation identity and deadline. The default budget is 120 seconds; allowed
@@ -265,8 +425,10 @@ deliveries. Generated root service notices are excluded. Preview rejects reply
 or ACK-reply links crossing the selected boundary and destination collisions.
 It never expands the selection to other conversations.
 
-Read context, reserve the exact `resource` from preview, save its token privately,
-and run the identical command through that resource's guard with `--confirm`,
+Read context, reserve the exact `resource` from preview with `--capability-file`
+in a private directory, and retain the returned exact RID. Run the identical
+command through that resource's guard with the same capability file and
+`--reservation-id RID`, followed by `--confirm`,
 `--expected-count` and `--expected-digest`. Retain the same request UUID/count/
 digest after a lost response; preview reports its durable journal status.
 Acquire/release holds using the normal queue and CLOSED receipt protocol.
@@ -313,8 +475,11 @@ pauses require the existing explicit release procedure; efficiency work does
 not override them.
 
 For bridge startup, `--token` is a compatibility alias for `--api-token`. On
-`check`, `run` and `release`, `--token` is the reservation token; HTTP credentials
-come from `AGENT_CHAT_API_TOKEN` or `--api-token`. Keep both kinds private and
+`check` and `release`, `--token` is the reservation token; supply it privately
+through `AGENT_CHAT_TOKEN`, read from the captured capability using `jq`.
+Single `run` requires the private capability file and exact RID, rather than a
+stdout token. HTTP credentials come from `AGENT_CHAT_API_TOKEN` or `--api-token`.
+Keep both kinds private and
 out of command arguments. Only perform manual recovery with the operator after
 inspecting the existing conversation and queue; uncertain jobs must not be
 blindly retried.
@@ -353,16 +518,261 @@ guards and clear the hold atomically after verifying restoration and actual
 process closure. Retain the existing owner, queue and evidence until it succeeds.
 Do not use a raw close operation to bypass receipt checks.
 
+### Recipient message consumption
+
+Only an exact recipient full-message read, or an untruncated recipient context
+item, establishes message-consumption evidence. Acknowledgement, an
+acknowledged reply, inbox listing or pagination, aggregate/history views, wake
+dispatch, and native delivery are separate routing or reporting events; none
+proves that the recipient consumed the body. An acknowledged but unconsumed
+message remains available through the recipient's normal unread paths until a
+genuine read occurs, except for the migrated historical scheduling boundary below.
+
+Older read records without durable origin are retained as `legacy_unknown`.
+They are not promoted to body-read or native-consumption proof. A fresh exact
+recipient full read may replace only that unknown marker; no historical task is
+automatically replayed to manufacture evidence.
+
+Provenance migration transactionally records `message_delivery_archive_before`
+in coordinator metadata. Ordinary inbox/context, bridge delivery, supervisor
+recovery and coordination freshness exclude ACKs recorded at or before that
+boundary, including history with no old read row. This prevents acknowledged
+historical work from being rescheduled. New ACK-only inputs and unacknowledged
+historical inputs still require genuine reads. Exact full reads and `inbox --all`
+retain access to history; messages, ACKs and unknown read origins are unchanged.
+This is scheduling metadata, never consumption proof. Privileged ownership
+disposition continues to require genuine recipient read provenance for archived
+messages too. Already migrated stores require an explicit, retained pre-upgrade
+boundary; absence of this metadata grants no archive exception.
+
+### Trusted-local Root control
+
+The configured coordinator's local operator can use the explicit `root-local`
+transport. It requires the actual process real and effective UID to equal the
+owner of the trusted installed provider, wrapper, executable, canonical master
+and registry. Database/plist arguments are equality assertions, never alternate
+authority; session/host/project arguments must match existing canonical state.
+It does not authenticate arbitrary shared-bearer callers or protect against a
+hostile process already running as that same OS user. No caller-supplied UID is
+accepted. The existing installed-provider deployment limits still apply.
+
+```sh
+agent-chat-client root-local --home-project HOME_PROJECT \
+  --home-session OWN_HOME_ROOT_SESSION --host-id OWN_EXISTING_HOST status
+agent-chat-client root-local --home-project HOME_PROJECT \
+  --home-session OWN_HOME_ROOT_SESSION --host-id OWN_EXISTING_HOST \
+  enroll --expected-thread OWN_CURRENT_MAIN_THREAD --confirm
+agent-chat-client root-local --home-project HOME_PROJECT \
+  --home-session OWN_HOME_ROOT_SESSION --host-id OWN_EXISTING_HOST \
+  route --project-id DEST_PROJECT
+```
+
+Enrollment requires a genuinely existing bound registration and fresh supported
+settings, neutral workspace, clean lifecycle state and no active measurement.
+Route (also spelled `in`) returns the Root's own joined project/session selectors;
+it does not execute an arbitrary nested command or borrow another actor. Use
+those selectors with ordinary HTTP messaging/attachment commands. `--home-session`
+and `--project-id` deliberately avoid the ordinary client's global selectors.
+
+For the bounded nonmutating operator read, use [local readiness](../root-orchestrator.md#reduced-nonmutating-root-readiness-read). It reuses the exact machine-read projection and does not synchronize or resolve registrations.
+
+Only readiness, status, enroll, in/route, configure, provision, delegate-management,
+team-lifecycle (stop-all/resume-all/stop-status only), fresh-start/fresh-status,
+stop-all/stop-status/resume-all are supported. Each method accepts only its
+explicit fields (`root-local METHOD --help`); there is no generic invoke, SQL,
+worker/native command, project-create, disposition or recovery route. Existing
+freshness, canonical binding, target/PO scope, confirmations, setup and stop/fresh
+barriers remain method-specific. Fresh-start and setup use their original UUID
+and exact payload on replay; stop/resume use the retained stop UUID. Do not infer
+a generic immutable replay contract for all operations or completion merely
+because a pending request was recorded. Native execution remains with existing
+workers; this adapter does not start a native process.
+
+Preflight reads canonical store metadata before schema-initializing application
+constructors. Every actual project open, including synchronization of other
+joined projects, also validates registered lineage and file ownership first;
+directory status can report an inconsistent project as unjoined without opening
+or initializing its target. Local application locks are process-local, not a cross-process
+SQLite transaction or proof of native quiescence. HTTP `/api/root/rpc` remains
+shared-bearer status-only (`fresh-status`/`stop-status`); this local adapter adds
+no HTTP privilege, CSRF exception or new credential.
+
+### Root local ownership disposition
+
+When the old owner's capability and process evidence are genuinely missing, the
+configured local Root application may run `agent-chat-ownership-disposition` for
+one exact `file:`, `validation:`, `operation:`, bare `git-index`, or registered
+raw absolute physical-path reservation that is already stale. A raw path must be
+the literal canonical name already registered in the selected project; no `file:`
+prefix, path resolution, alias, or renaming is added. Unregistered or lexically
+noncanonical raw paths are refused before passive sampling. Exact owner/RID/stale
+CAS and all ordinary current admission gates still apply. This is an audited
+abandonment, never recovery or a receipt: closure stays `UNVERIFIED`, the old
+token is never returned or transferred, and unrelated records/history remain.
+
+The command accepts only assertions of the installed configured plist/master;
+it validates the canonical master, separated project registry, Root lifecycle
+barriers, registered target metadata, owner thread/host binding, and fixed local
+`ws://127.0.0.1:4500` endpoint before it selects a target. It then takes one
+connect-only passive native sample: `idle`/`notLoaded`, no active turn, and an
+empty native queue are required. Direct-input capability is recorded as metadata
+only. The registry and target stores are locked in that order while exact stale
+binding, open guards, known bridge/control/reset work, and unacknowledged input
+are rechecked. Input arriving outside the app after capture remains an explicit
+unfenced residual.
+
+Privileged admission requires a read for the exact recipient whose provenance is
+recipient_full_message or recipient_context_full. An acknowledged reply obligation
+does not negate that proven consumption. Legacy_unknown, ACK-only and a different
+reader remain insufficient; unavailable provenance fails closed without a legacy
+fallback or historical upgrade.
+
+```sh
+agent-chat-ownership-disposition --service-plist EXACT_CONFIGURED_PLIST \
+  --master-db EXACT_CONFIGURED_MASTER --project-id EXACT_PROJECT \
+  --resource file:EXACT_PATH --reservation-id EXACT_RID \
+  --owner-session EXACT_OWNER --expected-state stale --request-id UUID \
+  --reason 'approved bounded reason'
+```
+
+An uncertain result is retried only with the identical complete payload and UUID;
+the durable original outcome is returned before a second native capture or state
+transition. This local command has no web, coordinator-RPC, or ordinary remote
+client route. It does not protect against hostile same-user Python or direct DB
+tampering; Root alone verifies live installed configuration and operates actual
+holds.
+
+Older configured stores may contain either of two application-created audit
+layouts: the required legacy tuple columns, or the eight-column layout containing
+request_id, payload_json, outcome, checks_json, sample_json, process_evidence_state,
+recorded_at and continuation_of. The eight-column sampler layout may require
+`sample_json TEXT NOT NULL`; its prior nullable-sample variant is also supported.
+The required-sample constraint is retained, not relaxed or added to legacy tuple
+layouts. Old missing requester fields remain unknown even when a sample exists.
+The local engine recognizes those exact layouts and
+their completed additive adaptations; unfamiliar columns, types or constraints
+fail closed. Additions occur inside the target transaction and roll back with it.
+Historic UUIDs, payloads, outcomes, checks, samples, timestamps, audit history and
+continuation links remain unchanged. Missing tuple/requester/host fields remain
+SQL NULL, even if similar values appear in an old payload. No historical native
+provenance is inferred. New records include the current validated tuple and
+passive sample. Exact old replay returns its immutable outcome without migration,
+sampling or a target transition. Historic blocked rows lacking recorded requester
+and sample provenance cannot authorize a successful continuation; a new explicit
+blocked record with those current fields retains normal continuation semantics.
+
+### Separate legacy OPEN-guard administrative selection
+
+An irrecoverable legacy guard is not a CLOSED receipt. The configured local Root
+application may separately invalidate stale capabilities without clearing their
+ownership. This route requires the same installed provider/effective-UID,
+canonical plist/master/separated registry and enrolled running Root authority as
+the local disposition above; selectors, reason and UUID are not credentials.
+It has no HTTP, coordinator RPC or ordinary remote-client route. Root alone
+verifies the installed prerequisites and decides actual use; source/test
+acceptance does not activate an installed executable or authorize a disposition.
+
+Future-use invocation (placeholders are not execution authority):
+
+```sh
+python3 -m agent_chat.ownership_disposition \
+  --master-db CONFIGURED_MASTER --service-plist CONFIGURED_PLIST \
+  --project-id REGISTERED_PROJECT --resource EXACT_REGISTERED_LEGACY_LITERAL \
+  --reservation-id EXACT_RID --owner-session EXACT_REGISTERED_OWNER \
+  --expected-state stale --expected-deadline EXACT_STORED_DEADLINE \
+  --legacy-guard-run-id EXACT_OPEN_RUN --request-id NEW_UUID --reason EXACT_REASON \
+  --additional-stale-obligation EXACT_LITERAL EXACT_RID SAME_OWNER EXACT_DEADLINE
+```
+
+`--additional-stale-obligation` may be repeated for at most 31 distinct additional
+stored resources. The anchor and every additional tuple must already be durably
+stale, expired, owned by the same original registered session, and have exactly
+the supplied RID/deadline with no FIFO claimant. Bare legacy literals are selected
+as stored, never mapped to aliases or added to the ordinary resource allowlist.
+The anchor must authenticate exactly one OPEN stored local/remote guard, including
+its original resource/RID/session/PID/start. Missing, closed, conflicting or
+foreign records refuse. Original records and recorded batch associations remain
+unchanged.
+
+This is a **new** privileged association, recorded as
+`NEW_ROOT_ADMINISTRATIVE_SELECTION`; additional members use
+`ROOT_SELECTED_ADDITIONAL_OBLIGATIONS`, not an invented historical batch. Current
+owner/thread/host comes only from existing supported registration on the permitted
+configured Root host (`CURRENT_REGISTERED_HOST`). No host assertion or new binding
+fallback exists. Missing historical local host/thread/batch remains `UNKNOWN`;
+recorded remote host/batch is retained without upgrading it to closure proof.
+
+Under registry-then-target locks, Root rechecks its lifecycle/identity, exact
+selection and unchanged current registration after a fresh bounded passive read
+of that thread: idle/notLoaded, no active turn and empty native queue. Genuine
+full direct-recipient consumption is required; an ACK, another reader or unknown
+provenance does not suffice. Pending controls/resets/wakes/known work, stopped or
+quarantined/retired owners, uncertain samples, member/CAS drift or queues refuse
+the whole operation without intent, audit, token or unrelated-state writes.
+Cooperative locks do not fence external native races or hostile same-user writes.
+
+Success is `legacy_stale_authority_invalidated`: only selected tokens become
+NULL, with an atomic immutable typed selection/passive audit and linked history.
+Original OPEN guards, owner/RID/grant/deadline/stale state and queues remain.
+Process closure, restoration, detached/helper coverage and residual external
+races remain `UNVERIFIED`. This is not FREE, CLOSED, recovered, safe native reuse,
+control transfer, a signal, or a new execution grant. Ordinary receipt recovery
+and execution admission are unchanged and remain separately required.
+
+Replay the identical request UUID and exact intent to reconcile a lost response;
+it returns the stored result without a new sample or transition. Changed intent
+or a replacement UUID for an already successful anchor refuses. An explicitly
+selected prior blocked audit may be linked with
+`--historical-blocked-request-id EXACT_ORIGINAL_UUID` using a distinct current
+privileged request, but its payload/outcome/unknown provenance stays immutable
+and supplies no current admission. Ordinary `--continue-request-id` is not this
+operation. Refusals are rollback-only, not durable blocked-result rewrites.
+
+### Ordinary disposition continuation and historical links
+
+If a recorded request was blocked only by a subsequently resolved gate, Root may
+submit a distinct UUID with `--continue-request-id ORIGINAL_UUID` and the same
+complete target payload. The engine requires the original immutable blocked
+outcome and stale tuple, re-runs all current native/cooperative gates, and links
+the new audit record atomically. An original replay remains historical; a
+continuation replay returns its own result. A changed payload, original state,
+or successor owner/RID is denied.
+
+For an immutable historical blocked request that lacks continuation provenance,
+the local entry supports a separate current operation:
+`--historical-blocked-request-id ORIGINAL_UUID` with a distinct `--request-id` and
+the explicitly selected complete current project/resource/owner/RID/stale tuple.
+The historical payload must contain that same tuple, agree with any recorded
+legacy columns, and have a blocked outcome. Incomplete/conflicting historical
+data and terminal-success originals are refused. This flag cannot be combined
+with ordinary continuation. Missing historical requester/host/sample fields stay
+unknown; the historical UUID is only an immutable audit link.
+
+The current operation requires the canonical local privilege and all fresh
+native, recipient-consumption, cooperative, Root, binding, host, control/reset,
+queue, guard and exact CAS gates. Read-only historical/target preflight and passive
+capture precede registry-to-target locks; history and current gates are rechecked
+under those locks. Only the current result, HISTORY_ONLY link, audit and exact
+transition commit together. The original remains byte-immutable. A current
+blocked outcome is immutable too: identical current UUID/payload replays its own
+outcome; another attempt requires an explicitly approved distinct local operation.
+Competing current operations can clear the exact reservation once. All new
+results retain UNVERIFIED process evidence and the existing external-input residual.
+
 Run guarded commands locally and release ownership with a closure receipt:
 
 ```sh
 agent-chat-client context
-agent-chat-client request validation-clone --minutes 35
-# Continue only if the result says state "owned"; save its reservation ID/token.
-export AGENT_CHAT_TOKEN=TOKEN_FROM_OWNED_RESPONSE
-agent-chat-client run validation-clone -- python3 validate.py
+mkdir -m 700 /absolute/private/capabilities
+CAPABILITY=/absolute/private/capabilities/validation-clone.json
+agent-chat-client request validation-clone --minutes 35 --capability-file "$CAPABILITY"
+# Continue only if the result says state "owned"; retain its exact reservation ID.
+RID=EXACT_RID_FROM_OWNED_RESPONSE
+agent-chat-client run --capability-file "$CAPABILITY" \
+  --reservation-id "$RID" validation-clone -- python3 validate.py
 agent-chat-client context
-agent-chat-client release validation-clone --receipt /absolute/path/to/CLOSED.json
+AGENT_CHAT_TOKEN=$(jq -er '.token' "$CAPABILITY") \
+  agent-chat-client release validation-clone --receipt /absolute/path/to/CLOSED.json
 ```
 
 `CLOSED.json` records restoration and process closure, with nonempty evidence:
@@ -608,6 +1018,14 @@ IDs. It never returns reservation tokens. A cached observation is not a fresh
 runtime check. `--refresh` requires the exact bound main thread and a UUID; check
 that request reaches `completed` and `observation.checked_at` advances.
 
+`agent-status` and each `agents` entry include `compaction_count` for the currently
+bound thread, counted from complete `compacted` records in its verified local
+rollout. A new thread with a readable rollout starts at zero; prior threads do
+not contribute. The count is `null` when there is no physical thread binding or
+its rollout is unavailable (including remote-host logs absent from the server).
+Orchestrators can query it without any UI display:
+`agent-chat-client agent-status --to coding | jq '{thread_id, compaction_count}'`.
+
 ~~~sh
 target_thread=$(agent-chat-client agent-status --to coding | jq -er .thread_id)
 request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
@@ -668,7 +1086,7 @@ reserve. Request UUIDs make identical retries idempotent; changed retry payloads
 are rejected. No stop, resume or reset authorizes workfile access: every agent
 must acquire exact file/resource holds before shared mutation.
 
-## Change a main agent's model on the same thread
+## Stage native model defaults on the same main thread
 
 Use the existing project identity and exact bound thread. A global root can route
 this command only to its designated project orchestrators; project orchestrators
@@ -679,20 +1097,119 @@ agent-chat-client context
 target_thread=$(agent-chat-client agent-status --to orchestrator | jq -er .thread_id)
 request_id=$(uuidgen)
 agent-chat-client agent-model --to orchestrator --expected-thread "$target_thread" \
-  --model gpt-5.6-terra --reasoning-effort high --request-id "$request_id" \
-  --allow-cold-resume --confirm
+  --model gpt-6.1-sol --reasoning-effort high --request-id "$request_id" --confirm
 agent-chat-client agent-status --to orchestrator
 # Global root uses its existing canonical identity and supported project route:
 agent-chat-client root in PROJECT_ID agent-model --to orchestrator \
-  --expected-thread EXACT_THREAD --model gpt-5.6-terra --reasoning-effort high \
-  --request-id EXACT_UUID --allow-cold-resume --confirm
+  --expected-thread EXACT_THREAD --model gpt-6.1-sol --reasoning-effort high \
+  --request-id EXACT_UUID --confirm
 ~~~
+
+The ordinary command stages a selection; it does not manufacture a turn, change
+an agent-wide preference, or claim observed settings. Running admission remains
+open. A known-busy thread, existing native queue, unloaded/non-input route or open
+guard waits without steering, queue deletion, interrupt or cold loading. Send the
+next genuine task through the normal message route when it is actually wanted;
+there is no dummy continuation or forcing the selection on every later input.
+
+The bridge associates the request UUID with one newly prepared genuine managed
+input job, its original ordered message IDs and wake/client UUID. It persists the
+submission boundary before a single ordinary `turn/start` containing only
+`threadId`, `clientUserMessageId`, `input`, `model`, and `effort`. No workspace,
+permission, provider, selected summary/personality or opaque setting override is
+sent. Three/four ordered-root and unknown/null preservation workflows are neutral
+synthetic evidence, not installed root/readback attestation. Subsequent normal
+input omits model/effort and uses that thread's native defaults; another native
+client may subsequently change them.
+
+Own dispatcher submissions remain serialized. Native `turn/start` is not an
+atomic idle admission: an independent native client can race the last idle check
+and the response may reflect start, steer, refusal or interruption. Do not claim
+cross-client no-steering, preservation of the active turn, or exact effective
+defaults. No separate experimental settings operation is needed by this ordinary
+route, and its eligibility does not inherit the experimental originator gate.
+
+`agent-status` retains requested settings separately from its latest observation.
+`pending`/`waiting` is staged, `submitting` is the durable process boundary,
+the displayed `native_input_state=accepted` records an actual ordinary-turn ACK
+or positive original client-ID history evidence, and `uncertain` withholds
+automatic replay. Input acceptance is recorded with the existing durable
+request `status=completed` to preserve lifecycle terminal-state compatibility;
+`observed_defaults_verified=false` remains explicit. `accepted` is input
+acceptance, not completed work or an exact model/settings readback. The native
+turn response and its actual status are retained without normalizing an
+interruption into success. History recovery records its different provenance and
+does not invent a missing ACK. `observed_settings_json` remains absent for this
+ordinary operation; older observed model fields must not be called new proof.
+
+Repeating the same request UUID with the same intent is idempotent; conflicting
+payloads or unresolved competing selections refuse. Disconnect/lost response
+keeps the original input association across dispatcher/server restart. Only
+positive original client-ID evidence reconciles it; absent history is not proof
+that nothing happened. Ambiguous ordinary model inputs cannot be bridge-retried
+or resolved through legacy exact-settings abandonment. A definite RPC refusal
+retains its failed selection and input; the owner's existing explicit
+`bridge-retry --confirm-not-started` can retry the input without its refused model
+override, after the ordinary verification/current-input requirements. A consumed
+associated input before submission fails that selection rather than replacing
+its original input or generating a dummy turn. No retry is automatic.
+
+Existing historical requests keep their recorded route. This source-only change
+needs normal installed deployment/restart and independent review; no loaded
+bridge, live project thread or paid/foreign model input was exercised by the
+synthetic workflows. Keep current source lineage and owner holds when composing.
+
+### Separately explicit legacy cold-resume and experimental histories
 
 Arrange an idle target with an empty native queue and no open guards before
 requesting the change. An active turn, queued input or guard blocks mutation.
 Do not retire workers: the existing session, thread, children, inbox, queues,
 reservations, workspace and permissions are preserved. Only model and reasoning
 effort change through the existing app-server; no new turn or server is started.
+
+The experimental 0.161.0 sparse settings-update observation path is implemented
+but production mutation remains **unsupported/fail-closed**. No independently
+trustworthy runtime originator anchor has been supplied. The client retains the
+complete actual initialize response privately, including raw `userAgent`;
+clientInfo version, `agent_chat_bridge`, a suffix substring, source/binary lineage
+or a configured version is not runtime attestation. There is no caller flag or
+configuration override that supplies that authority. Explicitly declared test
+fixture anchors cannot enable the production worker.
+
+The bounded synthetic contract uses only `threadId`, `model` and `effort` in
+`thread/settings/update`. Every protected override, including selected summary
+and personality, is omitted. Their unavailable before-values are unobserved:
+preservation relies on the exact-version sparse-omission contract, not fabricated
+observed equality. Actual post-event summary/personality values are recorded
+separately. Available protected values are compared as complete opaque JSON
+objects, retaining unknown nested members and distinguishing absent/null/scalar
+types; ordered runtime roots are compared exactly through separate fresh
+same-thread readback. Model/effort and their collaboration model/effort slots are
+the intended changes; a protected mismatch is not silently normalized away.
+
+Completion is not an empty RPC acknowledgement. It requires the matching ACK,
+a genuine applicable `thread/settings/updated` notification with
+`{threadId, threadSettings}`, then fresh protected settings and ordered-root
+readback. The public event has neither roots nor native request/intent ID. A
+pre-dispatch receive boundary drains already-readable data; notifications before
+and after ACK remain in receive order. This establishes observed post-state
+under legitimate serialization, never unique native causal UUID correlation.
+Stale buffered/unrelated-thread events cannot complete the action. Conflicting,
+malformed, missing, uncertain or disconnected observations and one bounded
+operation timeout remain ambiguous, with no retry, rollback, cold-load,
+unsubscribe, root reduction or convenient-event selection. The bounded raw
+notification window retains 1024 events; losing an observation prefix makes its
+boundary unavailable, not successful. Raw initialize metadata is not placed in
+public control completion evidence.
+
+Only an already-loaded idle/direct-ready exact thread with an empty queue and
+no guards is eligible even in declared fixtures. The immutable durable mutation
+boundary and current management/admission/binding checks remain; uncertain
+experimental jobs cannot automatically complete from later convenient readback
+or replay. Ordinary inspection and the separately explicit existing cold-resume
+route below are not experimental fallbacks. The missing production runtime
+anchor needs a separate accepted attestation decision, not another native probe
+or a claim that synthetic success establishes installed support.
 
 Codex 0.160.0 rejoins a loaded thread without applying resume overrides. The
 explicit cold-resume option lets this bridge detach only its own subscription
@@ -799,3 +1316,42 @@ The installed bridge owns its app-server child, so its reload needs a coordinate
 native-work boundary and verified recovery. Do not treat this as an HTTP-only
 restart, launch a parallel bridge, or recreate conversations. After recovery,
 enable each intended owner scope explicitly and verify fresh observations.
+# Private reservation capture and prospective process evidence
+
+The client request command requires `--capability-file PATH`. Create its parent
+directory with mode `0700`; the client atomically writes an owner-only `0600`
+regular file before emitting any owned response. The file binds the resource,
+session, host, reservation ID, token, server and project. Client stdout contains
+sanitized metadata and the file path, never the token. This intentionally replaces
+the old client stdout token contract. The core/API request semantics remain:
+repeating the same owner's active request returns the same exact reservation.
+This can complete capture after lost stdout; it does not recover stale holds.
+A queued response leaves the supplied destination untouched and captures no
+capability. A capture failure preserves the reservation and reports failure.
+
+Run a single captured hold with `run --capability-file PATH
+--reservation-id RID RESOURCE -- COMMAND`. Place run options before the resource;
+arguments after the resource belong to the guarded command. The exact resource, caller session, host, RID,
+server and project must match before admission or launcher creation. The server
+continues to verify owner, token, state and RID. Batch manifests keep their
+existing exact tuple contract. Symlinks, hard links, nonregular files and unsafe
+file/directory modes are rejected; capture replaces files atomically with fsync.
+
+Every app guarded runner retains a private prospective process journal. Remote
+run accepts `--process-evidence-file PATH` for a new file in a private directory;
+otherwise journals are retained under the client's `process-evidence` state
+directory. Facts include runner identity, owned child/group, guard admissions,
+remote attach and gate ordering, actual leader reap and return code, observed
+group absence, and guard request success/failure. Journals omit tokens and command
+arguments. Evidence retention failure before guard close stops the owned group
+and withholds close; disconnect also retains the server's open guard. If the
+server has already committed close and retention of its acknowledgment then
+fails, the successful close can remain unrecorded in the journal. Such evidence
+is incomplete and cannot by itself establish closeout. Abrupt runner death can
+leave a partial journal, which supplies no inferred exit or closure claim.
+
+Coverage is the instrumented process group. Detached groups, native applications
+and unrelated processes are outside this evidence. Journals are observations,
+not release receipts or universal closure proof. Existing receipt and server
+guard checks still govern closeout. Shared integration and activation require
+independent review.

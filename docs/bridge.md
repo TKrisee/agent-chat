@@ -6,6 +6,85 @@ and existing host bridge. Upgrade coordinator first; old bridges safely withhold
 root status reports actual matching host coverage and capability. Static browser
 controls can load separately, but do not activate this backend workflow.
 
+## Root recovery while its native CLI is open
+
+The bridge automatically continues the enrolled main root after a terminal
+temporary failure: provider overload/internal server errors, structured stream
+disconnections or connection failures with no HTTP status or 500/502/503/504,
+or the exact native error
+`Selected model is at capacity. Please try a different model.` when its structured
+code is absent or `other`. The captured remote-compaction failure beginning
+`Error running remote compact task: stream disconnected before completion: An error occurred while processing your request`
+is also eligible under absent/`other`; unrelated `other` errors remain blocked.
+Native `error` events with `willRetry: true` do not
+schedule a second retry; the bridge waits for terminal failure proof. Usage
+limits, rate limits, authentication, billing, context, permission, approval and
+safety failures remain visible blockers.
+
+The root must have its canonical direct chat binding and already be loaded on
+the **same app-server endpoint used by this bridge**. Its native CLI must
+explicitly resume that exact root thread:
+
+```sh
+codex --remote ws://127.0.0.1:4500/ resume EXACT_ROOT_THREAD_UUID
+```
+
+Use your configured endpoint if different. A read-only local owner monitor
+matches the native `codex` process's UID, explicit resume UUID, endpoint, PID and
+process start time. It persists that identity and root binding generation for
+the recovery sequence. Cwd, nicknames and the bridge's own subscriptions do not
+prove that the user's CLI is still open. Missing/ambiguous owner evidence or
+unavailable process tooling prevents new input. A previously bound owner can
+remain valid when another matching CLI appears; ownership is never silently
+transferred after the original process exits or its PID is reused. Relaunching
+without an explicit resume UUID does not qualify for automatic recovery.
+
+An independent
+stock CLI or a stored, unloaded rollout is not automatically taken over.
+Descendants and non-enrolled roots are excluded. Dispatcher ownership alone
+does not establish exclusive ownership of the native conversation.
+
+Retries wait 30, 60, 120 and 300 seconds, then remain capped at 300 seconds while
+eligible failures continue and the same owning CLI remains open. Attempt counts
+and deadlines survive reconnects. Recovery also handles an already-failed,
+loaded root when this positive native-owner proof exists at bridge startup.
+An idle root or a `systemError` root requires native direct-input admission and
+a latest eligible failed turn. Healthy completed turns never trigger input.
+The continuation asks the existing root to review prior effects and
+continue only unfinished, already-authorized work. It never replays the original
+request or tool calls. The same thread/session and current model, reasoning
+effort and permissions are retained. A metadata-only `thread/resume` on the
+already-loaded thread reads settings without overrides; configuration changes
+cancel stale recovery. After an explicitly settled model/configuration change,
+a proven cancellation may resume under the current settings with the same
+owner, retained retry count/backoff and a new attempt ID. Unknown outcomes,
+closed owners and canceled user input/stop/rebind sequences are not revived.
+The bridge uses a unique native queue item; queue/add can automatically start
+it, so positive exact queue/history evidence is required before settlement or
+an explicit queue start. These native operations cannot steer an active turn.
+
+New managed input, native queued input, a newer turn, root pause/stop, rebinding,
+CLI exit/PID reuse or configuration drift cancels stale recovery. Only the
+bridge's own recovery queue item is removed. If CLI closure races an already
+started recovery turn, the bridge interrupts only the exact current turn whose
+user item carries its own stable client ID, then requires terminal readback.
+It never interrupts a foreign/new user turn. Failed or unsupported interrupt
+remains visible awaiting proof. The watcher does not launch/restart a CLI or
+control windows, permissions or external processes.
+
+Durable attempt/deadline and native correlation state
+survive bridge reconnection. An ambiguous request without positive queue or
+history evidence becomes `uncertain` and is reconciled without replay. Later
+exact queue or turn proof settles its native handoff. No replacement model is
+selected.
+
+`agent-chat-client bridge-status` exposes `capacity_recoveries`, including
+pending deadline, attempts, owning PID/start/root generation, retry turn IDs,
+configuration rearm audit and cancellation/error evidence.
+Set `AGENT_CHAT_CAPACITY_RECOVERY=0` in the bridge process environment to disable
+discovery and cancel retained pending recovery on its next tick. Upgrade the
+coordinator and bridge worker together to load these authenticated operations.
+
 Coordinate bridge changes with the operator, active measurements, guards, wakes
 and any empty unmaterialized creation candidates. Preserve the existing app-server
 and its conversations. Do not start an extra bridge or use dispatcher recovery
@@ -112,7 +191,9 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   [adoption prompt](agents.md#adoption-prompt) during setup.
 - A thread must be loaded, idle and accept direct input. Active,
   approval-waiting, unloaded and non-input child threads wait. The bridge never
-  resumes a thread, starts or steers a turn directly, or answers approvals.
+  loads an unloaded thread, starts or steers a turn directly, or answers
+  approvals. Root capacity recovery above may attach metadata to an already
+  loaded thread and add its own bounded continuation queue item.
 - The bridge adds its durable input with a stable `clientUserMessageId` and
   starts only its own queue item through the idle-only queue API. A busy race
   leaves the item for later; existing Codex queued input keeps its place.

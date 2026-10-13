@@ -89,6 +89,7 @@ def handoff_settling(db,kind,job_id,host,status):
 def definite_settlement(kind,phase,status):
     if status=='rejected-before-dispatch': return True
     if kind=='wake': return (phase,status) in (('adding','queued'),('starting','dispatched'))
+    if kind=='capacity': return status in ('cancelled_verified','turn_observed_verified') or (phase.startswith('adding:') and status=='queued_verified') or (phase.startswith('starting:') and status in ('queued_verified','retrying','pending','completed','exhausted'))
     if kind=='reset': return (phase,status) in (('creating','created'),('adding','queued'),('starting','completed'))
     if kind=='control': return (phase=='changing' and status in ('completed','resolved_unchanged')) or (phase.startswith('interrupting:') and status in ('completed','waiting'))
     return False

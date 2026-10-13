@@ -62,9 +62,10 @@ async function run() {
     await page.goto(fixtureInfo.url);
     await page.waitForFunction(() => document.querySelectorAll('.message').length > 0 && !document.querySelector('#message-input').disabled);
     assert.equal(await page.locator('#feed').evaluate(feed => feed.clientHeight >= 600), true);
-    for (const selector of ['#connection-label', '#recipient', '.topbar', '.resources-heading', '.feed-footer', '.composer-recipient']) {
+    for (const selector of ['#connection-label', '#recipient', '.topbar', '.resources-heading', '.composer-recipient']) {
       assert.equal(await page.locator(selector).count(), 0, `${selector} should be removed`);
     }
+    assert.equal(await page.locator('.feed-footer:visible').count(), 0, 'Ordinary conversations have no feed footer');
 
     // The guide is local-only: a first visit opens it, dismissal and completion persist,
     // and an operator can still reopen it deliberately.

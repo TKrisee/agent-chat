@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -41,6 +42,8 @@ class Bridge:
         self.rpc = rpc
         self._history_pages = {}
         self._in_tick = False
+        from .capacity_recovery import CapacityWorker
+        self.capacity_worker = CapacityWorker(self)
 
     def queue(self, thread_id):
         items, cursor = [], None
@@ -96,6 +99,18 @@ class Bridge:
         return False
 
     def reconcile(self, job):
+        selection = job.get('model_control')
+        if selection:
+            if self.history_contains(job):
+                if selection['status'] in ('submitting', 'uncertain'):
+                    self.state.control_update(selection['id'], selection['status'], 'completed',
+                        input_job_id=job['id'], input_evidence='history_client_id',
+                        error='Original genuine input observed in history; ACK/start-or-steer outcome and effective native defaults remain unverified.')
+                self.state.update(job['id'], 'dispatched')
+            else:
+                self.state.update(job['id'], 'uncertain',
+                    error='No positive original input correlation; model/input automatic replay withheld.')
+            return
         matches = [item for item in self.queue(job['thread_id']) if item.get('clientUserMessageId') == job['id']]
         if len(matches) == 1:
             self.state.update(job['id'], 'queued', queue_id=matches[0]['id'])
@@ -113,6 +128,9 @@ class Bridge:
                 self.reconcile(job)
                 job = self.state.job(job['id'])
             if job['status'] not in ('prepared', 'queued'):
+                return
+            if job.get('model_control'):
+                self.advance_ordinary_input(job)
                 return
             if job['status'] == 'prepared':
                 if not self.still_unread(job):
@@ -152,18 +170,48 @@ class Bridge:
             self.state.update(job['id'], 'dispatched')
         except RpcError as error:
             current = self.state.job(job['id'])
-            if current['status'] == 'starting' and 'active or pending turn' in str(error):
+            if current.get('model_control') and current['status'] == 'starting':
+                self.state.update(job['id'], 'failed', error='Ordinary native turn explicitly refused; input and selection retained: ' + str(error))
+            elif current['status'] == 'starting' and 'active or pending turn' in str(error):
                 self.state.update(job['id'], 'queued', error=str(error))
             elif current['status'] in ('adding', 'starting'):
                 # A definite error while starting may leave our queued item.
                 self.state.update(job['id'], 'uncertain' if current['status'] == 'starting' else 'failed', error=str(error))
             else:
                 self.state.update(job['id'], current['status'], error=str(error))
-        except (TransportError, OSError, ValueError, KeyError, TypeError) as error:
+        except (TransportError, OSError, ValueError, KeyError, TypeError, CoordError) as error:
             current = self.state.job(job['id'])
             if current['status'] in ('adding', 'starting'):
                 self.state.update(job['id'], 'uncertain', error=str(error))
             raise
+
+    def advance_ordinary_input(self, job):
+        selection = job['model_control']
+        if (job['status'] != 'prepared' or selection['status'] not in ('pending', 'waiting')
+                or selection.get('model_route') != 'ordinary_input'
+                or selection.get('native_input_job_id') != job['id']):
+            raise CoordError('ordinary model input changed; submission withheld')
+        if not self.still_unread(job):
+            self.state.update(job['id'], 'cancelled')
+            return
+        if not self.idle(job['thread_id']) or self.queue(job['thread_id']):
+            return  # Our known busy/queued thread is never steered.
+        self.offer_policy('wake', job['id'], job['thread_id'], job['payload'])
+        self.state.update(job['id'], 'starting')
+        # The durable original wake UUID correlates the genuine input. Native
+        # clients can race this observation: ordinary start may start or steer,
+        # reject or interrupt. An ACK is not a defaults/readback guarantee.
+        result = self.rpc.request('turn/start', {
+            'threadId': job['thread_id'], 'clientUserMessageId': job['id'],
+            'input': [{'type': 'text', 'text': job['payload'], 'text_elements': []}],
+            'model': selection['requested_model'], 'effort': selection['requested_effort'],
+        })
+        turn = result['turn']
+        current = self.state.control_job(selection['id'])
+        self.state.control_update(selection['id'], current['status'], 'completed',
+            input_job_id=job['id'], input_evidence='rpc_ack', native_response=result, turn_id=turn['id'],
+            error='Ordinary native turn accepted; effective thread defaults and external start-or-steer/interruption are not verified.')
+        self.state.update(job['id'], 'dispatched')
 
     def payload(self, thread_id, messages):
         deliveries = []
@@ -263,6 +311,9 @@ class Bridge:
             for supervisor in self.state.supervisor_jobs():
                 try: SupervisorWorker(self).advance(supervisor)
                 except (CoordError, sqlite3.Error, TransportError) as error: record(error)
+        if hasattr(self.state, 'capacity_targets'):
+            try: self.capacity_worker.tick(enabled=os.environ.get('AGENT_CHAT_CAPACITY_RECOVERY', '1') != '0')
+            except (CoordError, sqlite3.Error, TransportError) as error: record(error)
         jobs = self.state.jobs()
         for job in jobs:
             try: self.advance(job)

@@ -4,6 +4,7 @@ This registry never dispatches model input itself. Project mains use the existin
 fresh-conversation state machine and authenticated host worker.
 """
 import contextlib
+import math
 import sqlite3
 from pathlib import PurePosixPath
 import time
@@ -125,6 +126,203 @@ class RootOrchestrator:
             if not binding or binding['thread_id'] != root['thread_id'] or not owner or owner['host_id'] != host:
                 raise CoordError('canonical root binding or host changed; routing withheld')
         return root
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _readiness_db(path):
+        # Never instantiate Coordinator/Projects or initialize/migrate a store.
+        with contextlib.closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('BEGIN')
+            yield db
+
+    def operator_attachment(self, project, session, host, source_project, message_id, attachment_id):
+        """Read one operator-to-managed-PO attachment; request IDs confer no authority."""
+        import hashlib
+        from .core import MAX_ATTACHMENT_SIZE
+        from .root_team_reset import quarantined
+        try:
+            # Serialize against application-local enrollment/designation changes.
+            # Separate stores are read snapshots, not a cross-store fencing claim.
+            with self.projects.root_lock, self._readiness_db(self.projects.path) as directory:
+                root = directory.execute('SELECT * FROM root_config WHERE singleton=1').fetchone()
+                owner = directory.execute('SELECT * FROM root_directory_owner WHERE singleton=1').fetchone()
+                if (not root or not owner or (project, session, host) !=
+                        (root['home_project'], root['home_session'], root['host_id'])
+                        or (owner['home_project'], owner['home_session']) != (project, session)):
+                    raise CoordError('attachment download requires the canonical Root home, session and host')
+                enrolled = directory.execute('SELECT * FROM root_projects WHERE project_id=? AND joined=1',
+                                             (source_project,)).fetchone()
+                if not enrolled or not enrolled['orchestrator_session']:
+                    raise CoordError('attachment source requires a currently enrolled designated PO')
+                # Paths derive only from exact existing registry IDs, never request paths.
+                def existing_path(selected):
+                    item = directory.execute('SELECT id FROM projects WHERE id=?', (selected,)).fetchone()
+                    if not item or (selected != 'default' and
+                                    (not selected.startswith('project_') or
+                                     any(char not in '0123456789abcdef' for char in selected[8:]) or
+                                     not selected[8:])):
+                        raise CoordError('attachment project registry association is unavailable')
+                    return (self.projects.database if selected == 'default' else
+                            self.projects.database.parent / (self.projects.database.name + '.projects') /
+                            selected / 'state.sqlite3')
+                with self._readiness_db(existing_path(project)) as home:
+                    binding = self._readiness_binding(home, session, host)
+                    if (not binding or binding['parent_session'] or binding['thread_id'] != root['thread_id']
+                            or not self._readiness_projection(home, session, root)
+                            or quarantined(home, session=session, thread=root['thread_id'])):
+                        raise CoordError('canonical Root attachment binding is unverifiable')
+                with self._readiness_db(existing_path(source_project)) as source:
+                    binding = self._readiness_binding(source, enrolled['session_id'], host)
+                    po = enrolled['orchestrator_session']
+                    role = source.execute('SELECT root_session FROM project_orchestrators WHERE session_id=?', (po,)).fetchone()
+                    registered = source.execute('SELECT 1 FROM sessions WHERE id=?', (po,)).fetchone()
+                    retired = source.execute('SELECT 1 FROM retired_sessions WHERE id=?', (po,)).fetchone()
+                    if (not binding or binding['parent_session'] or binding['thread_id'] != root['thread_id']
+                            or not self._readiness_projection(source, enrolled['session_id'], root)
+                            or not role or role['root_session'] != enrolled['session_id'] or not registered or retired
+                            or quarantined(source, session=enrolled['session_id'], thread=root['thread_id'])
+                            or quarantined(source, session=po)):
+                        raise CoordError('source enrollment or exact designated PO management is unverifiable')
+                    row = source.execute('''SELECT a.id,a.name,a.mime,a.size,a.content,m.id AS message_id
+                        FROM attachments a JOIN messages m ON m.id=a.message_id
+                        JOIN operator_message_origins o ON o.message_id=m.id AND o.sender_session=m.sender_session
+                        JOIN operator_identities i ON i.session_id=m.sender_session
+                        WHERE a.id=? AND m.id=? AND m.recipient_session=?
+                          AND o.channel='authenticated_operator_ui'
+                          AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)''',
+                                         (attachment_id, message_id, po)).fetchone()
+                    if not row:
+                        raise CoordError('attachment is not an exact authenticated operator-to-designated-PO message')
+                    content = bytes(row['content'])
+                    if (not isinstance(row['size'], int) or isinstance(row['size'], bool)
+                            or row['size'] != len(content) or not 0 < len(content) <= MAX_ATTACHMENT_SIZE):
+                        raise CoordError('stored attachment size is invalid')
+                    name, mime, _ = Coordinator._prepare_attachment(row['name'], content)
+                    if (name, mime) != (row['name'], row['mime']):
+                        raise CoordError('stored attachment metadata is invalid')
+                    return dict(attachment_id=row['id'], message_id=row['message_id'], name=name,
+                                mime=mime, size=len(content), sha256=hashlib.sha256(content).hexdigest(), content=content)
+        except (sqlite3.Error, OSError, KeyError, TypeError, ValueError):
+            raise CoordError('trusted attachment associations are unavailable or unsupported') from None
+
+    @staticmethod
+    def _readiness_table(db, table):
+        return bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone())
+
+    @classmethod
+    def _readiness_binding(cls, db, session, host):
+        if not all(cls._readiness_table(db, table) for table in ('sessions', 'bridge_bindings', 'remote_session_hosts')):
+            return None
+        registered = db.execute('SELECT registered_at FROM sessions WHERE id=?', (session,)).fetchone()
+        retired = (cls._readiness_table(db, 'retired_sessions') and
+                   db.execute('SELECT 1 FROM retired_sessions WHERE id=?', (session,)).fetchone())
+        binding = db.execute('SELECT thread_id,parent_session FROM bridge_bindings WHERE session_id=?', (session,)).fetchone()
+        owner = db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (session,)).fetchone()
+        if not registered or retired or not binding or not binding['thread_id'] or not owner or owner['host_id'] != host:
+            return None
+        if cls._readiness_table(db, 'agent_controls'):
+            admission = db.execute('SELECT mode FROM agent_controls WHERE target_session=?', (session,)).fetchone()
+            if admission and admission['mode'] != 'running':
+                return None
+        return binding
+
+    def readiness(self, project, session, host, targets, expected_thread):
+        """Allowlisted metadata from existing records only; selectors never confer authority."""
+        if (not isinstance(targets, list) or not targets or len(targets) > 64
+                or any(not isinstance(item, str) or not item or len(item) > 200
+                       or any(ord(char) < 32 for char in item) for item in targets)
+                or len(set(targets)) != len(targets)
+                or not isinstance(expected_thread, str) or not expected_thread):
+            raise CoordError('readiness requires unique explicit enrolled project IDs and expected thread')
+        try:
+            with self._readiness_db(self.projects.path) as directory:
+                root = directory.execute('SELECT home_project,home_session,thread_id,host_id,mode FROM root_config WHERE singleton=1').fetchone()
+                owner = directory.execute('SELECT home_project,home_session FROM root_directory_owner WHERE singleton=1').fetchone()
+                if (not root or not owner or (project, session, host, expected_thread) !=
+                        (root['home_project'], root['home_session'], root['host_id'], root['thread_id'])
+                        or (owner['home_project'], owner['home_session']) != (project, session)):
+                    raise CoordError('readiness requires the canonical enrolled home caller, host and thread')
+                selected = []
+                for target in targets:
+                    row = directory.execute('SELECT project_id,session_id,joined,orchestrator_session FROM root_projects WHERE project_id=?', (target,)).fetchone()
+                    setup = directory.execute('SELECT workspace,instructions FROM projects WHERE id=?', (target,)).fetchone()
+                    if not row or not setup:
+                        raise CoordError('readiness target is not an existing Root-enrolled project')
+                    selected.append((row, bool(setup['workspace'] and setup['instructions'])))
+                now = time.time()
+                with self._readiness_db(self.path(project)) as home:
+                    binding = self._readiness_binding(home, session, host)
+                    projection = self._readiness_projection(home, session, root)
+                    observed = (home.execute('SELECT thread_id,checked_at FROM agent_control_observations WHERE target_session=?',
+                                            (session,)).fetchone() if self._readiness_table(home, 'agent_control_observations') else None)
+                    if (not binding or binding['parent_session'] or binding['thread_id'] != expected_thread or not projection
+                            or not observed or observed['thread_id'] != expected_thread
+                            or not isinstance(observed['checked_at'], (int, float)) or not math.isfinite(observed['checked_at'])
+                            or not 0 <= now - observed['checked_at'] <= 120):
+                        raise CoordError('canonical readiness registration/binding/observation is missing, stale or unverifiable')
+                    caller = dict(record_match=True, project=project, session=session, thread_id=expected_thread,
+                                  host_id=host, observed_at=observed['checked_at'])
+                entries = [self._readiness_project(root, row, setup_ready, now) for row, setup_ready in selected]
+                return dict(authority=dict(scope='machine_read', named_session_authentication='UNVERIFIED'),
+                            caller=caller, projects=entries)
+        except (sqlite3.Error, OSError, KeyError, TypeError, ValueError):
+            # Neither SQL errors nor stored setup/error strings may disclose private paths/payloads.
+            raise CoordError('readiness trusted records are unavailable or unsupported') from None
+
+    @classmethod
+    def _readiness_projection(cls, db, session, root):
+        if not cls._readiness_table(db, 'root_projections'):
+            return False
+        row = db.execute('SELECT home_project,home_session,thread_id FROM root_projections WHERE session_id=?', (session,)).fetchone()
+        return bool(row and (row['home_project'], row['home_session'], row['thread_id']) ==
+                    (root['home_project'], root['home_session'], root['thread_id']))
+
+    def _readiness_project(self, root, row, setup_ready, now):
+        host = root['host_id']
+        entry = dict(project=row['project_id'], root_session=row['session_id'],
+                     registration=dict(state='unknown', reason='project_records_unavailable', observed_at=None),
+                     routing=dict(state='ready' if root['mode'] == 'running' else 'not_ready',
+                                  reason=None if root['mode'] == 'running' else 'root_routing_paused', observed_at=None),
+                     setup=dict(state='ready' if setup_ready else 'not_ready',
+                                reason=None if setup_ready else 'setup_incomplete', observed_at=None),
+                     po=dict(session=row['orchestrator_session'], thread_id=None, host_id=None,
+                             readiness='unknown', reason='po_not_designated', observed_at=None),
+                     bridge=dict(host_id=host, state='unknown', reason='host_coverage_not_recorded', observed_at=None,
+                                 native_endpoint_identity=None, endpoint_reason='native_endpoint_not_verified'))
+        try:
+            with self._readiness_db(self.path(row['project_id'])) as db:
+                binding = self._readiness_binding(db, row['session_id'], host)
+                joined = bool(row['joined'] and binding and binding['thread_id'] == root['thread_id']
+                              and self._readiness_projection(db, row['session_id'], root))
+                entry['registration'].update(state='ready' if joined else 'not_ready',
+                                             reason=None if joined else 'root_projection_binding_unverified')
+                if not joined:
+                    entry['routing'].update(state='not_ready', reason='root_projection_binding_unverified')
+                po = row['orchestrator_session']
+                if po:
+                    role = (db.execute('SELECT root_session FROM project_orchestrators WHERE session_id=?', (po,)).fetchone()
+                            if self._readiness_table(db, 'project_orchestrators') else None)
+                    po_binding = self._readiness_binding(db, po, host) if joined and role and role['root_session'] == row['session_id'] else None
+                    entry['po'].update(readiness='ready' if po_binding else 'not_ready',
+                                       reason=None if po_binding else 'po_registration_binding_unverified',
+                                       thread_id=po_binding['thread_id'] if po_binding else None,
+                                       host_id=host if po_binding else None)
+                coverage = (db.execute('SELECT pid,heartbeat,error FROM bridge_client_runtime WHERE host_id=?', (host,)).fetchone()
+                            if self._readiness_table(db, 'bridge_client_runtime') else None)
+                if coverage:
+                    stamp = coverage['heartbeat']
+                    valid = isinstance(stamp, (int, float)) and math.isfinite(stamp) and stamp <= now
+                    recent = valid and now - stamp < 30
+                    state = ('unknown' if not valid else 'stale' if not recent else
+                             'unhealthy' if not coverage['pid'] or coverage['error'] else 'healthy')
+                    reason = dict(unknown='coverage_time_unverifiable', stale='coverage_observation_stale',
+                                  unhealthy='coverage_reports_unhealthy', healthy=None)[state]
+                    entry['bridge'].update(state=state, reason=reason, observed_at=stamp if valid else None)
+        except (CoordError, sqlite3.Error, OSError, KeyError, TypeError, ValueError):
+            entry['routing'].update(state='unknown', reason='project_records_unavailable')
+            entry['po'].update(readiness='unknown', reason='project_records_unavailable')
+        return entry
 
     def fresh(self, root):
         with contextlib.closing(Coordinator(self.path(root['home_project']), root['home_session'])) as coord:

@@ -169,7 +169,9 @@ class Coordinator:
           PRIMARY KEY(sender_session, reply_to),
           FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE TABLE IF NOT EXISTS message_reads (
-          message_id TEXT PRIMARY KEY, reader_session TEXT NOT NULL, read_at REAL NOT NULL,
+          message_id TEXT NOT NULL, reader_session TEXT NOT NULL, read_at REAL NOT NULL,
+          provenance TEXT NOT NULL,
+          PRIMARY KEY(message_id,reader_session),
           FOREIGN KEY(message_id) REFERENCES messages(id));
         CREATE TABLE IF NOT EXISTS resources (
           name TEXT PRIMARY KEY, owner_session TEXT, reservation_id TEXT UNIQUE,
@@ -177,6 +179,10 @@ class Coordinator:
         CREATE TABLE IF NOT EXISTS resource_queue (
           seq INTEGER PRIMARY KEY AUTOINCREMENT, resource TEXT NOT NULL,
           session TEXT NOT NULL, queued_at REAL NOT NULL, UNIQUE(resource, session));
+        CREATE TABLE IF NOT EXISTS reservation_renewals (
+          reservation_id TEXT PRIMARY KEY,
+          successes INTEGER NOT NULL CHECK(successes BETWEEN 1 AND 4),
+          extra_minutes REAL NOT NULL CHECK(extra_minutes > 0 AND extra_minutes <= 120));
         CREATE TABLE IF NOT EXISTS receipts (
           reservation_id TEXT PRIMARY KEY, receipt_sha256 TEXT UNIQUE NOT NULL,
           evidence_sha256 TEXT NOT NULL, receipt_json TEXT NOT NULL, action TEXT NOT NULL, recorded_at REAL NOT NULL);
@@ -186,8 +192,49 @@ class Coordinator:
           closed_at REAL);
         INSERT OR IGNORE INTO meta(key,value) VALUES('schema_version','1');
         """)
+        self._migrate_message_reads()
         version = self.db.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
         if version != "1": raise CoordError("unsupported coordinator schema version")
+
+    def _migrate_message_reads(self) -> None:
+        """Preserve historic receipt rows without mistaking them for full reads.
+
+        Earlier versions could write the same row for acknowledgement/reply
+        bookkeeping.  The table held no origin field, so those records are
+        deliberately retained as ``legacy_unknown`` rather than promoted to
+        recipient-body or full-context evidence.
+        """
+        columns = self.db.execute("PRAGMA table_info(message_reads)").fetchall()
+        names = {row['name'] for row in columns}
+        composite = {row['name']: row['pk'] for row in columns}.get('message_id') == 1 and \
+            {row['name']: row['pk'] for row in columns}.get('reader_session') == 2
+        if names == {'message_id', 'reader_session', 'read_at', 'provenance'} and composite:
+            return
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # Record routing history once, in the same transaction as provenance migration.
+            # This archives prior ACKs; it never invents recipient consumption evidence.
+            self.db.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('message_delivery_archive_before',?)",
+                            (str(_now()),))
+            self.db.execute('''CREATE TABLE message_reads_migrating (
+                message_id TEXT NOT NULL, reader_session TEXT NOT NULL, read_at REAL NOT NULL,
+                provenance TEXT NOT NULL,
+                PRIMARY KEY(message_id,reader_session),
+                FOREIGN KEY(message_id) REFERENCES messages(id))''')
+            if {'message_id', 'reader_session', 'read_at'}.issubset(names):
+                # Every legacy marker is intentionally unknown: its original
+                # producer may have been an ACK/reply route rather than a body read.
+                self.db.execute('''INSERT INTO message_reads_migrating
+                    (message_id,reader_session,read_at,provenance)
+                    SELECT message_id,reader_session,read_at,'legacy_unknown'
+                    FROM message_reads''')
+            self.db.execute('DROP TABLE message_reads')
+            self.db.execute('ALTER TABLE message_reads_migrating RENAME TO message_reads')
+        except BaseException:
+            self.db.rollback()
+            raise
+        else:
+            self.db.commit()
 
     @contextlib.contextmanager
     def tx(self, observer=None) -> Iterator[sqlite3.Connection]:
@@ -199,6 +246,8 @@ class Coordinator:
             raise
         if observer: observer.mark('transaction_acquire', 'end')
         observed_at = _now()
+        observed_expiries = []
+        self._tx_observed_expiries = observed_expiries
         if observer: observer.mark('transaction_held', 'start')
         try:
             self.db.execute(
@@ -207,15 +256,24 @@ class Coordinator:
             )
             yield self.db
         except BaseException:
+            self._tx_observed_expiries = None
             self.db.rollback()
             # A refused operation must not undo an already-observed expiry.
             self.db.execute(
                 "UPDATE resources SET stale=1 WHERE owner_session IS NOT NULL AND deadline<?",
                 (observed_at,),
             )
+            # _row can first observe expiry after transaction entry. Retain
+            # only that exact pre-existing grant, not rolled-back new writes.
+            self.db.executemany(
+                "UPDATE resources SET stale=1 WHERE name=? AND owner_session=? "
+                "AND reservation_id=? AND token=? AND deadline=?",
+                observed_expiries,
+            )
             if observer: observer.mark('transaction_held', 'end', 'error')
             raise
         else:
+            self._tx_observed_expiries = None
             self.db.commit()
             if observer: observer.mark('transaction_held', 'end')
 
@@ -346,14 +404,18 @@ class Coordinator:
         return {"removed": session_id, "agent": agent_name}
 
     def _fresh(self, db: sqlite3.Connection, session: str) -> None:
+        # Prior ACKs are archival scheduling state; new ACKs never prove a read.
+        # Privileged consumption remains separate and requires genuine provenance.
         assert_reset_unlocked(db, session)
         row = db.execute("SELECT inbox_read_seq FROM sessions WHERE id=?", (session,)).fetchone()
         latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (session,)).fetchone()["n"]
         if row is None: raise CoordError("unknown session")
         unseen = db.execute(
-            "SELECT 1 FROM messages m WHERE m.recipient_session=? AND m.seq>? AND m.acked_at IS NULL "
-            "AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id AND r.reader_session=?) LIMIT 1",
-            (session, row["inbox_read_seq"], session)).fetchone()
+            "SELECT 1 FROM messages m WHERE m.recipient_session=? "
+            "AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id "
+            "AND r.reader_session=m.recipient_session "
+            "AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (m.acked_at IS NOT NULL AND m.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1)) LIMIT 1",
+            (session,)).fetchone()
         if unseen:
             raise CoordError("read your inbox after the newest message before changing ownership")
         if row["inbox_read_seq"] < latest:
@@ -446,7 +508,7 @@ class Coordinator:
         with self.tx(observer=observer) as db:
             if observer: observer.mark('inbox_query', 'start')
             try:
-                rows = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages WHERE recipient_session=? " + ("ORDER BY seq" if all_messages else "AND acked_at IS NULL ORDER BY seq"), (sid,)).fetchall()
+                rows = db.execute("SELECT id,sender_session,recipient_session,body,created_at,acked_at,seq FROM messages WHERE recipient_session=? " + ("ORDER BY seq" if all_messages else "AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id AND r.reader_session=messages.recipient_session AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (messages.acked_at IS NOT NULL AND messages.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1)) ORDER BY seq"), (sid,)).fetchall()
                 latest = db.execute("SELECT COALESCE(MAX(seq),0) n FROM messages WHERE recipient_session=?", (sid,)).fetchone()["n"]
                 db.execute("UPDATE sessions SET inbox_read_seq=? WHERE id=?", (latest, sid))
                 messages = self._message_dicts(db, rows)
@@ -500,7 +562,7 @@ class Coordinator:
             raise CoordError("resources must be a list of nonempty strings")
         named_resources = [] if resources is None else list(dict.fromkeys(self.resource_name(value) for value in resources))
         with self.tx() as db:
-            clauses = ["recipient_session=?", "acked_at IS NULL"]
+            clauses = ["recipient_session=?", "NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=messages.id AND r.reader_session=messages.recipient_session AND r.provenance IN ('recipient_full_message','recipient_context_full')) AND NOT (messages.acked_at IS NOT NULL AND messages.acked_at <= COALESCE(CAST((SELECT value FROM meta WHERE key='message_delivery_archive_before') AS REAL),-1))"]
             args: list[Any] = [sid]
             if cursor is not None:
                 clauses.append("seq>?")
@@ -597,8 +659,10 @@ class Coordinator:
                 result["cursor"] = row["seq"]
                 result["truncated"] = result["truncated"] or candidate["body_truncated"]
                 if not candidate["body_truncated"]:
-                    db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
-                               (row["id"], sid, _now()))
+                    db.execute("""INSERT INTO message_reads(message_id,reader_session,read_at,provenance) VALUES(?,?,?,?)
+                        ON CONFLICT(message_id,reader_session) DO UPDATE SET read_at=excluded.read_at,
+                          provenance=excluded.provenance WHERE message_reads.provenance='legacy_unknown'""",
+                               (row["id"], sid, _now(), 'recipient_context_full'))
             if len(result["messages"]) < len(rows):
                 result["has_more"] = True
             return result
@@ -613,9 +677,44 @@ class Coordinator:
                              "WHERE id=? AND recipient_session=?", (message_id, sid)).fetchone()
             if row is None:
                 raise CoordError("message is not in caller inbox")
-            db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
-                       (message_id, sid, _now()))
+            db.execute("""INSERT INTO message_reads(message_id,reader_session,read_at,provenance) VALUES(?,?,?,?)
+                ON CONFLICT(message_id,reader_session) DO UPDATE SET read_at=excluded.read_at,
+                  provenance=excluded.provenance WHERE message_reads.provenance='legacy_unknown'""",
+                       (message_id, sid, _now(), 'recipient_full_message'))
             return {"message": self._message_dicts(db, [row])[0]}
+
+    def private_inbox_attachment(self, attachment_id: str, *, operator_sender: bool = False) -> dict[str, Any]:
+        """Return one validated direct-message attachment owned by this inbox."""
+        sid = self.require_session()
+        valid_id = (isinstance(attachment_id, str) and attachment_id.startswith("attachment_")
+                    and len(attachment_id) > len("attachment_")
+                    and all(char.isalnum() or char in "_-" for char in attachment_id))
+        if not valid_id:
+            raise CoordError("attachment is not in caller private inbox")
+        with self.tx() as db:
+            if not self._has_attachments(db):
+                raise CoordError("attachment is not in caller private inbox")
+            row = db.execute(
+                """SELECT a.id,a.name,a.mime,a.size,a.content,m.id AS message_id,m.sender_session
+                     FROM attachments a JOIN messages m ON m.id=a.message_id
+                     WHERE a.id=? AND m.recipient_session=?
+                       AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
+                       AND (?=0 OR EXISTS (
+                           SELECT 1 FROM operator_identities o WHERE o.session_id=m.sender_session))""",
+                (attachment_id, sid, int(operator_sender)),
+            ).fetchone()
+            if row is None:
+                raise CoordError("attachment is not in caller private inbox")
+            content = bytes(row["content"])
+            if (isinstance(row["size"], bool) or not isinstance(row["size"], int)
+                    or row["size"] != len(content) or not 0 < len(content) <= MAX_ATTACHMENT_SIZE):
+                raise CoordError("stored attachment size is invalid")
+            name, mime, _ = self._prepare_attachment(row["name"], content)
+            if name != row["name"] or mime != row["mime"]:
+                raise CoordError("stored attachment metadata is invalid")
+            return {"attachment_id": row["id"], "message_id": row["message_id"],
+                    "name": name, "mime": mime, "size": len(content),
+                    "sha256": hashlib.sha256(content).hexdigest(), "content": content}
 
     @staticmethod
     def _image_mime(content: bytes) -> str | None:
@@ -779,8 +878,6 @@ class Coordinator:
                 metadata.append({"id": attachment_id, "name": name, "mime": mime, "size": len(content), "url": "/api/attachments/" + attachment_id})
             if ack_reply:
                 db.execute("UPDATE messages SET acked_at=COALESCE(acked_at,?) WHERE id=?", (_now(), reply_to))
-                db.execute("INSERT OR IGNORE INTO message_reads(message_id,reader_session,read_at) VALUES(?,?,?)",
-                           (reply_to, sid, _now()))
                 db.execute("INSERT INTO reply_ack_idempotency(sender_session,reply_to,fingerprint,message_id) VALUES(?,?,?,?)",
                            (sid, reply_to, fingerprint, mid))
         preview = None if parent is None else {"id": parent["id"], "seq": parent["seq"],
@@ -936,9 +1033,16 @@ class Coordinator:
     def _row(self, db: sqlite3.Connection, resource: str) -> sqlite3.Row | None:
         r = db.execute("SELECT * FROM resources WHERE name=?", (resource,)).fetchone()
         if r and r["owner_session"] and not r["stale"] and r["deadline"] < _now():
-            db.execute("UPDATE resources SET stale=1 WHERE name=?",(resource,))
+            self._latch_expiry(db, r)
             r=db.execute("SELECT * FROM resources WHERE name=?",(resource,)).fetchone()
         return r
+
+    def _latch_expiry(self, db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        observed = getattr(self, '_tx_observed_expiries', None)
+        if observed is not None:
+            observed.append(tuple(row[key] for key in
+                                  ('name', 'owner_session', 'reservation_id', 'token', 'deadline')))
+        db.execute("UPDATE resources SET stale=1 WHERE name=?", (row['name'],))
 
     @staticmethod
     def _state(r: sqlite3.Row | None) -> str:
@@ -961,7 +1065,10 @@ class Coordinator:
             self._fresh(db,sid); r = self._row(db,resource)
             if r and r["owner_session"] == sid:
                 st=self._state(r)
-                if st == "stale": raise CoordError("your reservation is stale; release or recover it with a receipt")
+                if st == "stale":
+                    if not r['stale']:
+                        self._latch_expiry(db, r)
+                    raise CoordError("your reservation is stale; release or recover it with a receipt")
                 return self._reservation_result(r, "owned", 0)
             assert_agent_running(db, sid)
             first = db.execute("SELECT session FROM resource_queue WHERE resource=? ORDER BY seq LIMIT 1", (resource,)).fetchone()
@@ -975,10 +1082,75 @@ class Coordinator:
             pos=db.execute("SELECT COUNT(*) n FROM resource_queue WHERE resource=? AND seq <= (SELECT seq FROM resource_queue WHERE resource=? AND session=?)", (resource,resource,sid)).fetchone()["n"]
             return {"state":"queued","resource":resource,"reservation_id":None,"token":None,"deadline":None,"queue_position":pos}
 
+    def renew(self, raw: str, minutes: float, reservation_id: str, token: str,
+              *, host_id: str) -> dict[str, Any]:
+        """Explicitly extend one live owner lease without changing its grant."""
+        if (isinstance(minutes, bool) or not isinstance(minutes, (int, float))
+                or not 1 <= minutes <= 30 or not math.isfinite(minutes)):
+            raise CoordError('renewal minutes must be finite and between 1 and 30')
+        if any(not isinstance(value, str) or not value for value in (reservation_id, token, host_id)):
+            raise CoordError('renewal requires an exact reservation, token and registered host')
+        sid, resource = self.require_session(), self.resource_name(raw)
+        if __package__:
+            from .root_orchestrator import projection
+            if projection(self.db, sid):
+                raise CoordError('global root is control-only; delegate exact resource work to the project orchestrator')
+        # Preserve the ordinary irreversible observation of actual expiry.
+        with self.tx() as db:
+            self._fresh(db, sid)
+            assert_agent_running(db, sid)
+            if __package__:
+                from .root_team_reset import quarantined
+                if quarantined(db, session=sid):
+                    raise CoordError('session is quarantined by team reset')
+            if db.execute('SELECT 1 FROM retired_sessions WHERE id=?', (sid,)).fetchone():
+                raise CoordError('session is retired')
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_session_hosts'").fetchone():
+                raise CoordError('renewal requires the existing registered host binding')
+            host = db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (sid,)).fetchone()
+            if not host or host['host_id'] != host_id:
+                raise CoordError('renewal registered host binding differs')
+            row = self._verify_owner(db, resource, sid, token)
+            if row['reservation_id'] != reservation_id:
+                raise CoordError('renewal reservation_id does not match')
+            remaining = row['deadline'] - _now()
+            if not 0 < remaining <= 600:
+                if remaining < 0:
+                    self._latch_expiry(db, row)
+                raise CoordError('renewal requires an unexpired lease with at most 10 minutes remaining')
+            if db.execute('SELECT 1 FROM resource_queue WHERE resource=? LIMIT 1', (resource,)).fetchone():
+                raise CoordError('renewal refused while a FIFO claimant is queued')
+            # Local guards have no registered host binding. Do not infer one
+            # from their PIDs or turn an extension into closure evidence.
+            if db.execute('SELECT 1 FROM guarded_runs WHERE closed_at IS NULL AND (resource=? OR reservation_id=?)',
+                          (resource, reservation_id)).fetchone():
+                raise CoordError('renewal refused for an unbound local guarded run')
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_guarded_runs'").fetchone():
+                guards = db.execute('SELECT * FROM remote_guarded_runs WHERE closed_at IS NULL AND (resource=? OR reservation_id=?)',
+                                    (resource, reservation_id)).fetchall()
+                if any((guard['resource'], guard['reservation_id'], guard['session_id'], guard['host_id']) !=
+                       (resource, reservation_id, sid, host_id) for guard in guards):
+                    raise CoordError('renewal refused for a conflicting guarded-run binding')
+            used = db.execute('SELECT successes,extra_minutes FROM reservation_renewals WHERE reservation_id=?',
+                              (reservation_id,)).fetchone()
+            count, extra = (used['successes'], used['extra_minutes']) if used else (0, 0)
+            if count >= 4 or extra + minutes > 120:
+                raise CoordError('reservation renewal budget is exhausted')
+            db.execute('UPDATE resources SET deadline=deadline+? WHERE name=?', (minutes * 60, resource))
+            db.execute('INSERT INTO reservation_renewals VALUES(?,?,?) ON CONFLICT(reservation_id) DO UPDATE '
+                       'SET successes=excluded.successes,extra_minutes=excluded.extra_minutes',
+                       (reservation_id, count + 1, extra + minutes))
+            renewed = db.execute('SELECT * FROM resources WHERE name=?', (resource,)).fetchone()
+            return dict(self._reservation_result(renewed, 'owned', 0),
+                        renewal_count=count + 1, renewal_minutes=extra + minutes)
+
     def _reservation_result(self,r: sqlite3.Row,state:str,pos:int)->dict[str,Any]:
         return {"state":state,"resource":r["name"],"reservation_id":r["reservation_id"],"token":r["token"],"deadline":r["deadline"],"queue_position":pos}
 
     def _resource_status(self, db: sqlite3.Connection, r: sqlite3.Row) -> dict[str, Any]:
+        state = self._state(r)
+        if state == 'stale' and not r['stale']:
+            self._latch_expiry(db, r)
         owner = None
         if r["owner_session"]:
             s = db.execute("SELECT agent FROM sessions WHERE id=?", (r["owner_session"],)).fetchone()
@@ -987,7 +1159,7 @@ class Coordinator:
             db.execute("SELECT q.session,s.agent FROM resource_queue q JOIN sessions s ON s.id=q.session "
                        "WHERE q.resource=? ORDER BY q.seq", (r["name"],)).fetchall())]
         return {"resource": r["name"], "owner_session": r["owner_session"], "owner_agent": owner,
-                "state": self._state(r), "reservation_id": r["reservation_id"], "deadline": r["deadline"],
+                "state": state, "reservation_id": r["reservation_id"], "deadline": r["deadline"],
                 "reason": r["reason"], "queue": q}
 
     def retained_reservation_result(self, db: sqlite3.Connection, resource: str,
@@ -1042,7 +1214,11 @@ class Coordinator:
     def _verify_owner(self,db:sqlite3.Connection,resource:str,sid:str,token:str, allow_stale:bool=False)->sqlite3.Row:
         r=self._row(db,resource)
         if not r or r["owner_session"]!=sid or not secrets.compare_digest(r["token"] or "",token or ""): raise CoordError("caller does not hold this reservation token")
-        if not allow_stale and self._state(r)!="owned": raise CoordError("reservation is stale")
+        if not allow_stale and self._state(r)!="owned":
+            if not r['stale']:
+                # _state's clock read may be the first actual expiry observation.
+                self._latch_expiry(db, r)
+            raise CoordError("reservation is stale")
         return r
 
     def check(self,raw:str,token:str,*,require_fresh:bool=True)->dict[str,Any]:
@@ -1167,7 +1343,8 @@ class ValidationGuard:
     def __enter__(self)->"ValidationGuard":
         try:
             self._emit_inbox()
-            self.run_id, _ = self.coord.begin_guard(self.resource,self.token,os.getpid())
+            self.run_id, reservation = self.coord.begin_guard(self.resource,self.token,os.getpid())
+            self.reservation_id = reservation['reservation_id']
             return self
         except BaseException:
             self.coord.close()
@@ -1175,8 +1352,17 @@ class ValidationGuard:
     def pulse(self)->None:
         self._emit_inbox();self.coord.check(self.resource,self.token,require_fresh=False)
     def __exit__(self,typ:Any,val:Any,tb:Any)->bool:
-        if self.run_id and self.safe_to_close: self.coord.close_guard(self.run_id)
-        self.coord.close();return False
+        try:
+            if self.run_id and self.safe_to_close:
+                evidence = getattr(self, 'evidence', None)
+                if evidence: evidence.record('guard_close_started', run_id=self.run_id)
+                self.coord.close_guard(self.run_id)
+                if evidence: evidence.record('guard_close_succeeded', run_id=self.run_id)
+        finally:
+            evidence = getattr(self, 'evidence', None)
+            if evidence: evidence.close()
+            self.coord.close()
+        return False
 
 
 def validation_guard(resource:str="validation-clone") -> ValidationGuard:
@@ -1193,6 +1379,19 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
         raise CoordError("run requires a command after --")
     guard = ValidationGuard(a.resource, _token(a), str(c.path), c.session)
     with guard:
+        if __package__:
+            from .private_artifacts import artifact_path, ProcessEvidence
+        else:
+            from private_artifacts import artifact_path, ProcessEvidence
+        guard.safe_to_close = False
+        evidence = ProcessEvidence(artifact_path('process-evidence', guard.run_id),
+                                  runner_pid=os.getpid(), runner_pgid=os.getpgrp(),
+                                  session_id=c.session, resource=c.resource_name(a.resource),
+                                  reservation_id=guard.reservation_id, run_id=guard.run_id,
+                                  host_id=__import__('socket').gethostname(),
+                                  coverage='instrumented_process_group_only', transport='local')
+        guard.evidence = evidence
+        evidence.record('admitted')
         resolved_db = str(c.path.resolve())
         resolved_session = c.session or ""
         resolved_token = _token(a)
@@ -1226,9 +1425,12 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
                 previous_handlers[sig] = signal.signal(sig, forward)
             if interrupted:
                 raise CoordError("command interrupted before launch")
+            evidence.record('child_launch_started')
             proc = subprocess.Popen(command, start_new_session=True, env=env)
+            evidence.record('child_created', child_pid=proc.pid, child_pgid=proc.pid)
             guard.safe_to_close = False
             c.attach_group(guard.run_id or "", proc.pid)
+            evidence.record('group_attached', child_pgid=proc.pid)
             last_poll = 0.0
             while proc.poll() is None:
                 if interrupted:
@@ -1238,6 +1440,7 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
                     last_poll = time.monotonic()
                 time.sleep(.1)
             code = proc.wait()
+            evidence.record('leader_reaped', child_pid=proc.pid, returncode=code)
             if interrupted:
                 raise CoordError("command interrupted; owned process group closed")
         finally:
@@ -1260,7 +1463,9 @@ def run_command(c: Coordinator, a: argparse.Namespace) -> dict[str, Any]:
                     if Coordinator._alive(proc.pid, True):
                         raise CoordError("could not prove command group was closed; reservation retained")
                     proc.wait(timeout=1)
-                guard.safe_to_close = True
+                    evidence.record('leader_reaped', child_pid=proc.pid, returncode=proc.returncode)
+                    evidence.record('group_absent', child_pgid=proc.pid)
+                guard.safe_to_close = not evidence.failed
             finally:
                 for sig, handler in previous_handlers.items():
                     signal.signal(sig, handler)
