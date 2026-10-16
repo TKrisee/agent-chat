@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import time
 from pathlib import Path
 
 from .core import CoordError
@@ -36,12 +37,32 @@ class WakePayloadTooLarge(CoordError):
     pass
 
 
+class _PolicyHistoryRpc:
+    """One optional page costs at most a list probe and its legacy readback."""
+    def __init__(self,rpc,snapshot=None):
+        self.rpc,self.snapshot=rpc,snapshot
+        self.requests=0
+        self.readback=None
+
+    def request(self,method,params):
+        fallback=method=='thread/read' and params.get('includeTurns') is True
+        if fallback and self.snapshot is not None: return self.snapshot
+        if self.requests>=2: raise CoordError('optional policy history request budget exhausted')
+        self.requests+=1
+        result=self.rpc.request(method,params)
+        if fallback: self.readback=result
+        return result
+
+
 class Bridge:
     def __init__(self, state, rpc):
         self.state = state
         self.rpc = rpc
         self._history_pages = {}
         self._in_tick = False
+        self._policy_scans = {}
+        self._policy_last_thread = None
+        self._policy_clock = time.monotonic
         from .capacity_recovery import CapacityWorker
         self.capacity_worker = CapacityWorker(self)
 
@@ -65,11 +86,11 @@ class Bridge:
         self.state.observe(thread_id, status if status != 'idle' or direct else 'direct_input_unavailable')
         return status == 'idle' and direct
 
-    def history_page(self, params):
+    def history_page(self, params, *, rpc=None):
         key=(params['threadId'],params.get('cursor'))
         if key not in self._history_pages:
             from .native_history import turns_page
-            page=turns_page(self.rpc,params)
+            page=turns_page(rpc or self.rpc,params)
             if not isinstance(page,dict) or not isinstance(page.get('data'),list):
                 raise CoordError('native history page unavailable for policy/reconciliation')
             if any(not isinstance(turn,dict) or not isinstance(turn.get('items',[]),list)
@@ -254,27 +275,71 @@ class Bridge:
         except (CoordError,sqlite3.Error,OSError):
             pass  # Optional cache failure remains cold; never replay native input.
 
-    def observe_policies(self):
-        self._history_pages.clear()
+    def observe_policies(self, *, offers=None, scans=None, receipt=None):
+        # Optional proof collection follows ready work. One fair page per tick
+        # prevents unloaded/stale threads from monopolizing native RPCs.
+        if not self._in_tick: self._history_pages.clear()
         if not hasattr(self.state,'policy_pending'): return
-        offers=self.state.policy_pending()
-        for thread in {offer['thread'] for offer in offers}:
-            by_client={offer['client_id']:offer for offer in offers if offer['thread']==thread}
-            cursor=None
-            for _ in range(4):
-                params=dict(threadId=thread,limit=25,itemsView='summary',sortDirection='desc')
-                if cursor: params['cursor']=cursor
-                try: page=self.history_page(params)
-                except (RpcError,CoordError): break  # Unavailable evidence keeps policy cold.
-                for turn in page['data']:
-                    if not isinstance(turn.get('id'),str) or not turn['id']: continue
-                    for item in turn.get('items',[]):
-                        offer=by_client.get(item.get('clientId')) if item.get('type')=='userMessage' and isinstance(item.get('clientId'),str) else None
-                        if offer: self.state.policy_receipt(offer,turn['id'])
-                cursor=page.get('nextCursor')
-                if not cursor: break
+        from .communication import policy_version
+        groups={};version=policy_version()
+        for offer in self.state.policy_pending() if offers is None else offers:
+            if offer['version']==version:
+                groups.setdefault(offer['thread'],{})[offer['client_id']]=offer
+        if scans is None:
+            self._policy_scans={thread:scan for thread,scan in self._policy_scans.items() if thread in groups and scan['version']==version}
+            scans=self._policy_scans
+        now=self._policy_clock();eligible=[]
+        for thread,by_client in groups.items():
+            scan=scans.setdefault(thread,dict(version=version,cursor=None,clients=set(by_client),retry_at=0,snapshot=None))
+            if scan['version']!=version:
+                scan=dict(version=version,cursor=None,clients=set(by_client),retry_at=0,snapshot=None)
+                scans[thread]=scan
+            # New input may restart an ended scan promptly, but never reset an
+            # in-progress cohort and starve evidence beyond its newest pages.
+            if scan['cursor'] is None and set(by_client)-scan['clients']:
+                scan.update(clients=set(by_client),retry_at=0,snapshot=None)
+            if scan['retry_at']<=now: eligible.append(thread)
+        if not eligible: return
+        ordered=sorted(eligible)
+        thread=next((t for t in ordered if self._policy_last_thread is None or t>self._policy_last_thread),ordered[0])
+        self._policy_last_thread=thread
+        scan=scans[thread];by_client=groups[thread]
+        params=dict(threadId=thread,limit=25,itemsView='summary',sortDirection='desc')
+        if scan['cursor']: params['cursor']=scan['cursor']
+        native=_PolicyHistoryRpc(self.rpc,scan['snapshot'])
+        try:
+            page=self.history_page(params,rpc=native)
+            following=page.get('nextCursor')
+            if following is not None and (not isinstance(following,str) or not following or following==scan['cursor']):
+                raise CoordError('optional policy history cursor is invalid or stalled')
+            if native.readback is not None:
+                # turns_page already validated the complete legacy readback.
+                # Retain only exact proof fields until this scan ends; paging
+                # it must not refetch the full native transcript every tick.
+                scan['snapshot']=dict(thread=dict(id=thread,turns=[dict(id=turn['id'],status=turn['status'],items=[
+                    dict(type='userMessage',clientId=item['clientId']) for item in turn['items']
+                    if item.get('type')=='userMessage' and isinstance(item.get('clientId'),str)])
+                    for turn in native.readback['thread']['turns']]))
+            for turn in page['data']:
+                if not isinstance(turn.get('id'),str) or not turn['id']: continue
+                for item in turn.get('items',[]):
+                    client=item.get('clientId')
+                    offer=by_client.get(client) if item.get('type')=='userMessage' and isinstance(client,str) and client in scan['clients'] else None
+                    if offer:
+                        (receipt or self.state.policy_receipt)(offer,turn['id'])
+                        scans.pop(thread,None)
+                        return thread
+            scan['cursor']=following
+            if not following:
+                scan.update(retry_at=self._policy_clock()+30 if set(by_client)<=scan['clients'] else 0,clients=set(by_client),snapshot=None)
+        except (RpcError,CoordError,sqlite3.Error,OSError) as error:
+            scan['retry_at']=self._policy_clock()+30
+            if isinstance(error,TransportError): raise  # Reconnect without replay.
+            # Optional cache/history failures leave policy cold; ready work has
+            # already run and other threads retain their next fair opportunity.
+        return thread
 
-    def tick(self):
+    def tick(self, *, observe_policies=True):
         self._in_tick=True
         self._history_pages.clear()
         errors = []
@@ -289,8 +354,6 @@ class Bridge:
                 # If Codex is unavailable, let reconnect fail into poll backoff.
                 self.rpc.close()
                 self.rpc.connect()
-        try: self.observe_policies()
-        except (CoordError,sqlite3.Error,TransportError) as error: record(error)
         if hasattr(self.state, 'root_fresh_jobs'):
             from .root_restart import RootRestartWorker
             for job in self.state.root_fresh_jobs():
@@ -349,6 +412,9 @@ class Bridge:
                 self.state.observe(thread_id, 'error', str(error))
                 continue  # e.g. binding not yet resumed on this server
             except (CoordError, sqlite3.Error, TransportError) as error: record(error, thread_id)
+        if observe_policies:
+            try: self.observe_policies()
+            except (RpcError,CoordError,sqlite3.Error,OSError,TransportError) as error: record(error)
         # Report the error after giving independent conversations a
         # chance to dispatch. Never clear or retry ambiguous durable intentions.
         self._in_tick=False

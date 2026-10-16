@@ -70,7 +70,8 @@ class _Bridge:
     def __init__(self, state, rpc):
         self.state, self.rpc = state, rpc
 
-    def tick(self):
+    def tick(self, *, observe_policies=True):
+        if observe_policies: raise AssertionError('host must defer per-project policy scans')
         self.ticks.append(self.state.client.project)
         if self.fail_default and self.state.client.project == 'default':
             raise CoordError('default unavailable')

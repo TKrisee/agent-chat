@@ -336,6 +336,40 @@ class RemoteRunTests(RemoteWebFixture):
             result = cli.main(self.capability_args(args))
         return result, output.getvalue(), errors.getvalue()
 
+    def test_completed_command_skips_polling_network_round(self):
+        original_popen, original_sleep = subprocess.Popen, time.sleep
+        original_call = HttpClient.call
+        children, operations = [], []
+
+        def launch(command, *args, **kwargs):
+            child = original_popen(command, *args, **kwargs)
+            if command[0] == sys.executable:
+                children.append(child)
+            return child
+
+        def finish_during_poll_wait(seconds):
+            if seconds == 0.5 and children:
+                children[-1].wait(timeout=5)
+            else:
+                original_sleep(seconds)
+
+        def capture(client, path, payload, **kwargs):
+            operations.append(payload['op'])
+            if payload['op'] in ('inbox', 'guard-pulse'):
+                raise RemoteCoordError('finished command reached blocking polling RPC')
+            return original_call(client, path, payload, **kwargs)
+
+        with (mock.patch.object(subprocess, 'Popen', launch),
+              mock.patch.object(time, 'sleep', finish_during_poll_wait),
+              mock.patch.object(HttpClient, 'call', capture)):
+            result, _ = self.invoke('run', 'shared', '--', sys.executable, '-c', 'pass')
+
+        self.assertEqual(result, 0)
+        self.assertEqual(operations, ['begin-guard', 'attach-guard-pid', 'close-guard'])
+        run = self.runs()[0]
+        self.assertIsNotNone(run['closed_at'])
+        self.assert_group_dead(run['local_pid'])
+
     def lifecycle_query(self, output, expression, *args):
         result = subprocess.run(['jq', '-ser', *args, expression], input=output,
                                 text=True, capture_output=True, check=False)

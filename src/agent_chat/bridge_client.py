@@ -179,6 +179,63 @@ def _codex_environment(args, api_token):
     return environment
 
 
+class HostPolicyScheduler:
+    """One optional native history page after every project's ready work.
+
+    Project rotation prevents a large project monopolizing the slot. Aliases
+    share native-thread scan progress/backoff, without sharing inbox content.
+    """
+    def __init__(self):
+        self.scans={}
+        self.last_project=None
+
+    def observe(self,records,projects):
+        offers={};errors=[]
+        for project in projects:
+            record=records.get(project)
+            if not record or not record['ready'] or not hasattr(record['state'],'policy_pending'): continue
+            try:
+                pending=record['state'].policy_pending()
+                if not isinstance(pending,list) or any(not isinstance(offer,dict) or any(not isinstance(offer.get(key),str) or not offer[key] for key in ('thread','version','client_id')) for offer in pending):
+                    raise CoordError('optional policy metadata is malformed')
+                offers[project]=pending
+            except (CoordError,RpcError,OSError,ValueError,KeyError,TypeError) as error:
+                errors.append((project,error))
+        # Failed metadata reads preserve unknown scan progress. Successful
+        # removal of every route may retire only this in-memory scan cache.
+        from .communication import policy_version
+        version=policy_version()
+        combined={};owners={}
+        for project,pending in offers.items():
+            for offer in pending:
+                if offer['version']!=version: continue
+                key=(offer['thread'],offer['client_id'],offer['version'])
+                combined.setdefault(key,offer)
+                if key not in owners or offer.get('project')==project:
+                    owners[key]=records[project]['state']
+        active={offer['thread'] for offer in combined.values()}
+        self.scans={thread:scan for thread,scan in self.scans.items()
+                    if scan['version']==version and (errors or thread in active)}
+        ordered=sorted(offers)
+        ordered=[p for p in ordered if self.last_project is None or p>self.last_project]+[p for p in ordered if self.last_project is not None and p<=self.last_project]
+        def receipt(offer,turn):
+            return owners[(offer['thread'],offer['client_id'],offer['version'])].policy_receipt(offer,turn)
+        for project in ordered:
+            try:
+                threads={offer['thread'] for offer in offers[project] if offer['version']==version}
+                # A shared native cursor requires the complete current cohort,
+                # independent of which alias wins this cycle's fair slot.
+                cohort=[offer for offer in combined.values() if offer['thread'] in threads]
+                visited=records[project]['bridge'].observe_policies(offers=cohort,scans=self.scans,receipt=receipt)
+            except (CoordError,RpcError,OSError,ValueError,KeyError,TypeError) as error:
+                errors.append((project,error));self.last_project=project
+                break  # A failed native slot never starts a second attempt.
+            if visited:
+                self.last_project=project
+                break
+        return errors
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, prog='agent-chat-client bridge')
     parser.add_argument('--server', default=os.environ.get('AGENT_CHAT_SERVER'))
@@ -204,6 +261,7 @@ def main(argv=None):
     previous, stop, stack = {}, threading.Event(), contextlib.ExitStack()
     rpc, codex = None, None
     records = {}
+    policy_scheduler = HostPolicyScheduler()
     usage_notice = None
     try:
         registry = HttpClient(args.server, args.api_token, project='default')
@@ -237,6 +295,18 @@ def main(argv=None):
             state = RemoteBridgeState(client, args.server.rstrip('/'), identity)
             records[project] = {'state': state, 'bridge': Bridge(state, rpc), 'acquired': False,
                                 'last_error': None, 'ready': False}
+
+        def project_error(project,record,error):
+            rpc.close()
+            record['ready'] = False
+            text = str(error)
+            if text != record['last_error']:
+                print(json.dumps({'bridge': 'waiting', 'project': project, 'error': text}),
+                      file=sys.stderr, flush=True)
+            record['last_error'] = text
+            if record['acquired']:
+                try: record['state'].heartbeat(args.codex_server, os.getpid(), text)
+                except (CoordError, OSError, ValueError): pass
 
         while not stop.is_set():
             if codex is not None and codex.poll() is not None:
@@ -291,7 +361,7 @@ def main(argv=None):
                     state.call('acquire')
                     record['acquired'] = True
                     rpc.connect()
-                    record['bridge'].tick()
+                    record['bridge'].tick(observe_policies=False)
                     state.heartbeat(args.codex_server, os.getpid())
                     if codex is not None and codex.poll() is not None:
                         raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
@@ -301,19 +371,14 @@ def main(argv=None):
                     record['ready'] = True
                     record['last_error'] = None
                 except (CoordError, RpcError, TransportError, OSError, ValueError, KeyError, TypeError) as error:
-                    rpc.close()
                     any_error = True
-                    record['ready'] = False
-                    text = str(error)
-                    if text != record['last_error']:
-                        print(json.dumps({'bridge': 'waiting', 'project': project, 'error': text}),
-                              file=sys.stderr, flush=True)
-                    record['last_error'] = text
-                    if record['acquired']:
-                        try:
-                            state.heartbeat(args.codex_server, os.getpid(), text)
-                        except (CoordError, OSError, ValueError):
-                            pass
+                    project_error(project,record,error)
+            if not stop.is_set():
+                for project,error in policy_scheduler.observe(records,projects):
+                    any_error=True
+                    project_error(project,records[project],error)
+                if codex is not None and codex.poll() is not None:
+                    raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
             if args.once:
                 return 2 if any_error else 0
             stop.wait(args.interval)

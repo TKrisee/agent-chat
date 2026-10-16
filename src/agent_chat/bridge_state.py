@@ -35,6 +35,7 @@ class BridgeState:
         self.coord = coord
         self.db = coord.db
         self.policy_store = None
+        self.root_restart = None
         import socket
         self.policy_host = socket.gethostname()
         self.policy_project = str(coord.path.resolve())
@@ -58,6 +59,23 @@ class BridgeState:
             CREATE TABLE IF NOT EXISTS bridge_observations (
                 thread_id TEXT PRIMARY KEY, state TEXT NOT NULL,
                 error TEXT, checked_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS bridge_job_origins (
+                job_id TEXT PRIMARY KEY,prepared_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS bridge_job_native_attempts (
+                job_id TEXT PRIMARY KEY,recorded_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS bridge_root_wake_batches (
+                job_id TEXT PRIMARY KEY,request_id TEXT NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS bridge_job_native_attempt BEFORE UPDATE OF status ON bridge_jobs
+                WHEN NEW.status NOT IN ('prepared','cancelled')
+                BEGIN INSERT OR IGNORE INTO bridge_job_native_attempts VALUES(NEW.id,julianday('now')); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_bridge_job_origin_update BEFORE UPDATE ON bridge_job_origins
+                BEGIN SELECT RAISE(ABORT,'wake preparation provenance is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_bridge_job_origin_delete BEFORE DELETE ON bridge_job_origins
+                BEGIN SELECT RAISE(ABORT,'wake preparation provenance is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_bridge_job_attempt_update BEFORE UPDATE ON bridge_job_native_attempts
+                BEGIN SELECT RAISE(ABORT,'wake submission evidence is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS immutable_bridge_job_attempt_delete BEFORE DELETE ON bridge_job_native_attempts
+                BEGIN SELECT RAISE(ABORT,'wake submission evidence is immutable'); END;
         ''')
         if 'project_scope_worker' not in {row['name'] for row in self.db.execute('PRAGMA table_info(bridge_client_runtime)')}:
             self.db.execute('ALTER TABLE bridge_client_runtime ADD COLUMN project_scope_worker INTEGER NOT NULL DEFAULT 0')
@@ -173,6 +191,8 @@ class BridgeState:
         return [message for message in messages if not held(self.db,message['recipient_session']) and not stopped(self.db,message['recipient_session']) and not (projection(self.db, message['recipient_session']) or {}).get('paused')]
 
     def still_unread(self, job_id):
+        if self.is_root_batch(job_id):
+            return self.check_root_batch(job_id)
         return bool(self.db.execute('''SELECT 1 FROM bridge_deliveries d
             JOIN messages m ON m.id=d.message_id
             WHERE d.job_id=? AND NOT EXISTS (SELECT 1 FROM message_reads r WHERE r.message_id=m.id
@@ -181,6 +201,22 @@ class BridgeState:
               AND NOT EXISTS (SELECT 1 FROM agent_controls c WHERE c.target_session=m.recipient_session AND c.mode<>'running')
               AND (NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)
                    OR EXISTS (SELECT 1 FROM message_attention a WHERE a.message_id=m.id)) LIMIT 1''', (job_id,)).fetchone())
+
+    def check_root_batch(self, job_id, admit=False):
+        if not self.root_restart:
+            raise CoordError('root wake batch requires its authenticated root registry')
+        return self.root_restart.check_batch(job_id,self.root_project,self.root_host,admit=admit,local_state=self)
+
+    def is_root_batch(self,job_id):
+        return bool(self.db.execute('SELECT 1 FROM bridge_root_wake_batches WHERE job_id=?',(job_id,)).fetchone()
+            or (self.root_restart and self.root_restart.is_batch(job_id)))
+
+    def pristine(self, job_id):
+        return bool(self.db.execute('''SELECT 1 FROM bridge_jobs j JOIN bridge_job_origins o ON o.job_id=j.id
+            WHERE j.id=? AND j.status='prepared' AND j.queue_id IS NULL AND j.error IS NULL
+              AND NOT EXISTS (SELECT 1 FROM bridge_job_native_attempts a WHERE a.job_id=j.id)
+              AND NOT EXISTS (SELECT 1 FROM agent_control_requests r WHERE r.native_input_job_id=j.id)
+              AND NOT EXISTS (SELECT 1 FROM bridge_root_wake_batches b WHERE b.job_id=j.id)''',(job_id,)).fetchone())
 
     def wake_messages(self, thread_id, message_ids):
         """Bound direct-recipient content without reading or acknowledging inboxes.
@@ -255,6 +291,7 @@ class BridgeState:
                 return None
             self.db.execute('INSERT INTO bridge_jobs VALUES(?,?,?,?,?,?,?,?)',
                             (job_id, thread_id, payload, 'prepared', None, None, time.time(), time.time()))
+            self.db.execute('INSERT INTO bridge_job_origins VALUES(?,?)',(job_id,time.time()))
             self.db.executemany('INSERT INTO bridge_deliveries VALUES(?,?)', [(m['id'], job_id) for m in live])
             # Claim selection only with genuine managed input; never manufacture
             # a turn to change defaults. One request remains tied to one wake UUID.
@@ -297,6 +334,8 @@ class BridgeState:
     def update(self, job_id, status, queue_id=None, error=None):
         def write():
             if status in ('adding','starting'):
+                if self.is_root_batch(job_id):
+                    self.check_root_batch(job_id,admit=status)
                 from .root_lifecycle import stopped
                 if any(stopped(self.db,row['recipient_session']) for row in self.db.execute(
                     'SELECT m.recipient_session FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.job_id=?', (job_id,))):

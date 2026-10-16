@@ -919,6 +919,10 @@ def _remote_main(raw, global_args, server, runtime):
                 time.sleep(0.5)
                 if interrupted: raise core.CoordError('command interrupted; process group closed')
                 check_restoration_deadline()
+                # A short command may finish during the poll wait. Close its
+                # process group before doing another inbox/pulse network round.
+                if poll_group() is not None:
+                    break
                 messages = run_call('inbox', 'inbox', {})['messages']
                 fresh = [m for m in messages if m['id'] not in seen]
                 seen.update(m['id'] for m in messages)

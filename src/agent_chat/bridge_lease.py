@@ -140,6 +140,10 @@ class BridgeManager:
                 row['kind']==kind and row['job_id']==job['id'] and row['host_id']==host for row in handoff_pending(c.db))
         usage = self.usage_store.status(host) if self.usage_store else None
         state = BridgeState(c)
+        if self.roots:
+            from .root_restart import RootRestart
+            state.root_restart=RootRestart(self.roots)
+            state.root_project,state.root_host=self.project_id,host
         if op in ('root-fresh-jobs' ,'root-fresh-job','root-fresh-update'):
             from .root_restart import RootRestart
             restart = RootRestart(self.roots)

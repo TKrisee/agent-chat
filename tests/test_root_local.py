@@ -21,6 +21,7 @@ from agent_chat.measurement import MeasurementStore
 from agent_chat.projects import Projects
 from agent_chat.remote_service import dispatch
 from agent_chat.root_orchestrator import RootOrchestrator
+from agent_chat.supervisor import SupervisorState
 from agent_chat.web import Handler
 from agent_chat.web import operator_session
 
@@ -217,7 +218,7 @@ class RootLocalTests(unittest.TestCase):
         class NoDispatch:
             def root_action(self, value):
                 raise AssertionError('privileged Root HTTP dispatch must not occur')
-        for method in ('enroll', 'route', 'configure', 'fresh-start', 'stop-all'):
+        for method in ('enroll', 'route', 'configure', 'fresh-start', 'stop-all', 'pause-routing', 'resume-routing'):
             with self.subTest(method=method), self.assertRaisesRegex(CoordError, 'shared bearer permits only'):
                 Handler.shared_bearer_root_action(NoDispatch(),
                     dict(op=method, session='root', host_id='host', params={}))
@@ -320,6 +321,404 @@ class RootLocalTests(unittest.TestCase):
         self.assertEqual(result['projects'][0]['registration']['state'], 'unknown')
         self.assertFalse(target.exists())
         self.assertEqual(self.snapshot(), before)
+
+    def maintenance_fixture(self):
+        self.enroll()
+        project = self.projects.create('Maintenance retained target')['id']
+        self.roots.sync()
+        self.consume()
+        with contextlib.closing(Coordinator(self.projects.db_path(project))) as coord:
+            dispatch(coord, {'op': 'register', 'session': 'sender', 'host_id': 'host', 'params': {'agent': 'sender'}})
+            AgentControlState(coord)
+            alias = coord.db.execute('SELECT session_id FROM root_projections').fetchone()[0]
+            for identifier in ('message_prepared', 'message_unread'):
+                coord.db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
+                    (identifier, 'sender', alias, 'Synthetic retained Root input', time.time()))
+            self.assertIsNotNone(BridgeState(coord).prepare(self.thread,
+                [{'id': 'message_prepared', 'recipient_session': alias}], 'Synthetic retained wake'))
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            control = AgentControlState(coord)
+            request = str(uuid.uuid4())
+            control.request('root', self.thread, 'inspect', request, False)
+            control.update(request, 'pending', 'completed', observation={
+                'state': 'active', 'turn_id': 'current-root-turn', 'queue_count': 0,
+                'model': 'retained-model', 'reasoning_effort': 'high', 'cwd': str(self.neutral),
+                'permissions': {'runtimeWorkspaceRoots': [str(self.neutral)]}})
+        stop = str(uuid.uuid4())
+        self.call('stop-all', request_id=stop, confirm=True)
+        return project
+
+    def maintenance_state(self):
+        # Only the lifecycle journal, routing flags and its specifically
+        # receipted system completion message may vary.
+        result = {}
+        with self.projects.connection() as db:
+            result['root_projects'] = [tuple(row) for row in db.execute('SELECT * FROM root_projects ORDER BY project_id')]
+            result['root_config'] = {key: value for key, value in self.roots.config().items() if key != 'mode'}
+            for table in ('root_team_operations', 'root_team_operation_projects'):
+                result[table] = [tuple(row) for row in db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
+            projects = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+        for project in projects:
+            with contextlib.closing(sqlite3.connect(self.projects.db_path(project['project_id']))) as db:
+                for table in ('sessions', 'bridge_bindings', 'remote_session_hosts', 'messages', 'message_reads',
+                              'project_orchestrators', 'agent_controls', 'agent_control_requests',
+                              'agent_control_observations', 'agent_control_workspace_roots',
+                              'operator_identities', 'operator_message_origins',
+                              'bridge_jobs', 'bridge_deliveries', 'bridge_job_origins', 'bridge_job_native_attempts',
+                              'root_team_stops', 'root_team_stop_targets', 'root_team_stop_interrupts'):
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                        notice_filter = ''
+                        if table == 'messages' and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_root_routing_notices'").fetchone():
+                            notice_filter = ' WHERE id NOT IN (SELECT message_id FROM supervisor_root_routing_notices)'
+                        result[(project['project_id'], table)] = db.execute('SELECT * FROM ' + table + notice_filter + ' ORDER BY 1').fetchall()
+                result[(project['project_id'], 'projection')] = db.execute('SELECT session_id,home_project,home_session,thread_id,cwd,model,effort FROM root_projections').fetchall()
+        return result
+
+    def assert_routing_paused(self, expected):
+        with self.projects.connection() as db:
+            rows = list(db.execute('SELECT project_id,session_id FROM root_projects'))
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            with contextlib.closing(sqlite3.connect(self.projects.db_path(row['project_id']))) as db:
+                self.assertEqual(db.execute('SELECT paused FROM root_projections WHERE session_id=?', (row['session_id'],)).fetchone()[0], expected)
+
+    def test_maintenance_pause_readback_replay_and_resume_preserve_retained_state(self):
+        project = self.maintenance_fixture()
+        before = self.maintenance_state()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        with patch.object(RootOrchestrator, 'join', side_effect=AssertionError('no onboarding')), \
+                patch('agent_chat.remote.HttpClient.call', side_effect=AssertionError('no native or HTTP dispatch')):
+            first = self.call('pause-routing', **params)
+            self.assertEqual(first['status'], 'paused')
+            self.assertEqual(self.call('status')['root']['mode'], 'maintenance_paused')
+            self.assert_routing_paused(1)
+            with contextlib.closing(Coordinator(self.projects.db_path(project))) as coord:
+                self.assertEqual(BridgeState(coord).jobs(), [])
+                self.assertEqual(BridgeState(coord).pending(), [])
+            self.assertEqual(self.maintenance_state(), before)
+            self.assertEqual(self.call('pause-routing', **params), first)
+            with self.assertRaisesRegex(CoordError, 'reuse its exact request'):
+                self.call('pause-routing', **dict(params, request_id=str(uuid.uuid4())))
+            self.assertEqual(self.call('resume-routing', confirm=True)['root']['mode'], 'running')
+            self.assert_routing_paused(0)
+            with contextlib.closing(Coordinator(self.projects.db_path(project))) as coord:
+                self.assertEqual(len(BridgeState(coord).jobs()), 1)
+                self.assertEqual([row['id'] for row in BridgeState(coord).pending()], ['message_unread'])
+            self.assertEqual(self.maintenance_state(), before)
+            self.assertEqual(self.call('pause-routing', **params)['status'], 'resumed')
+            self.assert_routing_paused(0)
+        with self.projects.connection() as db:
+            row = dict(db.execute('SELECT * FROM root_routing_pauses').fetchone())
+            self.assertEqual(row['id'], params['request_id'])
+            self.assertIsNotNone(row['resumed_at'])
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'audit is immutable'):
+                db.execute('UPDATE root_routing_pauses SET thread_id=?', ('different',))
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'audit is immutable'):
+                db.execute('DELETE FROM root_routing_pauses')
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'cohort is immutable'):
+                db.execute('DELETE FROM root_routing_pause_projects')
+
+    def test_maintenance_invalid_identity_thread_confirm_and_inspection_refuse_before_pause(self):
+        self.maintenance_fixture()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        before = self.snapshot()
+        for identity in (dict(self.identity, session='different'), dict(self.identity, host_id='different')):
+            with self.assertRaises(CoordError):
+                root_local.execute('pause-routing', params, **identity)
+        for values in (dict(params, confirm=False), dict(params, expected_thread='different'), dict(params, request_id='bad')):
+            with self.assertRaises(CoordError):
+                self.call('pause-routing', **values)
+        for field in ('getuid', 'geteuid'):
+            with patch('agent_chat.root_local.os.' + field, return_value=os.getuid()+1), self.assertRaises(CoordError):
+                self.call('pause-routing', **params)
+        self.assertEqual(self.snapshot(), before)
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute("UPDATE agent_control_requests SET updated_at=? WHERE action='inspect'", (time.time()-121,))
+        before = self.snapshot()
+        for operation, values in (('pause-routing', params), ('resume-routing', dict(confirm=True))):
+            with self.assertRaisesRegex(CoordError, 'fresh completed own settings inspection'):
+                self.call(operation, **values)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.roots.config()['mode'], 'running')
+        self.assert_routing_paused(0)
+
+    def test_maintenance_saved_uuid_rejects_changed_thread_payload(self):
+        self.maintenance_fixture()
+        request = str(uuid.uuid4())
+        self.call('pause-routing', expected_thread=self.thread, request_id=request, confirm=True)
+        replacement = str(uuid.uuid4())
+        # Simulate a later lifecycle binding. The old UUID cannot acquire the
+        # new payload even when the canonical selector now matches that thread.
+        with self.projects.connection() as db:
+            db.execute('UPDATE root_config SET thread_id=?', (replacement,))
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute('UPDATE bridge_bindings SET thread_id=? WHERE session_id=?', (replacement, 'root'))
+            coord.db.execute('UPDATE agent_control_observations SET thread_id=? WHERE target_session=?', (replacement, 'root'))
+            coord.db.execute("UPDATE agent_control_requests SET thread_id=? WHERE target_session=? AND action='inspect'", (replacement, 'root'))
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'retry payload differs'):
+            self.call('pause-routing', expected_thread=replacement, request_id=request, confirm=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_maintenance_cli_pauses_exact_retained_scope_without_http(self):
+        self.maintenance_fixture()
+        request = str(uuid.uuid4())
+        output = io.StringIO()
+        with patch('agent_chat.remote.HttpClient.call', side_effect=AssertionError('no HTTP')), contextlib.redirect_stdout(output):
+            self.assertEqual(cli.main(['root-local', '--home-project', 'default', '--home-session', 'root',
+                '--host-id', 'host', 'pause-routing', '--expected-thread', self.thread, '--request-id', request, '--confirm']), 0)
+        checked = subprocess.run(['jq', '-e', '--arg', 'request', request,
+            '.request_id == $request and .status == "paused" and (.projects | length) == 2'],
+            input=output.getvalue(), text=True, capture_output=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assert_routing_paused(1)
+
+    def test_maintenance_rejects_mismatched_retained_alias_before_pause(self):
+        project = self.maintenance_fixture()
+        with contextlib.closing(Coordinator(self.projects.db_path(project))) as coord:
+            coord.db.execute("UPDATE remote_session_hosts SET host_id='different' WHERE session_id IN (SELECT session_id FROM root_projections)")
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'retained projection, binding or host differs'):
+            self.call('pause-routing', expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.roots.config()['mode'], 'running')
+        self.assert_routing_paused(0)
+
+    def test_maintenance_stale_inspection_and_wrong_thread_never_initialize_new_journal(self):
+        self.maintenance_fixture()
+        with self.projects.connection() as db:
+            db.execute('DROP TABLE root_routing_pause_projects')
+            db.execute('DROP TABLE root_routing_pauses')
+        before = self.snapshot()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        with patch('agent_chat.projects.Projects') as constructor:
+            with self.assertRaisesRegex(CoordError, 'expected thread differs'):
+                self.call('pause-routing', **dict(params, expected_thread='different'))
+            constructor.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute("UPDATE agent_control_requests SET updated_at=? WHERE action='inspect'", (time.time()-121,))
+        before = self.snapshot()
+        with patch('agent_chat.projects.Projects') as constructor:
+            with self.assertRaisesRegex(CoordError, 'fresh completed own settings inspection'):
+                self.call('pause-routing', **params)
+            constructor.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_maintenance_resume_requires_confirmation_consumed_inbox_and_completed_inspection(self):
+        self.maintenance_fixture()
+        self.call('pause-routing', expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'explicit confirmation'):
+            self.call('resume-routing', confirm=False)
+        self.assertEqual(self.snapshot(), before)
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute("UPDATE agent_control_requests SET status='pending' WHERE action='inspect'")
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'fresh completed own settings inspection'):
+            self.call('resume-routing', confirm=True)
+        self.assertEqual(self.snapshot(), before)
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute("UPDATE agent_control_requests SET status='completed' WHERE action='inspect'")
+            operator = coord.db.execute("SELECT id FROM sessions WHERE agent='operator'").fetchone()[0]
+            coord.db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
+                ('message_synthetic_unread', operator, 'root', 'Synthetic unread operator input', time.time()))
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'read your inbox'):
+            self.call('resume-routing', confirm=True)
+        self.assertEqual(self.snapshot(), before)
+        self.assert_routing_paused(1)
+
+    def test_maintenance_partial_projection_sync_retries_exact_journal(self):
+        self.maintenance_fixture()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        before = self.maintenance_state()
+        update = RootOrchestrator._routing_projection
+        writes = []
+        def fail_second(roots, root, item, paused):
+            if paused is True:
+                writes.append(item['project_id'])
+                if len(writes) == 2:
+                    raise OSError('synthetic second projection unavailable')
+            return update(roots, root, item, paused)
+        with patch.object(RootOrchestrator, '_routing_projection', new=fail_second):
+            with self.assertRaisesRegex(OSError, 'second projection unavailable'):
+                self.call('pause-routing', **params)
+        self.assertEqual(self.call('status')['root']['mode'], 'maintenance_paused')
+        with self.projects.connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM root_routing_pauses').fetchone()[0], 'pausing')
+        self.assertEqual(self.maintenance_state(), before)
+        self.assertEqual(self.call('pause-routing', **params)['status'], 'paused')
+        self.assert_routing_paused(1)
+        self.assertEqual(self.maintenance_state(), before)
+
+    def test_maintenance_rejects_in_progress_turnover_or_detach(self):
+        self.maintenance_fixture()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        for mode in ('detaching', 'detached'):
+            with self.projects.connection() as db:
+                db.execute('UPDATE root_config SET mode=?', (mode,))
+            before = self.snapshot()
+            with self.assertRaisesRegex(CoordError, 'detaching or detached'):
+                self.call('pause-routing', **params)
+            self.assertEqual(self.snapshot(), before)
+        with self.projects.connection() as db:
+            db.execute("UPDATE root_config SET mode='running'")
+        self.call('fresh-start', expected_thread=self.thread, prompt='Synthetic pending turnover',
+                  request_id=str(uuid.uuid4()), confirm=True)
+        before = self.snapshot()
+        with self.assertRaisesRegex(CoordError, 'fresh-start is pending'):
+            self.call('pause-routing', **params)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_maintenance_pause_readback_mismatch_keeps_exact_journal_recoverable(self):
+        project = self.maintenance_fixture()
+        params = dict(expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        before = self.maintenance_state()
+        update = RootOrchestrator._routing_projection
+        def revert_alias_write(roots, root, item, paused):
+            result = update(roots, root, item, paused)
+            if paused is True and item['project_id'] == project:
+                # Simulate another writer reverting a successful projection
+                # update before the final readback; no write error is raised.
+                with contextlib.closing(Coordinator(roots.path(project))) as coord:
+                    coord.db.execute('UPDATE root_projections SET paused=0 WHERE session_id=?', (item['session_id'],))
+            return result
+        with patch.object(RootOrchestrator, '_routing_projection', new=revert_alias_write):
+            with self.assertRaisesRegex(CoordError, 'pause readback differs'):
+                self.call('pause-routing', **params)
+        self.assertEqual(self.roots.config()['mode'], 'maintenance_paused')
+        with self.projects.connection() as db:
+            journal = dict(db.execute('SELECT * FROM root_routing_pauses WHERE id=?', (params['request_id'],)).fetchone())
+        self.assertEqual(journal['status'], 'pausing')
+        self.assertEqual(self.maintenance_state(), before)
+        self.assertEqual(self.call('pause-routing', **params)['status'], 'paused')
+        self.assert_routing_paused(1)
+        with self.projects.connection() as db:
+            recovered = dict(db.execute('SELECT * FROM root_routing_pauses WHERE id=?', (params['request_id'],)).fetchone())
+        self.assertEqual(recovered, dict(journal, status='paused'))
+        self.assertEqual(self.maintenance_state(), before)
+
+    def test_maintenance_resume_readback_mismatch_keeps_maintenance_until_retry(self):
+        project = self.maintenance_fixture()
+        request = str(uuid.uuid4())
+        self.call('pause-routing', expected_thread=self.thread, request_id=request, confirm=True)
+        before = self.maintenance_state()
+        update = RootOrchestrator._routing_projection
+        def revert_alias_write(roots, root, item, paused):
+            result = update(roots, root, item, paused)
+            if paused is False and item['project_id'] == project:
+                with contextlib.closing(Coordinator(roots.path(project))) as coord:
+                    coord.db.execute('UPDATE root_projections SET paused=1 WHERE session_id=?', (item['session_id'],))
+            return result
+        with patch.object(RootOrchestrator, '_routing_projection', new=revert_alias_write):
+            with self.assertRaisesRegex(CoordError, 'resume readback differs'):
+                self.call('resume-routing', confirm=True)
+        self.assertEqual(self.roots.config()['mode'], 'maintenance_paused')
+        with self.projects.connection() as db:
+            journal = dict(db.execute('SELECT * FROM root_routing_pauses WHERE id=?', (request,)).fetchone())
+        self.assertEqual(journal['status'], 'paused')
+        self.assertIsNone(journal['resumed_at'])
+        self.assertEqual(self.maintenance_state(), before)
+        self.assertEqual(self.call('resume-routing', confirm=True)['status'], 'resumed')
+        self.assert_routing_paused(0)
+        self.assertEqual(self.maintenance_state(), before)
+
+    def test_maintenance_resume_emits_one_trusted_pending_notice_and_replay_only_reports(self):
+        self.maintenance_fixture()
+        before = self.maintenance_state()
+        request = str(uuid.uuid4())
+        self.call('pause-routing', expected_thread=self.thread, request_id=request, confirm=True)
+        result = self.call('resume-routing', confirm=True)
+        notice = result['notice_message_id']
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            pending = BridgeState(coord).pending()
+            self.assertEqual([row['id'] for row in pending], [notice])
+            row = coord.db.execute('SELECT * FROM messages WHERE id=?', (notice,)).fetchone()
+            described = coord._message_dicts(coord.db, [row])[0]
+            self.assertEqual(described['sender_session'], 'system:supervisor')
+            self.assertEqual(described['sender_role'], 'agent')
+            self.assertEqual(described['instruction_origin'], 'agent_message')
+            self.assertIn(request, described['body'])
+            self.assertEqual(tuple(coord.db.execute('SELECT sender_session,recipient_session FROM supervisor_notice_provenance WHERE message_id=?', (notice,)).fetchone()), ('system:supervisor', 'root'))
+            self.assertFalse(coord.db.execute("SELECT 1 FROM sessions WHERE id='system:supervisor'").fetchone())
+        self.assertEqual(self.maintenance_state(), before)
+        before_replay = self.snapshot()
+        with patch.object(RootOrchestrator, 'fresh', side_effect=AssertionError('completed replay must not consume inbox')), \
+                patch.object(RootOrchestrator, 'sync', side_effect=AssertionError('completed replay must not sync routing')):
+            self.assertEqual(self.call('resume-routing', confirm=True), result)
+        self.assertEqual(self.snapshot(), before_replay)
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            self.assertEqual([row['id'] for row in BridgeState(coord).pending()], [notice])
+            self.assertEqual(coord.db.execute('SELECT COUNT(*) FROM supervisor_root_routing_notices WHERE request_id=?', (request,)).fetchone()[0], 1)
+            with self.assertRaisesRegex(sqlite3.IntegrityError, 'receipt is immutable'):
+                coord.db.execute('DELETE FROM supervisor_root_routing_notices WHERE request_id=?', (request,))
+
+    def test_maintenance_completion_notice_recovers_stale_inspection_without_consuming_operator_input(self):
+        self.maintenance_fixture()
+        before = self.maintenance_state()
+        request = str(uuid.uuid4())
+        self.call('pause-routing', expected_thread=self.thread, request_id=request, confirm=True)
+        with patch.object(SupervisorState, 'root_routing_resumed', side_effect=OSError('synthetic notice store failure')):
+            with self.assertRaisesRegex(OSError, 'notice store failure'):
+                self.call('resume-routing', confirm=True)
+        self.assertEqual(self.roots.config()['mode'], 'running')
+        self.assertEqual(self.maintenance_state(), before)
+        with self.projects.connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM root_routing_pauses WHERE id=?', (request,)).fetchone()[0], 'resumed')
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            operator = coord.db.execute("SELECT id FROM sessions WHERE agent='operator'").fetchone()[0]
+            coord.db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
+                ('message_recovery_operator_input', operator, 'root', 'Unconsumed operator input', time.time()))
+            coord.db.execute("UPDATE agent_control_requests SET updated_at=? WHERE action='inspect'", (time.time()-121,))
+        before_recovery = self.maintenance_state()
+        with patch.object(RootOrchestrator, 'fresh', side_effect=AssertionError('completed recovery must not consume inbox')), \
+                patch.object(RootOrchestrator, 'sync', side_effect=AssertionError('completed recovery must not sync routing')):
+            result = self.call('resume-routing', confirm=True)
+        self.assertEqual(result['request_id'], request)
+        self.assertEqual(self.maintenance_state(), before_recovery)
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            self.assertFalse(coord.db.execute("SELECT 1 FROM message_reads WHERE message_id='message_recovery_operator_input'").fetchone())
+            self.assertEqual({row['id'] for row in BridgeState(coord).pending()}, {'message_recovery_operator_input', result['notice_message_id']})
+        before_replay = self.snapshot()
+        self.assertEqual(self.call('resume-routing', confirm=True), result)
+        self.assertEqual(self.snapshot(), before_replay)
+
+    def test_maintenance_completed_replay_with_stale_inspection_rejects_partial_routing(self):
+        project = self.maintenance_fixture()
+        self.call('pause-routing', expected_thread=self.thread, request_id=str(uuid.uuid4()), confirm=True)
+        self.call('resume-routing', confirm=True)
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            coord.db.execute("UPDATE agent_control_requests SET updated_at=? WHERE action='inspect'", (time.time()-121,))
+        with contextlib.closing(Coordinator(self.projects.db_path(project))) as coord:
+            coord.db.execute('UPDATE root_projections SET paused=1')
+        before = self.snapshot()
+        with patch('agent_chat.projects.Projects') as constructor:
+            with self.assertRaisesRegex(CoordError, 'fresh completed own settings inspection'):
+                self.call('resume-routing', confirm=True)
+            constructor.assert_not_called()
+        self.assertEqual(self.snapshot(), before)
+
+    def test_maintenance_supervisor_notice_rejects_uncommitted_or_different_audit(self):
+        self.maintenance_fixture()
+        request = str(uuid.uuid4())
+        self.call('pause-routing', expected_thread=self.thread, request_id=request, confirm=True)
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            supervisor = SupervisorState(coord)
+            before = self.snapshot()
+            with self.assertRaisesRegex(CoordError, 'completed current resume audit'):
+                supervisor.root_routing_resumed(self.roots, 'default', 'root', 'host', request)
+            self.assertEqual(self.snapshot(), before)
+        result = self.call('resume-routing', confirm=True)
+        with contextlib.closing(Coordinator(self.master, 'root')) as coord:
+            supervisor = SupervisorState(coord)
+            before = self.snapshot()
+            with self.assertRaises(CoordError):
+                supervisor.root_routing_resumed(self.roots, 'default', 'root', 'different-host', request)
+            with self.assertRaisesRegex(CoordError, 'completed current resume audit'):
+                supervisor.root_routing_resumed(self.roots, 'default', 'root', 'host', str(uuid.uuid4()))
+            self.assertEqual(self.snapshot(), before)
+            self.assertEqual([row['id'] for row in BridgeState(coord).pending()], [result['notice_message_id']])
 
 
 if __name__ == '__main__':

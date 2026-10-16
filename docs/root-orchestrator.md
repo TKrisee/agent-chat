@@ -423,6 +423,38 @@ Missing required records fail closed. It does not initialize schema, synchronize
 registrations, resolve routes, create missing databases, refresh observations or
 use HTTP. The local `status` and `route` methods remain separate operations;
 `status` synchronizes records and is not a nonmutating readiness prerequisite.
+
+For an authorized quiet bridge restart, the configured same-UID Root transport
+can hold Root routing while retaining every registration, binding, inbox, queue,
+project PO and project stop barrier:
+
+```sh
+agent-chat-client root-local --home-project OWN_CANONICAL_HOME_PROJECT \
+  --home-session OWN_CANONICAL_ROOT_SESSION --host-id OWN_ENROLLED_HOST \
+  pause-routing --expected-thread OWN_BOUND_ROOT_THREAD --request-id SAVED_UUID --confirm
+```
+
+This requires a completed own inspection within 120 seconds and a consumed Root
+inbox. It journals `maintenance_paused` and updates only the retained Root
+projections. Updates span separate project databases and are not atomic. A failed
+update leaves the journal in maintenance mode, but projections not yet updated
+can still route Root input; project stop barriers exempt Root projections.
+Keep the current Root turn active and retry the exact UUID/payload until the
+journal reports `paused` and every retained Root projection is verified paused.
+Only then may Root end its turn or restart the bridge. A successful pause does
+not prove that native turns or crossed inputs have drained. Preserve those
+through the existing runtime controls before ending the Root turn.
+After restoration and a fresh completed inspection, use the same identity with
+`root-local ... resume-routing --confirm`. This restores Root routing only;
+project team stops remain active. Replaying a resumed pause UUID reports
+`resumed` without pausing again. These methods grant no shared-bearer HTTP access.
+A completed maintenance resume returns `notice_message_id` for one durable
+system-supervisor lifecycle notice. Its acceptance does not prove native
+consumption or source-task completion. An identical completed replay can report
+or repair that notice without consuming new inbox input or synchronizing routes,
+only while the latest immutable audit, canonical identity, retained cohort and
+every resumed projection still match. Initial and partial resumes retain the
+fresh-inspection and consumed-inbox guards.
 There is no automatic local fallback after a network rejection. Use only the
 legitimate configured operator's own canonical selectors; this syntax does not
 authorize a worker to impersonate Root. The same-UID trust does not isolate a

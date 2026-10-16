@@ -17,6 +17,8 @@ import test_bridge_remote as remote_tests
 class PolicyWakeTests(remote_tests.RemoteBridgeTests):
     def setUp(self):
         super().setUp()
+        self.clock=0.
+        self.bridge._policy_clock=lambda:self.clock
         self.prove=False
         original=self.rpc.request
         def request(method,params):
@@ -28,6 +30,10 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
 
     def emitted(self):
         return [params['input'][0]['text'] for method,params in self.rpc.calls if method=='thread/queue/add']
+
+    def observe_now(self):
+        self.clock+=31
+        self.bridge.observe_policies()
 
     def test_cold_ack_is_not_proof_then_warm_wake_is_smaller(self):
         first=self.send_operator();self.bridge.tick()
@@ -41,6 +47,10 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
         self.prove=True
         self.rpc.status='idle'
         third=self.send_operator();self.bridge.tick()
+        self.assertIn(communication.STANDING_POLICY,self.emitted()[-1])
+        self.assertTrue(self.state.policy_consumed(self.tid))
+        self.rpc.status='idle'
+        fourth=self.send_operator();self.bridge.tick()
         warm=self.emitted()[-1]
         self.assertTrue(self.state.policy_consumed(self.tid))
         self.assertNotIn(communication.STANDING_POLICY,warm)
@@ -51,16 +61,16 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
         print(f'POLICY_METRICS cold_bytes={len(cold.encode())} warm_bytes={len(warm.encode())} cold_instruction_words={len(cold.split(chr(10))[0].split())} warm_instruction_words={len(warm.split(chr(10))[0].split())}')
         metadata=json.loads(warm.split('\n')[1])
         self.assertFalse(metadata['policy_included'])
-        record=next(record for record in metadata['messages'] if record['id']==third)
+        record=next(record for record in metadata['messages'] if record['id']==fourth)
         self.assertEqual(record['sender_role'],'human_operator')
         self.assertEqual(record['recipient_role'],'agent')
         self.assertEqual(record['instruction_origin'],'agent_message')
-        self.assertEqual([delivery['message_id'] for delivery in metadata['deliveries']],[third])
-        self.assertEqual(len(self.emitted()),3)
+        self.assertEqual([delivery['message_id'] for delivery in metadata['deliveries']],[fourth])
+        self.assertEqual(len(self.emitted()),4)
         self.assertEqual(self.call('policy')['version'],metadata['policy_version'])
 
     def test_new_hash_and_new_native_conversation_are_cold(self):
-        self.send_operator();self.bridge.tick();self.prove=True;self.bridge.observe_policies()
+        self.send_operator();self.bridge.tick();self.prove=True;self.observe_now()
         self.assertTrue(self.state.policy_consumed(self.tid))
         with mock.patch.object(communication,'STANDING_POLICY',communication.STANDING_POLICY+' Revised policy.'):
             self.assertFalse(self.state.policy_consumed(self.tid))
@@ -72,7 +82,7 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
             self.state.policy_consumed(str(uuid.uuid4()))
 
     def test_warm_parent_keeps_full_unknown_child_handoff(self):
-        self.send_operator();self.bridge.tick();self.prove=True;self.bridge.observe_policies()
+        self.send_operator();self.bridge.tick();self.prove=True;self.observe_now()
         self.assertTrue(self.state.policy_consumed(self.tid))
         self.call('register',session='child',agent='alpha/child')
         self.call('bind',session='child',parent_session='a',agent_path='/root/child')
@@ -86,7 +96,7 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
         self.assertEqual(metadata['deliveries'][0]['route'][-1]['agent_path'],'/root/child')
 
     def test_wrong_version_and_wrong_thread_proof_stay_cold(self):
-        self.send_operator();self.bridge.tick();self.prove=True;self.bridge.observe_policies()
+        self.send_operator();self.bridge.tick();self.prove=True;self.observe_now()
         self.assertTrue(self.state.policy_consumed(self.tid))
         self.assertFalse(self.state.call('policy-consumed',thread_id=self.tid,version='wrong')['consumed'])
         self.call('register',session='other',agent='other')
@@ -121,7 +131,7 @@ class PolicyWakeTests(remote_tests.RemoteBridgeTests):
         mid=self.send_operator()
         legacy=communication.COORDINATION_STYLE+'\n'+json.dumps(dict(policy_version=communication.policy_version()))
         job=self.state.prepare(self.tid,[dict(id=mid,recipient_session='a')],legacy)
-        self.bridge.tick();self.prove=True;self.bridge.observe_policies()
+        self.bridge.tick();self.prove=True;self.observe_now()
         self.assertFalse(self.state.policy_consumed(self.tid))
         self.rpc.status='idle';self.send_operator();self.bridge.tick()
         self.assertIn(communication.STANDING_POLICY,self.emitted()[-1])
@@ -134,12 +144,14 @@ for name in vars(remote_tests.RemoteBridgeTests):
 
 class RootPolicyBootstrapTests(root_tests.RootFreshStartTests):
     def test_root_bootstrap_proof_warms_aliases_but_ack_does_not(self):
+        clock=[0.];self.bridge._policy_clock=lambda:clock[0]
         project=self.project()
         rid=str(uuid.uuid4());self.fresh(rid);self.bridge.tick()
         job=self.status(rid)
         self.assertEqual(job['status'],'starting')
         self.assertFalse(self.state.policy_consumed(job['new_thread_id']))
-        self.publish_consumption=True;self.bridge.tick()
+        self.assertTrue(any(offer['client_id']==rid and offer['thread']==job['new_thread_id'] for offer in self.state.policy_pending()))
+        self.publish_consumption=True;clock[0]+=31;self.bridge.tick()
         self.assertEqual(self.status(rid)['status'],'completed')
         self.assertTrue(self.state.policy_consumed(job['new_thread_id']))
         alias,bridge=self.project_bridge(project)
@@ -150,6 +162,7 @@ class RootPolicyBootstrapTests(root_tests.RootFreshStartTests):
 
 class ResetPolicyBootstrapTests(reset_tests.SessionResetTests):
     def test_reset_ack_stays_cold_and_positive_boot_turn_warms(self):
+        clock=[0.];self.bridge._policy_clock=lambda:clock[0]
         self.request_reset();self.bridge.tick()
         self.assertEqual(self.reset()['status'],'completed')  # Existing lifecycle contract remains unchanged.
         self.assertFalse(self.state.policy_consumed(self.rpc.new))
@@ -159,7 +172,7 @@ class ResetPolicyBootstrapTests(reset_tests.SessionResetTests):
             if method=='thread/turns/list' and params['threadId']==self.rpc.new:
                 for turn in result['data']: turn['id']='native-reset-bootstrap-turn'
             return result
-        self.rpc.request=proof;self.bridge.observe_policies()
+        self.rpc.request=proof;clock[0]+=31;self.bridge.observe_policies()
         self.assertTrue(self.state.policy_consumed(self.rpc.new))
         self.assertEqual(len([item for item in self.rpc.calls if item[0]=='thread/start']),1)
         self.assertEqual(len([item for item in self.rpc.calls if item[0]=='thread/queue/add']),1)

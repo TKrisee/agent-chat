@@ -98,6 +98,22 @@ class RootOrchestrator:
                 CREATE TABLE IF NOT EXISTS root_workspace_roots (position INTEGER PRIMARY KEY,path TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS root_reconfigurations (project_id TEXT PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,target_session TEXT NOT NULL,old_thread_id TEXT NOT NULL,prompt TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS root_reconfiguration_workspaces (project_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL,PRIMARY KEY(project_id,position));
+                CREATE TABLE IF NOT EXISTS root_routing_pauses (
+                    id TEXT PRIMARY KEY, home_project TEXT NOT NULL, home_session TEXT NOT NULL,
+                    host_id TEXT NOT NULL, thread_id TEXT NOT NULL, created_at REAL NOT NULL,
+                    status TEXT NOT NULL, resumed_at REAL);
+                CREATE TABLE IF NOT EXISTS root_routing_pause_projects (
+                    request_id TEXT NOT NULL, project_id TEXT NOT NULL, session_id TEXT NOT NULL,
+                    PRIMARY KEY(request_id,project_id));
+                CREATE TRIGGER IF NOT EXISTS root_routing_pause_payload_immutable
+                    BEFORE UPDATE OF id,home_project,home_session,host_id,thread_id,created_at ON root_routing_pauses
+                    BEGIN SELECT RAISE(ABORT,'root routing pause audit is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS root_routing_pause_delete_immutable BEFORE DELETE ON root_routing_pauses
+                    BEGIN SELECT RAISE(ABORT,'root routing pause audit is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS root_routing_pause_projects_update_immutable BEFORE UPDATE ON root_routing_pause_projects
+                    BEGIN SELECT RAISE(ABORT,'root routing pause cohort is immutable'); END;
+                CREATE TRIGGER IF NOT EXISTS root_routing_pause_projects_delete_immutable BEFORE DELETE ON root_routing_pause_projects
+                    BEGIN SELECT RAISE(ABORT,'root routing pause cohort is immutable'); END;
             ''')
             if 'mode' not in {row['name'] for row in db.execute('PRAGMA table_info(root_config)')}:
                 db.execute("ALTER TABLE root_config ADD COLUMN mode TEXT NOT NULL DEFAULT 'running'")
@@ -448,7 +464,7 @@ class RootOrchestrator:
     def sync(self):
         """Repair partial onboarding with stable IDs, never recreate native threads."""
         root = self.config()
-        if not root or root['mode'] == 'detached':
+        if not root or root['mode'] in ('detached', 'maintenance_paused'):
             return
         with self.projects.connection() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -923,13 +939,152 @@ class RootOrchestrator:
             db.commit()
         return dict(detached=True, registrations_retained=True)
 
+    @staticmethod
+    def _routing_inspection(db, root):
+        now = time.time()
+        for table in ('agent_control_requests', 'agent_control_observations'):
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                raise CoordError('root routing requires a fresh completed own settings inspection')
+        inspected = db.execute('''SELECT 1 FROM agent_control_requests r
+            JOIN agent_control_observations o ON o.target_session=r.target_session AND o.thread_id=r.thread_id
+            WHERE r.target_session=? AND r.thread_id=? AND r.host_id=?
+            AND r.action='inspect' AND r.status='completed'
+            AND r.updated_at BETWEEN ? AND ? AND o.checked_at BETWEEN ? AND ?''',
+            (root['home_session'], root['thread_id'], root['host_id'], now-120, now, now-120, now)).fetchone()
+        if not inspected:
+            raise CoordError('root routing requires a fresh completed own settings inspection')
+
+    def _routing_fresh(self, root):
+        # A completed native inspection is distinct from the consumed-inbox guard.
+        with self._readiness_db(self.path(root['home_project'])) as db:
+            self._routing_inspection(db, root)
+        self.fresh(root)
+
+    def _routing_projection(self, root, item, paused):
+        # Projection-only maintenance: no onboarding, notices, native dispatch,
+        # registration repair, PO updates or team-barrier changes.
+        path = self.path(item['project_id'])
+        with contextlib.closing(sqlite3.connect(path.as_uri() + ('?mode=ro' if paused is None else '?mode=rw'), uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute('BEGIN' if paused is None else 'BEGIN IMMEDIATE')
+            route = projection(db, item['session_id'])
+            binding = db.execute('SELECT thread_id,parent_session FROM bridge_bindings WHERE session_id=?', (item['session_id'],)).fetchone()
+            owner = db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (item['session_id'],)).fetchone()
+            registered = db.execute('SELECT 1 FROM sessions WHERE id=?', (item['session_id'],)).fetchone()
+            if (not route or not binding or not owner or not registered or binding['parent_session']
+                    or (route['home_project'], route['home_session'], route['thread_id']) !=
+                    (root['home_project'], root['home_session'], root['thread_id'])
+                    or binding['thread_id'] != root['thread_id'] or owner['host_id'] != root['host_id']):
+                raise CoordError('root routing retained projection, binding or host differs')
+            if paused is not None:
+                db.execute('UPDATE root_projections SET paused=? WHERE session_id=?', (int(paused), item['session_id']))
+                db.commit()
+            else:
+                return bool(route.get('paused'))
+
+    def pause_routing(self, project, session, host, expected_thread, request_id, confirmed):
+        root = self.authorize(project, session, host)
+        if confirmed is not True:
+            raise CoordError('root routing pause requires explicit confirmation')
+        try:
+            request_id = str(uuid.UUID(request_id))
+        except (ValueError, TypeError, AttributeError):
+            raise CoordError('root routing pause request_id must be a UUID')
+        if expected_thread != root['thread_id']:
+            raise CoordError('root routing expected thread differs')
+        with self.projects.connection() as db:
+            if db.execute("SELECT 1 FROM root_fresh_requests WHERE status<>'completed'").fetchone():
+                raise CoordError('root fresh-start is pending; routing pause withheld')
+            if root['mode'] not in ('running', 'maintenance_paused'):
+                raise CoordError('root is detaching or detached; routing pause withheld')
+            prior = db.execute('SELECT * FROM root_routing_pauses WHERE id=?', (request_id,)).fetchone()
+            if prior and (prior['home_project'], prior['home_session'], prior['host_id'], prior['thread_id']) != (project, session, host, expected_thread):
+                raise CoordError('root routing pause retry payload differs')
+            rows = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+            if dict(project_id=project, session_id=session) not in rows:
+                raise CoordError('root routing canonical retained projection is missing')
+            if prior:
+                saved = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_routing_pause_projects WHERE request_id=? ORDER BY project_id', (request_id,))]
+                if saved != rows:
+                    raise CoordError('root routing retained cohort differs')
+            elif root['mode'] != 'running':
+                raise CoordError('root routing pause already pending; reuse its exact request')
+        if prior and prior['status'] == 'resumed':
+            with self.projects.connection() as db:
+                latest = db.execute('SELECT id FROM root_routing_pauses ORDER BY created_at DESC,id DESC LIMIT 1').fetchone()
+            if (root['mode'] != 'running' or latest['id'] != request_id
+                    or any(self._routing_projection(root, row, None) for row in rows)):
+                raise CoordError('completed root routing pause readback differs')
+            return dict(request_id=request_id, status='resumed', projects=rows)
+        self._routing_fresh(root)
+        for row in rows:
+            self._routing_projection(root, row, None)
+        if not prior:
+            with self.projects.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("INSERT INTO root_routing_pauses VALUES(?,?,?,?,?,?,'pausing',NULL)", (request_id, project, session, host, expected_thread, time.time()))
+                db.executemany('INSERT INTO root_routing_pause_projects VALUES(?,?,?)', [(request_id, row['project_id'], row['session_id']) for row in rows])
+                db.execute("UPDATE root_config SET mode='maintenance_paused'")
+                db.commit()
+        for row in rows:
+            self._routing_projection(root, row, True)
+        if not all(self._routing_projection(root, row, None) for row in rows):
+            raise CoordError('root routing projection pause readback differs; retry exact request')
+        with self.projects.connection() as db:
+            db.execute("UPDATE root_routing_pauses SET status='paused' WHERE id=? AND status='pausing'", (request_id,))
+        return dict(request_id=request_id, status='paused', projects=rows)
+
+    def _routing_resumed_result(self, root, request_id, rows):
+        from .supervisor import SupervisorState
+        with contextlib.closing(Coordinator(self.path(root['home_project']), root['home_session'])) as coord:
+            notice = SupervisorState(coord).root_routing_resumed(self, root['home_project'], root['home_session'], root['host_id'], request_id)
+        return dict(root=self.config(), request_id=request_id, status='resumed', projects=rows, notice_message_id=notice)
+
     def resume_routing(self, project, session, host, confirmed):
         root = self.authorize(project, session, host)
         if root['mode'] == 'detached':
             raise CoordError('detach committed; finish root detach rather than resuming old routing')
         if confirmed is not True:
             raise CoordError('root routing resume requires explicit confirmation')
-        self.fresh(root)
+        if root['mode'] == 'running':
+            with self.projects.connection() as db:
+                latest = db.execute('SELECT * FROM root_routing_pauses ORDER BY created_at DESC,id DESC LIMIT 1').fetchone()
+                rows = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+            if (latest and latest['status'] == 'resumed'
+                    and (latest['home_project'], latest['home_session'], latest['host_id'], latest['thread_id']) ==
+                    (project, session, host, root['thread_id'])):
+                # Only recover/report the already committed lifecycle effect.
+                # Do not consume subsequent operator input or repeat routing sync.
+                return self._routing_resumed_result(root, latest['id'], rows)
+        if root['mode'] == 'maintenance_paused':
+            self._routing_fresh(root)
+        else:
+            self.fresh(root)
+        with self.projects.connection() as db:
+            if db.execute("SELECT 1 FROM root_fresh_requests WHERE status<>'completed'").fetchone():
+                raise CoordError('root fresh-start is pending; routing resume withheld')
+            rows = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+            if root['mode'] == 'maintenance_paused':
+                pauses = list(db.execute("SELECT * FROM root_routing_pauses WHERE status IN ('pausing','paused')"))
+                if (len(pauses) != 1 or (pauses[0]['home_project'], pauses[0]['home_session'], pauses[0]['host_id'], pauses[0]['thread_id']) !=
+                        (project, session, host, root['thread_id'])):
+                    raise CoordError('root routing pause audit differs; resume withheld')
+                saved = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_routing_pause_projects WHERE request_id=? ORDER BY project_id', (pauses[0]['id'],))]
+                if saved != rows:
+                    raise CoordError('root routing retained cohort differs; resume withheld')
+        if root['mode'] == 'maintenance_paused':
+            for row in rows:
+                self._routing_projection(root, row, None)
+            for row in rows:
+                self._routing_projection(root, row, False)
+            if any(self._routing_projection(root, row, None) for row in rows):
+                raise CoordError('root routing projection resume readback differs; retry resume')
+            with self.projects.connection() as db:
+                db.execute('BEGIN IMMEDIATE')
+                db.execute("UPDATE root_config SET mode='running'")
+                db.execute("UPDATE root_routing_pauses SET status='resumed',resumed_at=? WHERE status IN ('pausing','paused')", (time.time(),))
+                db.commit()
+            return self._routing_resumed_result(root, pauses[0]['id'], rows)
         with self.projects.connection() as db:
             db.execute("UPDATE root_config SET mode='running'")
         self.sync()

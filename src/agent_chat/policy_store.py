@@ -52,11 +52,18 @@ class PolicyStore:
 
     def offer(self, host, project, kind, client_id, thread, payload):
         # Version is derived from the actual emitted body, never caller flags.
+        # Root's authority preamble spans lines. Its current policy still must
+        # occur intact immediately before its metadata, without changing boot.
+        body=payload
         try:
-            metadata=json.loads(payload.split('\n')[1])
+            if kind=='root' and not payload.startswith(communication.STANDING_POLICY):
+                _,found,following=payload.partition('\n'+communication.STANDING_POLICY)
+                if not found: return {'offered':False}
+                body=communication.STANDING_POLICY+following
+            metadata=json.loads(body.split('\n')[1])
             version=metadata.get('policy_version')
         except (ValueError,IndexError,AttributeError): return {'offered':False}
-        if version!=communication.policy_version() or communication.STANDING_POLICY not in payload.split('\n')[0]:
+        if version!=communication.policy_version() or communication.STANDING_POLICY not in body.split('\n')[0]:
             return {'offered':False}
         digest=hashlib.sha256(payload.encode()).hexdigest()
         with self.connection() as db:
@@ -70,8 +77,8 @@ class PolicyStore:
     def pending(self, host):
         with self.connection() as db:
             return [dict(row) for row in db.execute('''SELECT o.* FROM native_policy_offers o
-                WHERE o.host=? AND NOT EXISTS(SELECT 1 FROM native_policy_receipts r
-                WHERE r.host=o.host AND r.thread=o.thread AND r.version=o.version)''',(host,))]
+                WHERE o.host=? AND o.version=? AND NOT EXISTS(SELECT 1 FROM native_policy_receipts r
+                WHERE r.host=o.host AND r.thread=o.thread AND r.version=o.version)''',(host,communication.policy_version()))]
 
     def receipt(self, host, thread, client_id, version, turn_id):
         if not isinstance(turn_id,str) or not turn_id:

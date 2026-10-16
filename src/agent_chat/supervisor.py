@@ -2,7 +2,9 @@
 import hashlib
 import json
 import pathlib
+import sqlite3
 import time
+import uuid
 
 from .core import CoordError
 
@@ -178,8 +180,34 @@ class SupervisorState:
         return {'pending_wakes': len(rows), 'pending_unread_messages': unread,
                 'wake_states': rows[:8], 'uncertain_wake': 'uncertain' in rows}
 
+    def _intentional_team_stop(self, job):
+        # Admission remains governed by root_lifecycle. This narrower check only
+        # quiets pending-work notices for an exact, supported stop snapshot.
+        try:
+            row = self.db.execute('''SELECT s.id AS stop_id,t.id AS target_id
+                FROM root_team_stops s JOIN root_team_stop_targets t ON t.stop_id=s.id
+                WHERE s.active=1 AND s.resumed_at IS NULL
+                  AND (SELECT COUNT(*) FROM root_team_stops WHERE active=1)=1
+                  AND t.requester_session=s.root_session AND t.target_session=?
+                  AND t.host_id=? AND t.thread_id=?
+                  AND t.status IN ('pending','waiting','interrupting','completed')
+                  AND EXISTS(SELECT 1 FROM root_projections r WHERE r.session_id=s.root_session)
+                  AND NOT EXISTS(SELECT 1 FROM root_projections r WHERE r.session_id=t.target_session)
+                  AND NOT EXISTS(SELECT 1 FROM operator_identities o WHERE o.session_id=t.target_session)''',
+                (job['target_session'], job.get('host_id'), job.get('thread_id'))).fetchone()
+        except sqlite3.OperationalError:
+            return False  # Absent or unsupported stop schema is not intent.
+        if not row:
+            return False
+        try:
+            return row['target_id'] == str(uuid.uuid5(uuid.UUID(row['stop_id']), job['target_session']))
+        except (ValueError, TypeError, AttributeError):
+            return False
+
     def _incident(self, job, condition, summary):
         if condition not in ACTIONABLE:
+            return
+        if condition in ('unloaded_pending', 'source_report_pending') and self._intentional_team_stop(job):
             return
         now = time.time()
         key = (job['owner_session'], job['target_session'], job['route_generation'], condition)

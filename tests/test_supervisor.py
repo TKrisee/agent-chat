@@ -4,11 +4,13 @@ import copy
 import io
 import os
 from pathlib import Path
+import plistlib
+import shlex
 import time
 import uuid
 from unittest import mock
 
-from agent_chat import cli
+from agent_chat import cli, root_local, service
 from agent_chat.bridge import Bridge
 from agent_chat.bridge_client import RemoteBridgeState
 from agent_chat.core import Coordinator, CoordError
@@ -589,7 +591,6 @@ class SupervisorWorkflowTests(RemoteWebFixture):
         self.sample(61)
         self.assertEqual(len(self.notices()), 1)
         notice = self.notices()[0]
-        self.assertEqual(self.call('message', session='b', id=notice['id'])['message']['id'], notice['id'])
         with self.assertRaises(RemoteCoordError):
             self.call('message', id=notice['id'])
         self.assertIn(self.target_thread, notice['body'])
@@ -610,6 +611,11 @@ class SupervisorWorkflowTests(RemoteWebFixture):
         additions = [params for method, params in self.rpc.calls if method == 'thread/queue/add']
         self.assertEqual(len(additions), 1)
         self.assertEqual(additions[0]['threadId'], self.owner_thread)
+        # A complete recipient read consumes the notice; inspect it only after
+        # verifying delivery, rather than expecting a wake for consumed input.
+        self.assertEqual(self.call('message', session='b', id=notice['id'])['message']['id'], notice['id'])
+        self.bridge.tick()
+        self.assertEqual(len([1 for method, _ in self.rpc.calls if method == 'thread/queue/add']), 1)
 
     def test_disable_and_route_change_refuse_stale_host_reports(self):
         self.enable()
@@ -792,11 +798,33 @@ class SupervisorWorkflowTests(RemoteWebFixture):
 
 
 class RootSupervisorRoutingTests(RemoteWebFixture):
-    root = root_fixture.RootOrchestratorTests.root
     project = root_fixture.RootOrchestratorTests.project
     routed = root_fixture.RootOrchestratorTests.routed
     configure = root_fixture.RootOrchestratorTests.configure
     project_bridge = root_fixture.RootOrchestratorTests.project_bridge
+
+    def root(self, op, session='a', host='mac', **params):
+        return root_local.execute(op, params, master_db=self.db.resolve(), service_plist=self.root_service_plist,
+                                  home_project='default', session=session, host_id=host)
+
+    def local_provider_fixture(self):
+        base = Path(self.tmp.name).resolve()
+        self.root_service_plist = base / 'server.plist'
+        wrapper = base / 'server-wrapper'
+        executable = base / 'server-bin'
+        executable.write_text('')
+        config = service.InstalledServerConfig(self.root_service_plist, wrapper, executable,
+            self.db.resolve(), base, os.getuid(), '127.0.0.1', self.server.server_port)
+        wrapper.write_text('exec ' + shlex.join([str(executable), '--db', str(self.db.resolve()),
+            '--host', '127.0.0.1', '--port', str(self.server.server_port)]) + '\n')
+        self.root_service_plist.write_bytes(plistlib.dumps({
+            'Label': service.LABEL + '.server', 'AssociatedBundleIdentifiers': [service.LABEL + '.server'],
+            'WorkingDirectory': str(base), 'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10,
+            'ProgramArguments': [str(wrapper)], 'EnvironmentVariables': {}}))
+        for target in ('agent_chat.service._installed_server_config', 'agent_chat.root_local._installed_server_config'):
+            replacement = mock.patch(target, return_value=config)
+            replacement.start()
+            self.addCleanup(replacement.stop)
 
     def setUp(self):
         super().setUp()
@@ -807,6 +835,7 @@ class RootSupervisorRoutingTests(RemoteWebFixture):
         self.neutral.mkdir()
         self.workspace = Path(self.tmp.name).resolve() / 'project'
         self.workspace.mkdir()
+        self.local_provider_fixture()
         self.rpc = root_fixture.ScopedRpc(self.thread_id, str(self.neutral))
         self.identity = dict(owner='root-supervisor-fixture', secret='x' * 40, host_id='mac')
         self.state = RemoteBridgeState(self.client, self.url, self.identity)
@@ -817,6 +846,8 @@ class RootSupervisorRoutingTests(RemoteWebFixture):
         self.root('enroll', expected_thread=self.thread_id, confirm=True)
 
     def test_root_cli_monitors_only_designated_orchestrator(self):
+        with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+            root_fixture.RootOrchestratorTests.root(self, 'route', project='default')
         project = self.project()
         self.configure(project)
         state, bridge = self.project_bridge(project)
@@ -824,7 +855,8 @@ class RootSupervisorRoutingTests(RemoteWebFixture):
         target = self.routed(project, 'session-reset-status', to='orchestrator')['thread_id']
         self.rpc.status[target] = 'idle'
         baseline = copy.deepcopy(self.rpc.started[target])
-        args = ['--server', self.url, '--session', 'a', 'root', 'in', project, 'supervisor-configure', '--enable']
+        route = self.root('route', project=project)
+        args = ['--server', self.url, '--project', project, '--session', route['session'], 'supervisor-configure', '--enable']
         with mock.patch.dict(os.environ, dict(AGENT_CHAT_API_TOKEN=TOKEN), clear=True), mock.patch('agent_chat.remote.client_host_id', return_value='mac'):
             with contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(cli.main(args), 0)

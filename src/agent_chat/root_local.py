@@ -27,6 +27,9 @@ FIELDS = {
     'stop-status': {'request_id'},
     'fresh-start': {'expected_thread', 'prompt', 'request_id', 'confirm'},
     'fresh-status': {'request_id'},
+    'delivery-metadata': {'expected_thread', 'message_ids'},
+    'pause-routing': {'expected_thread', 'request_id', 'confirm'},
+    'resume-routing': {'confirm'},
 }
 
 
@@ -90,6 +93,108 @@ def _target(master, registry, project, uid):
     return path
 
 
+def _completed_routing_resume(master, registry, root, uid):
+    """Read-only exception for an already committed, unchanged lifecycle effect."""
+    if root['mode'] != 'running':
+        return False
+    from .root_orchestrator import RootOrchestrator
+    try:
+        with _read(registry) as db:
+            if not all(_table(db, name) for name in ('root_routing_pauses', 'root_routing_pause_projects')):
+                return False
+            audit = db.execute('SELECT * FROM root_routing_pauses ORDER BY created_at DESC,id DESC LIMIT 1').fetchone()
+            if (not audit or audit['status'] != 'resumed' or audit['resumed_at'] is None
+                    or (audit['home_project'], audit['home_session'], audit['host_id'], audit['thread_id']) !=
+                    (root['home_project'], root['home_session'], root['host_id'], root['thread_id'])):
+                return False
+            saved = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_routing_pause_projects WHERE request_id=? ORDER BY project_id', (audit['id'],))]
+            current = [dict(row) for row in db.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+            if not saved or saved != current or dict(project_id=root['home_project'], session_id=root['home_session']) not in saved:
+                return False
+
+        class Readback(RootOrchestrator):
+            def __init__(self):
+                pass  # Do not initialize or migrate any schema during preflight.
+
+            def path(self, project):
+                return _target(master, registry, project, uid)
+
+        readback = Readback()
+        return all(not readback._routing_projection(root, row, None) for row in saved)
+    except (CoordError, sqlite3.Error, OSError):
+        return False
+
+
+def _delivery_metadata(master, home_project, session, host, expected_thread, message_ids):
+    """Exact own-recipient history without content, native reads or writes."""
+    registry = Path(str(master) + '.projects.sqlite3')
+    home = _target(master, registry, home_project, master.lstat().st_uid)
+    with _read(registry) as roots, _read(home) as db:
+        roots.execute('BEGIN')
+        db.execute('BEGIN')
+        root = roots.execute('SELECT * FROM root_config WHERE singleton=1').fetchone()
+        if not root or (root['home_project'], root['home_session'], root['host_id'], root['thread_id']) != (
+                home_project, session, host, expected_thread):
+            raise CoordError('local Root delivery canonical identity or thread differs')
+        binding = db.execute('''SELECT b.thread_id,b.parent_session,h.host_id
+            FROM bridge_bindings b JOIN remote_session_hosts h ON h.session_id=b.session_id
+            WHERE b.session_id=?''', (session,)).fetchone()
+        if not binding or (binding['thread_id'], binding['parent_session'], binding['host_id']) != (expected_thread, None, host):
+            raise CoordError('local Root delivery current binding or host differs')
+        if any(not _table(db, table) for table in ('messages', 'bridge_deliveries', 'bridge_jobs')):
+            raise CoordError('local Root delivery metadata schema is unavailable')
+        deliveries = []
+        for message_id in message_ids:
+            row = db.execute('''SELECT m.id AS message_id,m.created_at AS message_created_at,
+                m.acked_at AS message_acked_at,d.job_id,j.thread_id,j.status AS job_status,j.queue_id,
+                j.created_at AS job_created_at,j.updated_at AS job_updated_at
+                FROM messages m LEFT JOIN bridge_deliveries d ON d.message_id=m.id
+                LEFT JOIN bridge_jobs j ON j.id=d.job_id
+                WHERE m.id=? AND m.recipient_session=?''', (message_id, session)).fetchone()
+            if not row:
+                raise CoordError('local Root message is unavailable for the canonical recipient')
+            item = dict(row)
+            if item['job_id'] is not None and item['thread_id'] != expected_thread:
+                raise CoordError('local Root delivery job is unavailable for the current thread')
+            item['client_user_message_id'] = item['job_id']
+            item['job_prepared_at'] = None
+            item['native_attempt_recorded_at_julian_day'] = None
+            item['native_proof'] = []
+            if item['job_id'] is not None:
+                for table, column, field in (
+                        ('bridge_job_origins', 'prepared_at', 'job_prepared_at'),
+                        ('bridge_job_native_attempts', 'recorded_at', 'native_attempt_recorded_at_julian_day')):
+                    if _table(db, table):
+                        stamp = db.execute(f'SELECT {column} FROM {table} WHERE job_id=?', (item['job_id'],)).fetchone()
+                        if stamp:
+                            item[field] = stamp[0]
+                if all(_table(roots, table) for table in ('native_policy_offers', 'native_policy_receipts')):
+                    proofs = roots.execute('''SELECT r.version AS policy_version,r.turn_id AS native_turn_id,r.observed_at
+                        FROM native_policy_receipts r JOIN native_policy_offers o
+                        ON o.host=r.host AND o.thread=r.thread AND o.client_id=r.client_id AND o.version=r.version
+                        WHERE o.host=? AND o.thread=? AND o.client_id=? AND o.project=? AND o.kind='wake'
+                        ORDER BY r.observed_at,r.version''', (host, expected_thread, item['job_id'], home_project))
+                    item['native_proof'] = [dict(proof) for proof in proofs
+                                            if isinstance(proof['native_turn_id'], str) and proof['native_turn_id']]
+            deliveries.append(item)
+    return {
+        'authority': {'scope': 'machine_read', 'named_session_authentication': 'UNVERIFIED'},
+        'project': home_project, 'session': session, 'host_id': host, 'thread_id': expected_thread,
+        'timestamp_semantics': {
+            'message_created_at': 'persisted Unix seconds: message row creation',
+            'message_acked_at': 'mutable Unix seconds: message acknowledgement, not native consumption',
+            'job_created_at': 'persisted Unix seconds: job row creation',
+            'job_updated_at': 'mutable Unix seconds: latest job write, not a dispatch, start or consumption timestamp',
+            'job_prepared_at': 'persisted Unix seconds: immutable preparation provenance, when present',
+            'native_attempt_recorded_at_julian_day': 'SQLite Julian day: first status update beyond prepared/cancelled, not native acceptance',
+            'native_proof.observed_at': 'persisted Unix seconds: exact policy receipt observation, not native turn start',
+        },
+        'client_id_semantics': 'bridge job ID used as clientUserMessageId; not proof of native acceptance',
+        'native_proof_semantics': 'existing exact host/thread/client/project policy receipt only; empty means no persisted proof',
+        'deliveries': deliveries,
+    }
+
+
 def _preflight(master_db, service_plist, home_project, session, host, operation, params):
     config = _installed_server_config()
     # The caller cannot supply a UID. File ownership anchors both actual UIDs.
@@ -118,6 +223,11 @@ def _preflight(master_db, service_plist, home_project, session, host, operation,
             raise CoordError('local Root is not enrolled')
         if root and any(not _table(db, name) for name in ('root_fresh_requests', 'root_team_operations')):
             raise CoordError('local Root lifecycle schema is incomplete')
+        if operation in ('pause-routing', 'resume-routing'):
+            if db.execute("SELECT 1 FROM root_fresh_requests WHERE status<>'completed'").fetchone():
+                raise CoordError('root fresh-start is pending; routing change withheld')
+            if operation == 'pause-routing' and root['mode'] not in ('running', 'maintenance_paused'):
+                raise CoordError('root is detaching or detached; routing pause withheld')
     with _read(home) as db:
         if any(not _table(db, name) for name in ('sessions', 'bridge_bindings', 'remote_session_hosts')):
             raise CoordError('local Root registration schema is incomplete')
@@ -128,8 +238,13 @@ def _preflight(master_db, service_plist, home_project, session, host, operation,
             raise CoordError('local Root existing registration, main binding or host differs')
         if root and binding['thread_id'] != root['thread_id']:
             raise CoordError('local Root current thread differs')
-        if operation == 'enroll' and params['expected_thread'] != binding['thread_id']:
+        if operation in ('enroll', 'pause-routing', 'delivery-metadata') and params['expected_thread'] != binding['thread_id']:
             raise CoordError('local Root expected thread differs')
+        if operation in ('pause-routing', 'resume-routing'):
+            # Reject stale/missing native inspection before any schema migration.
+            from .root_orchestrator import RootOrchestrator
+            if operation != 'resume-routing' or not _completed_routing_resume(master, registry, root, owner):
+                RootOrchestrator._routing_inspection(db, root)
     if 'project' in params:
         _target(master, registry, params['project'], owner)
     # Preserve the HTTP application's setup measurement barrier without creating
@@ -153,6 +268,14 @@ def execute(operation, params, *, master_db, service_plist, home_project, sessio
     for field in ('project', 'agent', 'po', 'target', 'expected_thread', 'expected_host', 'request_id'):
         if field in params:
             _text(params[field], field)
+    if 'message_ids' in params:
+        ids = params['message_ids']
+        if not isinstance(ids, list) or not 1 <= len(ids) <= 20:
+            raise CoordError('local Root delivery requires 1 to 20 exact message IDs')
+        for message_id in ids:
+            _text(message_id, 'message ID')
+        if len(set(ids)) != len(ids):
+            raise CoordError('local Root delivery message IDs must be distinct')
     if 'request_id' in params:
         try:
             uuid.UUID(params['request_id'])
@@ -167,6 +290,8 @@ def execute(operation, params, *, master_db, service_plist, home_project, sessio
     master, enrolled = _preflight(master_db, service_plist, home_project, session, host_id, operation, params)
     if operation == 'status' and not enrolled:
         return {'enrolled': False}
+    if operation == 'delivery-metadata':
+        return _delivery_metadata(master, home_project, session, host_id, params['expected_thread'], params['message_ids'])
     from .projects import Projects
     from .root_orchestrator import RootOrchestrator
     owner = master.lstat().st_uid
@@ -195,6 +320,10 @@ def execute(operation, params, *, master_db, service_plist, home_project, sessio
         if operation == 'enroll':
             return roots.enroll(*args, params['expected_thread'], params['confirm'])
         roots.authorize(*args)
+        if operation == 'pause-routing':
+            return roots.pause_routing(*args, params['expected_thread'], params['request_id'], params['confirm'])
+        if operation == 'resume-routing':
+            return roots.resume_routing(*args, params['confirm'])
         if operation == 'status':
             roots.sync()
             return roots.status()
@@ -231,8 +360,9 @@ def main(argv=None):
     for method, fields in FIELDS.items():
         command = commands.add_parser(method)
         for field in sorted(fields):
-            option = '--project-id' if field in ('project', 'projects') else '--' + field.replace('_', '-')
-            if field == 'projects':
+            option = ('--project-id' if field in ('project', 'projects') else
+                      '--message-id' if field == 'message_ids' else '--' + field.replace('_', '-'))
+            if field in ('projects', 'message_ids'):
                 command.add_argument(option, dest=field, action='append', required=True)
             elif field == 'confirm':
                 command.add_argument(option, action='store_true')

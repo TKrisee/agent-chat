@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import struct
 import subprocess
 import sys
@@ -136,6 +137,25 @@ class BridgeTests(unittest.TestCase):
     def job(self):
         return dict(self.agent.db.execute('SELECT * FROM bridge_jobs ORDER BY created_at DESC LIMIT 1').fetchone())
 
+    def test_pristine_proof_survives_neither_native_attempt_nor_explicit_retry(self):
+        self.send()
+        pending=self.state.pending()
+        job=self.state.prepare(self.thread,pending,self.bridge.payload(self.thread,pending))
+        self.assertTrue(self.state.pristine(job['id']))
+        self.state.update(job['id'],'adding')
+        self.assertFalse(self.state.pristine(job['id']))
+        self.state.update(job['id'],'uncertain')
+        self.state.retry(job['id'],True)
+        retained=self.state.job(job['id'])
+        self.assertEqual((retained['status'],retained['queue_id'],retained['error']),('prepared',None,None))
+        self.assertFalse(self.state.pristine(job['id']))
+        with self.assertRaisesRegex(sqlite3.IntegrityError,'immutable'):
+            self.agent.db.execute('DELETE FROM bridge_job_native_attempts WHERE job_id=?',(job['id'],))
+
+    def test_legacy_prepared_job_has_no_positive_pristine_proof(self):
+        self.agent.db.execute("INSERT INTO bridge_jobs VALUES('legacy',?,'legacy payload','prepared',NULL,NULL,1,1)",(self.thread,))
+        self.assertFalse(self.state.pristine('legacy'))
+
     def test_native_wake_roles_preserve_complete_peer_context_and_user_style(self):
         with self.operator.tx() as db:
             db.execute('INSERT INTO operator_identities VALUES(?)',('human',))
@@ -148,7 +168,7 @@ class BridgeTests(unittest.TestCase):
         instructions,metadata=payload.split('\n')
         self.assertIn('Agent communication: concise normal grammar despite inherited style.',instructions)
         self.assertIn('Human/operator replies: Caveman full unless explicitly changed.',instructions)
-        self.assertLessEqual(len(instructions.split()),90)
+        self.assertLessEqual(len(payload.encode('utf-8')),12288)
         # These are application-native payload records, not investigation JSON parsing.
         records={item['id']:item for item in json.loads(metadata)['messages']}
         self.assertEqual(records[peer_message]['sender_role'],'agent')
@@ -181,9 +201,9 @@ class BridgeTests(unittest.TestCase):
         self.assertIn('Chat only via agent-chat-client', instructions)
         self.assertIn('no duplicate terminal replies', instructions)
         self.assertIn('--reply-to INBOX_MESSAGE_ID', instructions)
-        self.assertIn('no ACK-only messages', instructions)
+        self.assertIn('no ACK-only or duplicate chatter', instructions)
         self.assertNotIn('child', instructions)
-        self.assertLessEqual(len(instructions.split()), 90)
+        self.assertLessEqual(len(payload.encode('utf-8')), 12288)
         self.assertEqual({k: v for k, v in json.loads(metadata).items() if k != 'messages'}, {
             'database': str(self.db.resolve()), 'thread_id': self.thread,
             'policy_version': policy_version(), 'policy_included':True,
