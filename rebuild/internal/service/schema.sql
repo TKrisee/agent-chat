@@ -1,0 +1,64 @@
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, po_id TEXT NOT NULL UNIQUE,
+  workspace TEXT NOT NULL, stopped INTEGER NOT NULL DEFAULT 0 CHECK(stopped IN (0,1))
+);
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('root','po','worker')),
+  project_id TEXT REFERENCES projects(id), model TEXT NOT NULL, effort TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('assigned','queued','review','accepted','completed','blocked')),
+  owner_id TEXT NOT NULL REFERENCES agents(id)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  seq INTEGER PRIMARY KEY, id TEXT NOT NULL UNIQUE, sender TEXT NOT NULL, recipient TEXT NOT NULL,
+  role TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL,
+  task_id TEXT REFERENCES tasks(id), project_id TEXT REFERENCES projects(id)
+);
+CREATE TABLE IF NOT EXISTS task_origins (
+  task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+  message_id TEXT NOT NULL REFERENCES messages(id)
+);
+CREATE TABLE IF NOT EXISTS message_replies (
+  message_id TEXT PRIMARY KEY REFERENCES messages(id),
+  parent_id TEXT NOT NULL REFERENCES messages(id),
+  CHECK(message_id<>parent_id)
+);
+CREATE TABLE IF NOT EXISTS message_mentions (
+  message_id TEXT NOT NULL REFERENCES messages(id),
+  agent_id TEXT NOT NULL REFERENCES agents(id),
+  PRIMARY KEY(message_id,agent_id)
+);
+CREATE TABLE IF NOT EXISTS operator_message_reads (
+  message_id TEXT PRIMARY KEY REFERENCES messages(id),
+  read_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attachments (
+  id TEXT PRIMARY KEY, message_id TEXT NOT NULL REFERENCES messages(id),
+  name TEXT NOT NULL, media_type TEXT NOT NULL, content BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_id);
+CREATE TABLE IF NOT EXISTS attachment_shares (
+  message_id TEXT NOT NULL REFERENCES messages(id),
+  attachment_id TEXT NOT NULL REFERENCES attachments(id),
+  PRIMARY KEY(message_id,attachment_id)
+);
+CREATE VIEW IF NOT EXISTS message_attachments AS
+  SELECT id AS attachment_id,message_id FROM attachments
+  UNION ALL
+  SELECT attachment_id,message_id FROM attachment_shares;
+CREATE TABLE IF NOT EXISTS approvals (
+  id TEXT PRIMARY KEY, project_id TEXT REFERENCES projects(id), task_id TEXT REFERENCES tasks(id),
+  requested_by TEXT NOT NULL REFERENCES agents(id), title TEXT NOT NULL, body TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','approved','denied'))
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
+  project_id TEXT REFERENCES projects(id), task_id TEXT REFERENCES tasks(id),
+  source_id TEXT NOT NULL REFERENCES messages(id), kind TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','submitted','running','completed','uncertain')),
+  request BLOB NOT NULL, result BLOB, diagnostic TEXT, next_at INTEGER NOT NULL,
+  UNIQUE(agent_id,source_id,kind)
+);
+CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,next_at);
