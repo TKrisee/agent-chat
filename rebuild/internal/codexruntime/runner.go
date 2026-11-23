@@ -137,28 +137,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	return nil
 }
-func syncFile(path string, data []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if _, err = f.Write(data); err != nil {
-		return err
-	}
-	return f.Sync()
-}
-func syncDir(path string) error {
-	f, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
 
 // A capacity receipt records a definite Start failure before any child exists.
-// The retry marker is removed and the directory synced before every retry.
+// The retry marker is consumed before every new launch.
 func recordCapacity(dir, code string, prune func(string, string) error) error {
 	if code != "EMFILE" && code != "ENFILE" {
 		return errors.New("invalid capacity code")
@@ -368,7 +349,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		}
 		priorRetryMarker = string(marker)
 		_ = r.prune(dir, priorRetryMarker)
-		if e = os.Remove(filepath.Join(dir, "retryable")); e != nil {
+		if e = consumeRetryMarker(filepath.Join(dir, "retryable")); e != nil {
 			return zero, fmt.Errorf("%w: %v", ErrUnknown, e)
 		}
 		if e = syncDir(dir); e != nil {
@@ -452,12 +433,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	if err != nil {
 		return zero, validationFailure(dir, err)
 	}
-	resultFile, err := os.Open(filepath.Join(dir, "result.json"))
-	if err != nil {
-		return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
-	}
-	err = resultFile.Sync()
-	resultFile.Close()
+	err = syncResultFile(filepath.Join(dir, "result.json"))
 	if err != nil {
 		return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
 	}
