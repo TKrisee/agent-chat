@@ -77,7 +77,7 @@ func Open(opts Options) (*Service, error) {
 		lock.Close()
 		return nil, fmt.Errorf("acquire single service lock: %w", err)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: filepath.Join(dir, "agentchat.db"),
+	dsn := (&url.URL{Scheme: "file", Path: sqliteURIPath(filepath.Join(dir, "agentchat.db")),
 		RawQuery: "_foreign_keys=on&_journal_mode=WAL&_synchronous=FULL&_busy_timeout=5000&_txlock=immediate"}).String()
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {

@@ -216,7 +216,11 @@ func TestArtifactsAndPreCancelledInput(t *testing.T) {
 	}
 	t.Setenv("FAKE_RESULT", string(data))
 	result, err := r.Execute(context.Background(), req)
-	if err != nil || len(result.Attachments) != 1 || result.Attachments[0].Path != artifact {
+	want, pathErr := filepath.EvalSymlinks(artifact)
+	if pathErr != nil {
+		t.Fatal(pathErr)
+	}
+	if err != nil || len(result.Attachments) != 1 || result.Attachments[0].Path != want {
 		t.Fatalf("artifact result %v %v", result, err)
 	}
 }

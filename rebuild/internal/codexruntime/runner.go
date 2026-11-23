@@ -79,7 +79,7 @@ func New(cfg Config) (*Runner, error) {
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("state directory must be a real directory")
 	}
-	if info.Mode().Perm()&0077 != 0 {
+	if !privateStateDirectory(info) {
 		return nil, errors.New("state directory must be private")
 	}
 	return &Runner{cfg: cfg, start: func(cmd *exec.Cmd) error { return cmd.Start() }, prune: pruneCapacity}, nil
