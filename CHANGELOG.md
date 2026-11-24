@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/TKrisee/agent-chat/compare/v0.5.2...v0.5.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* match and center the sidebar utility icons ([8e082c2](https://github.com/TKrisee/agent-chat/commit/8e082c260ce1338cb3b039d72992cf53ba427d32))
+
 ## [0.5.2](https://github.com/TKrisee/agent-chat/compare/v0.5.1...v0.5.2) (2026-11-24)
 
 
