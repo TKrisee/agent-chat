@@ -9,9 +9,18 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(project).toBeVisible({timeout: 20000});
   await project.click();
   const group = page.getByLabel('Message atlas chat');
+  const scopeNotice = page.getByRole('article', {name:'Agent Chat workflow notice'}).filter({hasText:'Root sent the project owner a request for scope assessment.'});
+  const scopeButton = scopeNotice.getByRole('button', {name:'View scope request'});
+  await expect(scopeButton).toBeVisible({timeout:20000});
+  await scopeButton.click();
+  await expect(scopeNotice.locator('.scope-detail')).toContainText('Check room visibility');
+  await scopeNotice.getByRole('button', {name:'Hide scope request'}).click();
+  await expect(scopeNotice.locator('.scope-detail')).toBeHidden();
+
   const dispatchNotice = page.getByRole('article', {name:'Agent Chat workflow notice'}).filter({hasText:'The project owner queued work for a worker.'});
   await expect(dispatchNotice).toBeVisible({timeout:20000});
   await expect(dispatchNotice.locator('[data-reply]')).toHaveCount(0);
+  await expect(dispatchNotice.getByRole('button', {name:'View scope request'})).toHaveCount(0);
   await expect(page.locator('.composer-heading')).not.toContainText('Idle');
   await expect(page.locator('[data-agent]').first()).toHaveAttribute('aria-label', /(?:Idle|Working|Starting|Queued|Needs attention|Failed|Stopped|Status unavailable)/);
   await group.fill('Shared untagged message');
@@ -34,6 +43,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await lead.click();
   const direct = page.locator('#message');
   await expect(dispatchNotice).toHaveCount(0);
+  await expect(page.getByRole('button', {name:'View scope request'})).toHaveCount(0);
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toHaveCount(0);
   await expect(page.getByText('Shared tagged message', {exact:false})).toHaveCount(0);
   await expect(page.getByText('PO replied in the project group:', {exact:false})).toHaveCount(0);
@@ -56,4 +66,24 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(page.getByText(/Stop requested for atlas\. \d+ jobs? remain(?:s)? submitted, running or uncertain\./)).toBeVisible();
   await expect(project.locator('small')).toHaveText(/^(stopped|stopping)$/);
   await expect(rootComposer).toHaveValue('');
+});
+
+test('project panel shows current work once and preserves earlier uncertainty', async ({page, serviceURL}) => {
+  // Fixed state models an older uncertain attempt and a newer submitted attempt.
+  const state = `{"projects":[{"id":"sample","name":"Sample","status":"running","po_id":"11111111-1111-4111-8111-111111111111","goal_objective":"Deliver the full goal","goal_status":"active"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"},{"id":"11111111-1111-4111-8111-111111111111","name":"Sample-PO","role":"po","project_id":"sample","status":"busy","model":"test"}],"tasks":[{"id":"22222222-2222-4222-8222-222222222222","project_id":"sample","title":"Deliver launch","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111"}],"jobs":[{"id":"33333333-3333-4333-8333-333333333333","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"uncertain","diagnostic":"Earlier run outcome unknown"},{"id":"44444444-4444-4444-8444-444444444444","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"submitted"}],"messages":[]}`;
+  await page.route('**/api/state', route=>route.fulfill({status:200,contentType:'application/json',body:state}));
+  await page.goto(serviceURL);
+  await page.locator('[data-project="sample"]').click();
+  const panel=page.getByLabel('Sample activity');
+  await expect(panel.getByRole('heading',{name:'Team'})).toBeVisible();
+  await expect(panel.locator('.pa-team li').filter({hasText:'Sample-PO'})).toContainText('Starting');
+  await expect(page.getByText('PROJECT LEAD',{exact:true})).toHaveCount(0);
+  await expect(page.getByText('Recent work',{exact:true})).toHaveCount(0);
+  await panel.getByText('PO goal',{exact:false}).click();
+  await expect(panel.getByText('Deliver the full goal')).toBeVisible();
+  await panel.getByText('Work',{exact:false}).click();
+  await expect(panel.getByText('Deliver launch',{exact:true})).toHaveCount(1);
+  await expect(panel.locator('.pa-work li').filter({hasText:'Deliver launch'})).toContainText('Starting');
+  await panel.getByText('Details',{exact:true}).click();
+  await expect(panel.getByText('Earlier run outcome unknown')).toBeVisible();
 });

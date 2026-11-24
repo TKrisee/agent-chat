@@ -131,3 +131,8 @@
 .po-goal p { white-space: pre-wrap; margin: 6px 0 0; }
 
 .channel-header .work-toggle[hidden] { display:none; }
+.scope-toggle { margin-top:7px; padding:4px 8px; border:1px solid #cbdccb; border-radius:7px; background:#fff; color:#315d49; font:inherit; font-size:12px; font-weight:600; cursor:pointer; }
+.scope-toggle:focus-visible { outline:2px solid #769e7d; outline-offset:2px; }
+.scope-detail { margin-top:8px; padding:9px 10px; border-radius:7px; background:#fff; color:#34483c; font-size:12px; }
+.scope-detail[hidden] { display:none; }
+.scope-detail pre { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; line-height:1.5; }

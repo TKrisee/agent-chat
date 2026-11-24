@@ -44,6 +44,13 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   }).toBeLessThan(4);
   await composer.fill('');
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
+  await composer.fill(Array(40).fill('Earlier conversation').join('\n\n'));
+  await composer.press('Enter');
+  await expect(page.getByRole('article').filter({hasText:'Earlier conversation'}).first()).toBeVisible();
+  const scroll = page.locator('#chat-scroll');
+  await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.clientHeight)).toBeGreaterThan(300);
+  await scroll.evaluate(el => {el.scrollTop=0;});
+  await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBe(0);
   const transfer = await page.evaluateHandle(() => {
     const data = new DataTransfer();
     const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII='), c => c.charCodeAt(0));
@@ -58,6 +65,7 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.fill('Please review the notes');
   await composer.press('Enter');
   await expect(page.getByRole('article').filter({ hasText: 'Please review the notes' }).getByText('tiny.png')).toBeVisible();
+  await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop)).toBeLessThan(3);
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
 
   await add.click();

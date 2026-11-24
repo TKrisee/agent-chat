@@ -22,6 +22,7 @@ type AttachmentRef struct {
 }
 
 type Message struct {
+	NoticeDetail   string          `json:"notice_detail,omitempty"`
 	RoomID         string          `json:"room_id"`
 	ID             string          `json:"id"`
 	Sender         string          `json:"sender"`
@@ -152,6 +153,14 @@ func (s *Service) state() (State, error) {
 		if err != nil {
 			return err
 		}
+		scopeDetails, err := querySlice(tx, "SELECT message_id FROM ("+scopeDetailsSQL+")", func(rows *sql.Rows) (string, error) { var id string; err := rows.Scan(&id); return id, err })
+		if err != nil {
+			return err
+		}
+		scopeEligible := make(map[string]bool, len(scopeDetails))
+		for _, d := range scopeDetails {
+			scopeEligible[d] = true
+		}
 		byMentionedMessage := make(map[string][]string)
 		for _, m := range mentions {
 			byMentionedMessage[m.message] = append(byMentionedMessage[m.message], m.agent)
@@ -175,6 +184,9 @@ func (s *Service) state() (State, error) {
 			byMessage[a.Message] = append(byMessage[a.Message], a.AttachmentRef)
 		}
 		for i := range view.Messages {
+			if scopeEligible[view.Messages[i].ID] {
+				view.Messages[i].NoticeDetail = "scope_request"
+			}
 			view.Messages[i].MentionIDs = byMentionedMessage[view.Messages[i].ID]
 			if refs := byMessage[view.Messages[i].ID]; len(refs) > 0 {
 				view.Messages[i].Attachments = refs
@@ -244,6 +256,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/usage", s.usageStatus)
 	mux.HandleFunc("POST /api/usage/settings", s.usageSettings)
+	mux.HandleFunc("GET /api/workflow-notices/{id}/scope-request", s.scopeRequest)
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		view, err := s.state()
 		if err != nil {
