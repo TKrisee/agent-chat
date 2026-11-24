@@ -25,6 +25,7 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 	default:
 		return fmt.Errorf("%w: runner already active", errConflict)
 	}
+	go s.pollUsage(ctx, runner)
 	tick := time.NewTicker(s.opts.Poll)
 	defer tick.Stop()
 	active := make(map[string]bool)
@@ -67,13 +68,19 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 func (s *Service) claim(active map[string]bool) (*job, error) {
 	var selected *job
 	err := s.write(func(tx *sql.Tx) error {
+		var enabled bool
+		var reserve int
+		if err := tx.QueryRow("SELECT enabled,reserve FROM usage_settings WHERE id=1").Scan(&enabled, &reserve); err != nil {
+			return err
+		}
+		paused := enabled && s.usageBlocked(reserve)
 		query := `
 			SELECT ` + jobColumns + ` FROM jobs j
 			WHERE j.next_at<=? AND
 			  (j.status IN ('submitted','running') OR
-			    (j.status='pending' AND NOT EXISTS
+			    (j.status='pending' AND ?=0 AND NOT EXISTS
 			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1)))`
-		args := []any{now()}
+		args := []any{now(), paused}
 		if len(active) != 0 {
 			query += " AND j.agent_id NOT IN (" + strings.Repeat("?,", len(active)-1) + "?)"
 			for id := range active {
@@ -118,6 +125,13 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		}
 		if err := s.materialize(j.Request); err != nil {
 			return s.disposition(j.ID, "pending", "prepare request: "+err.Error(), s.opts.Poll)
+		}
+		hold, err := s.shouldHoldUsage()
+		if err != nil {
+			return s.disposition(j.ID, "pending", "usage policy unavailable", s.opts.Poll)
+		}
+		if hold {
+			return s.disposition(j.ID, "pending", "weekly usage guard", s.opts.Poll)
 		}
 		result, err := runner.Execute(ctx, j.Request)
 		if err == nil {

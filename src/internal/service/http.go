@@ -240,6 +240,8 @@ func (s *Service) state() (State, error) {
 
 func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/usage", s.usageStatus)
+	mux.HandleFunc("POST /api/usage/settings", s.usageSettings)
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		view, err := s.state()
 		if err != nil {

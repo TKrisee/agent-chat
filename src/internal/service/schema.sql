@@ -62,3 +62,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   UNIQUE(agent_id,source_id,kind)
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,next_at);
+
+CREATE TABLE IF NOT EXISTS usage_settings (
+ id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+ warn INTEGER NOT NULL CHECK(warn BETWEEN 0 AND 100), reserve INTEGER NOT NULL CHECK(reserve BETWEEN 0 AND warn)
+);
+INSERT OR IGNORE INTO usage_settings VALUES (1,0,40,30);

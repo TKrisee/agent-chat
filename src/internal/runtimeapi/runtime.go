@@ -90,3 +90,14 @@ func (e CapacityError) Error() string {
 	}
 	return "provider capacity unavailable before submission"
 }
+
+// WeeklyUsage is a provider-reported seven-day window. Reset may be absent.
+type WeeklyUsage struct {
+	Remaining int
+	Reset     *int64
+}
+
+// WeeklyUsageReader is optional; unsupported or failed reads must return an error.
+type WeeklyUsageReader interface {
+	ReadWeeklyUsage(context.Context) (WeeklyUsage, error)
+}
