@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.4](https://github.com/TKrisee/agent-chat/compare/v0.2.3...v0.2.4) (2026-11-24)
+
+
+### Bug Fixes
+
+* align attachment controls and clarify group activity ([43c3859](https://github.com/TKrisee/agent-chat/commit/43c3859b470bc351ed5cc1dc44bb40fd4f087f39))
+
 ## [0.2.3](https://github.com/TKrisee/agent-chat/compare/v0.2.2...v0.2.3) (2026-11-24)
 
 
