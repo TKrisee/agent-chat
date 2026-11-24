@@ -1,5 +1,7 @@
 import { test, expect } from './fixture.js';
 
+test.use({deviceScaleFactor:1});
+
 test('channel header retains panel controls on desktop and mobile', async ({ page, serviceURL }) => {
   let saved = '';
   await page.route('**/api/usage**', async route => {
@@ -24,6 +26,31 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
         Math.abs((glyph.x + glyph.width/2) - (target.x + target.width/2)) < 1;
     })).toBe(true);
   }
+  // Compare the painted pixels, not just the equal CSS boxes.
+  const paintedBounds = async locator => {
+    const png = await locator.screenshot({animations:'disabled'});
+    return page.evaluate(async bytes => {
+      const image = await createImageBitmap(new Blob([Uint8Array.from(bytes)], {type:'image/png'}));
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width; canvas.height = image.height;
+      const context = canvas.getContext('2d');
+      context.drawImage(image,0,0); image.close();
+      const pixels = context.getImageData(0,0,canvas.width,canvas.height).data;
+      const bg = [pixels[0],pixels[1],pixels[2]];
+      let left=canvas.width,top=canvas.height,right=-1,bottom=-1;
+      for(let y=0;y<canvas.height;y++)for(let x=0;x<canvas.width;x++){
+        const i=(y*canvas.width+x)*4;
+        if(Math.max(...bg.map((v,n)=>Math.abs(v-pixels[i+n])))>20){left=Math.min(left,x);right=Math.max(right,x);top=Math.min(top,y);bottom=Math.max(bottom,y);}
+      }
+      return {left,top,right,bottom};
+    }, [...png]);
+  };
+  await page.mouse.move(0,0);
+  const pie = await paintedBounds(weekly.locator('span'));
+  const cog = await paintedBounds(page.getByRole('button', {name:'Settings', exact:true}).locator('span'));
+  console.log('Painted icon bounds', {pie, cog});
+  expect(pie.right).toBeGreaterThan(pie.left);
+  for(const edge of ['left','top','right','bottom']) expect(Math.abs(pie[edge]-cog[edge])).toBeLessThanOrEqual(1);
   await weekly.focus();
   await expect(page.getByRole('tooltip')).toHaveText('Weekly · 53% left');
   await weekly.click();
