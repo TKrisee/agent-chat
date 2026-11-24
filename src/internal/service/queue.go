@@ -49,7 +49,12 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 				break
 			}
 			active[j.Agent] = true
-			go func() { done <- attempt{j.Agent, s.runJob(ctx, runner, *j)} }()
+			runCtx := ctx
+			release := func() {}
+			if j.Status == "pending" {
+				runCtx, release = s.registerRun(ctx, *j)
+			}
+			go func() { err := s.runJob(runCtx, runner, *j); release(); done <- attempt{j.Agent, err} }()
 		}
 		select {
 		case <-ctx.Done():
@@ -133,9 +138,9 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		if hold {
 			return s.disposition(j.ID, "pending", "weekly usage guard", s.opts.Poll)
 		}
-		runCtx := ctx
+		runCtx := runtimeapi.WithStartGate(ctx, func(start func() error) error { return s.startGate(ctx, j, start) })
 		if j.Kind == "work" && j.Project != "" {
-			runCtx = runtimeapi.WithStartNotification(ctx, func() {
+			runCtx = runtimeapi.WithStartNotification(runCtx, func() {
 				if err := s.workerStarted(j); err != nil {
 					log.Printf("record worker start: %v", err)
 				}
@@ -144,6 +149,12 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		result, err := runner.Execute(runCtx, j.Request)
 		if err == nil {
 			return s.finish(j, result)
+		}
+		if errors.Is(err, runtimeapi.ErrStartWithheld) {
+			return s.disposition(j.ID, "pending", "execution withheld before launch", 0)
+		}
+		if ctx.Err() != nil {
+			return s.disposition(j.ID, "uncertain", "interrupted; execution outcome requires review", 0)
 		}
 		if delay, ok := capacityDelay(err); ok {
 			if delay <= 0 {

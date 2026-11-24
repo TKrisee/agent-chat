@@ -43,4 +43,17 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await project.click();
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
   await expect(page.getByText('Private direct message', {exact:true})).toHaveCount(0);
+  await page.getByRole('button', {name:/Root conversation/}).click();
+  const rootComposer=page.getByLabel('Message Root');
+  await rootComposer.fill('/stop missing');
+  await rootComposer.press('Enter');
+  await expect(page.getByText('Project missing was not found.', {exact:false})).toBeVisible();
+  await expect(rootComposer).toHaveValue('/stop missing');
+  await rootComposer.fill('/stop atlas');
+  const stopResponse=page.waitForResponse(r=>r.url().endsWith('/api/projects/atlas/stop') && r.request().method()==='POST');
+  await rootComposer.press('Enter');
+  expect((await stopResponse).status()).toBe(200);
+  await expect(page.getByText(/Stop requested for atlas\. \d+ jobs? remain(?:s)? submitted, running or uncertain\./)).toBeVisible();
+  await expect(project.locator('small')).toHaveText(/^(stopped|stopping)$/);
+  await expect(rootComposer).toHaveValue('');
 });

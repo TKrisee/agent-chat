@@ -183,7 +183,7 @@ func pruneCapacity(dir, keep string) error {
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if name == keep || (name != "capacity-EMFILE" && name != "capacity-ENFILE") {
+		if name == keep || (name != "capacity-EMFILE" && name != "capacity-ENFILE" && name != "prestart-STOP") {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, name)); err != nil {
@@ -202,6 +202,13 @@ func retryable(dir string) (bool, error) {
 		return false, err
 	}
 	name := string(b)
+	if name == "prestart-STOP" {
+		proof, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || string(proof) != "STOP" {
+			return false, errors.New("invalid prestart stop receipt")
+		}
+		return true, nil
+	}
 	if name != "capacity-EMFILE" && name != "capacity-ENFILE" {
 		return false, errors.New("invalid capacity receipt")
 	}
@@ -215,6 +222,26 @@ func retryable(dir string) (bool, error) {
 	}
 	return true, nil
 }
+
+// persistWithheld proves no process was launched and permits a later safe retry.
+func persistWithheld(dir string) error {
+	proof := filepath.Join(dir, "prestart-STOP")
+	if err := syncFile(proof, []byte("STOP")); err != nil && !os.IsExist(err) {
+		return err
+	}
+	b, err := os.ReadFile(proof)
+	if err != nil || string(b) != "STOP" {
+		return errors.New("invalid prestart stop proof")
+	}
+	if err = syncDir(dir); err != nil {
+		return err
+	}
+	if err = syncFile(filepath.Join(dir, "retryable"), []byte("prestart-STOP")); err != nil {
+		return err
+	}
+	return syncDir(dir)
+}
+
 func lockRun(dir string, exclusive bool) (*os.File, error) {
 	f, err := os.OpenFile(filepath.Join(dir, "lock"), os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
@@ -271,7 +298,7 @@ func prompt(req runtimeapi.Request) string {
 func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeapi.Result, error) {
 	var zero runtimeapi.Result
 	if err := ctx.Err(); err != nil {
-		return zero, err
+		return zero, runtimeapi.StartCancellation(ctx)
 	}
 	if err := validate(req); err != nil {
 		return zero, err
@@ -343,7 +370,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 			return zero, fmt.Errorf("%w: retry proof changed", ErrUnknown)
 		}
 		if e = runCtx.Err(); e != nil {
-			return zero, e
+			return zero, runtimeapi.StartCancellation(runCtx)
 		}
 		marker, e := os.ReadFile(filepath.Join(dir, "retryable"))
 		if e != nil {
@@ -370,6 +397,12 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	}
 	args = append(args, "-")
 	if err = runCtx.Err(); err != nil {
+		if errors.Is(runtimeapi.StartCancellation(runCtx), runtimeapi.ErrStartWithheld) {
+			if e := persistWithheld(dir); e != nil {
+				return zero, fmt.Errorf("%w: persist withheld start: %v", ErrUnknown, e)
+			}
+			return zero, runtimeapi.ErrStartWithheld
+		}
 		if priorRetryMarker != "" {
 			if e := syncFile(filepath.Join(dir, "retryable"), []byte(priorRetryMarker)); e != nil {
 				return zero, fmt.Errorf("%w: restore prelaunch proof: %v", ErrUnknown, e)
@@ -381,6 +414,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		}
 		return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
 	}
+
 	cmd := exec.Command(r.cfg.CodexPath, args...)
 	configureProcess(cmd)
 	cmd.WaitDelay = 2 * time.Second
@@ -395,7 +429,30 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		}
 		cmd.Env = append(cmd.Env, item)
 	}
-	if err = r.start(cmd); err != nil {
+	var cleanup func()
+	if err = runtimeapi.StartThroughGate(runCtx, func() error {
+		if err := r.start(cmd); err != nil {
+			return err
+		}
+		var err error
+		cleanup, err = containProcess(cmd)
+		return err
+	}); err != nil {
+		if errors.Is(err, runtimeapi.ErrStartWithheld) && cmd.Process == nil {
+			if e := persistWithheld(dir); e != nil {
+				return zero, fmt.Errorf("%w: persist withheld start: %v", ErrUnknown, e)
+			}
+			return zero, runtimeapi.ErrStartWithheld
+		}
+		if cmd.Process == nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) && priorRetryMarker != "" {
+			if e := syncFile(filepath.Join(dir, "retryable"), []byte(priorRetryMarker)); e != nil {
+				return zero, fmt.Errorf("%w: restore prelaunch proof: %v", ErrUnknown, e)
+			}
+			if e := syncDir(dir); e != nil {
+				return zero, fmt.Errorf("%w: restore prelaunch proof: %v", ErrUnknown, e)
+			}
+			return zero, err
+		}
 		if cmd.Process == nil && (errors.Is(err, syscall.EMFILE) || errors.Is(err, syscall.ENFILE)) {
 			code := "EMFILE"
 			if errors.Is(err, syscall.ENFILE) {
@@ -410,13 +467,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 			_ = killProcess(cmd)
 			_ = cmd.Wait()
 		}
-		return zero, fmt.Errorf("%w: process launch failed: %v", ErrUnknown, err)
-	}
-	cleanup, err := containProcess(cmd)
-	if err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		return zero, fmt.Errorf("%w: process containment failed: %v", ErrUnknown, err)
+		return zero, fmt.Errorf("%w: process launch or containment failed: %v", ErrUnknown, err)
 	}
 	defer cleanup()
 	runtimeapi.NotifyStart(ctx)

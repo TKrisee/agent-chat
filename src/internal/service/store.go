@@ -47,15 +47,18 @@ type Options struct {
 }
 
 type Service struct {
-	usageMu   sync.RWMutex
-	usage     weeklySample
-	usageKick chan struct{}
-	db        *sql.DB
-	lock      *os.File
-	dir       string
-	opts      Options
-	kick      chan struct{}
-	run       chan struct{}
+	startMu    sync.Mutex
+	activeMu   sync.Mutex
+	activeRuns map[string]activeRun
+	usageMu    sync.RWMutex
+	usage      weeklySample
+	usageKick  chan struct{}
+	db         *sql.DB
+	lock       *os.File
+	dir        string
+	opts       Options
+	kick       chan struct{}
+	run        chan struct{}
 }
 
 func Open(opts Options) (*Service, error) {
@@ -89,7 +92,7 @@ func Open(opts Options) (*Service, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	s := &Service{db: db, lock: lock, dir: dir, opts: opts, kick: make(chan struct{}, 1), run: make(chan struct{}, 1), usageKick: make(chan struct{}, 1)}
+	s := &Service{db: db, lock: lock, dir: dir, opts: opts, kick: make(chan struct{}, 1), run: make(chan struct{}, 1), usageKick: make(chan struct{}, 1), activeRuns: make(map[string]activeRun)}
 	if err := s.initialize(); err != nil {
 		s.Close()
 		return nil, err

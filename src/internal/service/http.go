@@ -43,6 +43,8 @@ type Project struct {
 	Status           string `json:"status"`
 	PO               string `json:"po_id"`
 	UnsettledEffects int    `json:"unsettled_effects"`
+	GoalObjective    string `json:"goal_objective,omitempty"`
+	GoalStatus       string `json:"goal_status,omitempty"`
 }
 
 type Task struct {
@@ -178,12 +180,12 @@ func (s *Service) state() (State, error) {
 				view.Messages[i].Attachments = refs
 			}
 		}
-		view.Projects, err = querySlice(tx, `SELECT p.id,p.name,p.po_id,p.stopped,(SELECT COUNT(*) FROM jobs j
+		view.Projects, err = querySlice(tx, `SELECT p.id,p.name,p.po_id,p.stopped,COALESCE(g.objective,''),COALESCE(g.status,''),(SELECT COUNT(*) FROM jobs j
 			WHERE j.project_id=p.id AND j.status IN ('submitted','running','uncertain'))
-			FROM projects p ORDER BY p.id`, func(rows *sql.Rows) (Project, error) {
+			FROM projects p LEFT JOIN project_goals g ON g.project_id=p.id ORDER BY p.id`, func(rows *sql.Rows) (Project, error) {
 			var p Project
 			var stopped bool
-			err := rows.Scan(&p.ID, &p.Name, &p.PO, &stopped, &p.UnsettledEffects)
+			err := rows.Scan(&p.ID, &p.Name, &p.PO, &stopped, &p.GoalObjective, &p.GoalStatus, &p.UnsettledEffects)
 			p.Status = "running"
 			if stopped {
 				p.Status = "stopped"
@@ -425,6 +427,8 @@ func (s *Service) serveAttachment(w http.ResponseWriter, r *http.Request, previe
 }
 
 func (s *Service) setStop(w http.ResponseWriter, id string, stopped bool) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	var unsettled int
 	err := s.write(func(tx *sql.Tx) error {
 		var err error
@@ -435,8 +439,12 @@ func (s *Service) setStop(w http.ResponseWriter, id string, stopped bool) {
 		httpFailure(w, err)
 		return
 	}
+	interruptions := 0
+	if stopped {
+		interruptions = s.cancelProject(id)
+	}
 	s.signal()
-	respond(w, http.StatusOK, map[string]any{"id": id, "admission_stopped": stopped, "unsettled_effects": unsettled})
+	respond(w, http.StatusOK, map[string]any{"id": id, "admission_stopped": stopped, "unsettled_effects": unsettled, "interruption_requests": interruptions})
 }
 
 func updateStop(tx *sql.Tx, id string, stopped bool) (int, error) {

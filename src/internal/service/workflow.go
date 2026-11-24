@@ -32,6 +32,7 @@ func agentGuide(role, kind string, shared bool) string {
 	switch role {
 	case "root":
 		guide = rootGuide
+		guide += "\nOnly when the operator explicitly asks to set a PO goal, emit set_project_goal with the exact existing project ID, objective in body, and empty title and recipient. To change an existing goal only on explicit operator instruction, emit set_project_goal_status with the project ID and body exactly active, paused, or complete. These actions do not dispatch work."
 	case "po":
 		guide = poGuide
 		if kind == "operator_message" {
@@ -52,6 +53,16 @@ func agentGuide(role, kind string, shared bool) string {
 
 func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, instructions string) error {
 	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
+	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind {
+		var objective string
+		err := tx.QueryRow(`SELECT g.objective FROM project_goals g JOIN projects p ON p.id=g.project_id WHERE g.project_id=? AND p.po_id=? AND g.status='active'`, project, a.ID).Scan(&objective)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			guide += "\nCurrent active PO goal (project context, subject to the current assignment): " + objective
+		}
+	}
 	if a.Role == "root" && (kind == "operator_message" || kind == "approval_approved") {
 		projects, err := querySlice(tx, "SELECT id FROM projects ORDER BY id", func(rows *sql.Rows) (string, error) {
 			var id string
@@ -181,6 +192,8 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 }
 
 func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi.Attachment, files []attachmentData, invalid error) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	payload, err := json.Marshal(result)
 	if err != nil {
 		return err
@@ -245,6 +258,7 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 		return err
 	})
 	if err == nil {
+		s.cancelStoppedRuns()
 		s.signal()
 	}
 	return err
@@ -450,6 +464,8 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	}
 	if a.Role == "root" && (j.Kind == "operator_message" || j.Kind == "approval_approved") {
 		switch action.Type {
+		case "set_project_goal", "set_project_goal_status":
+			return setProjectGoal(tx, action)
 		case "delegate", "create_project":
 			return s.rootAssignment(tx, a, j, action)
 		case "stop_project", "resume_project":

@@ -3,6 +3,7 @@ package runtimeapi
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -112,4 +113,35 @@ func NotifyStart(ctx context.Context) {
 	if f, ok := ctx.Value(startNotificationKey{}).(func()); ok {
 		f()
 	}
+}
+
+// ErrStartWithheld means admission was revoked before a provider process began.
+var ErrStartWithheld = errors.New("project start withheld")
+
+// ErrProjectStop marks cancellation caused by an explicit project stop.
+var ErrProjectStop = errors.New("project stop requested")
+
+func StartCancellation(ctx context.Context) error {
+	if errors.Is(context.Cause(ctx), ErrProjectStop) {
+		return ErrStartWithheld
+	}
+	return ctx.Err()
+}
+
+type startGateKey struct{}
+
+func WithStartGate(ctx context.Context, gate func(func() error) error) context.Context {
+	return context.WithValue(ctx, startGateKey{}, gate)
+}
+func StartThroughGate(ctx context.Context, start func() error) error {
+	checked := func() error {
+		if ctx.Err() != nil {
+			return StartCancellation(ctx)
+		}
+		return start()
+	}
+	if gate, ok := ctx.Value(startGateKey{}).(func(func() error) error); ok {
+		return gate(checked)
+	}
+	return checked()
 }

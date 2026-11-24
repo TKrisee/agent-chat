@@ -47,11 +47,14 @@ func (f Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeapi
 	if err := os.MkdirAll(f.Dir, 0700); err != nil {
 		return got, err
 	}
-	started, err := os.OpenFile(f.startedPath(req), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	err = runtimeapi.StartThroughGate(ctx, func() error {
+		started, err := os.OpenFile(f.startedPath(req), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+		if err != nil {
+			return err
+		}
+		return errors.Join(started.Sync(), started.Close())
+	})
 	if err != nil {
-		return got, err
-	}
-	if err := errors.Join(started.Sync(), started.Close()); err != nil {
 		return got, err
 	}
 

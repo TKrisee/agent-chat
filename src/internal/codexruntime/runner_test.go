@@ -529,6 +529,17 @@ func TestGracefulCancellationRestoresPrelaunchProof(t *testing.T) {
 	if launchCount(t) != 0 {
 		t.Fatal("native child started during graceful cancellation")
 	}
+	stopCtx, stop := context.WithCancelCause(context.Background())
+	r.afterRetryConsumed = func() { stop(runtimeapi.ErrProjectStop) }
+	if _, err := r.Execute(stopCtx, req); !errors.Is(err, runtimeapi.ErrStartWithheld) {
+		t.Fatalf("project stop was not distinguished: %v", err)
+	}
+	if _, state, err := r.Recover(context.Background(), req); err != nil || state != runtimeapi.NotStarted {
+		t.Fatalf("stopped prelaunch proof lost: %v %v", state, err)
+	}
+	if launchCount(t) != 0 {
+		t.Fatal("project stop launched a native child")
+	}
 	r.afterRetryConsumed = nil
 	r.start = func(cmd *exec.Cmd) error { return cmd.Start() }
 	if _, err := r.Execute(context.Background(), req); err != nil || launchCount(t) != 1 {
