@@ -63,9 +63,9 @@
 .attachment-menu button:hover,.attachment-menu button:focus-visible { background:#edf3e9; outline:none; }
 .send-button { flex:none; display:grid; place-items:center; width:36px; height:36px; padding:0; border-radius:10px; font-size:16px; }
 @media(hover:none) { .attach-button,.send-button { width:44px; height:44px; } }
-.channel-header { display:flex; align-items:center; gap:12px; min-height:52px; padding:0 min(4%,38px); border-bottom:1px solid #e4eae1; background:#fbfcf8; }
+.channel-header { display:flex; align-items:center; gap:8px; min-height:52px; padding:0 10px; border-bottom:1px solid #e4eae1; background:#fbfcf8; }
 .channel-header h1 { margin:0; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font:700 15px Manrope,sans-serif; color:#34483c; }
-@media(max-width:760px) { .channel-header { padding:0 14px; } .channel-header .menu { display:block; margin:0; padding:0 4px; } }
+@media(max-width:760px) { .channel-header { padding:0 8px; } .channel-header .menu { display:block; margin:0; padding:0 4px; } }
 .rail-toggle { display:grid; place-items:center; width:36px; height:36px; padding:6px; }
 @media(max-width:760px) { .rail-toggle { display:none; } }
 .file-list { gap:8px; padding:0 0 8px; }
@@ -79,9 +79,24 @@
 .file-card button { position:absolute; top:3px; right:4px; border:0; border-radius:6px; background:transparent; color:#53675b; font-size:18px; }
 .compose-box textarea { resize:none; height:auto; max-height:min(240px, 35dvh); overflow-y:auto; }
 /* Panel controls remain in the channel header when panels are closed. */
-.channel-header .rail-toggle,.channel-header .work-toggle { display:grid; flex:none; align-self:center; place-items:center; width:36px; height:36px; margin:0; padding:6px; border:1px solid #dce4d8; border-radius:8px; background:#fff; color:#315d49; }
+.channel-header .rail-toggle,.channel-header .work-toggle { display:grid; flex:none; align-self:center; place-items:center; width:28px; height:28px; margin:0; padding:3px; border:1px solid #dce4d8; border-radius:8px; background:#fff; color:#315d49; }
 .channel-header .work-toggle { margin-left:auto; }
 .channel-header .work-toggle[aria-expanded="false"] .toggle-chevron { transform:rotate(180deg); }
-.context.collapsed { display:none; }
+
 @media(max-width:760px) { .sidebar { top:52px; } .context:not(.collapsed) { top:52px; } }
 .sidebar.rail-collapsed:not(.open) .side-empty { display:none; }
+
+@media(hover:none) { .channel-header .rail-toggle,.channel-header .work-toggle { width:40px; height:40px; } }
+
+/* Animate the rail and panel without retaining a closed-panel gutter. */
+.sidebar { overflow:hidden; transition:width .18s ease, padding .18s ease; }
+.context { overflow:hidden; transition:width .18s ease, padding .18s ease, border-width .18s ease, visibility 0s; }
+.context-body { min-width:200px; opacity:1; transition:opacity .14s ease; }
+.context.collapsed { display:flex; width:0; padding:0; border-width:0; visibility:hidden; transition:width .18s ease, padding .18s ease, border-width .18s ease, visibility 0s linear .18s; }
+.context.collapsed .context-body { opacity:0; }
+@media(max-width:760px) {
+ .sidebar { display:flex; transform:translateX(-105%); visibility:hidden; pointer-events:none; transition:transform .18s ease, visibility 0s linear .18s; }
+ .sidebar.open { transform:translateX(0); visibility:visible; pointer-events:auto; transition:transform .18s ease, visibility 0s; }
+ .context.collapsed { width:0; padding:0; border-width:0; }
+}
+@media(prefers-reduced-motion:reduce) { .sidebar,.sidebar.open,.context,.context.collapsed,.context-body { transition:none; } }
