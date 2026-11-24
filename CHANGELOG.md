@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/TKrisee/agent-chat/compare/v0.5.1...v0.5.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* enlarge and center the Settings cog ([e9e1a7b](https://github.com/TKrisee/agent-chat/commit/e9e1a7b0a874e6e8f99f1bedfcff188eccb88e34))
+
 ## [0.5.1](https://github.com/TKrisee/agent-chat/compare/v0.5.0...v0.5.1) (2026-11-24)
 
 
