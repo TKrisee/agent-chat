@@ -74,7 +74,7 @@ This runs under your user account and normally starts with its user manager at l
 
 ### macOS login agent
 
-Copy `packaging/com.agentchat.server.plist` to `~/Library/LaunchAgents/`, replace every placeholder with an absolute path (XML-escape special characters), and create the parent directory for the log files. Then run:
+Extract the release archive to a stable directory writable by the service account. Copy `packaging/com.agentchat.server.plist` to `~/Library/LaunchAgents/`, replace every placeholder with an absolute path (XML-escape special characters), and create the parent directory for the log files. The example starts `agentchat-launcher`, which selects the bundled UI and enables managed updates. Keep the data directory outside the release directory. Then run:
 
 ```sh
 launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.agentchat.server.plist

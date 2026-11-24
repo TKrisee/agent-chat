@@ -18,22 +18,19 @@ const workerGuide = "You are a worker. Complete the assigned task in your projec
 const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
 const groupChatGuide = "The operator explicitly mentioned you in the shared project group conversation. Your text and any attached regular workspace files will be shared with the project group. Use the shared history for context. Answer without orchestration actions or relays."
 
-func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, instructions string) error {
+// workflowDefaults are app-owned guidance, subordinate to the task, project
+// instructions, and the runtime's permission and safety requirements.
+const workflowDefaults = `When applicable to the assigned work, follow these defaults:
+- Agree on the smallest useful acceptance criteria and prove the normal user workflow early when practical.
+- Investigate concrete blockers; retry only when inputs or evidence change, and keep repeated attempts bounded without preventing distinct recovery.
+- Stop repeating checks once the relevant workflow passes and required checks are complete.
+- Preserve working patches and receipts. Give each remaining blocker one owner and report its evidence and next step instead of discarding work or restarting it. Continue independent work.`
+
+func agentGuide(role, kind string, shared bool) string {
 	guide := workerGuide
-	switch a.Role {
+	switch role {
 	case "root":
 		guide = rootGuide
-		if kind == "operator_message" || kind == "approval_approved" {
-			projects, err := querySlice(tx, "SELECT id FROM projects ORDER BY id", func(rows *sql.Rows) (string, error) {
-				var id string
-				err := rows.Scan(&id)
-				return id, err
-			})
-			if err != nil {
-				return err
-			}
-			guide += "\nExisting project IDs: " + strings.Join(projects, ", ")
-		}
 	case "po":
 		guide = poGuide
 	case "worker":
@@ -43,8 +40,24 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	}
 	if kind == groupMessageKind {
 		guide = groupChatGuide
-	} else if project != "" && project == a.Project {
+	} else if shared {
 		guide += "\nMessages marked with a project group recipient are shared context. Follow the instructions for the current task or conversation."
+	}
+	return guide + "\n\n" + workflowDefaults
+}
+
+func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, instructions string) error {
+	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
+	if a.Role == "root" && (kind == "operator_message" || kind == "approval_approved") {
+		projects, err := querySlice(tx, "SELECT id FROM projects ORDER BY id", func(rows *sql.Rows) (string, error) {
+			var id string
+			err := rows.Scan(&id)
+			return id, err
+		})
+		if err != nil {
+			return err
+		}
+		guide += "\nExisting project IDs: " + strings.Join(projects, ", ")
 	}
 	workspace := s.workspace("_root")
 	if project != "" {

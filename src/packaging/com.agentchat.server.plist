@@ -3,10 +3,9 @@
 <plist version="1.0"><dict>
   <key>Label</key><string>com.agentchat.server</string>
   <key>ProgramArguments</key><array>
-    <string>/ABSOLUTE/PATH/TO/agentchat/agentchat</string>
+    <string>/ABSOLUTE/PATH/TO/agentchat/agentchat-launcher</string>
     <string>-runtime</string><string>codex</string>
     <string>-data</string><string>/ABSOLUTE/PATH/TO/agentchat-data</string>
-    <string>-static</string><string>/ABSOLUTE/PATH/TO/agentchat/web</string>
     <string>-listen</string><string>127.0.0.1:8877</string>
     <string>-codex-path</string><string>/ABSOLUTE/PATH/TO/codex</string>
     <string>-jq-path</string><string>/ABSOLUTE/PATH/TO/jq</string>
