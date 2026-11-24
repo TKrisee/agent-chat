@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.2](https://github.com/TKrisee/agent-chat/compare/v0.2.1...v0.2.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* isolate chat rooms and enforce whitespace-free names ([2d2af68](https://github.com/TKrisee/agent-chat/commit/2d2af685c9881944f965a144cace19cc70d4c4d0))
+* move panel toggles into the chat topbar ([84ae369](https://github.com/TKrisee/agent-chat/commit/84ae369154990a35d2cbff225618c9c237c09552))
+* send chat with Enter and grow the composer automatically ([3c35a58](https://github.com/TKrisee/agent-chat/commit/3c35a58d3d6da019f74f36a2d533521c1d2fff2b))
+
 ## [0.2.1](https://github.com/TKrisee/agent-chat/compare/v0.2.0...v0.2.1) (2026-11-24)
 
 
