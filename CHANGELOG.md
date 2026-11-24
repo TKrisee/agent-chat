@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.4](https://github.com/TKrisee/agent-chat/compare/v0.5.3...v0.5.4) (2026-11-24)
+
+
+### Bug Fixes
+
+* match the rendered sidebar icon sizes ([dfb2edf](https://github.com/TKrisee/agent-chat/commit/dfb2edfc5382296d77ff701c1d5fa4ef5533bae0))
+
 ## [0.5.3](https://github.com/TKrisee/agent-chat/compare/v0.5.2...v0.5.3) (2026-11-24)
 
 
