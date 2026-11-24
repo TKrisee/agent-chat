@@ -10,6 +10,9 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
       'X-AgentChat-Guard-Warn':'40', 'X-AgentChat-Guard-Reserve':'30', 'X-AgentChat-Guard-Paused':'false',
     }});
   });
+  await page.route('**/api/update', route => route.fulfill({status:200,headers:{
+    'X-AgentChat-Update-Available':'true', 'X-AgentChat-Update-Current':'0.5.0', 'X-AgentChat-Update-State':'idle',
+  }}));
   await page.goto(serviceURL);
   const weekly=page.getByRole('button', {name:'Weekly · 53% left, open settings'});
   await expect(weekly).toBeVisible();
@@ -17,12 +20,15 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await expect(page.getByRole('tooltip')).toHaveText('Weekly · 53% left');
   await weekly.click();
   await expect(page.getByRole('heading', {name:'Settings'})).toBeVisible();
+  await expect(page.getByRole('button', {name:'Back to chat'})).toHaveCount(0);
+  await expect(page.locator('.settings-page #update-panel').getByRole('button', {name:'Check for updates'})).toBeVisible();
+  await expect(page.locator('#work-panel #update-panel')).toHaveCount(0);
   await page.getByLabel('Pause new work when the weekly reserve is reached').check();
   await page.getByRole('button', {name:'Save settings'}).click();
   await expect.poll(() => saved).toContain('enabled=true');
   await expect.poll(() => saved).toContain('warn_percent=40');
   await expect.poll(() => saved).toContain('reserve_percent=30');
-  await page.getByRole('button', {name:'Back to chat'}).click();
+  await page.getByRole('button', {name:/Root conversation/}).click();
   const header = page.locator('.channel-header');
   const left = header.locator('#rail-toggle');
   const right = header.locator('#work-toggle');
@@ -53,4 +59,10 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await expect(page.locator('#work-panel')).toBeHidden();
   await right.click();
   await expect(page.locator('#work-panel')).toBeVisible();
+  await left.click();
+  await page.getByRole('button', {name:'Settings', exact:true}).click();
+  await expect(header.getByRole('heading', {name:'Settings'})).toBeVisible();
+  await left.click();
+  await page.getByRole('button', {name:/Root conversation/}).click();
+  await expect(header.getByRole('heading', {name:'Root'})).toBeVisible();
 });
