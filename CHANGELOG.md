@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3](https://github.com/TKrisee/agent-chat/compare/v0.2.2...v0.2.3) (2026-11-24)
+
+
+### Bug Fixes
+
+* keep the composer stable while messages send ([4dda1ee](https://github.com/TKrisee/agent-chat/commit/4dda1eef81702545c9fc5f546fd5dafbf5c0fd4e))
+* tighten header controls and restore panel animations ([e048682](https://github.com/TKrisee/agent-chat/commit/e0486829b38575cb0f14d1eb6578a787794dde39))
+
 ## [0.2.2](https://github.com/TKrisee/agent-chat/compare/v0.2.1...v0.2.2) (2026-11-24)
 
 
