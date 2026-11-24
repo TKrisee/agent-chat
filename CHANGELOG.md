@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/TKrisee/agent-chat/compare/v0.2.4...v0.3.0) (2026-11-24)
+
+
+### Features
+
+* show weekly allowance and guard new agent work ([e20858d](https://github.com/TKrisee/agent-chat/commit/e20858d6145d20b6308ea07022c9c3c429aa2ad1))
+
 ## [0.2.4](https://github.com/TKrisee/agent-chat/compare/v0.2.3...v0.2.4) (2026-11-24)
 
 
