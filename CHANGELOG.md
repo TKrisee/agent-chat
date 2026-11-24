@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/TKrisee/agent-chat/compare/v0.6.0...v0.6.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* confirm when project owner assignments start ([075311a](https://github.com/TKrisee/agent-chat/commit/075311aebe8164d3276f79c7b46f34ee5b17a327))
+
 ## [0.6.0](https://github.com/TKrisee/agent-chat/compare/v0.5.4...v0.6.0) (2026-11-24)
 
 
