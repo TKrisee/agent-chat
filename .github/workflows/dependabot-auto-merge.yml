@@ -5,6 +5,7 @@ on:
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
+  actions: read
   contents: write
   pull-requests: write
 
@@ -23,4 +24,40 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --auto --merge "$PR_URL"
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if output=$(gh pr merge --auto --merge --match-head-commit "$HEAD_SHA" "$PR_URL" 2>&1); then
+            echo "$output"
+            exit 0
+          fi
+          echo "$output" >&2
+          if [[ "$output" != *'Pull request is in clean status (enablePullRequestAutoMerge)'* ]]; then
+            exit 1
+          fi
+
+          # On an unprotected branch GitHub rejects --auto for a CLEAN PR.
+          # Wait for the latest Validate run on this exact PR head to pass.
+          for attempt in {1..30}; do
+            runs=$(gh api --method GET "repos/$REPO/actions/workflows/ci.yml/runs" -f event=pull_request -f head_sha="$HEAD_SHA" -f per_page=100)
+            run_id=$(jq -r '[.workflow_runs[] | select(.head_sha == $sha)] | sort_by(.id) | last | .id // empty' --arg sha "$HEAD_SHA" <<<"$runs")
+            if [[ -n "$run_id" ]]; then
+              jobs=$(gh api "repos/$REPO/actions/runs/$run_id/jobs?per_page=100")
+              state=$(jq -r '[.jobs[] | select(.name == "go")] | last | if . == null then "missing" elif .status != "completed" then "pending" else .conclusion end' <<<"$jobs")
+              if [[ "$state" == success ]]; then
+                pr=$(gh pr view "$PR_URL" --json headRefOid,mergeStateStatus,author,isDraft)
+                jq -e --arg sha "$HEAD_SHA" '.headRefOid == $sha and .mergeStateStatus == "CLEAN" and .author.login == "dependabot[bot]" and .isDraft == false' <<<"$pr" >/dev/null
+                gh pr merge --merge --match-head-commit "$HEAD_SHA" "$PR_URL"
+                exit 0
+              fi
+              if [[ "$state" != pending && "$state" != missing ]]; then
+                echo "Validate go check did not pass: $state" >&2
+                exit 1
+              fi
+            fi
+            sleep 10
+          done
+          echo 'Timed out waiting for Validate go on the PR head' >&2
+          exit 1
