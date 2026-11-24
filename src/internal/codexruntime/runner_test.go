@@ -320,9 +320,21 @@ func TestRoleActionScopeAndRootWithoutProject(t *testing.T) {
 		if _, err := r.Execute(context.Background(), req); err != nil {
 			t.Fatal(err)
 		}
-		cmd := exec.Command(r.cfg.JQPath, "-e", `.properties | has("actions") | not`, filepath.Join(r.dir(req.ID), "schema.json"))
+		cmd := exec.Command(r.cfg.JQPath, "-e", `.properties.actions.items.properties.type.enum == ["post_group"]`, filepath.Join(r.dir(req.ID), "schema.json"))
 		if err := cmd.Run(); err != nil {
-			t.Fatal("worker schema exposes actions")
+			t.Fatal("worker schema must expose only post_group")
+		}
+	})
+	t.Run("worker group post allowed", func(t *testing.T) {
+		r, req, _ := setup(t)
+		req.Role = "worker"
+		t.Setenv("FAKE_RESULT", `{"text":"done","actions":[{"type":"post_group","project":"pebble","title":"","body":"Project update","recipient":""}],"attachments":[]}`)
+		result, err := r.Execute(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Actions) != 1 || result.Actions[0].Type != "post_group" || result.Actions[0].Body != "Project update" {
+			t.Fatalf("worker group post missing: %+v", result.Actions)
 		}
 	})
 	t.Run("unsupported action refused", func(t *testing.T) {

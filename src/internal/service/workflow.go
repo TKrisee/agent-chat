@@ -97,7 +97,9 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient,recipient,room_id"
 	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
 		WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL
-		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + ` OR ` + groupNoticeSender + `) ORDER BY m.seq DESC LIMIT `
+		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + `) ORDER BY m.seq DESC LIMIT `
+	const notice = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
+        WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL AND ` + groupNoticeSender + ` ORDER BY m.seq DESC LIMIT 12`
 	groupRecipient := groupPrefix + project
 	sharedArgs := []any{project, groupRecipient, operator}
 	query := "SELECT " + privateColumns + " FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 24"
@@ -114,9 +116,15 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		}
 	}
 	query = "SELECT * FROM (" + query + ")"
+	if kind == groupMessageKind {
+		query += " UNION SELECT * FROM (" + notice + ")"
+		args = append(args, project, groupRecipient)
+	}
 	if kind != groupMessageKind && kind != "operator_message" && project != "" && (project == a.Project || a.Role == "root") {
 		query += " UNION SELECT * FROM (" + shared + "12)"
 		args = append(args, sharedArgs...)
+		query += " UNION SELECT * FROM (" + notice + ")"
+		args = append(args, project, groupRecipient)
 	}
 	if kind == "scope_review" {
 		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages
