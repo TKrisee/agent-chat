@@ -1,0 +1,36 @@
+import { test, expect } from './fixture.js';
+
+test('group and agent conversations stay in their own rooms', async ({ page, serviceURL }) => {
+  await page.goto(serviceURL);
+  const root = page.getByLabel('Message Root');
+  await root.fill('Start project atlas: Check room visibility');
+  await root.press('Enter');
+  const project = page.locator('[data-project="atlas"]');
+  await expect(project).toBeVisible({timeout: 20000});
+  await project.click();
+  const group = page.getByLabel('Message atlas chat');
+  await group.fill('Shared untagged message');
+  await group.press('Enter');
+  await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
+  const lead = page.locator('[data-agent]').first();
+  await expect(lead).toBeVisible();
+  const leadId = await lead.getAttribute('data-agent');
+  await page.getByRole('button', {name:'@ Mention'}).click();
+  await page.locator(`[data-mention-choice="${leadId}"]`).click();
+  await group.press('End');
+  await group.pressSequentially(' Shared tagged message');
+  await group.press('Enter');
+  await expect(page.locator('.chat').getByText('Shared tagged message', {exact:false})).toBeVisible();
+  await expect(page.locator('.chat').getByText('PO replied in the project group:', {exact:false})).toBeVisible({timeout:20000});
+  await lead.click();
+  const direct = page.locator('#message');
+  await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toHaveCount(0);
+  await expect(page.getByText('Shared tagged message', {exact:false})).toHaveCount(0);
+  await expect(page.getByText('PO replied in the project group:', {exact:false})).toHaveCount(0);
+  await direct.fill('Private direct message');
+  await direct.press('Enter');
+  await expect(page.locator('.chat').getByText('Private direct message', {exact:true})).toBeVisible();
+  await project.click();
+  await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
+  await expect(page.getByText('Private direct message', {exact:true})).toHaveCount(0);
+});

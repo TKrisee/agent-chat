@@ -90,9 +90,9 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 }
 
 func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kind string) ([]runtimeapi.Message, error) {
-	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient"
-	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient FROM messages m
-		WHERE m.project_id=? AND m.recipient=? AND m.task_id IS NULL
+	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient,recipient,room_id"
+	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
+		WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL
 		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + `) ORDER BY m.seq DESC LIMIT `
 	groupRecipient := groupPrefix + project
 	sharedArgs := []any{project, groupRecipient, operator}
@@ -110,7 +110,7 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		}
 	}
 	query = "SELECT * FROM (" + query + ")"
-	if kind != groupMessageKind && project != "" && project == a.Project {
+	if kind != groupMessageKind && kind != "operator_message" && project != "" && (project == a.Project || a.Role == "root") {
 		query += " UNION SELECT * FROM (" + shared + "12)"
 		args = append(args, sharedArgs...)
 	}
@@ -125,11 +125,24 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		args = append(args, task)
 	}
 	if parent != "" {
-		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END
+		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END,recipient,room_id
 			FROM messages WHERE id=?`
 		args = append(args, groupRecipient, project, parent)
 	}
-	query = "SELECT id,sender,role,text,group_recipient FROM (" + query + ") ORDER BY seq"
+	query = "SELECT id,sender,role,text,group_recipient FROM (" + query + ") WHERE ((room_id LIKE 'dm:%' AND (sender=? OR recipient=?)) OR (room_id=? AND ?=1))"
+	groupAllowed := 0
+	if project != "" && (a.Role == "root" || a.Project == project) {
+		groupAllowed = 1
+	}
+	args = append(args, a.ID, a.ID, groupRecipient, groupAllowed)
+	if kind == "operator_message" {
+		query += " AND room_id=?"
+		args = append(args, directRoom(a.ID, operator))
+	} else if kind == groupMessageKind {
+		query += " AND room_id=?"
+		args = append(args, groupRecipient)
+	}
+	query += " ORDER BY seq"
 	messages, err := querySlice(tx, query, func(rows *sql.Rows) (runtimeapi.Message, error) {
 		var m runtimeapi.Message
 		err := rows.Scan(&m.ID, &m.Sender, &m.Role, &m.Text, &m.GroupRecipient)
@@ -493,6 +506,9 @@ func activeReviewWorker(tx *sql.Tx, j job, po string) (string, error) {
 }
 
 func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
+	if err := validateDisplayName(action.Project); err != nil {
+		return fmt.Errorf("%w: project/channel name %v", errWorkflow, err)
+	}
 	if !projectID.MatchString(action.Project) || strings.TrimSpace(action.Title) == "" ||
 		strings.TrimSpace(action.Body) == "" {
 		return fmt.Errorf("%w: assignment needs project ID, title and body", errWorkflow)
@@ -512,8 +528,11 @@ func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.A
 			action.Project, action.Project, poID, s.workspace(action.Project)); err != nil {
 			return err
 		}
-		for _, member := range []agent{{ID: poID, Name: action.Project + " PO", Role: "po", Model: s.opts.POModel},
-			{ID: newID(), Name: action.Project + " Worker", Role: "worker", Model: s.opts.WorkerModel}} {
+		for _, member := range []agent{{ID: poID, Name: action.Project + "-PO", Role: "po", Model: s.opts.POModel},
+			{ID: newID(), Name: action.Project + "-Worker", Role: "worker", Model: s.opts.WorkerModel}} {
+			if err := validateDisplayName(member.Name); err != nil {
+				return fmt.Errorf("%w: agent name %v", errWorkflow, err)
+			}
 			if _, err := tx.Exec("INSERT INTO agents VALUES (?,?,?,?,?,?)",
 				member.ID, member.Name, member.Role, action.Project, member.Model, s.opts.Effort); err != nil {
 				return err

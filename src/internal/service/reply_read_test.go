@@ -105,7 +105,14 @@ func TestOperatorReplyAndReadReceipts(t *testing.T) {
 	afterRead := snapshot()
 	if !rootRead.Equal(*message(afterRead, olderIncoming).OperatorReadAt) ||
 		message(afterRead, unread).OperatorReadAt != nil || message(afterRead, olderOutgoing).OperatorReadAt != nil ||
-		message(afterRead, internal).OperatorReadAt != nil {
+		func() bool {
+			requireHidden(t, afterRead, internal)
+			var n int
+			if err := s.db.QueryRow("SELECT count(*) FROM operator_message_reads WHERE message_id=?", internal).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n != 0
+		}() {
 		t.Fatal("read batch changed an ineligible receipt or rewrote its original timestamp")
 	}
 

@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,42 @@ func openTest(t *testing.T, dir string) *Service {
 		t.Fatal(err)
 	}
 	return s
+}
+
+// storedMessageForTest inspects an internal handoff without exposing it through operator state.
+func storedMessageForTest(t *testing.T, s *Service, id string) Message {
+	t.Helper()
+	var m Message
+	if err := s.db.QueryRow(`SELECT id,sender,recipient,role,text,COALESCE(task_id,''),COALESCE(project_id,''),COALESCE(room_id,'') FROM messages WHERE id=?`, id).Scan(&m.ID, &m.Sender, &m.Recipient, &m.Role, &m.Text, &m.Task, &m.Project, &m.RoomID); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := querySlice(s.db, `SELECT a.id,a.name,a.media_type FROM message_attachments l JOIN attachments a ON a.id=l.attachment_id WHERE l.message_id=? ORDER BY a.id`, func(rows *sql.Rows) (AttachmentRef, error) {
+		var a AttachmentRef
+		err := rows.Scan(&a.ID, &a.Name, &a.MediaType)
+		a.URL = "/api/attachments/" + a.ID
+		return a, err
+	}, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Attachments = refs
+	return m
+}
+func internalMessageID(t *testing.T, s *Service, task, role, recipient string) string {
+	t.Helper()
+	var id string
+	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role=? AND recipient=? ORDER BY seq DESC LIMIT 1", task, role, recipient).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+func requireHidden(t *testing.T, state State, id string) {
+	t.Helper()
+	for _, m := range state.Messages {
+		if m.ID == id {
+			t.Fatalf("internal message %s exposed to operator", id)
+		}
+	}
 }
 
 func runTest(t *testing.T, s *Service, r runtimeapi.Runner) func() {
@@ -160,7 +197,7 @@ func TestHTTPVerticalSliceAndRestart(t *testing.T) {
 	if acceptedMessages != 1 {
 		t.Fatalf("operator UUID appears %d times in GET state", acceptedMessages)
 	}
-	attachment := assertReportAttachment(t, state, state.Tasks[0].ID, "check launch")
+	attachment := assertReportAttachment(t, s, state, state.Tasks[0].ID, "check launch")
 	got := call(t, second.URL+attachment.URL, "GET", nil, 200)
 	if string(got) != "Completed: check launch\n" {
 		t.Fatalf("attachment body: %q", got)
@@ -204,10 +241,10 @@ func TestHTTPVerticalSliceAndRestart(t *testing.T) {
 	if len(state.Projects) != 1 || state.Projects[0].PO != po || len(state.Tasks) != 2 || len(state.Jobs) != 15 {
 		t.Fatalf("delegation failed or duplicated: %+v", state)
 	}
-	if earlier := assertReportAttachment(t, state, state.Tasks[0].ID, "check launch"); earlier != attachment {
+	if earlier := assertReportAttachment(t, s, state, state.Tasks[0].ID, "check launch"); earlier != attachment {
 		t.Fatalf("attachment changed on restart: %+v != %+v", earlier, attachment)
 	}
-	later := assertReportAttachment(t, state, state.Tasks[1].ID, "verify logs")
+	later := assertReportAttachment(t, s, state, state.Tasks[1].ID, "verify logs")
 	if later.ID == attachment.ID {
 		t.Fatal("attachment was shared across tasks")
 	}
@@ -219,9 +256,24 @@ func TestHTTPVerticalSliceAndRestart(t *testing.T) {
 	}
 }
 
-func assertReportAttachment(t *testing.T, state State, task, title string) AttachmentRef {
+func assertReportAttachment(t *testing.T, s *Service, state State, task, title string) AttachmentRef {
 	t.Helper()
 	var original, poReport, operatorReport AttachmentRef
+	var workerID, poID string
+	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role='worker' ORDER BY seq DESC LIMIT 1", task).Scan(&workerID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role='po' AND recipient='root' ORDER BY seq DESC LIMIT 1", task).Scan(&poID); err != nil {
+		t.Fatal(err)
+	}
+	requireHidden(t, state, workerID)
+	requireHidden(t, state, poID)
+	w, p := storedMessageForTest(t, s, workerID), storedMessageForTest(t, s, poID)
+	if len(w.Attachments) != 1 || len(p.Attachments) != 1 {
+		t.Fatal("internal handoff attachments missing")
+	}
+	original = w.Attachments[0]
+	poReport = p.Attachments[0]
 	for _, m := range state.Messages {
 		if m.Task != task || len(m.Attachments) != 1 || !strings.Contains(m.Text, title) {
 			continue
@@ -510,7 +562,7 @@ func TestPOReviewAcceptsOnlyTheCurrentWorkerReference(t *testing.T) {
 				return false
 			})
 			if tc.diagnostic == "" {
-				ref := assertReportAttachment(t, state, taskID, title)
+				ref := assertReportAttachment(t, s, state, taskID, title)
 				if got := call(t, server.URL+ref.URL, "GET", nil, 200); string(got) != "Completed: "+title+"\n" {
 					t.Fatalf("review attachment: %q", got)
 				}
@@ -618,8 +670,14 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 	if project.ID != "slate-smoke" || !clientID.MatchString(project.PO) || task.Owner != project.PO {
 		t.Fatalf("service-owned PO missing: project=%+v task=%+v", project, task)
 	}
-	var accepted, relayed AttachmentRef
-	var workerSource string
+	workerSource := internalMessageID(t, s, task.ID, "worker", project.PO)
+	requireHidden(t, state, workerSource)
+	internal := storedMessageForTest(t, s, workerSource)
+	if len(internal.Attachments) != 1 {
+		t.Fatal("worker artifact missing")
+	}
+	accepted := internal.Attachments[0]
+	var relayed AttachmentRef
 	for _, m := range state.Messages {
 		if m.Task != task.ID || len(m.Attachments) != 1 {
 			continue

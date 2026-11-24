@@ -121,6 +121,9 @@ func (s *Service) initialize() error {
 		if _, err := tx.Exec(schema); err != nil {
 			return err
 		}
+		if err := migrateRooms(tx); err != nil {
+			return err
+		}
 		_, err := tx.Exec("INSERT OR IGNORE INTO agents VALUES (?,?,?,?,?,?)",
 			root, "Root", "root", nil, s.opts.RootModel, s.opts.Effort)
 		return err
@@ -333,17 +336,12 @@ func groupTargets(tx *sql.Tx, project string, mentions []string) ([]agent, error
 }
 
 func checkReplyParent(tx *sql.Tx, parent, recipient, project string) error {
-	var row *sql.Row
+	room := directRoom(operator, recipient)
 	if project != "" {
-		row = tx.QueryRow(`SELECT 1 FROM messages m WHERE m.id=? AND m.project_id=? AND m.recipient=? AND m.task_id IS NULL
-			AND ((m.sender=? AND m.role='operator') OR `+groupMemberSender+`)`, parent, project, recipient, operator)
-	} else {
-		row = tx.QueryRow(`SELECT 1 FROM messages WHERE id=? AND
-			((sender=? AND recipient=?) OR (sender=? AND recipient=?))`,
-			parent, operator, recipient, recipient, operator)
+		room = groupPrefix + project
 	}
 	var allowed int
-	err := row.Scan(&allowed)
+	err := tx.QueryRow("SELECT 1 FROM messages WHERE id=? AND room_id=?", parent, room).Scan(&allowed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: reply parent is unavailable in this conversation", errAbsent)
 	}
@@ -362,8 +360,8 @@ func (s *Service) markOperatorRead(ids []string) error {
 			args = append(args, id)
 		}
 	}
-	scope := ` FROM messages m WHERE ((m.recipient=? AND m.sender<>?) OR
-		(m.task_id IS NULL AND m.recipient=?||m.project_id AND ` + groupMemberSender + `))
+	scope := ` FROM messages m WHERE ((m.recipient=? AND m.sender<>? AND m.room_id='dm:'||CASE WHEN m.sender<m.recipient THEN m.sender||':'||m.recipient ELSE m.recipient||':'||m.sender END) OR
+		(m.task_id IS NULL AND m.room_id=?||m.project_id AND m.recipient=m.room_id AND ` + groupMemberSender + `))
 		AND m.id IN (` + strings.Repeat("?,", len(seen)-1) + "?)"
 	return s.write(func(tx *sql.Tx) error {
 		var eligible int
@@ -380,7 +378,45 @@ func (s *Service) markOperatorRead(ids []string) error {
 }
 
 func addMessage(tx *sql.Tx, id, sender, recipient, role, text, project, task string) error {
-	_, err := tx.Exec("INSERT INTO messages(id,sender,recipient,role,text,at,task_id,project_id) VALUES(?,?,?,?,?,?,?,?)",
-		id, sender, recipient, role, text, now(), nullIfEmpty(task), nullIfEmpty(project))
+	room := directRoom(sender, recipient)
+	if strings.HasPrefix(recipient, groupPrefix) {
+		if project == "" || recipient != groupPrefix+project {
+			return fmt.Errorf("%w: invalid group room", errInvalid)
+		}
+		room = recipient
+	}
+	_, err := tx.Exec("INSERT INTO messages(id,sender,recipient,role,text,at,task_id,project_id,room_id) VALUES(?,?,?,?,?,?,?,?,?)",
+		id, sender, recipient, role, text, now(), nullIfEmpty(task), nullIfEmpty(project), room)
+	return err
+}
+
+// directRoom is stable regardless of message direction.
+func directRoom(a, b string) string {
+	if a > b {
+		a, b = b, a
+	}
+	return "dm:" + a + ":" + b
+}
+
+// Existing rows are classified once; malformed or ambiguous rows remain hidden.
+func migrateRooms(tx *sql.Tx) error {
+	var exists int
+	if err := tx.QueryRow("SELECT count(*) FROM pragma_table_info('messages') WHERE name='room_id'").Scan(&exists); err != nil {
+		return err
+	}
+	if exists != 0 {
+		return nil
+	}
+	if _, err := tx.Exec("ALTER TABLE messages ADD COLUMN room_id TEXT"); err != nil {
+		return err
+	}
+	_, err := tx.Exec(`UPDATE messages AS m SET room_id=CASE
+ WHEN project_id IS NOT NULL AND recipient='group:'||project_id AND task_id IS NULL
+  AND EXISTS (SELECT 1 FROM projects p WHERE p.id=m.project_id)
+  AND ((sender='operator' AND role='operator') OR ` + groupMemberSender + `) THEN recipient
+ WHEN sender<>recipient AND (sender IN ('operator','root','service') OR EXISTS (SELECT 1 FROM agents a WHERE a.id=m.sender))
+  AND (recipient IN ('operator','root','service') OR EXISTS (SELECT 1 FROM agents a WHERE a.id=m.recipient))
+  THEN 'dm:' || CASE WHEN sender<recipient THEN sender||':'||recipient ELSE recipient||':'||sender END
+ ELSE NULL END`)
 	return err
 }

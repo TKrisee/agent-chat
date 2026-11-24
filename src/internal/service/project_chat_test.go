@@ -95,7 +95,8 @@ func TestProjectAgentDirectChat(t *testing.T) {
 		t.Helper()
 		i := slices.IndexFunc(state.Messages, func(m Message) bool { return m.ID == id })
 		if i < 0 {
-			t.Fatalf("missing message %q", id)
+			requireHidden(t, state, id)
+			return storedMessageForTest(t, s, id)
 		}
 		return state.Messages[i]
 	}
@@ -164,7 +165,7 @@ func TestProjectAgentDirectChat(t *testing.T) {
 			return slices.ContainsFunc(req.Context, func(m runtimeapi.Message) bool { return m.ID == id })
 		}
 		if req.Kind != "operator_message" || req.Role != "worker" || req.AgentID != worker || req.ProjectID != "atlas" ||
-			req.TaskID != "" || !has(source) || !has(taskResult) || has(other) ||
+			req.TaskID != "" || !has(source) || has(taskResult) || has(other) ||
 			(parent != "" && (!has(parent) || !strings.Contains(req.Instructions, parent))) {
 			t.Fatalf("wrong direct worker context: %+v", req)
 		}

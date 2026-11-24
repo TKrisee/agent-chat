@@ -4,17 +4,23 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await page.goto(serviceURL);
   const header = page.locator('.channel-header');
   await expect(header.getByRole('heading', { name: 'Root' })).toBeVisible();
-  expect((await header.boundingBox()).height).toBeLessThanOrEqual(56);
+  await expect.poll(async () => (await header.boundingBox())?.height ?? Infinity).toBeLessThanOrEqual(56);
   const composer = page.getByLabel('Message Root');
   const add = page.getByRole('button', { name: 'Add attachment' });
   const upload = page.getByRole('button', { name: 'Upload a file' });
   await expect(page.getByRole('button', { name: 'Send message' })).toHaveCount(0);
   await expect(page.locator('.compose-bottom')).toHaveCount(0);
-  const inputBox = await composer.boundingBox();
+  await expect(composer).toBeVisible();
+  let inputBox;
+  await expect.poll(async () => {
+    const box = await composer.boundingBox();
+    if (box) inputBox = box;
+    return box?.height ?? 0;
+  }).toBeGreaterThan(0);
   const initialHeight = inputBox.height;
   await add.click();
   await expect(upload).toBeVisible();
-  expect((await upload.boundingBox()).y).toBeLessThan(inputBox.y);
+  await expect.poll(async () => (await upload.boundingBox())?.y ?? Infinity).toBeLessThan(inputBox.y);
   await page.keyboard.press('Escape');
   await expect(upload).toBeHidden();
   await expect(add).toBeFocused();
@@ -24,15 +30,15 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.fill('First line');
   await composer.press('Shift+Enter');
   await expect(composer).toHaveValue('First line\n');
-  await expect.poll(async () => (await composer.boundingBox()).height).toBeGreaterThan(initialHeight);
+  await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBeGreaterThan(initialHeight);
   await page.getByRole('button', { name: /Root conversation/ }).click();
   await expect(composer).toHaveValue('First line\n');
-  await expect.poll(async () => (await composer.boundingBox()).height).toBeGreaterThan(initialHeight);
+  await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBeGreaterThan(initialHeight);
   await composer.fill(Array(50).fill('Long draft').join('\n'));
-  await expect.poll(async () => (await composer.boundingBox()).height).toBeLessThanOrEqual(240);
-  await expect.poll(() => composer.evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true);
+  await expect.poll(async () => ((await composer.boundingBox())?.height ?? Infinity)).toBeLessThanOrEqual(240);
+  await expect.poll(() => composer.evaluateAll(els => els.some(el => el.scrollHeight > el.clientHeight))).toBe(true);
   await composer.fill('');
-  await expect.poll(async () => (await composer.boundingBox()).height).toBe(initialHeight);
+  await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
   const transfer = await page.evaluateHandle(() => {
     const data = new DataTransfer();
     const png = Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII='), c => c.charCodeAt(0));
@@ -47,7 +53,7 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.fill('Please review the notes');
   await composer.press('Enter');
   await expect(page.getByRole('article').filter({ hasText: 'Please review the notes' }).getByText('tiny.png')).toBeVisible();
-  await expect.poll(async () => (await composer.boundingBox()).height).toBe(initialHeight);
+  await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
 
   await add.click();
   const chooser = page.waitForEvent('filechooser');

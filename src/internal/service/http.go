@@ -22,6 +22,7 @@ type AttachmentRef struct {
 }
 
 type Message struct {
+	RoomID         string          `json:"room_id"`
 	ID             string          `json:"id"`
 	Sender         string          `json:"sender"`
 	Recipient      string          `json:"recipient"`
@@ -118,15 +119,17 @@ func (s *Service) state() (State, error) {
 	err := s.write(func(tx *sql.Tx) error {
 		var err error
 		view.Messages, err = querySlice(tx, `SELECT m.id,m.sender,m.recipient,m.role,m.text,m.at,
-			COALESCE(m.task_id,''),COALESCE(m.project_id,''),COALESCE(reply.parent_id,''),receipt.read_at
+			COALESCE(m.task_id,''),COALESCE(m.project_id,''),COALESCE(reply.parent_id,''),receipt.read_at,m.room_id
 			FROM messages m
 			LEFT JOIN message_replies reply ON reply.message_id=m.id
-			LEFT JOIN operator_message_reads receipt ON receipt.message_id=m.id ORDER BY m.seq`, func(rows *sql.Rows) (Message, error) {
+			LEFT JOIN operator_message_reads receipt ON receipt.message_id=m.id
+            WHERE m.room_id IS NOT NULL AND ((m.room_id LIKE 'dm:%' AND (m.sender='operator' OR m.recipient='operator'))
+              OR (m.room_id='group:'||m.project_id AND EXISTS (SELECT 1 FROM projects p WHERE p.id=m.project_id))) ORDER BY m.seq`, func(rows *sql.Rows) (Message, error) {
 			var m Message
 			var millis int64
 			var readMillis sql.NullInt64
 			err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Role, &m.Text, &millis,
-				&m.Task, &m.Project, &m.ReplyTo, &readMillis)
+				&m.Task, &m.Project, &m.ReplyTo, &readMillis, &m.RoomID)
 			m.At = time.UnixMilli(millis).UTC()
 			if readMillis.Valid {
 				at := time.UnixMilli(readMillis.Int64).UTC()
@@ -386,7 +389,10 @@ func (s *Service) serveAttachment(w http.ResponseWriter, r *http.Request, previe
 	}
 	var name, mediaType string
 	var content []byte
-	if err := s.db.QueryRow("SELECT name,media_type,content FROM attachments WHERE id=?", id).
+	if err := s.db.QueryRow(`SELECT a.name,a.media_type,a.content FROM attachments a WHERE a.id=? AND EXISTS (
+        SELECT 1 FROM message_attachments link JOIN messages m ON m.id=link.message_id
+        WHERE link.attachment_id=a.id AND m.room_id IS NOT NULL AND ((m.room_id LIKE 'dm:%' AND (m.sender='operator' OR m.recipient='operator'))
+          OR (m.room_id='group:'||m.project_id AND EXISTS (SELECT 1 FROM projects p WHERE p.id=m.project_id))))`, id).
 		Scan(&name, &mediaType, &content); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = errAbsent

@@ -85,9 +85,9 @@ func TestProjectGroupMessages(t *testing.T) {
 	if req := request(); req.Kind != "operator_message" || !contains(req, direct) {
 		t.Fatalf("unexpected direct PO context: %+v", req)
 	}
-	internal := message(before, func(m Message) bool {
-		return m.Project == "atlas" && m.Recipient == po && m.Role == "worker"
-	})
+	internalID := internalMessageID(t, s, projects.Tasks[0].ID, "worker", po)
+	requireHidden(t, before, internalID)
+	internal := storedMessageForTest(t, s, internalID)
 	worker := internal.Sender
 
 	group := "group:atlas"
@@ -213,7 +213,14 @@ func TestProjectGroupMessages(t *testing.T) {
 	persisted := message(readback, func(m Message) bool { return m.ID == firstReply.ID }).OperatorReadAt
 	if receipt == nil || persisted == nil || !persisted.Equal(*receipt) || !slices.Equal(readback.Jobs, multicast.Jobs) ||
 		message(readback, func(m Message) bool { return m.ID == workerReply.ID }).OperatorReadAt == nil ||
-		message(readback, func(m Message) bool { return m.ID == internal.ID }).OperatorReadAt != nil {
+		func() bool {
+			requireHidden(t, readback, internal.ID)
+			var n int
+			if err := s.db.QueryRow("SELECT count(*) FROM operator_message_reads WHERE message_id=?", internal.ID).Scan(&n); err != nil {
+				t.Fatal(err)
+			}
+			return n != 0
+		}() {
 		t.Fatal("group read receipt changed execution, another message, or its original timestamp")
 	}
 
@@ -252,8 +259,8 @@ func TestProjectGroupMessages(t *testing.T) {
 	await(t, base, func(state State) bool {
 		return hasMessage(state, po, operator, "PO received your feedback: direct after group")
 	})
-	if req := request(); req.Kind != "operator_message" || !contains(req, direct) || !containsShared(req, broadcast, group) {
-		t.Fatalf("normal PO turn lost its private and same-project shared context: %+v", req)
+	if req := request(); req.Kind != "operator_message" || !contains(req, direct) || containsShared(req, broadcast, group) {
+		t.Fatalf("normal PO turn lost its direct context or received group context: %+v", req)
 	}
 	post(t, base, newID(), root, "For project atlas: check fresh group context", 201)
 	finished := await(t, base, func(state State) bool {

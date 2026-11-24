@@ -2,7 +2,7 @@
 export type ActivityProject = {id:string; name:string; po_id:string};
 export type ActivityAgent = {id:string; name:string; role:string; project_id:string; status:string; parent_id?:string};
 export type ActivityJob = {id:string; agent_id:string; project_id:string; task_id:string; status:string; source_id?:string; kind?:string};
-export type ActivityMessage = {id:string; sender:string; recipient:string; text:string; at:string; project_id?:string};
+export type ActivityMessage = {id:string; room_id:string; sender:string; recipient:string; text:string; at:string; project_id?:string};
 export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string};
 export type ActivityState = {projects:ActivityProject[]; agents:ActivityAgent[]; jobs:ActivityJob[]; messages:ActivityMessage[]; tasks:ActivityTask[]};
 const escape = (value:unknown) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -10,7 +10,7 @@ const short = (value:string, limit:number) => Array.from(value).slice(0,limit).j
 const time = (value:string) => {const d = new Date(value); return Number.isNaN(d.getTime()) ? '' : d.toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});};
 
 /** Returns escaped HTML; caller inserts it into its own secondary panel and re-renders on state updates. */
-export function renderProjectActivity(state:ActivityState, projectId:string):string {
+export function renderProjectActivity(state:ActivityState, projectId:string, roomId:string):string {
  const project = state.projects.find(p => p.id === projectId);
  if (!project) return '<section class="project-activity" aria-label="Project activity"><p class="pa-empty">Select a project to view its activity.</p></section>';
  const agents = state.agents.filter(a => a.project_id === projectId);
@@ -44,7 +44,7 @@ export function renderProjectActivity(state:ActivityState, projectId:string):str
  let tree = roots.map(a=>node(a,visited)).join('');
  // Malformed cycles are shown without inventing an edge or omitting an agent.
  tree += nodes.filter(a=>!visited.has(a.id)).map(a=>node(a,visited)).join('');
- const messages = state.messages.filter(m=>m.project_id===projectId && (ids.has(m.sender)||ids.has(m.recipient))).slice(-8).reverse();
+ const messages = state.messages.filter(m=>m.room_id===roomId).slice(-8).reverse();
  const exchanges = messages.map(m=>`<li><div class="pa-exchange-meta"><strong>${escape(who(m.sender))}</strong><span aria-hidden="true">→</span><strong>${escape(who(m.recipient))}</strong><time>${escape(time(m.at))}</time></div><p>${escape(short(m.text,180))}</p></li>`).join('');
  return `<section class="project-activity" aria-label="${escape(project.name)} activity"><div class="pa-heading"><span>PROJECT ACTIVITY</span><h2>${escape(project.name)}</h2></div><h3>Team</h3>${tree?`<ul class="pa-tree">${tree}</ul>`:'<p class="pa-empty">No team members available yet.</p>'}<h3>Recent exchanges</h3>${exchanges?`<ol class="pa-exchanges">${exchanges}</ol>`:'<p class="pa-empty">No project messages yet.</p>'}</section>`;
 }
