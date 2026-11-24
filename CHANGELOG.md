@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/TKrisee/agent-chat/compare/v0.4.0...v0.5.0) (2026-11-24)
+
+
+### Features
+
+* interrupt active project work and persist PO goals ([d7d556d](https://github.com/TKrisee/agent-chat/commit/d7d556d1c9844580db28db5e30e83c1abc0b9b7e))
+
 ## [0.4.0](https://github.com/TKrisee/agent-chat/compare/v0.3.0...v0.4.0) (2026-11-24)
 
 
