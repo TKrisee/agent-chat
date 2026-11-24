@@ -7,6 +7,8 @@ go test ./...
 go run ./cmd/agentchat -data /tmp/agentchat-demo -listen 127.0.0.1:8877
 ```
 
+For frontend browser tests, run `npm ci`, `npx playwright install chromium`, and `npm test` from `src/web`. The test builds the UI and starts a fixture service with a temporary data directory. Go and a C compiler must be available on PATH.
+
 Use a new data directory for isolated runs. Reuse it to test restart. Pass `-static ./web/dist` to serve the built chat UI from the same origin. Root is always `root` in HTTP requests and state. Project conversations use the exact `po_id` from the state endpoint.
 
 ```sh

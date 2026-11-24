@@ -28,5 +28,9 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: src/web/package-lock.json
-      - run: npm ci && npm run build
+      - run: npm ci
+        working-directory: src/web
+      - run: npx playwright install --with-deps chromium
+        working-directory: src/web
+      - run: npm test
         working-directory: src/web
