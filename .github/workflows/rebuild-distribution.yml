@@ -2,16 +2,38 @@ name: Go distribution
 
 on:
   push:
-    paths: ['rebuild/**', '.github/workflows/rebuild-distribution.yml']
   pull_request:
-    paths: ['rebuild/**', '.github/workflows/rebuild-distribution.yml']
+    paths: ['src/**', '.github/workflows/rebuild-distribution.yml']
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing stable release tag to retry asset publication
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
+  release:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
   package:
+    needs: release
+    if: always() && (needs.release.result == 'success' || needs.release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -25,21 +47,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: rebuild
+        working-directory: src
         shell: pwsh
     env:
       CGO_ENABLED: '1'
+      RELEASE_TAG: ${{ needs.release.outputs.tag || inputs.release_tag }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
-          go-version-file: rebuild/go.mod
-          cache-dependency-path: rebuild/go.sum
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
       - uses: actions/setup-node@v6
         with:
           node-version: '24'
           cache: npm
-          cache-dependency-path: rebuild/web/package-lock.json
+          cache-dependency-path: src/web/package-lock.json
       - name: Build web UI
         run: |
           Push-Location web
@@ -58,7 +81,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force dist | Out-Null
           $exe = if ($IsWindows) { 'agentchat.exe' } else { 'agentchat' }
-          go build -tags codexruntime -trimpath -o "dist/$exe" ./cmd/agentchat
+          go build -tags codexruntime -trimpath -ldflags "-X main.releaseBaseURL=https://github.com/${{ github.repository }}/releases" -o "dist/$exe" ./cmd/agentchat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = if ($env:RELEASE_TAG) { $env:RELEASE_TAG.TrimStart('v') } else { '0.0.0' }
+          $launcher = if ($IsWindows) { 'agentchat-launcher.exe' } else { 'agentchat-launcher' }
+          go build -trimpath -ldflags "-X main.version=$version" -o "dist/$launcher" ./cmd/agentchat-launcher
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item -Recurse web/dist dist/web
           Copy-Item -Recurse packaging dist/packaging
@@ -110,5 +137,34 @@ jobs:
         with:
           name: agentchat-${{ matrix.platform }}
           path: |
-            rebuild/agentchat-${{ matrix.platform }}.*
+            src/agentchat-${{ matrix.platform }}.*
           if-no-files-found: error
+
+  publish:
+    needs: [release, package]
+    if: always() && needs.package.result == 'success' && (needs.release.outputs.created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: agentchat-*
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release assets and updater manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.release.outputs.tag || inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          cd artifacts
+          printf 'version %s\n' "${TAG#v}" > agentchat-update.txt
+          for file in agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip; do
+            test -f "$file"
+            printf '%s %s\n' "$(sha256sum "$file" | cut -d' ' -f1)" "$file" >> agentchat-update.txt
+          done
+          gh release upload "$TAG" agentchat-update.txt agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip --clobber
