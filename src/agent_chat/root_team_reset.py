@@ -33,6 +33,9 @@ def transaction(db):
 
 
 def quarantined(db, *, session=None, thread=None, job=None):
+    from .parked_retirement import retired
+    if retired(db, request_id=job, session=session, thread=thread):
+        return True
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='root_team_reset_targets'").fetchone():
         return False
     if session and db.execute('SELECT 1 FROM root_team_reset_targets WHERE session_id=?',(session,)).fetchone():
@@ -67,6 +70,24 @@ def handoff_begin(db,kind,job,host,phase):
         thread=job.get('new_thread_id') or job.get('thread_id') or job.get('old_thread_id')
         if quarantined(db,session=target,thread=thread,job=job['id']):
             raise CoordError('team reset quarantined native admission')
+        # Stop/inspection is quiescence or readback, never new execution. This
+        # deny-only check shares the existing handoff BEGIN IMMEDIATE lock.
+        if (not (kind == 'control' and job.get('action') in ('stop', 'inspect')) and
+                db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='original_owner_dispositions'").fetchone()):
+            from .core import assert_original_owner_admission
+            actors = {target} if target else set()
+            if thread and db.execute("SELECT 1 FROM sqlite_master WHERE name='bridge_bindings'").fetchone():
+                actors.update(row[0] for row in db.execute(
+                    'SELECT session_id FROM bridge_bindings WHERE thread_id=?', (thread,)))
+            if kind == 'wake':
+                actors.update(row[0] for row in db.execute('''SELECT m.recipient_session
+                    FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id
+                    WHERE d.job_id=?''', (job['id'],)))
+            for actor in actors:
+                assert_original_owner_admission(db, actor)
+        if not (kind=='control' and job.get('action') in ('stop','inspect')):
+            from .core import execution_epoch_native_check
+            execution_epoch_native_check(db,thread=job.get('old_thread_id') or thread,actor=target)
         prior=db.execute('SELECT active FROM root_native_handoffs WHERE kind=? AND job_id=? AND phase=?',
             (kind,job['id'],phase)).fetchone()
         if prior and prior['active']:
@@ -90,7 +111,7 @@ def definite_settlement(kind,phase,status):
     if status=='rejected-before-dispatch': return True
     if kind=='wake': return (phase,status) in (('adding','queued'),('starting','dispatched'))
     if kind=='capacity': return status in ('cancelled_verified','turn_observed_verified') or (phase.startswith('adding:') and status=='queued_verified') or (phase.startswith('starting:') and status in ('queued_verified','retrying','pending','completed','exhausted'))
-    if kind=='reset': return (phase,status) in (('creating','created'),('adding','queued'),('starting','completed'))
+    if kind=='reset': return (phase,status) in (('creating','created'),('creating','provider-rejected'),('materializing','parked'),('adding','queued'),('starting','completed'))
     if kind=='control': return (phase=='changing' and status in ('completed','resolved_unchanged')) or (phase.startswith('interrupting:') and status in ('completed','waiting'))
     return False
 
@@ -213,13 +234,30 @@ class RootTeamReset:
 
     def public(self,request):
         state=json.loads(request['snapshot_json'])
+        from .capacity_admission import effective_open_guards
+        retired=request['status'] in ('quarantined','completed')
+        disposition=[]
+        # Administrative retirement does not close guards or grant a new claim.
+        # Read current availability, including ownership acquired after reset.
+        path=self.roots.path(request['project_id'])
+        with contextlib.closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True)) as db:
+            db.row_factory=sqlite3.Row
+            db.execute('BEGIN')
+            for row in state['ownership']:
+                blocked=bool(effective_open_guards(db,row['name']))
+                current=db.execute('SELECT owner_session,reservation_id,token FROM resources WHERE name=?',(row['name'],)).fetchone()
+                available=current is not None and current['owner_session'] is None
+                original=current is not None and all(key in row and current[key]==row[key]
+                    for key in ('owner_session','reservation_id','token'))
+                disposition.append(dict(resource=row['name'],reservation_id=row['reservation_id'],
+                    owner_session=row['owner_session'],resource_reusable=retired and not blocked and available,
+                    will_make_resource_reusable=not blocked and (available if retired else original),
+                    process_closure='unverified'))
         return dict(request_id=request['id'],project=request['project_id'],status=request['status'],
             digest=request['digest'],authority=json.loads(request['authority_json']),
             targets=[dict(session_id=r['id'],agent=r['agent']) for r in state['targets']],
             retired_session_ids=[r['id'] for r in state['targets']] if request['status'] in ('quarantined','completed') else [],
-            ownership_disposition=[dict(resource=r['name'],reservation_id=r['reservation_id'],owner_session=r['owner_session'],
-                resource_reusable=request['status'] in ('quarantined','completed'),will_make_resource_reusable=True,
-                process_closure='unverified') for r in state['ownership']],
+            ownership_disposition=disposition,
             native_processes_stopped=False,process_closure='unverified',
             retained=dict(messages=True,history=True,queue_history=True,guards=True,outcomes=True,native_journals=True),
             queued_claims_retired=[dict(seq=r['seq'],resource=r['resource'],session=r['session']) for r in state['queue']] if request['status'] in ('quarantined','completed') else [],
@@ -314,7 +352,25 @@ class RootTeamReset:
 
     def status(self,project,session,host,target,request_id):
         self.scope(project,session,host,target)
-        with contextlib.closing(Coordinator(self.roots.path(target))) as coord:
-            row=coord.db.execute('SELECT * FROM root_team_reset_requests WHERE id=?',(request_id,)).fetchone()
+        try:
+            with self.roots._readiness_db(self.roots.path(target)) as db:
+                names=('root_team_reset_requests','root_team_reset_targets','root_team_reset_jobs','root_team_reset_events')
+                objects={row['name']:row['type'] for row in db.execute("SELECT name,type FROM sqlite_master WHERE name IN (?,?,?,?)",names)}
+                if not objects:
+                    raise CoordError('unknown team reset request')
+                required={'root_team_reset_requests':{'id','root_session','project_id','digest','authority_json','snapshot_json','status','created_at','completed_at'},
+                          'root_team_reset_targets':{'session_id','request_id','thread_id','host_id'},
+                          'root_team_reset_jobs':{'job_id','request_id'},
+                          'root_team_reset_events':{'id','request_id','event','evidence_json','recorded_at'}}
+                if objects != {name:'table' for name in names} or any(
+                    not required[name] <= {row['name'] for row in db.execute('PRAGMA table_info('+name+')')} for name in names):
+                    raise CoordError('team reset journal unavailable or schema incomplete; inspect before initialization')
+                guards={f'root_team_reset_{kind}_{action}' for kind in ('request','target','job','event') for action in ('update','delete')}
+                found={row['name'] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'root_team_reset_%'")}
+                if not guards <= found:
+                    raise CoordError('team reset journal unavailable or schema incomplete; inspect before initialization')
+                row=db.execute('SELECT * FROM root_team_reset_requests WHERE id=?',(request_id,)).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise CoordError('team reset journal unavailable or corrupt; inspect the project store') from error
         if not row: raise CoordError('unknown team reset request')
         return self.public(dict(row))

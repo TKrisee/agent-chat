@@ -6,7 +6,7 @@ import os
 import uuid
 from unittest import mock
 from agent_chat import cli
-from agent_chat.core import Coordinator
+from agent_chat.core import Coordinator, CoordError
 from agent_chat.remote import RemoteCoordError
 from agent_chat.root_authority import ROOT_AUTHORITY
 from test_remote_web import TOKEN
@@ -49,7 +49,7 @@ class RootAuthorityCommandTests(management_fixture.RetainedManagementTests):
             self.assertIsNone(coord.db.execute("SELECT 1 FROM sqlite_master WHERE name='agent_management_requests'").fetchone())
 
     def test_missing_intent_flag_is_not_new_human_approval_dialogue(self):
-        with self.assertRaisesRegex(RemoteCoordError,'--confirm intent confirmation for authorized orchestration'):
+        with self.assertRaisesRegex(CoordError,'local Root mutation requires explicit confirmation'):
             self.grant(confirm=False)
         self.grant(confirm=True)
         self.assertEqual(self.call('agent-status',session='po',to='retained')['manager_session'],'po')

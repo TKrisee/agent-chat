@@ -10,6 +10,23 @@ from unittest import mock
 from agent_chat.service import ServiceError, ServiceManager
 
 
+def private_provider(test):
+    """Provide only a test-owned provider; never consult installed defaults."""
+    from agent_chat import service
+    scratch=tempfile.TemporaryDirectory(prefix='service-provider-')
+    test.addCleanup(scratch.cleanup)
+    base=Path(scratch.name)
+    binary=base/'agent-chat-server'
+    binary.write_text('#!/bin/sh\nexit 99\n')
+    binary.chmod(0o700)
+    environment=mock.patch.dict(os.environ, {'PATH':str(base)+os.pathsep+os.environ.get('PATH','')})
+    environment.start();test.addCleanup(environment.stop)
+    config=service.InstalledServerConfig(base/'server.plist',base/'wrapper',base/'server-bin',
+        base/'state.sqlite3',base,os.getuid(),'127.0.0.1',8765)
+    provider=mock.patch.object(service,'INSTALLED_SERVER_CONFIG',config)
+    provider.start();test.addCleanup(provider.stop)
+
+
 class ServiceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -36,6 +53,31 @@ class ServiceTests(unittest.TestCase):
         wrapper = self.manager()._wrapper("client", self.args)
         self.assertIn("cat --", wrapper)
         self.assertNotIn("http://127.0.0.1:8765", text)
+
+    def test_install_connect_only_persists_existing_server_without_codex_binary(self):
+        from agent_chat import service
+        import shlex
+        manager = self.manager()
+        argv = ['install', '--component', 'client', '--connect-only', '--no-start',
+                '--db', self.args.db, '--server', self.args.server,
+                '--project-root', self.args.project_root, '--state-dir', self.args.state_dir,
+                '--codex-server', 'ws://127.0.0.1:4500', '--codex-bin', 'missing-fixture-codex']
+        with mock.patch('agent_chat.service.ServiceManager', return_value=manager), \
+                mock.patch('agent_chat.service.shutil.which', return_value=None):
+            self.assertEqual(service.main(argv), 0)
+        wrapper = manager.paths('client')['wrapper']
+        command = shlex.split(next(line[5:] for line in wrapper.read_text().splitlines() if line.startswith('exec ')))
+        self.assertEqual(command.count('--connect-only'), 1)
+        self.assertEqual(command[command.index('--codex-server')+1], 'ws://127.0.0.1:4500')
+        self.assertEqual(wrapper.stat().st_mode & 0o777, 0o700)
+        self.assertFalse(any(call[0][0] == 'launchctl' for call in self.calls))
+
+    def test_connect_only_does_not_change_default_or_server_wrapper(self):
+        manager = self.manager()
+        self.assertNotIn('--connect-only', manager._wrapper('client', self.args))
+        server = manager._wrapper('server', self.args)
+        self.args.connect_only = True
+        self.assertEqual(manager._wrapper('server', self.args), server)
 
     def test_systemd_render_preserves_all_project_discovery(self):
         text = self.manager("Linux").render("client", self.args)
@@ -201,3 +243,200 @@ class ServiceTests(unittest.TestCase):
             manager.uninstall("server")
         self.assertTrue(manager.paths("server")["config"].exists())
         self.assertTrue(manager.paths("server")["wrapper"].exists())
+
+
+class ServerDrainGuardTests(unittest.TestCase):
+    def setUp(self):
+        private_provider(self)
+
+    def state(self, *, active=0, sealed=False):
+        return dict(instance='a'*32, pid=123, epoch='b'*32, active=active,
+                    sealed=sealed, state='sealed' if sealed else 'draining')
+
+    def manager(self):
+        from agent_chat.service import _installed_server_config
+        manager = ServiceManager(system='Darwin', run=mock.Mock(return_value=subprocess.CompletedProcess([],0,stdout='    pid = 123\n')))
+        manager._drain_binding = mock.Mock(return_value=(_installed_server_config(), ('pin',), 'synthetic-private-test-token'))
+        return manager
+
+    def test_zero_seal_then_exact_server_only_restart(self):
+        manager = self.manager()
+        manager._maintenance_call = mock.Mock(side_effect=[self.state(),self.state(),self.state(sealed=True)])
+        result = manager.drain('server', restart=True)
+        self.assertTrue(result['restart_requested'])
+        commands = [call.args[0] for call in manager.run.call_args_list]
+        self.assertEqual(commands, [['launchctl','print','gui/501/com.agent-chat.server'],
+                                    ['launchctl','kickstart','-k','gui/501/com.agent-chat.server']])
+
+    def test_timeout_and_provider_pid_mismatch_never_restart(self):
+        manager = self.manager()
+        manager._maintenance_call = mock.Mock(return_value=self.state(active=1))
+        with self.assertRaisesRegex(ServiceError, 'timed out'): manager.drain('server', timeout=.001, restart=True)
+        manager.run.assert_not_called()
+        manager = self.manager()
+        manager._maintenance_call = mock.Mock(side_effect=[self.state(),self.state(),self.state(sealed=True)])
+        manager._drain_binding.side_effect = [manager._drain_binding.return_value,
+            (manager._drain_binding.return_value[0], ('changed',), 'same')]
+        with self.assertRaisesRegex(ServiceError, 'provider changed'): manager.drain('server', restart=True)
+        manager.run.assert_not_called()
+        manager = self.manager()
+        manager.run.return_value.stdout = '    pid = 999\n'
+        manager._maintenance_call = mock.Mock(side_effect=[self.state(),self.state(),self.state(sealed=True)])
+        with self.assertRaisesRegex(ServiceError, 'PID differs'): manager.drain('server', restart=True)
+        self.assertEqual(manager.run.call_count, 1)
+
+    def test_scope_instance_change_unavailable_and_invalid_timeout_refuse(self):
+        manager = self.manager()
+        for component in ['client','all']:
+            with self.assertRaises(ServiceError): manager.drain(component, restart=True)
+        for value in [0,61,float('nan'),float('inf')]:
+            with self.assertRaises(ServiceError): manager.drain('server',timeout=value,restart=True)
+        manager.run.assert_not_called()
+        manager._maintenance_call = mock.Mock(side_effect=ServiceError('unavailable'))
+        with self.assertRaises(ServiceError): manager.drain('server',restart=True)
+        manager.run.assert_not_called()
+        changed = dict(self.state(),instance='c'*32)
+        manager._maintenance_call = mock.Mock(side_effect=[self.state(),changed])
+        with self.assertRaisesRegex(ServiceError,'instance changed'): manager.drain('server',restart=True)
+        manager.run.assert_not_called()
+
+    def test_fixed_binding_rejects_changed_provider_before_http(self):
+        manager = ServiceManager(system='Darwin')
+        with mock.patch('agent_chat.service.os.geteuid', return_value=501), mock.patch('agent_chat.service.configured_server_database', side_effect=ServiceError('wrong provider')):
+            with self.assertRaisesRegex(ServiceError,'wrong provider'): manager._drain_binding()
+
+
+    def test_token_rotation_during_drain_refuses_restart(self):
+        manager = self.manager()
+        config, pins, token = manager._drain_binding.return_value
+        manager._drain_binding.side_effect = [(config,pins,token),(config,pins,'rotated')]
+        manager._maintenance_call = mock.Mock(side_effect=[self.state(),self.state(),self.state(sealed=True)])
+        with self.assertRaisesRegex(ServiceError,'provider changed'): manager.drain('server',restart=True)
+        manager.run.assert_not_called()
+
+    @unittest.skipUnless(os.geteuid() == 501, 'fixed-provider file ownership fixture requires UID501')
+    def test_real_isolated_fixed_provider_http_seal_and_mocked_kickstart(self):
+        import dataclasses
+        import threading
+        from agent_chat.core import Coordinator
+        from agent_chat.web import create_server
+        from agent_chat.service import _installed_server_config
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            master = root/'state.sqlite3'
+            Coordinator(master).close()
+            master.chmod(0o600)
+            token = 'synthetic-maintenance-private-token-123456'
+            tokenfile = Path(str(master)+'.api-token')
+            tokenfile.write_text(token); tokenfile.chmod(0o600)
+            server = create_server(master, port=0, api_token=token)
+            thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
+            try:
+                config = dataclasses.replace(_installed_server_config(), plist=root/'server.plist',
+                    wrapper=root/'wrapper', executable=root/'agent-chat-server', master=master,
+                    working_directory=root, port=server.server_port)
+                config.executable.write_text('synthetic fixed executable');config.executable.chmod(0o700)
+                config.wrapper.write_text('exec '+__import__('sys').executable+' '+str(config.executable)+
+                    ' --db '+str(master)+' --host 127.0.0.1 --port '+str(server.server_port)+'\n')
+                config.wrapper.chmod(0o700)
+                config.plist.write_bytes(plistlib.dumps(dict(Label='com.agent-chat.server',
+                    AssociatedBundleIdentifiers=['com.agent-chat.server'], WorkingDirectory=str(root),
+                    RunAtLoad=True, KeepAlive=True, ThrottleInterval=10,
+                    ProgramArguments=[str(config.wrapper)], EnvironmentVariables={})))
+                config.plist.chmod(0o600)
+                run = mock.Mock(return_value=subprocess.CompletedProcess([],0,stdout='    pid = '+str(os.getpid())+'\n'))
+                manager = ServiceManager(system='Darwin',run=run)
+                with mock.patch('agent_chat.service._installed_server_config', return_value=config):
+                    result = manager.drain('server',timeout=1,restart=True)
+                self.assertEqual((result['active'],result['sealed'],result['restart_requested']), (0,True,True))
+                self.assertTrue(server.http_sealed)
+                self.assertEqual(run.call_args.args[0], ['launchctl','kickstart','-k','gui/501/com.agent-chat.server'])
+            finally:
+                server.shutdown();server.server_close();thread.join(3)
+                self.assertFalse(thread.is_alive())
+
+
+class OneShotDrainRestartTests(unittest.TestCase):
+    def setUp(self):
+        private_provider(self)
+
+    def fixture(self, ambiguous=False):
+        import contextlib
+        import dataclasses
+        import threading
+        from agent_chat.core import Coordinator
+        from agent_chat.web import create_server
+        from agent_chat.service import _installed_server_config
+        @contextlib.contextmanager
+        def owned():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve(); master = root/'state.sqlite3'
+                Coordinator(master).close(); master.chmod(0o600)
+                token = 'synthetic-one-shot-maintenance-token-123456'
+                tokenfile = Path(str(master)+'.api-token'); tokenfile.write_text(token);tokenfile.chmod(0o600)
+                server = create_server(master,port=0,api_token=token)
+                thread = threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+                try:
+                    config = dataclasses.replace(_installed_server_config(),plist=root/'server.plist',
+                        wrapper=root/'wrapper',executable=root/'agent-chat-server',master=master,
+                        working_directory=root,port=server.server_port)
+                    config.executable.write_text('synthetic executable');config.executable.chmod(0o700)
+                    config.wrapper.write_text('exec '+__import__('sys').executable+' '+str(config.executable)+
+                        ' --db '+str(master)+' --host 127.0.0.1 --port '+str(server.server_port)+'\n')
+                    config.wrapper.chmod(0o700)
+                    config.plist.write_bytes(plistlib.dumps(dict(Label='com.agent-chat.server',
+                        AssociatedBundleIdentifiers=['com.agent-chat.server'],WorkingDirectory=str(root),
+                        RunAtLoad=True,KeepAlive=True,ThrottleInterval=10,
+                        ProgramArguments=[str(config.wrapper)],EnvironmentVariables={})))
+                    config.plist.chmod(0o600)
+                    kicks = []; lock = threading.Lock()
+                    def run(command, **kwargs):
+                        if command[:2] == ['launchctl','print']:
+                            return subprocess.CompletedProcess(command,0,stdout='    pid = '+str(os.getpid())+'\n')
+                        assert command == ['launchctl','kickstart','-k','gui/501/com.agent-chat.server']
+                        with lock:kicks.append(command)
+                        if ambiguous:raise subprocess.CalledProcessError(1,command)
+                        return subprocess.CompletedProcess(command,0)
+                    manager = ServiceManager(system='Darwin',run=run)
+                    with mock.patch('agent_chat.service._installed_server_config',return_value=config):
+                        yield manager,server,kicks
+                finally:
+                    server.shutdown();server.server_close();thread.join(3)
+                    self.assertFalse(thread.is_alive())
+        return owned()
+
+    @unittest.skipUnless(os.geteuid()==501,'fixed-provider ownership fixture requires UID501')
+    def test_concurrent_and_sequential_attempts_share_only_one_seal(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        with self.fixture() as (manager,server,kicks):
+            barrier = threading.Barrier(2); local = threading.local()
+            original = manager._maintenance_call
+            def synchronized(*args,**kwargs):
+                result = original(*args,**kwargs)
+                if args[2] == 'status' and not getattr(local,'seen',False):
+                    local.seen=True;barrier.wait(timeout=3)
+                return result
+            manager._maintenance_call=synchronized
+            def attempt():
+                try:manager.drain('server',timeout=2,restart=True);return 'requested'
+                except ServiceError:return 'refused'
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures=[pool.submit(attempt),pool.submit(attempt)]
+                outcomes=[future.result(timeout=5) for future in futures]
+            self.assertEqual(sorted(outcomes),['refused','requested'])
+            self.assertEqual(len(kicks),1)
+            manager._maintenance_call=original
+            with self.assertRaisesRegex(ServiceError,'initially sealed'):
+                manager.drain('server',timeout=2,restart=True)
+            self.assertEqual(len(kicks),1)
+            self.assertTrue(server.http_sealed)
+
+    @unittest.skipUnless(os.geteuid()==501,'fixed-provider ownership fixture requires UID501')
+    def test_ambiguous_first_kickstart_cannot_be_blindly_repeated_in_same_epoch(self):
+        with self.fixture(ambiguous=True) as (manager,server,kicks):
+            with self.assertRaises(subprocess.CalledProcessError):manager.drain('server',restart=True)
+            self.assertTrue(server.http_sealed)
+            with self.assertRaisesRegex(ServiceError,'initially sealed'):
+                manager.drain('server',restart=True)
+            self.assertEqual(len(kicks),1)

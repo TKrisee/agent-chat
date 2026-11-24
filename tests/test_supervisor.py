@@ -302,12 +302,13 @@ class SupervisorWorkflowTests(RemoteWebFixture):
                               if 'source_report_pending' in item['body']]), 1)
         first_reply = self.call('send', session='a', to='b', body='First completed.', reply_to=message['id'], ack_reply=True)
         self.assertEqual(self.target()['recovery']['source_reporting']['state'],
-                         'awaiting_acknowledged_reply')
+                         'reported')
+        self.assertIsNone(self.call('message', session='a', id=other['id'])['message']['acked_at'])
         retry_reply = self.call('send', session='a', to='b', body='First completed.',
                                 reply_to=message['id'], ack_reply=True)
         self.assertEqual(retry_reply['id'], first_reply['id'])
         self.assertEqual(self.target()['recovery']['source_reporting']['state'],
-                         'awaiting_acknowledged_reply')
+                         'reported')
         self.call('send', session='a', to='b', body='Second completed.', reply_to=other['id'], ack_reply=True)
         self.assertEqual(self.target()['recovery']['source_reporting']['state'], 'reported')
         self.assertEqual(self.target()['recovery']['source_reporting_obligation'], {
@@ -322,6 +323,103 @@ class SupervisorWorkflowTests(RemoteWebFixture):
         self.assertEqual(len(self.resume_calls()), 1)
         self.assertEqual([item['clientId'] for item in self.rpc.history[self.target_thread]], consumed)
         self.assertFalse(any(method in ('thread/start', 'turn/start', 'turn/steer') for method, _ in self.rpc.calls))
+
+    def test_reporting_evidence_separates_transport_ack_typed_ack_and_result(self):
+        private_body = 'PRIVATE reporting payload must never be returned'
+        message = self.attended_target(private_body)
+        # Recovery deliveries target an agent, so the operator-decision API
+        # must refuse to mark this same message as a decision request.
+        with self.assertRaisesRegex(RemoteCoordError, 'registered operator'):
+            self.call('decision-mark', session='b', id=message['id'])
+        with self.assertRaisesRegex(RemoteCoordError, 'decision requests must target'):
+            self.call('send', session='b', to='worker', body='Choose an outcome',
+                      decision_needed=True)
+        self.enable()
+        self.recovery_consent()
+        self.rpc.status[self.target_thread] = 'notLoaded'
+        self.sample()
+        self.sample(61)
+        self.bridge.tick()
+        self.sample(61)
+
+        evidence = self.target()['recovery']['source_reporting_evidence']
+        self.assertEqual(evidence['state'], 'complete')
+        self.assertTrue(evidence['complete'])
+        self.assertFalse(evidence['truncated'])
+        self.assertEqual(len(evidence['deliveries']), 1)
+        delivery = evidence['deliveries'][0]
+        self.assertEqual(delivery['original_message_id'], message['id'])
+        self.assertEqual(delivery['wake_id'], self.recovery_rows()[0]['wake_id'])
+        self.assertEqual(delivery['recipient_session'], 'a')
+        self.assertEqual(delivery['transport_ack'], {'state': 'not_acknowledged', 'acked_at': None})
+        self.assertEqual(delivery['directed_replies'], [])
+        self.assertEqual(delivery['ack_reply']['state'], 'unrecorded')
+        self.assertEqual(delivery['decision']['state'], 'unrecorded')
+        self.assertEqual(delivery['substantive_ack'], 'NOT_DEMONSTRATED')
+        self.assertEqual(delivery['factual_result'], 'UNRECORDED')
+
+        self.call('acknowledge', session='a', id=message['id'])
+        reply = self.call('send', session='a', to='b', body='accepted; task finished',
+                          reply_to=message['id'], ack_reply=True)
+        evidence = self.target()['recovery']['source_reporting_evidence']
+        delivery = evidence['deliveries'][0]
+        self.assertEqual(delivery['transport_ack']['state'], 'acknowledged')
+        self.assertEqual(delivery['ack_reply'], {'state': 'recorded',
+                         'reply_message_id': reply['id'],
+                         'created_at': delivery['directed_replies'][0]['created_at']})
+        self.assertEqual(delivery['directed_replies'][0]['reply_to'], message['id'])
+        self.assertEqual(delivery['directed_replies'][0]['sender_session'], 'a')
+        self.assertEqual(delivery['directed_replies'][0]['recipient_session'], 'b')
+        self.assertEqual(delivery['decision']['state'], 'unrecorded')
+        self.assertEqual(delivery['substantive_ack'], 'NOT_DEMONSTRATED')
+        self.assertEqual(delivery['factual_result'], 'UNRECORDED')
+        self.assertNotIn(private_body, str(evidence))
+        self.assertNotIn('accepted; task finished', str(evidence))
+        evidence_tables = ('messages', 'message_replies', 'reply_ack_idempotency',
+                           'operator_decision_requests', 'operator_decision_answers')
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            before = {table: [tuple(row) for row in coord.db.execute(
+                'SELECT * FROM ' + table + ' ORDER BY rowid')] for table in evidence_tables}
+        self.target()  # Existing status reconciliation remains intact; evidence itself is read-only.
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            after = {table: [tuple(row) for row in coord.db.execute(
+                'SELECT * FROM ' + table + ' ORDER BY rowid')] for table in evidence_tables}
+        self.assertEqual(after, before)
+
+    def test_reporting_evidence_withholds_malformed_direction_and_truncation(self):
+        message = self.attended_target('Private source body')
+        self.enable()
+        self.recovery_consent()
+        self.rpc.status[self.target_thread] = 'notLoaded'
+        self.sample()
+        self.sample(61)
+        self.bridge.tick()
+        self.sample(61)
+        row = self.recovery_rows()[0]
+
+        self.call('register', session='c', agent='unrelated')
+        unrelated = self.call('send', session='c', to='b', body='Private unrelated body')
+        with contextlib.closing(Coordinator(self.db)) as coord, coord.tx() as db:
+            db.execute('INSERT INTO message_replies(message_id,reply_to) VALUES(?,?)',
+                       (unrelated['id'], message['id']))
+            db.execute('INSERT INTO operator_decision_requests VALUES(?,?,?,?,?)',
+                       (message['id'], 'b', 'a', 'different-project', self.now))
+        evidence = self.target()['recovery']['source_reporting_evidence']
+        self.assertEqual(evidence['state'], 'unknown')
+        self.assertFalse(evidence['complete'])
+        self.assertEqual(evidence['deliveries'][0]['directed_replies'], [])
+        self.assertEqual(evidence['deliveries'][0]['state'], 'unknown')
+        self.assertEqual(evidence['deliveries'][0]['decision']['state'], 'unknown')
+        self.assertNotIn('Private source body', str(evidence))
+        self.assertNotIn('Private unrelated body', str(evidence))
+
+        with mock.patch('agent_chat.supervisor._REPORT_MAX_DELIVERIES', 0):
+            evidence = self.target()['recovery']['source_reporting_evidence']
+        self.assertEqual(evidence['state'], 'truncated')
+        self.assertTrue(evidence['truncated'])
+        self.assertFalse(evidence['complete'])
+        self.assertEqual(evidence['deliveries'], [])
+        self.assertEqual(evidence['factual_result'], 'UNRECORDED')
 
     def test_internal_recovery_changed_binding_withholds_resume(self):
         self.call('send', session='b', to='worker', body='Only the original exact thread')
@@ -847,7 +945,7 @@ class RootSupervisorRoutingTests(RemoteWebFixture):
 
     def test_root_cli_monitors_only_designated_orchestrator(self):
         with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
-            root_fixture.RootOrchestratorTests.root(self, 'route', project='default')
+            self.client.call('/api/root/rpc', dict(op='route',session='a',host_id='mac',params={'project':'default'}))
         project = self.project()
         self.configure(project)
         state, bridge = self.project_bridge(project)

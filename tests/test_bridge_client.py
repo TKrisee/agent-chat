@@ -13,6 +13,7 @@ from unittest import mock
 
 from agent_chat.core import CoordError
 from agent_chat import bridge_client, cli
+from agent_chat.approvals import METHODS
 
 
 class _Http:
@@ -33,7 +34,9 @@ class _Http:
 class _Rpc:
     instances = []
 
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, *, server_request_methods, server_request_timeout):
+        if server_request_methods != METHODS or server_request_timeout != 120:
+            raise AssertionError('bridge must configure the supported approval request contract')
         self.endpoint = endpoint
         self.connected = 0
         self.closed = 0
@@ -59,7 +62,7 @@ class _State:
         self.events.append((op, params))
         return {}
 
-    def heartbeat(self, server, pid, error=None):
+    def heartbeat(self, server, pid, error=None, versions=None):
         self.events.append(('heartbeat', {'pid': pid, 'error': error}))
 
 
@@ -83,6 +86,9 @@ class BridgeClientTests(unittest.TestCase):
             value.clear()
         _Bridge.fail_default = False
         self.patches = [
+            mock.patch.object(bridge_client, 'version_observation', return_value=(None, None)),
+            mock.patch('agent_chat.approvals.ApprovalPump'),
+            mock.patch.dict(os.environ, {'AGENT_CHAT_PROJECT': ''}),
             mock.patch.object(bridge_client, 'host_id', return_value='h'),
             mock.patch.object(bridge_client, 'UsageGuard', return_value=mock.Mock(check=mock.Mock(return_value={'blocked': False}))),
             mock.patch.object(bridge_client, 'HttpClient', _Http),
@@ -190,6 +196,23 @@ class BridgeClientTests(unittest.TestCase):
                 mock.patch.object(bridge_client.subprocess, 'Popen') as popen:
             self.assertEqual(bridge_client.main(['--server', 'https://chat.example', '--once']), 2)
         self.assertFalse(popen.called)
+
+    def test_tokenless_localhost_bridge_retains_identity(self):
+        class NoTokenHttp(_Http):
+            def __init__(self, server, token, project='default'):
+                super().__init__(server, token, project)
+                self.token = None
+        child = mock.Mock(pid=123)
+        child.poll.return_value = None
+        with mock.patch.object(bridge_client, 'HttpClient', NoTokenHttp), mock.patch.object(bridge_client.subprocess, 'Popen', return_value=child), mock.patch.object(bridge_client, '_stop_codex'):
+            self.assertEqual(bridge_client.main(['--server', 'http://127.0.0.1:8765', '--once']), 0)
+        self.assertTrue(any(event[0] == 'acquire' for event in _State.instances[0].events))
+
+    def test_only_literal_http_loopback_is_token_optional(self):
+        for url in ('http://localhost:8765', 'http://127.0.0.1:8765', 'http://[::1]:8765'):
+            self.assertTrue(bridge_client.local_http_endpoint(url))
+        for url in ('https://localhost:8765', 'http://localhost.example', 'http://user@localhost', 'http://192.168.1.1'):
+            self.assertFalse(bridge_client.local_http_endpoint(url))
 
     def test_missing_codex_binary_fails_cleanly(self):
         self.assertEqual(bridge_client.main([

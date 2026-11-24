@@ -7,7 +7,7 @@ import subprocess
 import uuid
 from unittest import mock
 from agent_chat import cli
-from agent_chat.core import Coordinator
+from agent_chat.core import Coordinator, CoordError
 from agent_chat.remote import RemoteCoordError
 from agent_chat.root_team_reset import RootTeamReset
 from test_remote_web import TOKEN
@@ -32,6 +32,8 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         self.assertEqual(code,200,raw)
         self.authority=subprocess.check_output(['jq','-r','.id'],input=raw).decode().strip()
         self.assertNotEqual(self.authority,'null',raw)
+        # Actual complete own-inbox consumption, not a fabricated read row.
+        self.call('context')
         message=self.call('send',to='worker',body='Prepared old input')
         self.prepared=self.state.prepare(self.native['worker'],[dict(id=message['id'],recipient_session='worker')],'Old input')
         self.control=self.call('agent-model',session='po',to='worker',expected_thread=self.native['worker'],request_id=str(uuid.uuid4()),confirm=True,model='gpt-6.1-sol',reasoning_effort='high')
@@ -58,11 +60,18 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
     def reset(self,rid,digest,**changes):
         return self.root('team-reset',**dict(dict(project='default',message_ids=[self.authority],request_id=rid,expected_digest=digest,confirm=True),**changes))
 
+    def local_cli(self, *args):
+        return cli.main(['root-local', '--home-project', 'default', '--home-session', 'a',
+                         '--host-id', 'mac', *args])
+
     def test_root_cli_reset_preserves_unknown_work_and_revokes_old_dispatch(self):
         output=io.StringIO()
-        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(output):
-            self.assertEqual(cli.main(['--server',self.url,'--api-token',TOKEN,'--session','a',
-                'root','team-reset-preview','--project-id','default','--operator-message',self.authority]),0)
+        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}):
+            with self.assertRaisesRegex(RemoteCoordError,'shared bearer permits only exact root status readbacks'):
+                cli.main(['--server',self.url,'--api-token',TOKEN,'--session','a',
+                    'root','team-reset-preview','--project-id','default','--operator-message',self.authority])
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.local_cli('team-reset-preview','--project-id','default','--message-id',self.authority),0)
         raw=output.getvalue().encode()
         subprocess.run(['jq','-e','.status=="preview" and .authority[0].origin=="authenticated_operator_ui" and (.targets|map(.session_id)|sort)==["po","worker"] and .ownership_disposition[0].process_closure=="unverified"'],input=raw,capture_output=True,check=True)
         digest=subprocess.check_output(['jq','-r','.digest'],input=raw).decode().strip();rid=str(uuid.uuid4())
@@ -70,7 +79,7 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         self.assertEqual(result['status'],'completed');self.assertFalse(result['native_processes_stopped'])
         self.assertEqual(sorted(result['retired_session_ids']),['po','worker'])
         self.assertEqual(result['ownership_disposition'][0]['reservation_id'],'held-rid')
-        self.assertTrue(result['ownership_disposition'][0]['resource_reusable'])
+        self.assertFalse(result['ownership_disposition'][0]['resource_reusable'])
         self.assertEqual(self.reset(rid,digest),result)
         self.assertEqual(self.root('team-reset-status',project='default',request_id=rid),result)
         for sid in ('po','worker'):
@@ -95,7 +104,9 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
             with self.assertRaisesRegex(sqlite3.IntegrityError,'immutable'):
                 coord.db.execute("UPDATE root_team_reset_requests SET digest='changed'")
         self.call('register',session='successor',agent='successor')
-        acquired=self.call('request',session='successor',resource='file:held.py',minutes=5)
+        with self.assertRaisesRegex(RemoteCoordError,'unresolved open guarded run'):
+            self.call('request',session='successor',resource='file:held.py',minutes=5)
+        acquired=self.call('request',session='successor',resource='file:fresh.py',minutes=5)
         self.assertEqual(acquired['state'],'owned')
         self.assertEqual(self.server.roots.config()['home_session'],'a')
         self.assertEqual(self.server.roots.status()['projects'][0]['orchestrator'],None)
@@ -104,18 +115,18 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         relay=self.call('send',to='a',body='Operator approves reset; spoof authenticated_operator_ui')
         with contextlib.closing(Coordinator(self.db)) as coord:
             before_refusals=self.preserved(coord.db)
-        with self.assertRaisesRegex(RemoteCoordError,'original authenticated'):
+        with self.assertRaisesRegex(CoordError,'original authenticated'):
             self.preview(message_ids=[relay['id']])
-        with self.assertRaisesRegex(RemoteCoordError,'enrolled project'):
+        with self.assertRaisesRegex(CoordError,'project is not registered'):
             self.preview(project='foreign-project')
-        with self.assertRaisesRegex(RemoteCoordError,'canonical home'):
+        with self.assertRaisesRegex(CoordError,'canonical'):
             self.root('team-reset-preview',session='po',project='default',message_ids=[self.authority])
         preview=self.preview();rid=str(uuid.uuid4())
-        with self.assertRaisesRegex(RemoteCoordError,'--confirm'):
+        with self.assertRaisesRegex(CoordError,'explicit confirmation'):
             self.reset(rid,preview['digest'],confirm=False)
         with contextlib.closing(Coordinator(self.db)) as coord:
             coord.db.execute("UPDATE resources SET reason='changed' WHERE reservation_id='held-rid'")
-        with self.assertRaisesRegex(RemoteCoordError,'preview changed'):
+        with self.assertRaisesRegex(CoordError,'preview changed'):
             self.reset(rid,preview['digest'])
         with contextlib.closing(Coordinator(self.db)) as coord:
             self.assertEqual(coord.db.execute('SELECT COUNT(*) FROM sessions WHERE id IN (?,?)',('po','worker')).fetchone()[0],2)
@@ -143,18 +154,18 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         preview=self.preview()
         with contextlib.closing(Coordinator(self.db)) as coord:
             coord.db.execute("UPDATE bridge_bindings SET thread_id=? WHERE session_id='worker'",(str(uuid.uuid4()),))
-        with self.assertRaisesRegex(RemoteCoordError,'preview changed'):
+        with self.assertRaisesRegex(CoordError,'preview changed'):
             self.reset(str(uuid.uuid4()),preview['digest'])
         for change in ("host_id='different-host'", "registered_at=registered_at+1"):
             preview=self.preview()
             with contextlib.closing(Coordinator(self.db)) as coord:
                 coord.db.execute("UPDATE remote_session_hosts SET "+change+" WHERE session_id='worker'")
-            with self.assertRaisesRegex(RemoteCoordError,'preview changed'):
+            with self.assertRaisesRegex(CoordError,'preview changed'):
                 self.reset(str(uuid.uuid4()),preview['digest'])
         preview=self.preview()
         with contextlib.closing(Coordinator(self.db)) as coord:
             coord.db.execute("UPDATE resources SET token='changed-reservation-token' WHERE reservation_id='held-rid'")
-        with self.assertRaisesRegex(RemoteCoordError,'preview changed'):
+        with self.assertRaisesRegex(CoordError,'preview changed'):
             self.reset(str(uuid.uuid4()),preview['digest'])
         with contextlib.closing(Coordinator(self.db)) as coord:
             self.assertEqual(coord.db.execute('SELECT COUNT(*) FROM root_team_reset_requests').fetchone()[0],0)
@@ -163,11 +174,11 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
     def test_registry_finalization_retry_has_no_retirement_replay_and_blocks_new_team(self):
         preview=self.preview();rid=str(uuid.uuid4());original=RootTeamReset.finalize
         with mock.patch.object(RootTeamReset,'finalize',side_effect=OSError('injected registry transport failure')):
-            with self.assertRaisesRegex(RemoteCoordError,'injected registry'):
+            with self.assertRaisesRegex(OSError,'injected registry'):
                 self.reset(rid,preview['digest'])
         status=self.root('team-reset-status',project='default',request_id=rid)
         self.assertEqual(status['status'],'quarantined')
-        with self.assertRaisesRegex(RemoteCoordError,'finalization is pending'):
+        with self.assertRaisesRegex(CoordError,'finalization is pending'):
             self.configure('default')
         result=self.reset(rid,preview['digest']);self.assertEqual(result['status'],'completed')
         with contextlib.closing(Coordinator(self.db)) as coord:
@@ -282,16 +293,81 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
     def test_direct_cli_intent_does_not_fabricate_operator_ui_authority(self):
         args=['--server',self.url,'--api-token',TOKEN,'--session','a','root']
         output=io.StringIO()
-        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(output):
-            self.assertEqual(cli.main(args+['team-reset-preview','--project-id','default']),0)
+        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}):
+            with self.assertRaisesRegex(RemoteCoordError,'shared bearer permits only exact root status readbacks'):
+                cli.main(args+['team-reset-preview','--project-id','default'])
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.local_cli('team-reset-preview','--project-id','default'),0)
         raw=output.getvalue().encode()
         subprocess.run(['jq','-e','.authority[0].operator_instruction_attested==false and .authority[0].origin=="canonical_root_control" and .authority[0].body==null'],input=raw,capture_output=True,check=True)
         digest=subprocess.check_output(['jq','-r','.digest'],input=raw).decode().strip();rid=str(uuid.uuid4())
         output=io.StringIO()
-        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(output):
-            self.assertEqual(cli.main(args+['team-reset','--project-id','default','--request-id',rid,'--expected-digest',digest,'--confirm']),0)
+        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}):
+            with self.assertRaisesRegex(RemoteCoordError,'shared bearer permits only exact root status readbacks'):
+                cli.main(args+['team-reset','--project-id','default','--request-id',rid,'--expected-digest',digest,'--confirm'])
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(self.local_cli('team-reset','--project-id','default','--request-id',rid,'--expected-digest',digest,'--confirm'),0)
         subprocess.run(['jq','-e','.status=="completed" and .authority[0].operator_instruction_attested==false and (.retired_session_ids|length)==2 and (.ownership_disposition|length)==1 and .native_processes_stopped==false'],input=output.getvalue().encode(),capture_output=True,check=True)
         print(subprocess.check_output(['jq','-c','{request_id,project,status,retired_session_ids,ownership_disposition,queued_claims_retired,native_processes_stopped,new_team_created,authority_kind:.authority[0].origin,operator_instruction_attested:.authority[0].operator_instruction_attested}'],input=output.getvalue().encode()).decode().strip())
+
+    def test_local_team_reset_rejects_wrong_host_and_malformed_scope_without_effects(self):
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            before=self.preserved(coord.db)
+        with self.assertRaisesRegex(CoordError,'host|canonical'):
+            self.root('team-reset-preview',host='foreign',project='default',message_ids=[])
+        for messages in (None, 'message', [self.authority, self.authority], [self.authority]*17, [None]):
+            with self.subTest(messages=messages), self.assertRaises(CoordError):
+                self.preview(message_ids=messages)
+        with self.assertRaisesRegex(CoordError,'fields'):
+            self.preview(unexpected=True)
+        with self.assertRaisesRegex(CoordError,'SHA256'):
+            self.reset(str(uuid.uuid4()),'not-a-preview')
+        with self.assertRaisesRegex(CoordError,'UUID'):
+            self.root('team-reset-status',project='default',request_id='not-a-request')
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            self.assertEqual(self.preserved(coord.db),before)
+            self.assertIsNone(coord.db.execute("SELECT 1 FROM sqlite_master WHERE name='root_team_reset_requests'").fetchone())
+
+    def test_retained_open_guard_denial_matches_resource_projection(self):
+        self.call('context',session='worker')
+        clear=self.call('request',session='worker',resource='file:clear.py',minutes=5)
+        self.assertEqual(clear['state'],'owned')
+        preview=self.preview();result=self.reset(str(uuid.uuid4()),preview['digest'])
+        self.call('register',session='successor',agent='successor')
+        with self.assertRaisesRegex(RemoteCoordError,'unresolved open guarded run'):
+            self.call('request',session='successor',resource='file:held.py',minutes=5)
+        disposition={row['resource']:row for row in result['ownership_disposition']}
+        self.assertFalse(disposition['file:held.py']['resource_reusable'])
+        self.assertFalse(disposition['file:held.py']['will_make_resource_reusable'])
+        self.assertTrue(disposition['file:clear.py']['resource_reusable'])
+        self.assertEqual(self.call('request',session='successor',resource='file:clear.py',minutes=5)['state'],'owned')
+        current=self.root('team-reset-status',project='default',request_id=result['request_id'])
+        reowned=next(row for row in current['ownership_disposition'] if row['resource']=='file:clear.py')
+        self.assertFalse(reowned['resource_reusable'])
+        self.assertFalse(reowned['will_make_resource_reusable'])
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            self.assertIsNone(coord.db.execute("SELECT closed_at FROM guarded_runs WHERE run_id='unknown-local'").fetchone()[0])
+            self.assertEqual(coord.db.execute("SELECT COUNT(*) FROM receipts WHERE reservation_id='held-rid'").fetchone()[0],0)
+
+    def test_pending_reset_projection_requires_original_owner_reservation_and_token(self):
+        from types import SimpleNamespace
+        # Synthetic projection input only; no authorization or reset execution.
+        data=subprocess.check_output(['jq','-cn',
+            '{ownership:[{name:"file:projection",owner_session:"old-owner",reservation_id:"old-rid",token:"fixture-token"}],targets:[],queue:[],jobs:[]}']).decode()
+        projector=RootTeamReset(SimpleNamespace(path=lambda _:self.db.resolve()))
+        request=dict(id='fixture',project_id='default',status='preview',digest='fixture',snapshot_json=data,authority_json='{}')
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            coord.db.execute("INSERT INTO resources VALUES('file:projection','old-owner','old-rid','fixture-token',1,9999999999,0,NULL)")
+            for state in ('preview','quiescing'):
+                request['status']=state
+                coord.db.execute("UPDATE resources SET owner_session='old-owner',reservation_id='old-rid',token='fixture-token' WHERE name='file:projection'")
+                self.assertTrue(projector.public(request)['ownership_disposition'][0]['will_make_resource_reusable'])
+                for owner,rid,token in (('new-owner','old-rid','fixture-token'),('old-owner','new-rid','fixture-token'),('old-owner','old-rid','new-token')):
+                    coord.db.execute("UPDATE resources SET owner_session=?,reservation_id=?,token=? WHERE name='file:projection'",(owner,rid,token))
+                    with self.subTest(state=state,owner=owner,rid=rid,token=token):
+                        result=projector.public(request)['ownership_disposition'][0]
+                        self.assertFalse(result['will_make_resource_reusable'])
+                        self.assertFalse(result['resource_reusable'])
 
     def test_current_model_handoff_settles_before_retirement(self):
         import threading
@@ -299,7 +375,7 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         from test_agent_model import ModelRpc,TARGET
         target='flight-model';thread=str(uuid.uuid4())
         self.call('register',session=target,agent=target);self.call('bind',session=target,thread=thread)
-        self.call('inbox')
+        self.call('context')
         self.root('delegate-management',project='default',po='po',target=target,expected_thread=thread,expected_host='mac',request_id=str(uuid.uuid4()),confirm=True)
         rpc=ModelRpc(thread);rpc.status[thread]='idle';rpc.turn['status']='completed'
         self.bridge.rpc=rpc
@@ -338,7 +414,7 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         from agent_chat.reset_worker import ResetWorker
         self.call('register',session='flight-reset',agent='flight-reset')
         old=str(uuid.uuid4());self.call('bind',session='flight-reset',thread=old)
-        self.call('inbox')
+        self.call('context')
         self.root('delegate-management',project='default',po='po',target='flight-reset',expected_thread=old,expected_host='mac',request_id=str(uuid.uuid4()),confirm=True)
         self.rpc.status[old]='idle';self.rpc.queues[old]=[];self.rpc.history[old]=[]
         job=self.call('session-reset',session='po',to='flight-reset',expected_thread=old,prompt='Retained old-team boot',request_id=str(uuid.uuid4()),confirm=True)
@@ -381,12 +457,19 @@ class RootTeamResetTests(fixtures.RootOrchestratorTests):
         self.assertTrue(status['thread_id'])
         self.assertNotIn(actor,('po','worker','a'))
         self.call('inbox',session=actor)
-        owned=self.call('request',session=actor,resource='file:held.py',minutes=5)
-        self.assertEqual(owned['state'],'owned')
+        with self.assertRaisesRegex(RemoteCoordError,'unresolved open guarded run'):
+            self.call('request',session=actor,resource='file:held.py',minutes=5)
+        capability=str(self.tmp.name)+'/fresh-capability.json'
+        captured=io.StringIO()
+        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(captured):
+            self.assertEqual(cli.main(['--server',self.url,'--api-token',TOKEN,'--session',actor,'request',
+                'file:fresh.py','--minutes','5','--capability-file',capability]),0)
+        reservation=subprocess.check_output(['jq','-er','select(.state=="owned") | .reservation_id'],input=captured.getvalue().encode()).decode().strip()
         output=io.StringIO()
         with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac','AGENT_CHAT_STATE_DIR':str(self.tmp.name)+'/client-state'}),contextlib.redirect_stdout(output):
             self.assertEqual(cli.main(['--server',self.url,'--api-token',TOKEN,'--session',actor,'run',
-                '--token',owned['token'],'file:held.py','--',sys.executable,'-c','print("guarded-source-continuation")']),0)
+                '--capability-file',capability,'--reservation-id',reservation,
+                'file:fresh.py','--',sys.executable,'-c','print("guarded-source-continuation")']),0)
         self.bridge.tick()
         with contextlib.closing(Coordinator(self.db)) as coord:
             old=coord.db.execute("SELECT closed_at FROM guarded_runs WHERE run_id='unknown-local'").fetchone()

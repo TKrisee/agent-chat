@@ -66,9 +66,11 @@ def assert_inbox_trace_observation(case, *, traces, rows, sink):
         dispatch_start, dispatch_end = positions[('dispatch', 'start')][0], positions[('dispatch', 'end')][-1]
         response_start, response_end = positions[('response', 'start')][0], positions[('response', 'end')][-1]
         case.assertLess(project_start, project_end)
-        case.assertLess(project_end, body_start)
+        # Coordinator project selection follows request-body parsing so the
+        # operation can choose the appropriate metadata-only route.
         case.assertLess(body_start, body_end)
-        case.assertLess(body_end, dispatch_start)
+        case.assertLess(body_end, project_start)
+        case.assertLess(project_end, dispatch_start)
         case.assertLess(dispatch_start, dispatch_end)
         case.assertLess(dispatch_end, response_start)
         case.assertLess(response_start, response_end)
@@ -637,8 +639,10 @@ class RemoteWebTests(RemoteWebFixture):
         self.assertEqual({row['request_id'] for row in traced if (row['phase'], row['edge']) == ('response', 'end')}, traces)
 
     def test_all_ui_and_data_routes_require_auth(self):
+        self.assertEqual(self.request('GET', '/', auth=None)[0], 200)
+        self.assertEqual(self.request('GET', '/api/config', auth=None)[0], 200)
         for path in ('/', '/app.js', '/api/config', '/api/snapshot', '/api/events', '/api/attachments/fake'):
-            status, body, headers = self.request('GET', path, auth=None)
+            status, body, headers = self.request('GET', path, auth=None, headers={'X-Forwarded-For': '192.0.2.1'})
             self.assertEqual(status, 401, path)
             self.assertIn('Basic', headers['WWW-Authenticate'])
         self.assertEqual(self.request('GET', '/', auth='basic')[0], 200)
@@ -665,13 +669,16 @@ class RemoteWebTests(RemoteWebFixture):
         self.call('register', session='b', agent='beta')
         msg = self.call('send', to='b', body='Question')
         image = b'\x89PNG\r\n\x1a\n' + b'fixture'
-        reply = self.call('send', session='b', to='a', body='Answer', reply_to=msg['id'], attachments=[{'name': 'answer.png', 'content_base64': base64.b64encode(image).decode()}])
+        self.call('message', session='b', id=msg['id'])
+        reply = self.call('send', session='b', to='a', body='Answer', reply_to=msg['id'], ack_reply=True, attachments=[{'name': 'answer.png', 'content_base64': base64.b64encode(image).decode()}])
         inbox = self.call('inbox')['messages']
         self.assertEqual(inbox[0]['reply_to'], msg['id'])
         self.assertIsNone(inbox[0]['acked_at'])
         attachment = reply['attachments'][0]
         self.assertEqual(self.request('GET', attachment['url'])[1], image)
         self.assertTrue(self.call('acknowledge', id=reply['id'])['acknowledged'])
+        self.assertEqual(self.call('inbox')['messages'][0]['id'], reply['id'])
+        self.call('message', id=reply['id'])
         self.assertEqual(self.call('inbox')['messages'], [])
         with self.assertRaises(RemoteCoordError):
             self.call('status', host='another-mac')
@@ -690,7 +697,8 @@ class RemoteWebTests(RemoteWebFixture):
             status, downloaded, headers = self.request('GET', attachment['url'])
             self.assertEqual((status, downloaded), (200, content))
             self.assertTrue(headers['Content-Disposition'].startswith('attachment;'))
-            self.assertEqual(self.request('GET', attachment['url'], auth=None)[0], 401)
+            self.assertEqual(self.request('GET', attachment['url'], auth=None)[0], 200)
+            self.assertEqual(self.request('GET', attachment['url'], auth=None, headers={'X-Forwarded-For': '192.0.2.1'})[0], 401)
         with self.assertRaises(RemoteCoordError):
             self.call('send', to='b', body='', attachments=[
                 {'name': 'program.exe', 'content_base64': base64.b64encode(b'\x89PNG\r\n\x1a\n').decode()}
@@ -727,7 +735,8 @@ class RemoteWebTests(RemoteWebFixture):
             self.assertEqual(self.request('GET', attachment['url'])[1], content)
             self.assertEqual(self.request('GET', attachment['url'], headers={'Range': 'bytes=0-15'})[:2],
                              (206, content[:16]))
-            self.assertEqual(self.request('GET', attachment['url'], auth=None, headers={'Range': 'bytes=0-15'})[0], 401)
+            self.assertEqual(self.request('GET', attachment['url'], auth=None, headers={'Range': 'bytes=0-15'})[0], 206)
+            self.assertEqual(self.request('GET', attachment['url'], auth=None, headers={'Range': 'bytes=0-15', 'X-Forwarded-For': '192.0.2.1'})[0], 401)
 
     def test_csrf_required_for_removal_and_operator_is_preserved(self):
         self.call('register', agent='alpha')
@@ -743,7 +752,8 @@ class RemoteWebTests(RemoteWebFixture):
         self.call('register', session='b', agent='beta')
         question = self.call('send', to='b', body='Screenshot please')
         image = b'\x89PNG\r\n\x1a\n' + b'fixture' * 450000
-        reply = self.call('send', session='b', to='a', body='', reply_to=question['id'], attachments=[{'name':'large.png','content_base64':base64.b64encode(image).decode()}])
+        self.call('message', session='b', id=question['id'])
+        reply = self.call('send', session='b', to='a', body='', reply_to=question['id'], ack_reply=True, attachments=[{'name':'large.png','content_base64':base64.b64encode(image).decode()}])
         self.assertEqual(reply['reply_preview']['body'], 'Screenshot please')
         self.assertEqual(self.request('GET', reply['attachments'][0]['url'])[1], image)
 
@@ -759,7 +769,7 @@ class PersistentWorkloadAssertionTests(unittest.TestCase):
     def _facts(self):
         traces = [str(uuid.uuid4()), str(uuid.uuid4())]
         samples = [[(trace, 1.0, 1.1, {})] for trace in traces]
-        events = (('handler', 'start'), ('project', 'start'), ('project', 'end'), ('body', 'start'), ('body', 'end'),
+        events = (('handler', 'start'), ('body', 'start'), ('body', 'end'), ('project', 'start'), ('project', 'end'),
                   ('dispatch', 'start'), ('transaction_acquire', 'start'), ('transaction_acquire', 'end'),
                   ('transaction_held', 'start'), ('inbox_query', 'start'), ('inbox_query', 'end'),
                   ('transaction_held', 'end'), ('dispatch', 'end'), ('response', 'start'), ('response', 'end'))
@@ -801,8 +811,8 @@ class PersistentWorkloadAssertionTests(unittest.TestCase):
         with self.assertRaises(AssertionError): self._assert_facts(samples, nonpositive_sequence, sink, observed_at=.5)
         emitted_drop = [dict(row, dropped=1) if index == 0 else row for index, row in enumerate(rows)]
         with self.assertRaises(AssertionError): self._assert_facts(samples, emitted_drop, sink, observed_at=.5)
-        out_of_order = [dict(row, phase='body') if row['sequence'] == 2 else
-                        dict(row, phase='project') if row['sequence'] == 4 else row for row in rows]
+        out_of_order = [dict(row, phase='project') if row['sequence'] == 2 else
+                        dict(row, phase='body') if row['sequence'] == 4 else row for row in rows]
         with self.assertRaises(AssertionError): self._assert_facts(samples, out_of_order, sink, observed_at=.5)
         inbox_end_before_start = [
             dict(row, edge='end') if row['phase'] == 'inbox_query' and row['sequence'] == 10 else
@@ -810,3 +820,112 @@ class PersistentWorkloadAssertionTests(unittest.TestCase):
             for row in rows
         ]
         with self.assertRaises(AssertionError): self._assert_facts(samples, inbox_end_before_start, sink, observed_at=.5)
+
+
+class HttpDrainWorkflowTests(RemoteWebFixture):
+    def maintenance(self, action, epoch=None):
+        payload = dict(action=action)
+        if epoch is not None: payload['epoch'] = epoch
+        from agent_chat.service import ServiceManager
+        from types import SimpleNamespace
+        return ServiceManager()._maintenance_call(SimpleNamespace(port=self.server.server_port), TOKEN, action, epoch)
+
+    def test_existing_event_stream_finishes_when_drain_starts(self):
+        import http.client
+        connection = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=4)
+        self.addCleanup(connection.close)
+        connection.request('GET', '/api/events', headers={
+            'Host': '127.0.0.1:' + str(self.server.server_port),
+            'Authorization': 'Bearer ' + TOKEN})
+        response = connection.getresponse()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(response.readline().startswith(b'event: snapshot'))
+        state = self.maintenance('start')
+        deadline = time.monotonic() + 3
+        while state['active'] and time.monotonic() < deadline:
+            time.sleep(.02)
+            state = self.maintenance('status')
+        self.assertEqual(state['active'], 0)
+        self.assertEqual(state['state'], 'draining')
+        self.assertEqual(response.read()[-2:], b'\n\n')
+        self.assertEqual(self.request('GET', '/api/state')[0], 503)
+        self.assertEqual(self.maintenance('resume', state['epoch'])['state'], 'open')
+        reconnected = http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=4)
+        self.addCleanup(reconnected.close)
+        reconnected.request('GET', '/api/events', headers={
+            'Host': '127.0.0.1:' + str(self.server.server_port),
+            'Authorization': 'Bearer ' + TOKEN})
+        resumed = reconnected.getresponse()
+        self.assertEqual(resumed.status, 200)
+        self.assertTrue(resumed.readline().startswith(b'event: snapshot'))
+        reconnected.close()
+
+    def test_active_upload_download_drain_race_and_response_completion(self):
+        import socket
+        from unittest import mock
+        from agent_chat.web import Handler
+        entered, release = threading.Event(), threading.Event()
+        original = Handler.respond
+        def held(handler, *args, **kwargs):
+            result = original(handler, *args, **kwargs)
+            if handler.path == '/app.js':
+                entered.set()
+                if not release.wait(5): raise RuntimeError('fixture response release deadline')
+            return result
+        upload = socket.create_connection(('127.0.0.1', self.server.server_port), timeout=3)
+        self.addCleanup(upload.close)
+        body = b'{"op":"invalid-synthetic-operation","session":"fixture","host_id":"fixture","params":{}}'
+        header = ('POST /api/coord HTTP/1.1\r\nHost: 127.0.0.1:' + str(self.server.server_port)
+                  + '\r\nAuthorization: Bearer ' + TOKEN + '\r\nContent-Type: application/json\r\nContent-Length: '
+                  + str(len(body)) + '\r\nConnection: close\r\n\r\n').encode()
+        errors = []
+        with mock.patch.object(Handler, 'respond', held):
+            worker = threading.Thread(target=lambda: self.request('GET', '/app.js'), daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                upload.sendall(header + body[:1])
+                deadline = time.monotonic() + 3
+                while self.maintenance('status')['active'] < 2 and time.monotonic() < deadline: time.sleep(.01)
+                state = self.maintenance('start')
+                self.assertGreaterEqual(state['active'], 2)
+                self.assertEqual(state['state'], 'draining')
+                status, raw, _ = self.request('GET', '/api/state')
+                self.assertEqual(status, 503)
+                with self.assertRaises(Exception): self.maintenance('seal', state['epoch'])
+                # Client already got download bytes, but handler has not returned:
+                # accounting must still include it until response/flush completion.
+                self.assertGreaterEqual(self.maintenance('status')['active'], 2)
+            finally:
+                release.set()
+                upload.sendall(body[1:])
+                while upload.recv(4096): pass
+                upload.close()
+                worker.join(3)
+            self.assertFalse(worker.is_alive())
+        deadline = time.monotonic() + 3
+        state = self.maintenance('status')
+        while state['active'] and time.monotonic() < deadline:
+            time.sleep(.01); state = self.maintenance('status')
+        self.assertEqual(state['active'], 0)
+        sealed = self.maintenance('seal', state['epoch'])
+        self.assertTrue(sealed['sealed'])
+        with self.assertRaises(Exception): self.maintenance('seal', state['epoch'])
+        self.assertEqual(self.request('GET', '/')[0], 503)
+        with self.assertRaises(Exception): self.maintenance('resume', state['epoch'])
+        # Actual fixture process/server replacement uses same store, no service:
+        instance = sealed['instance']
+        self.stop(); self.start()
+        fresh = self.maintenance('status')
+        self.assertEqual((fresh['state'], fresh['active']), ('open', 0))
+        self.assertNotEqual(fresh['instance'], instance)
+
+    def test_maintenance_requires_direct_local_bearer_and_epoch(self):
+        self.assertEqual(self.request('POST', '/api/server-maintenance', {'action':'start'}, auth=None)[0], 401)
+        self.assertEqual(self.request('POST', '/api/server-maintenance', {'action':'start'}, auth='basic')[0], 401)
+        self.assertEqual(self.request('POST', '/api/server-maintenance', {'action':'start'},
+                                     headers={'X-Forwarded-For':'127.0.0.1'})[0], 403)
+        self.assertEqual(self.maintenance('status')['state'], 'open')
+        state = self.maintenance('start')
+        with self.assertRaises(Exception): self.maintenance('resume', 'wrong')
+        self.assertEqual(self.maintenance('resume', state['epoch'])['state'], 'open')

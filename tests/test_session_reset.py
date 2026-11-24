@@ -31,6 +31,10 @@ class ResetRpc:
         self.reject_create = False
         self.changed_permissions = False
         self.unmaterialized = False
+        self.unloaded = set()
+        self.read_unavailable = set()
+        self.no_rollout = set()
+        self.resume_id_override = None
         self.auto_admit = False
         self.original = dict(model='test-model', modelProvider='openai', cwd='/tmp/test-project',
             approvalPolicy='on-request', approvalsReviewer='user', reasoningEffort='high',
@@ -44,12 +48,21 @@ class ResetRpc:
         self.calls.append((method, copy.deepcopy(params)))
         thread = params.get('threadId')
         if method == 'thread/read':
+            if thread in self.unloaded:
+                raise RpcError(-32600, 'thread not loaded: '+thread)
+            if thread in self.read_unavailable:
+                return {'thread': {'id': thread, 'status': {'type': 'idle'}, 'canAcceptDirectInput': None}}
             return {'thread': {'id': thread, 'status': {'type': self.status[thread]}, 'canAcceptDirectInput': self.status[thread] == 'idle'}}
         if method == 'thread/resume':
+            if thread in self.no_rollout:
+                raise RpcError(-32600, 'no rollout found for thread id '+thread)
             if self.unmaterialized and thread == self.new:
                 raise RpcError(-32600, 'no rollout found for thread id '+thread)
+            if thread in self.unloaded:
+                self.unloaded.remove(thread)
+            self.read_unavailable.discard(thread)
             result = copy.deepcopy(self.original)
-            result['thread'] = {'id': thread}
+            result['thread'] = {'id': self.resume_id_override or thread}
             if thread == self.new and self.changed_permissions:
                 result['sandbox'] = {'type': 'dangerFullAccess'}
             return result
@@ -294,6 +307,22 @@ class SessionResetTests(RemoteWebFixture):
         self.request_reset(); self.bridge.tick()
         self.assertEqual(self.reset()['status'],'completed')
         self.assertEqual(sum(method=='thread/start' for method, _ in self.rpc.calls), 1)
+        self.assertEqual(len(self.rpc.history[self.rpc.new]), 1)
+        self.assertEqual(sum(method=='thread/queue/start' for method, _ in self.rpc.calls), 1)
+
+    def test_unloaded_new_thread_never_bootstraps_or_claims_completion(self):
+        original = self.rpc.request
+        def unload_after_start(method, params):
+            result = original(method, params)
+            if method == 'thread/start': self.rpc.unloaded.add(self.rpc.new)
+            return result
+        self.rpc.unmaterialized = True
+        self.rpc.request = unload_after_start
+        self.request_reset(); self.bridge.tick()
+        self.assertEqual(self.reset()['status'], 'created')
+        self.assertIn('thread not loaded', self.reset()['error'])
+        self.assertFalse(any(method in ('thread/queue/add', 'thread/queue/start') for method, _ in self.rpc.calls))
+        self.assertEqual(self.rpc.history[self.rpc.new], [])
 
     def test_legacy_history_method_uses_explicit_readback_before_bootstrap(self):
         original = self.rpc.request
@@ -380,6 +409,9 @@ class ProjectScopeStartSettingsTests(unittest.TestCase):
         from agent_chat.reset_worker import ResetWorker
         self.tmp = tempfile.TemporaryDirectory(prefix='project-scope-start-')
         self.addCleanup(self.tmp.cleanup)
+        from agent_chat.core import Coordinator
+        self.coord = Coordinator(Path(self.tmp.name) / 'epoch.sqlite3')
+        self.addCleanup(self.coord.close)
         self.members = [str(Path(self.tmp.name).resolve() / name) for name in ('core', 'api', 'web')]
         for member in self.members:
             Path(member).mkdir()
@@ -398,7 +430,7 @@ class ProjectScopeStartSettingsTests(unittest.TestCase):
             self.job.update(values, status=status)
             self.transitions.append(status)
             return copy.deepcopy(self.job)
-        self.state = SimpleNamespace(reset_update=update,
+        self.state = SimpleNamespace(coord=self.coord, reset_update=update,
                                      reset_job=lambda job_id: copy.deepcopy(self.job),
                                      connection_metadata=lambda: {})
         self.worker = ResetWorker(Bridge(self.state, self.rpc))
@@ -422,6 +454,9 @@ class ProjectScopeStartSettingsTests(unittest.TestCase):
         self.assertEqual(self.job['new_settings_digest'], self.job['settings_digest'])
         self.assertIn('ready', self.transitions)
         self.assertEqual(len(self.rpc.history[self.rpc.new]), 1)
+        handoffs = self.coord.db.execute('SELECT method, outcome FROM execution_epoch_handoffs ORDER BY rowid').fetchall()
+        self.assertTrue(any(row['method'] == 'thread/start' and row['outcome'] == 'submitted' for row in handoffs))
+        self.assertTrue(any(row['method'] == 'thread/queue/add' and row['outcome'] == 'submitted' for row in handoffs))
         settings = next(result for method, result in self.rpc.calls if method == 'thread/start')
         self.assertEqual(settings['runtimeWorkspaceRoots'], self.members)
         self.assertEqual(sum(method == 'thread/start' for method, _ in self.rpc.calls), 1)
@@ -495,6 +530,13 @@ class ProjectScopeStartSettingsTests(unittest.TestCase):
         self.assertIn('no rollout found', self.job['error'])
         self.assertNotIn('ready', self.transitions)
         self.assertEqual(self.rpc.history[self.rpc.new], [])
+
+    def test_missing_epoch_coordinator_rejects_before_native_submission(self):
+        del self.state.coord
+        self.worker.advance(copy.deepcopy(self.job))
+        self.assertEqual(self.job['status'], 'pending')
+        self.assertIn('native epoch admission requires an actual coordinator', self.job['error'])
+        self.assertFalse(any(method in ('thread/resume', 'thread/start', 'thread/queue/add', 'thread/queue/start') for method, _ in self.rpc.calls))
 
 
 class WorkspaceSettingsTests(unittest.TestCase):

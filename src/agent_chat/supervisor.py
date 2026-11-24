@@ -1,6 +1,7 @@
 """Durable owner supervision and incident-linked exact-thread recovery."""
 import hashlib
 import json
+import math
 import pathlib
 import sqlite3
 import time
@@ -15,12 +16,93 @@ ACTIONABLE = ('unavailable_host', 'stale_host', 'error_host', 'no_binding',
               'unloaded_pending', 'uncertain_wake', 'native_error',
               'source_report_pending')
 HOST_CONDITIONS = ('unavailable_host', 'stale_host', 'error_host', 'no_binding')
+_NATIVE_ERROR_PHASES = frozenset(
+    [prefix + phase for prefix in ('', 'recovery-before-resume:', 'recovery-after-resume:')
+     for phase in ('thread/read:before','thread/queue/list','thread/turns/list','thread/read:after','snapshot:interpret')]
+    + ['recovery:claim','recovery:prepare-wake','recovery:attempt-admission',
+       'recovery:thread/resume','recovery:ready-report','recovery:uncertain-report',
+       'recovery:consumption-check','observation:classify','observation:report'])
+_REPORT_MAX_DELIVERIES = 32
+_REPORT_MAX_REPLIES = 8
+_REPORT_MAX_ITEM_BYTES = 8192
+_REPORT_MAX_BYTES = 16 * 1024
+_REPORT_MAX_ID_BYTES = 256
+
+
+def reject_cold_epoch(db, *, method, thread, actor, host, wake_id, reason):
+    if method != 'thread/resume' or not thread or not wake_id:
+        return False
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cold_message_loads'").fetchone():
+        return False
+    row = db.execute("SELECT source_id FROM cold_message_loads WHERE thread_id=? AND target_session=? AND host_id=? AND wake_id=? AND status='claimed'", (thread,actor,host,wake_id)).fetchone()
+    if not row:
+        return False
+    now=time.time()
+    db.execute("UPDATE cold_message_loads SET status='rejected',updated_at=? WHERE source_id=? AND status='claimed'", (now,row['source_id']))
+    db.execute('INSERT INTO cold_message_load_events(source_id,status,detail,created_at) VALUES(?,?,?,?)', (row['source_id'],'rejected',str(reason)[:512],now))
+    return True
+
+
+def cold_epoch_check(coord, db, *, method, thread, actor, host, wake_id):
+    """Revalidate a pending cold load inside the native epoch transaction."""
+    if method != 'thread/resume' or not thread:
+        return
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cold_message_loads'").fetchone():
+        return
+    rows = db.execute("SELECT * FROM cold_message_loads WHERE thread_id=? AND status IN ('claimed','attempting')", (thread,)).fetchmany(2)
+    if not rows:
+        return
+    if len(rows) != 1:
+        raise CoordError('ambiguous cold message epoch')
+    row = rows[0]
+    if row['status'] != 'claimed' or (row['wake_id'], row['target_session'], row['host_id']) != (wake_id, actor, host):
+        raise CoordError('cold message epoch identity changed')
+    supervisor = SupervisorState.__new__(SupervisorState)
+    supervisor.coord, supervisor.db = coord, db
+    job = dict(row)
+    supervisor._cold_check(job, host, pending_wake=wake_id)
+    from .project_activity import non_runnable_task_sources
+    if (row['source_id'] in non_runnable_task_sources(db)
+            or not supervisor._recovery_delivery_eligible(row['source_id'], actor)):
+        raise CoordError('cold message source no longer eligible')
+    linked = db.execute('SELECT message_id FROM bridge_deliveries WHERE job_id=?', (wake_id,)).fetchall()
+    pristine = db.execute('''SELECT 1 FROM bridge_jobs j JOIN bridge_job_origins o ON o.job_id=j.id
+        WHERE j.id=? AND j.thread_id=? AND j.status='prepared' AND j.queue_id IS NULL AND j.error IS NULL
+        AND NOT EXISTS (SELECT 1 FROM bridge_job_native_attempts a WHERE a.job_id=j.id)
+        AND NOT EXISTS (SELECT 1 FROM agent_control_requests r WHERE r.native_input_job_id=j.id)
+        AND NOT EXISTS (SELECT 1 FROM bridge_root_wake_batches b WHERE b.job_id=j.id)''', (wake_id,thread)).fetchone()
+    if not pristine or len(linked) != 1 or linked[0]['message_id'] != row['source_id']:
+        raise CoordError('cold message wake no longer pristine')
+    if db.execute("SELECT 1 FROM bridge_jobs WHERE thread_id=? AND id<>? AND status NOT IN ('dispatched','cancelled')", (thread,wake_id)).fetchone():
+        raise CoordError('cold message conflicts with another wake')
+    now=time.time()
+    db.execute("UPDATE cold_message_loads SET status='attempting',updated_at=? WHERE source_id=?", (now,row['source_id']))
+    db.execute('INSERT INTO cold_message_load_events(source_id,status,created_at) VALUES(?,?,?)', (row['source_id'],'attempting',now))
 
 
 class SupervisorState:
     def __init__(self, coord):
         self.coord, self.db = coord, coord.db
         self.db.executescript('''
+            CREATE TABLE IF NOT EXISTS cold_message_loads (
+                source_id TEXT PRIMARY KEY, wake_id TEXT NOT NULL UNIQUE,
+                owner_session TEXT NOT NULL, target_session TEXT NOT NULL,
+                thread_id TEXT NOT NULL, host_id TEXT NOT NULL,
+                route_generation TEXT NOT NULL, status TEXT NOT NULL,
+                created_at REAL NOT NULL, updated_at REAL NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS cold_message_load_identity_immutable
+            BEFORE UPDATE OF source_id,wake_id,owner_session,target_session,thread_id,host_id,route_generation,created_at ON cold_message_loads
+            BEGIN SELECT RAISE(ABORT,'cold message identity is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS cold_message_load_delete_forbidden
+            BEFORE DELETE ON cold_message_loads
+            BEGIN SELECT RAISE(ABORT,'cold message history is immutable'); END;
+            CREATE TABLE IF NOT EXISTS cold_message_load_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, source_id TEXT NOT NULL,
+                status TEXT NOT NULL, detail TEXT, created_at REAL NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS cold_message_event_update_forbidden BEFORE UPDATE ON cold_message_load_events
+            BEGIN SELECT RAISE(ABORT,'cold message events are immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS cold_message_event_delete_forbidden BEFORE DELETE ON cold_message_load_events
+            BEGIN SELECT RAISE(ABORT,'cold message events are immutable'); END;
             CREATE TABLE IF NOT EXISTS supervisor_policies (
                 owner_session TEXT NOT NULL, target_session TEXT NOT NULL, enabled INTEGER NOT NULL,
                 updated_at REAL NOT NULL, PRIMARY KEY(owner_session,target_session));
@@ -55,6 +137,13 @@ class SupervisorState:
             CREATE TRIGGER IF NOT EXISTS supervisor_notice_provenance_delete BEFORE DELETE ON supervisor_notice_provenance
             BEGIN SELECT RAISE(ABORT,'supervisor notice provenance is immutable'); END;
             CREATE TABLE IF NOT EXISTS supervisor_notice_migrations (version INTEGER PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS supervisor_root_routing_notices (
+                request_id TEXT PRIMARY KEY,home_project TEXT NOT NULL,root_session TEXT NOT NULL,
+                host_id TEXT NOT NULL,thread_id TEXT NOT NULL,message_id TEXT UNIQUE NOT NULL,created_at REAL NOT NULL);
+            CREATE TRIGGER IF NOT EXISTS supervisor_root_routing_notices_update BEFORE UPDATE ON supervisor_root_routing_notices
+            BEGIN SELECT RAISE(ABORT,'root routing notice receipt is immutable'); END;
+            CREATE TRIGGER IF NOT EXISTS supervisor_root_routing_notices_delete BEFORE DELETE ON supervisor_root_routing_notices
+            BEGIN SELECT RAISE(ABORT,'root routing notice receipt is immutable'); END;
         """)
         # Public registration reserves this exact SID; send requires a registered
         # caller. Never infer provenance from a display name or message body.
@@ -73,6 +162,54 @@ class SupervisorState:
             self.db.execute('ALTER TABLE supervisor_incidents ADD COLUMN active INTEGER NOT NULL DEFAULT 1')
         if 'episode' not in columns:
             self.db.execute('ALTER TABLE supervisor_incidents ADD COLUMN episode INTEGER NOT NULL DEFAULT 1')
+        if 'error_signature' not in columns:
+            self.db.execute('ALTER TABLE supervisor_incidents ADD COLUMN error_signature TEXT')
+
+    def root_routing_resumed(self, roots, project, session, host, request_id):
+        """Emit only a verified committed Root lifecycle effect; never caller prose."""
+        root = roots.authorize(project, session, host)
+        if self.coord.require_session() != session or self.coord.path.resolve() != roots.path(project).resolve():
+            raise CoordError('root routing notice requires the canonical own home coordinator')
+        with roots.projects.connection() as directory:
+            audit = directory.execute('SELECT * FROM root_routing_pauses ORDER BY created_at DESC,id DESC LIMIT 1').fetchone()
+            if (root['mode'] != 'running' or not audit or audit['id'] != request_id
+                    or audit['status'] != 'resumed' or audit['resumed_at'] is None
+                    or (audit['home_project'], audit['home_session'], audit['host_id'], audit['thread_id']) !=
+                    (project, session, host, root['thread_id'])
+                    or directory.execute("SELECT 1 FROM root_fresh_requests WHERE status<>'completed'").fetchone()):
+                raise CoordError('root routing notice requires the exact completed current resume audit')
+            saved = [dict(row) for row in directory.execute('SELECT project_id,session_id FROM root_routing_pause_projects WHERE request_id=? ORDER BY project_id', (request_id,))]
+            current = [dict(row) for row in directory.execute('SELECT project_id,session_id FROM root_projects ORDER BY project_id')]
+            if not saved or saved != current or dict(project_id=project, session_id=session) not in saved:
+                raise CoordError('root routing notice retained cohort differs')
+        if any(roots._routing_projection(root, row, None) for row in saved):
+            raise CoordError('root routing notice requires every retained projection resumed')
+        identity = (request_id, project, session, host, root['thread_id'])
+        message_id = 'supervisor_routing_' + hashlib.sha256('|'.join(identity).encode()).hexdigest()[:32]
+        body = ('System supervisor notice: Root routing maintenance resumed. Request=' + request_id
+                + ' thread=' + root['thread_id'] + ' host=' + host
+                + '. This is system lifecycle evidence, not an operator instruction or source-task completion. '
+                'Existing project pauses and authorization limits remain. Consume and acknowledge this notice; '
+                'system:supervisor has no reply route.')
+        with self.coord.tx() as db:
+            prior = db.execute('SELECT * FROM supervisor_root_routing_notices WHERE request_id=?', (request_id,)).fetchone()
+            if prior:
+                message = db.execute('SELECT sender_session,recipient_session,body FROM messages WHERE id=?', (message_id,)).fetchone()
+                provenance = db.execute('SELECT sender_session,recipient_session FROM supervisor_notice_provenance WHERE message_id=?', (message_id,)).fetchone()
+                if ((prior['request_id'], prior['home_project'], prior['root_session'], prior['host_id'], prior['thread_id']) != identity
+                        or prior['message_id'] != message_id or not message or not provenance
+                        or tuple(message) != (SYSTEM_SENDER, session, body) or tuple(provenance) != (SYSTEM_SENDER, session)):
+                    raise CoordError('root routing completion notice receipt differs')
+                return message_id
+            if (db.execute('SELECT 1 FROM messages WHERE id=?', (message_id,)).fetchone()
+                    or db.execute('SELECT 1 FROM supervisor_notice_provenance WHERE message_id=?', (message_id,)).fetchone()):
+                raise CoordError('root routing completion notice identity already exists')
+            now = time.time()
+            db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
+                       (message_id, SYSTEM_SENDER, session, body, now))
+            db.execute('INSERT INTO supervisor_notice_provenance VALUES(?,?,?,?)', (message_id, SYSTEM_SENDER, session, now))
+            db.execute('INSERT INTO supervisor_root_routing_notices VALUES(?,?,?,?,?,?,?)', (*identity, message_id, now))
+        return message_id
 
     def _operator(self):
         try:
@@ -200,7 +337,15 @@ class SupervisorState:
         if not row:
             return False
         try:
-            return row['target_id'] == str(uuid.uuid5(uuid.UUID(row['stop_id']), job['target_session']))
+            exact_target = row['target_id'] == str(uuid.uuid5(uuid.UUID(row['stop_id']), job['target_session']))
+            if not exact_target:
+                return False
+            # A current PO stop admission preserves coordination authority for
+            # this exact target while the rest of the team remains stopped.
+            # Do not silence its pending-work incident as though it were an
+            # ordinary stopped worker; lifecycle/recovery gates still apply.
+            from .root_lifecycle import po_admitted
+            return not po_admitted(self.db, row['stop_id'], job['target_session'])
         except (ValueError, TypeError, AttributeError):
             return False
 
@@ -211,16 +356,37 @@ class SupervisorState:
             return
         now = time.time()
         key = (job['owner_session'], job['target_session'], job['route_generation'], condition)
+        error = summary.get('error') if condition == 'native_error' else None
+        phase = summary.get('phase') if condition == 'native_error' else None
+        if not isinstance(phase,str) or phase not in _NATIVE_ERROR_PHASES: phase = None
+        legacy_signature = hashlib.sha256(error.encode('utf-8')).hexdigest() if isinstance(error,str) else None
+        signature = (hashlib.sha256((phase+'\0'+error).encode('utf-8')).hexdigest()
+                     if phase and isinstance(error,str) else legacy_signature)
         row = self.db.execute('''SELECT * FROM supervisor_incidents WHERE owner_session=? AND target_session=?
             AND route_generation=? AND condition=?''', key).fetchone()
         if not row:
-            self.db.execute('''INSERT INTO supervisor_incidents(owner_session,target_session,route_generation,condition,first_seen,last_seen,last_sample,message_id,active,episode)
-                VALUES(?,?,?,?,?,?,?,NULL,1,1)''', (*key, now, now, now))
+            self.db.execute('''INSERT INTO supervisor_incidents(owner_session,target_session,route_generation,condition,first_seen,last_seen,last_sample,message_id,active,episode,error_signature)
+                VALUES(?,?,?,?,?,?,?,NULL,1,1,?)''', (*key, now, now, now, signature))
             return
         if not row['active']:
-            self.db.execute('''UPDATE supervisor_incidents SET active=1,episode=episode+1,first_seen=?,last_seen=?,last_sample=?,message_id=NULL
-                WHERE owner_session=? AND target_session=? AND route_generation=? AND condition=?''', (now, now, now, *key))
+            self.db.execute('''UPDATE supervisor_incidents SET active=1,episode=episode+1,first_seen=?,last_seen=?,last_sample=?,message_id=NULL,error_signature=?
+                WHERE owner_session=? AND target_session=? AND route_generation=? AND condition=?''', (now, now, now, signature, *key))
             return
+        # Older clients lacking phase must not reopen the same known error.
+        if not phase and isinstance(error,str) and row['error_signature']:
+            phased = {hashlib.sha256((item+'\0'+error).encode('utf-8')).hexdigest() for item in _NATIVE_ERROR_PHASES}
+            if row['error_signature'] in phased:
+                signature = row['error_signature']
+        # Enrich an existing legacy error identity without creating a duplicate
+        # episode for the same previously recorded error text.
+        if phase and row['error_signature'] == legacy_signature and signature != legacy_signature:
+            self.db.execute('''UPDATE supervisor_incidents SET error_signature=? WHERE owner_session=? AND target_session=? AND route_generation=? AND condition=?''', (signature,*key))
+        elif signature is not None and row['error_signature'] is not None and signature != row['error_signature']:
+            self.db.execute('''UPDATE supervisor_incidents SET episode=episode+1,first_seen=?,last_seen=?,last_sample=?,message_id=NULL,error_signature=?
+                WHERE owner_session=? AND target_session=? AND route_generation=? AND condition=?''', (now,now,now,signature,*key))
+            return
+        if signature is not None and row['error_signature'] is None:
+            self.db.execute('''UPDATE supervisor_incidents SET error_signature=? WHERE owner_session=? AND target_session=? AND route_generation=? AND condition=?''', (signature,*key))
         self.db.execute('''UPDATE supervisor_incidents SET last_seen=?,last_sample=? WHERE owner_session=?
             AND target_session=? AND route_generation=? AND condition=?''', (now, now, *key))
         if row['message_id'] or now - row['first_seen'] < 60:
@@ -232,8 +398,11 @@ class SupervisorState:
         evidence = json.dumps(summary, sort_keys=True, separators=(',', ':'))[:1200]
         body = ('System supervisor notice: ' + condition + '. owner=' + job['owner_session']
                 + ' target=' + job['target_session'] + ' thread=' + str(job.get('thread_id'))
-                + ' host=' + str(job.get('host_id')) + ' route_generation=' + job['route_generation'] + '. Evidence: ' + evidence
-                + '. Inspect this exact agent status and bridge state. This informational notice needs consumption and ACK only; '
+                + ' host=' + str(job.get('host_id')) + ' route_generation=' + job['route_generation']
+                + ' phase=' + (phase or 'unknown') + '. Evidence: ' + evidence
+                + '. Inspect this exact agent status and bridge state; retain its wake and ownership records, and do not replay an uncertain input. '
+                'A queued or dispatched wake is not proof of useful execution; native start, task completion and result consumption require separate evidence. '
+                'This informational notice needs consumption and ACK only; '
                 'system:supervisor has no reply route. ACK is not source-task completion or process/ownership closure.')
         if condition == 'source_report_pending':
             body += (" Native history confirms only that the input was consumed; it does not "
@@ -314,7 +483,8 @@ class SupervisorState:
             if condition:
                 self._coordinator_evidence(policy, route, condition,
                                            {'host_id': route['host_id'], 'checked_at': now})
-                self._resolve_conditions(policy, route, condition)
+                # Host availability cannot resolve a native observation.
+                self._resolve_conditions(policy, route, condition, conditions=HOST_CONDITIONS)
             else:
                 # Host recovery cannot resolve a native delivery condition.
                 # Only a coherent subsequent native sample can do that.
@@ -415,6 +585,7 @@ class SupervisorState:
         reporting = self._recovery_reporting(row)
         if reporting:
             result['source_reporting'] = reporting
+            result['source_reporting_evidence'] = self._recovery_reporting_evidence(row)
             report_incident = self.db.execute('''SELECT active,message_id FROM supervisor_incidents
                 WHERE owner_session=? AND target_session=? AND route_generation=?
                   AND condition='source_report_pending' ''',
@@ -439,6 +610,42 @@ class SupervisorState:
         } if consumed else None)
         return result
 
+    def _report_first_ack_role(self, message_id):
+        """Validate immutable ACK role; never classify content or task completion."""
+        unknown = {'state': 'unknown'}
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reply_ack_idempotency'").fetchone():
+            return unknown
+        rows = self.db.execute('''SELECT a.sender_session AS ack_sender,a.reply_to AS ack_parent,
+                a.fingerprint,a.message_id,m.sender_session,m.recipient_session,m.seq,m.created_at,
+                r.reply_to,parent.sender_session AS parent_sender,
+                parent.recipient_session AS parent_recipient,parent.seq AS parent_seq,
+                parent.acked_at AS parent_acked_at
+            FROM reply_ack_idempotency a
+            LEFT JOIN messages m ON m.id=a.message_id
+            LEFT JOIN message_replies r ON r.message_id=m.id
+            LEFT JOIN messages parent ON parent.id=a.reply_to
+            WHERE a.message_id=? LIMIT 2''', (message_id,)).fetchall()
+        if not rows:
+            return {'state': 'not_recorded'}
+        if len(rows) != 1:
+            return unknown
+        row = rows[0]
+        if (row['message_id'] != message_id or row['ack_sender'] != row['sender_session']
+                or row['ack_parent'] != row['reply_to']
+                or row['parent_sender'] != row['recipient_session']
+                or row['parent_recipient'] != row['sender_session']
+                or row['sender_session'] == row['recipient_session']
+                or not isinstance(row['seq'], int) or not isinstance(row['parent_seq'], int)
+                or row['parent_seq'] >= row['seq']
+                or not isinstance(row['created_at'], (int, float)) or not math.isfinite(row['created_at'])
+                or not isinstance(row['parent_acked_at'], (int, float)) or not math.isfinite(row['parent_acked_at'])
+                or not isinstance(row['fingerprint'], str) or len(row['fingerprint']) != 64
+                or any(value not in '0123456789abcdef' for value in row['fingerprint'])
+                or self.db.execute('SELECT 1 FROM message_batches WHERE message_id IN (?,?)',
+                                   (message_id,row['ack_parent'])).fetchone()):
+            return unknown
+        return {'state': 'verified', 'source_message_id': row['ack_parent']}
+
     def _recovery_reporting(self, recovery):
         """Message reporting settlement is never source-task or process proof."""
         if recovery['native_consumed'] != 1 or not recovery['wake_id']:
@@ -454,16 +661,227 @@ class SupervisorState:
                             AND reply.recipient_session=m.sender_session) AS replied
             FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id
             WHERE d.job_id=? ORDER BY m.seq''', (recovery['wake_id'],))]
-        reported = bool(deliveries) and all(item['acked_at'] is not None and
-                                             (item['informational'] or item['replied']) for item in deliveries)
-        real_pending = any(not item['informational'] and (item['acked_at'] is None or not item['replied'])
-                           for item in deliveries)
+        for item in deliveries:
+            item['informational_ack'] = self._report_first_ack_role(item['message_id'])['state'] == 'verified'
+        reported = bool(deliveries) and all(
+            (item['acked_at'] is not None if item['informational'] or item['informational_ack']
+             else bool(item['replied'])) for item in deliveries)
+        real_pending = any(not (item['informational'] or item['informational_ack']) and
+                           not item['replied'] for item in deliveries)
         result = {'state': ('reported' if reported else 'awaiting_acknowledged_reply'
                             if real_pending or not deliveries else 'awaiting_notice_acknowledgement'),
                   'delivered_count': len(deliveries)}
         informational = sum(bool(item['informational']) for item in deliveries)
+        informational_acks = sum(bool(item['informational_ack']) for item in deliveries)
         if informational:
-            result.update(informational_notice_count=informational, scope='message_reporting_only')
+            result['informational_notice_count'] = informational
+        if informational_acks:
+            result['informational_ack_count'] = informational_acks
+        if informational or informational_acks:
+            result['scope'] = 'message_reporting_only'
+        return result
+
+    @staticmethod
+    def _report_json_size(value):
+        return len(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+
+    def _recovery_reporting_evidence(self, recovery):
+        """Bounded metadata-only source evidence; never message content or task proof."""
+        result = {'state': 'unknown', 'complete': False, 'truncated': False,
+                  'deliveries': [], 'factual_result': 'UNRECORDED'}
+        owner, target, wake_id = (recovery['owner_session'], recovery['target_session'],
+                                  recovery['wake_id'])
+        if (recovery['native_consumed'] != 1 or not isinstance(wake_id, str) or
+                not wake_id or len(wake_id.encode('utf-8')) > _REPORT_MAX_ID_BYTES):
+            return result
+        try:
+            expected_ids = json.loads(recovery['message_ids_json'])
+        except (TypeError, ValueError):
+            return result
+        if (not isinstance(expected_ids, list) or not expected_ids or
+                any(not isinstance(value, str) or not value or
+                    len(value.encode('utf-8')) > _REPORT_MAX_ID_BYTES for value in expected_ids) or
+                len(set(expected_ids)) != len(expected_ids)):
+            return result
+        expected_set = set(expected_ids)
+        project_row = self.db.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+        project_id = project_row['value'] if project_row else 'default'
+        deliveries = self.db.execute('''SELECT d.job_id,d.message_id,m.sender_session,m.recipient_session,
+                m.acked_at,m.created_at,m.seq
+            FROM bridge_deliveries d LEFT JOIN messages m ON m.id=d.message_id
+            WHERE d.job_id=? ORDER BY m.seq,d.message_id LIMIT ?''',
+                                      (wake_id, _REPORT_MAX_DELIVERIES + 1)).fetchall()
+        truncated = len(deliveries) > _REPORT_MAX_DELIVERIES
+        integrity_unknown = False
+        seen_ids = set()
+        for delivery in deliveries[:_REPORT_MAX_DELIVERIES]:
+            message_id = delivery['message_id']
+            base = {'delivery_id': message_id if isinstance(message_id, str) and
+                    0 < len(message_id.encode('utf-8')) <= _REPORT_MAX_ID_BYTES else None,
+                    'original_message_id': message_id if isinstance(message_id, str) and
+                    0 < len(message_id.encode('utf-8')) <= _REPORT_MAX_ID_BYTES else None,
+                    'wake_id': wake_id, 'factual_result': 'UNRECORDED'}
+            if (delivery['job_id'] != wake_id or base['original_message_id'] is None or
+                    message_id not in expected_set or delivery['recipient_session'] != target or
+                    message_id in seen_ids or not isinstance(delivery['sender_session'], str) or
+                    not isinstance(delivery['recipient_session'], str) or
+                    max(len(delivery['sender_session'].encode('utf-8')),
+                        len(delivery['recipient_session'].encode('utf-8'))) > _REPORT_MAX_ID_BYTES):
+                integrity_unknown = True
+                base.update(state='unknown', transport_ack={'state': 'unknown', 'acked_at': None},
+                            directed_replies=[], ack_reply={'state': 'unknown'},
+                            substantive_ack='NOT_DEMONSTRATED', decision={'state': 'unknown'})
+                result['deliveries'].append(base)
+                continue
+            seen_ids.add(message_id)
+            sender, recipient = delivery['sender_session'], delivery['recipient_session']
+            acked_at = delivery['acked_at']
+            if acked_at is not None and (not isinstance(acked_at, (int, float)) or
+                                         not math.isfinite(acked_at)):
+                integrity_unknown = True
+                ack_state, acked_at = 'unknown', None
+            else:
+                ack_state = 'acknowledged' if acked_at is not None else 'not_acknowledged'
+            item = dict(base, sender_session=sender, recipient_session=recipient,
+                        original_created_at=(delivery['created_at'] if isinstance(delivery['created_at'], (int, float))
+                                             and math.isfinite(delivery['created_at']) else None),
+                        transport_ack={'state': ack_state, 'acked_at': acked_at},
+                        directed_replies=[], ack_reply={'state': 'unrecorded'},
+                        substantive_ack='NOT_DEMONSTRATED',
+                        decision={'state': 'unrecorded'}, state='recorded')
+            if item['original_created_at'] is None:
+                integrity_unknown = True
+                item['state'] = 'unknown'
+            first_ack = self._report_first_ack_role(message_id)
+            item['first_ack_role'] = first_ack
+            item['source_reply_obligation'] = ('not_required_informational_ack'
+                                                if first_ack['state'] == 'verified' else 'required')
+            if first_ack['state'] == 'unknown':
+                integrity_unknown = True
+                item['state'] = 'unknown'
+            provenance = self.db.execute('''SELECT sender_session,recipient_session
+                FROM supervisor_notice_provenance WHERE message_id=?''', (message_id,)).fetchone()
+            item['informational_notice'] = ('verified' if provenance and
+                provenance['sender_session'] == sender and provenance['recipient_session'] == recipient
+                else 'not_recorded' if provenance is None else 'unknown')
+            if item['informational_notice'] == 'verified':
+                item['source_reply_obligation'] = 'not_required_informational_notice'
+            if provenance and item['informational_notice'] == 'unknown':
+                integrity_unknown = True
+                item['state'] = 'unknown'
+            reply_rows = self.db.execute('''SELECT r.message_id,r.reply_to,reply.sender_session,
+                    reply.recipient_session,reply.created_at
+                FROM message_replies r JOIN messages reply ON reply.id=r.message_id
+                WHERE r.reply_to=? ORDER BY reply.seq,r.message_id LIMIT ?''',
+                                         (message_id, _REPORT_MAX_REPLIES + 1)).fetchall()
+            if len(reply_rows) > _REPORT_MAX_REPLIES:
+                truncated = True
+            valid_replies = {}
+            for reply in reply_rows[:_REPORT_MAX_REPLIES]:
+                rid = reply['message_id']
+                created = reply['created_at']
+                if (not isinstance(rid, str) or not 0 < len(rid.encode('utf-8')) <= _REPORT_MAX_ID_BYTES or
+                        reply['reply_to'] != message_id or reply['sender_session'] != recipient or
+                        reply['recipient_session'] != sender or not isinstance(created, (int, float)) or
+                        not math.isfinite(created)):
+                    integrity_unknown = True
+                    item['state'] = 'unknown'
+                    continue
+                valid_replies[rid] = {'reply_message_id': rid, 'reply_to': message_id,
+                                      'sender_session': recipient, 'recipient_session': sender,
+                                      'created_at': created}
+            item['directed_replies'] = list(valid_replies.values())
+            if self.db.execute('SELECT 1 FROM sqlite_master WHERE type=? AND name=?',
+                               ('table', 'reply_ack_idempotency')).fetchone():
+                ack_rows = self.db.execute('''SELECT sender_session,reply_to,message_id FROM reply_ack_idempotency
+                    WHERE reply_to=? ORDER BY sender_session LIMIT 2''', (message_id,)).fetchall()
+                if len(ack_rows) > 1:
+                    integrity_unknown = True
+                    item['ack_reply'] = {'state': 'unknown'}
+                elif ack_rows:
+                    ackrow = ack_rows[0]
+                    ackreply = valid_replies.get(ackrow['message_id'])
+                    if (ackrow['reply_to'] != message_id or ackrow['sender_session'] != recipient or
+                            not ackreply or self.db.execute(
+                                'SELECT 1 FROM message_batches WHERE message_id=?',
+                                (ackrow['message_id'],)).fetchone()):
+                        integrity_unknown = True
+                        item['ack_reply'] = {'state': 'unknown'}
+                    else:
+                        item['ack_reply'] = {'state': 'recorded',
+                                             'reply_message_id': ackreply['reply_message_id'],
+                                             'created_at': ackreply['created_at']}
+            else:
+                integrity_unknown = True
+                item['ack_reply'] = {'state': 'unknown'}
+            request = self.db.execute('''SELECT message_id,author_session,recipient_session,project_id,created_at
+                FROM operator_decision_requests WHERE message_id=?''', (message_id,)).fetchone()
+            if request:
+                if (request['author_session'] != sender or request['recipient_session'] != recipient or
+                        request['project_id'] != project_id or not isinstance(request['created_at'], (int, float)) or
+                        not math.isfinite(request['created_at']) or self.db.execute(
+                            'SELECT 1 FROM message_batches WHERE message_id=?', (message_id,)).fetchone() or
+                        not self.db.execute('SELECT 1 FROM operator_identities WHERE session_id=?',
+                                            (recipient,)).fetchone()):
+                    integrity_unknown = True
+                    item['decision'] = {'state': 'unknown'}
+                else:
+                    answer = self.db.execute('''SELECT a.message_id,a.reply_message_id,a.recorded_by,a.outcome,
+                            a.recorded_at,m.sender_session,m.recipient_session,r.reply_to
+                        FROM operator_decision_answers a
+                        LEFT JOIN messages m ON m.id=a.reply_message_id
+                        LEFT JOIN message_replies r ON r.message_id=a.reply_message_id
+                        WHERE a.message_id=?''', (message_id,)).fetchone()
+                    if answer:
+                        if (answer['message_id'] != message_id or answer['reply_to'] != message_id or
+                                answer['recorded_by'] != sender or answer['sender_session'] != recipient or
+                                answer['recipient_session'] != sender or answer['outcome'] not in
+                                ('accepted', 'declined', 'conditional', 'clarification') or
+                                not isinstance(answer['recorded_at'], (int, float)) or
+                                not math.isfinite(answer['recorded_at']) or
+                                answer['reply_message_id'] not in valid_replies or
+                                self.db.execute('SELECT 1 FROM message_batches WHERE message_id=?',
+                                                (answer['reply_message_id'],)).fetchone()):
+                            integrity_unknown = True
+                            item['decision'] = {'state': 'unknown'}
+                        else:
+                            item['decision'] = {'state': 'recorded',
+                                'request_message_id': message_id,
+                                'request_created_at': request['created_at'],
+                                'answer_reply_message_id': answer['reply_message_id'],
+                                'recorded_by': answer['recorded_by'], 'outcome': answer['outcome'],
+                                'recorded_at': answer['recorded_at']}
+                    else:
+                        # The recovery target is an agent, while decision-needed
+                        # requests are addressed to an operator. A reply alone
+                        # cannot supply an operator answer record.
+                        item['decision'] = {'state': 'unrecorded',
+                                            'request_message_id': message_id,
+                                            'request_created_at': request['created_at']}
+            else:
+                # An answer without its immutable request is inconsistent evidence.
+                orphan = self.db.execute('SELECT 1 FROM operator_decision_answers WHERE message_id=?',
+                                         (message_id,)).fetchone()
+                if orphan:
+                    integrity_unknown = True
+                    item['decision'] = {'state': 'unknown'}
+            if self._report_json_size(item) > _REPORT_MAX_ITEM_BYTES:
+                truncated = True
+                item = dict(base, sender_session=sender, recipient_session=recipient,
+                            state='unknown', transport_ack={'state': ack_state, 'acked_at': acked_at},
+                            directed_replies=[], ack_reply={'state': 'unknown'},
+                            substantive_ack='NOT_DEMONSTRATED', decision={'state': 'unknown'})
+            candidate = result['deliveries'] + [item]
+            if self._report_json_size(dict(result, deliveries=candidate)) > _REPORT_MAX_BYTES:
+                truncated = True
+                break
+            result['deliveries'].append(item)
+        if seen_ids != expected_set:
+            integrity_unknown = True
+        result['truncated'] = truncated
+        result['complete'] = not truncated and not integrity_unknown and seen_ids == expected_set and len(deliveries) == len(result['deliveries'])
+        result['state'] = ('truncated' if truncated else 'unknown' if integrity_unknown else
+                           'complete' if result['complete'] else 'unknown')
         return result
 
 
@@ -510,11 +928,11 @@ class SupervisorState:
                 'targets': result, 'has_more': len(self._rows(owner, target)) > 50}
 
 
-    def _recovery_allowed(self, job):
+    def _recovery_allowed(self, job, *, cold_message=False):
         """Recheck coordinator gates at every recovery mutation boundary."""
         consent = self.db.execute('''SELECT 1 FROM supervisor_owner_policies
             WHERE owner_session=? AND enabled=1 AND recovery_enabled=1''', (job['owner_session'],)).fetchone()
-        if not consent:
+        if not consent and not cold_message:
             raise CoordError('supervisor recovery consent withheld')
         from .root_orchestrator import projection
         from .session_reset import assert_reset_unlocked
@@ -529,9 +947,22 @@ class SupervisorState:
                 or len(route['route']['route']) != 1 or self._host_condition(route, time.time())):
             raise CoordError('unavailable supervisor recovery withheld')
         if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='remote_guarded_runs'").fetchone():
-            if self.db.execute('SELECT 1 FROM remote_guarded_runs WHERE session_id=? AND closed_at IS NULL',
-                               (job['target_session'],)).fetchone():
-                raise CoordError('open guarded work recovery withheld')
+            rows = self.db.execute('''SELECT run_id,resource,reservation_id,
+                session_id AS owner_session,host_id,local_pid AS pid,NULL AS pgid,
+                started_at,closed_at FROM remote_guarded_runs
+                WHERE session_id=? AND closed_at IS NULL''',
+                (job['target_session'],)).fetchmany(2)
+            if rows:
+                from .d6b4_retirement import HOST, OWNER, is_retired_guard
+                # This exact administrative audit permits ordinary delivery to
+                # its original owner. It does not close the guard, restore work,
+                # clear holdings, or assert original process termination.
+                retired_delivery = (len(rows) == 1 and job['target_session'] == OWNER
+                    and job.get('host_id') == HOST and route.get('host_id') == HOST
+                    and route.get('generation') == job.get('route_generation')
+                    and is_retired_guard(self.db, 'remote_guarded_runs', dict(rows[0])))
+                if not retired_delivery:
+                    raise CoordError('open guarded work recovery withheld')
 
     def _recovery_view(self, row):
         if not row:
@@ -679,9 +1110,97 @@ class SupervisorState:
             raise CoordError('invalid supervisor recovery report')
         return {'accepted': True, 'recovery': self._recovery_view(self._recovery_for(job))}
 
+    def _cold_owner(self, target):
+        from .management import manager
+        owner = manager(self.db, target)
+        if owner and self._designated(owner) and not self._designated(target):
+            return owner
+        if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_orchestrators'").fetchone():
+            row = self.db.execute('SELECT root_session FROM project_orchestrators WHERE session_id=?', (target,)).fetchone()
+            if row and self._root(row['root_session']):
+                return row['root_session']
+        if (not owner or not self._root(owner) or target == SYSTEM_SENDER
+                or not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_direct_creations'").fetchone()):
+            return None
+        if not self.db.execute('''
+                SELECT 1 FROM root_direct_creations d
+                JOIN meta p ON p.key='project_id' AND p.value=d.project_id
+                JOIN sessions r ON r.id=d.root_session
+                JOIN sessions w ON w.id=d.target_session AND w.agent<>'operator'
+                WHERE d.root_session=? AND d.target_session=?
+                    AND NOT EXISTS (SELECT 1 FROM operator_identities i WHERE i.session_id=w.id)
+            ''', (owner, target)).fetchone():
+            return None
+        from .root_orchestrator import assert_management_target
+        try:
+            assert_management_target(self.db, owner, target)
+        except CoordError:
+            return None
+        return owner
+
+    def _cold_check(self, job, host, *, pending_wake=None):
+        from .root_lifecycle import stopped
+        from .root_restart import held
+        owner, target = job.get('owner_session'), job.get('target_session')
+        if not owner or self._cold_owner(target) != owner or not self._owner_allowed(owner):
+            raise CoordError('cold message management changed')
+        if self.db.execute("SELECT 1 FROM cold_message_loads WHERE target_session=? AND status IN ('claimed','attempting') AND wake_id IS NOT ?", (target,pending_wake)).fetchone():
+            raise CoordError('prior cold message effect is uncertain')
+        if any(stopped(self.db, sid) or held(self.db, sid) for sid in (owner, target)):
+            raise CoordError('cold message project or agent stopped')
+        route = self._route(target)
+        if (not route['route'] or route['host_id'] != host
+                or route['generation'] != job.get('route_generation')
+                or route['route']['thread_id'] != job.get('thread_id')):
+            raise CoordError('cold message route changed')
+        self._recovery_allowed(job, cold_message=True)
+        held_resources = self.db.execute('SELECT 1 FROM resources WHERE owner_session=? LIMIT 1', (target,)).fetchone()
+        guarded = False
+        for table, column in (('guarded_runs','session'), ('remote_guarded_runs','session_id')):
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                guarded = guarded or bool(self.db.execute(f'SELECT 1 FROM {table} WHERE {column}=? AND closed_at IS NULL LIMIT 1', (target,)).fetchone())
+        if held_resources or guarded:
+            raise CoordError('cold message guarded work withheld')
+        return route
+
+    def _cold_jobs(self, host):
+        from .bridge_state import BridgeState
+        state = BridgeState(self.coord)
+        messages = state.pending()
+        # An interrupted preparation may be re-entered only with durable
+        # pristine proof and its exact single delivery.
+        for wake in state.jobs():
+            if wake.get('pristine') is not True:
+                continue
+            rows = self.db.execute('SELECT m.id,m.recipient_session FROM bridge_deliveries d JOIN messages m ON m.id=d.message_id WHERE d.job_id=?', (wake['id'],)).fetchall()
+            if len(rows) == 1 and state.still_unread(wake['id']):
+                messages.append(dict(rows[0], wake_id=wake['id']))
+        result, seen = [], set()
+        for message in messages:
+            target = message['recipient_session']
+            if target in seen or self.db.execute('SELECT 1 FROM cold_message_loads WHERE source_id=?', (message['id'],)).fetchone():
+                continue
+            owner = self._cold_owner(target)
+            if not owner:
+                continue
+            route = self._route(target)
+            if not route.get('route'):
+                continue
+            job = dict(cold_message=True, source_id=message['id'], wake_id=message.get('wake_id'),
+                       owner_session=owner, target_session=target, host_id=host,
+                       thread_id=route['route']['thread_id'], route_generation=route['generation'],
+                       admission='running', wake_summary={}, holds=0, open_guards=[])
+            try:
+                self._cold_check(job, host)
+            except CoordError:
+                continue
+            result.append(job); seen.add(target)
+        return result
+
     def jobs(self, host):
         now, result = time.time(), []
         from .agent_control import AgentControlState
+        result.extend(self._cold_jobs(host))
         with self.coord.tx():
             for owner in self.db.execute('SELECT * FROM supervisor_owner_policies WHERE enabled=1'):
                 managed = self._managed(owner['owner_session']) if self._owner_allowed(owner['owner_session']) else []
@@ -713,12 +1232,66 @@ class SupervisorState:
                                    recovery=self._recovery_view(self._recovery_for(dict(policy, route_generation=route['generation'])))))
         return result
 
+    def _cold_ready(self, job, summary, host):
+        with self.coord.tx():
+            row = self.db.execute('SELECT * FROM cold_message_loads WHERE source_id=?', (job.get('source_id'),)).fetchone()
+            if (not row or row['status'] != 'attempting' or row['host_id'] != host
+                    or any(row[key] != job.get(key) for key in ('owner_session','target_session','thread_id','route_generation'))
+                    or row['wake_id'] != summary.get('wake_id')
+                    or summary.get('before') != 'idle' or summary.get('after') != 'idle'
+                    or summary.get('direct_input') is not True or summary.get('contradictory') is not False
+                    or summary.get('queue_count') != 0 or summary.get('history_state') != 'available'):
+                raise CoordError('cold message loaded proof missing')
+            now=time.time()
+            self.db.execute("UPDATE cold_message_loads SET status='loaded',updated_at=? WHERE source_id=?", (now,row['source_id']))
+            self.db.execute('INSERT INTO cold_message_load_events(source_id,status,created_at) VALUES(?,?,?)', (row['source_id'],'loaded',now))
+            return {'accepted':True}
+
+    def _cold_attempt(self, job, summary, host):
+        from .project_activity import non_runnable_task_sources
+        source, wake_id = job.get('source_id'), summary.get('wake_id')
+        if not source or not wake_id or job.get('cold_message') is not True:
+            raise CoordError('invalid cold message attempt')
+        with self.coord.tx():
+            self._cold_check(job, host)
+            if (summary.get('before') not in ('notLoaded', 'unloaded')
+                    or summary.get('after') != summary.get('before')
+                    or summary.get('contradictory') is not False
+                    or summary.get('history_state') != 'available'
+                    or summary.get('queue_count') != 0 or summary.get('turn_status') == 'inProgress'):
+                raise CoordError('cold message native observation changed')
+            if source in non_runnable_task_sources(self.db) or not self._recovery_delivery_eligible(source, job['target_session']):
+                raise CoordError('cold message source no longer eligible')
+            wake = self.db.execute('''SELECT j.* FROM bridge_jobs j JOIN bridge_job_origins o ON o.job_id=j.id
+                WHERE j.id=? AND j.thread_id=? AND j.status='prepared' AND j.queue_id IS NULL AND j.error IS NULL
+                AND NOT EXISTS (SELECT 1 FROM bridge_job_native_attempts a WHERE a.job_id=j.id)
+                AND NOT EXISTS (SELECT 1 FROM agent_control_requests r WHERE r.native_input_job_id=j.id)
+                AND NOT EXISTS (SELECT 1 FROM bridge_root_wake_batches b WHERE b.job_id=j.id)''',
+                (wake_id, job['thread_id'])).fetchone()
+            linked = self.db.execute('SELECT message_id FROM bridge_deliveries WHERE job_id=?', (wake_id,)).fetchall()
+            if not wake or len(linked) != 1 or linked[0]['message_id'] != source:
+                raise CoordError('cold message pristine wake changed')
+            if self.db.execute("SELECT 1 FROM bridge_jobs WHERE thread_id=? AND id<>? AND status NOT IN ('dispatched','cancelled')", (job['thread_id'], wake_id)).fetchone():
+                raise CoordError('cold message conflicts with another wake')
+            prior=self.db.execute('SELECT * FROM cold_message_loads WHERE source_id=? OR wake_id=?', (source,wake_id)).fetchone()
+            now = time.time()
+            values=(source,wake_id,job['owner_session'],job['target_session'],job['thread_id'],host,job['route_generation'])
+            if prior:
+                return {'accepted':True, 'resume_allowed':False}
+            self.db.execute('INSERT INTO cold_message_loads VALUES(?,?,?,?,?,?,?,?,?,?)', (*values,'claimed',now,now))
+            self.db.execute('INSERT INTO cold_message_load_events(source_id,status,created_at) VALUES(?,?,?)',(source,'claimed',now))
+            return {'accepted':True, 'resume_allowed':True}
+
     def observe(self, job, report, host):
         required = {'state', 'summary', 'source'}
         if not isinstance(job, dict) or not isinstance(report, dict) or set(report) != required or report['source'] != 'native':
             raise CoordError('invalid supervisor observation')
         if not isinstance(report['state'], str) or not isinstance(report['summary'], dict):
             raise CoordError('invalid supervisor observation')
+        if report['state'] == 'cold_message_attempt':
+            return self._cold_attempt(job, report['summary'], host)
+        if report['state'] == 'cold_message_ready':
+            return self._cold_ready(job, report['summary'], host)
         now = time.time()
         with self.coord.tx():
             owner = self.db.execute('SELECT * FROM supervisor_owner_policies WHERE owner_session=? AND enabled=1',

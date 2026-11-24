@@ -7,12 +7,16 @@ const MESSAGE_PREVIEW_LENGTH = 2000;
 const RESOURCE_PAGE_LIMIT = 50;
 const MAX_FILES = 50;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const MAX_MODEL_FILE_BYTES = 64 * 1024 * 1024;
 const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp']);
 const VIDEO_EXTENSIONS = new Set(['mp4', 'm4v', 'mov', 'webm']);
-const DOCUMENT_EXTENSIONS = new Set(['pdf', 'txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
+const AUDIO_EXTENSIONS = new Set(['wav']);
+const MODEL_EXTENSIONS = new Set(['glb', 'fbx']);
+const DOCUMENT_EXTENSIONS = new Set(['eml', 'pdf', 'txt', 'md', 'markdown', 'json', 'xml', 'csv', 'tsv', 'log', 'yaml', 'yml', 'toml']);
 const SETUP_STORAGE_KEY = 'agent-chat.setup-guide.v1';
 const IMAGE_MIMES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
 const VIDEO_MIMES = new Set(['video/mp4', 'video/quicktime', 'video/webm']);
+const AUDIO_MIMES = new Set(['audio/wav']);
 let mediaViewer = null;
 const state = {
   rootView: location.pathname === '/root',
@@ -21,7 +25,7 @@ const state = {
   hasOlder: false, source: null, newCount: 0, config: null, sending: false,
   mentionOptions: [], mentionIndex: 0, reply: null, originals: new Map(), highlighted: null,
   project: new URL(location.href).searchParams.get('project') || 'default', epoch: 0,
-  projects: [], drafts: new Map(), busy: false, rootOverviewData: null, rootWorkspaceRequests: new Map(),
+  activeProjectsOnly: false, projects: [], drafts: new Map(), busy: false, rootOverviewData: null, rootWorkspaceRequests: new Map(),
   hasNewer: false, historyLoaded: false, loadingHistory: false,
   historyDirection: null, historyError: null, scrollTop: 0,
   viewGeneration: 0, viewLoading: false,
@@ -30,6 +34,8 @@ const state = {
   usage: null, usageDialogDirty: false, usageSaving: false,
   measurement: null, measurementLoading: false, measurementSaving: false, measurementRequest: 0, measurementPoll: null,
 };
+const rootAck = {scope:null,pending:null,loading:false,running:false,error:'',done:0,total:0,request:0};
+const decisionAlerts = { scope: null, pending: [], total: 0 };
 const timeFormat = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
 const dateFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 
@@ -840,13 +846,20 @@ function addImages(files) {
   if (state.attachments.length + files.length > MAX_FILES) {
     composerStatus('Attach up to 50 files per message.', true); return;
   }
+  const totalBytes = [...state.attachments, ...files].reduce((sum, item) => sum + (item.file || item).size, 0);
+  if (totalBytes > MAX_FILES * MAX_FILE_BYTES) {
+    composerStatus('Attachments may total up to 500 MiB before metadata.', true); return;
+  }
   for (const file of files) {
     const extension = fileExtension(file.name);
-    if (!IMAGE_EXTENSIONS.has(extension) && !VIDEO_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
-      composerStatus('Choose a supported image, video, PDF or text file.', true); return;
+    if (!IMAGE_EXTENSIONS.has(extension) && !VIDEO_EXTENSIONS.has(extension) && !AUDIO_EXTENSIONS.has(extension) && !MODEL_EXTENSIONS.has(extension) && !DOCUMENT_EXTENSIONS.has(extension)) {
+      composerStatus('Choose a supported image, video, PDF or text file, WAV audio, EML mail, GLB or FBX model.', true); return;
     }
-    if (!file.size || file.size > MAX_FILE_BYTES) {
-      composerStatus('Each file must be nonempty and no larger than 10 MiB.', true); return;
+    const sizeLimit = MODEL_EXTENSIONS.has(extension) ? MAX_MODEL_FILE_BYTES : MAX_FILE_BYTES;
+    if (!file.size || file.size > sizeLimit) {
+      composerStatus(MODEL_EXTENSIONS.has(extension)
+        ? 'GLB v2 and binary FBX 7400 models may be up to 64 MiB; other files may be up to 10 MiB.'
+        : 'Each non-model file must be nonempty and no larger than 10 MiB.', true); return;
     }
   }
   state.attachments.push(...files.map(file => ({ file, url: isImageFile(file) || VIDEO_EXTENSIONS.has(fileExtension(file.name)) ? URL.createObjectURL(file) : null })));
@@ -981,6 +994,160 @@ function stepMedia(direction) {
   renderMediaViewer();
 }
 
+function positionDeliveryTimeline(details, panel) {
+  if (!details.open || !panel.matches(':popover-open')) return;
+  const trigger = details.querySelector('summary');
+  if (!trigger) return;
+  const rect = trigger.getBoundingClientRect();
+  const edge = 12, gap = 6;
+  const maxHeight = Math.min(360, window.innerHeight * 0.65, window.innerHeight - edge * 2);
+  const aboveSpace = Math.max(0, rect.top - gap - edge);
+  const belowSpace = Math.max(0, window.innerHeight - rect.bottom - gap - edge);
+  const needed = Math.min(maxHeight, panel.scrollHeight);
+  const above = aboveSpace >= needed || (belowSpace < needed && aboveSpace >= belowSpace);
+  const available = above ? aboveSpace : belowSpace;
+  panel.style.maxHeight = `${Math.max(1, Math.min(maxHeight, available))}px`;
+  const panelRect = panel.getBoundingClientRect();
+  const left = Math.max(edge, Math.min(window.innerWidth - edge - panelRect.width, rect.right - panelRect.width));
+  const top = above
+    ? Math.max(edge, rect.top - gap - panelRect.height)
+    : Math.min(window.innerHeight - edge - panelRect.height, rect.bottom + gap);
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
+
+let deliveryTimelineGlobalHandlersInstalled = false;
+function installDeliveryTimelineGlobalHandlers() {
+  if (deliveryTimelineGlobalHandlersInstalled) return;
+  deliveryTimelineGlobalHandlersInstalled = true;
+  const openTimelines = () => document.querySelectorAll('.delivery-timeline[open]').forEach(details => {
+    const panel = details.querySelector('.delivery-timeline-panel');
+    if (panel) positionDeliveryTimeline(details, panel);
+  });
+  document.addEventListener('pointerdown', event => {
+    document.querySelectorAll('.delivery-timeline[open]').forEach(details => {
+      if (!details.contains(event.target)) details.open = false;
+    });
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    const details = [...document.querySelectorAll('.delivery-timeline[open]')].at(-1);
+    if (!details) return;
+    event.preventDefault();
+    details.open = false;
+    details.querySelector('summary')?.focus();
+  }, true);
+  document.addEventListener('scroll', openTimelines, true);
+  window.addEventListener('resize', openTimelines);
+}
+
+function deliveryTimeline(receipt, observedAt) {
+  if (!receipt) return null;
+  installDeliveryTimelineGlobalHandlers();
+  const details = node('details', 'delivery-timeline');
+  const acked = receipt.agent_ack_at != null;
+  const job = receipt.native_job;
+  const summaryText = acked ? 'Delivery status · agent acknowledgement recorded'
+    : job?.status === 'queued' ? 'Delivery status · native queue entry recorded'
+    : job?.status === 'dispatched' ? 'Delivery status · input found in conversation history'
+    : receipt.wake_requested ? 'Delivery status · saved; native delivery pending'
+    : 'Delivery status · saved; no wake requested';
+  const summary = node('summary', 'delivery-menu-trigger');
+  summary.setAttribute('aria-label', summaryText);
+  summary.title = summaryText;
+  summary.append(node('span', 'delivery-menu-icon', '···'));
+  summary.append(node('span', 'sr-only', 'Show delivery status details'));
+  details.append(summary);
+  const panel = node('div', 'delivery-timeline-panel');
+  panel.setAttribute('popover', 'manual');
+  details.addEventListener('toggle', () => {
+    if (details.open) {
+      if (typeof panel.showPopover === 'function') {
+        if (!panel.matches(':popover-open')) panel.showPopover();
+        positionDeliveryTimeline(details, panel);
+      }
+    } else if (panel.matches(':popover-open')) panel.hidePopover();
+  });
+  panel.append(node('p', 'delivery-timeline-status', summaryText));
+  const list = node('ol', 'delivery-timeline-events');
+  const add = (label, at = null, note = '') => {
+    const item = node('li', '', label);
+    if (at != null) {
+      const time = node('time', '', timeFormat.format(new Date(at * 1000)));
+      time.dateTime = new Date(at * 1000).toISOString();
+      time.title = new Date(at * 1000).toLocaleString();
+      item.append(' · ', time);
+    }
+    if (note) item.append(node('span', 'delivery-event-note', ` — ${note}`));
+    list.append(item);
+  };
+  add('Saved by Agent Chat', receipt.saved_at);
+  if (job) {
+    const labels = {
+      prepared: ['Native wake prepared', 'not yet confirmed in the native queue'],
+      adding: ['Adding to native queue', 'submission is in progress'],
+      queued: ['Native queue entry recorded', 'this confirms queueing, not that a turn started'],
+      starting: ['Native start requested', 'a running turn is not confirmed'],
+      dispatched: ['Input found in conversation history', 'this confirms input presence, not task completion'],
+      uncertain: ['Delivery outcome uncertain', 'automatic retry was withheld'],
+      failed: ['Native dispatch failed'],
+      cancelled: ['Native dispatch cancelled'],
+    };
+    const [label, note] = labels[job.status] || ['Native dispatch status unavailable'];
+    add(label, null, note);
+    if (job.updated_at != null) add('Native dispatch record last updated', job.updated_at,
+      'latest saved job update; not necessarily the queue or start time');
+  } else if (receipt.wake_requested) add('Wake requested', null, 'request time is not stored; no native dispatch record is available yet');
+  else add('No wake requested', null, 'the message is stored in the recipient inbox');
+  if (acked) add('Agent acknowledgement recorded', receipt.agent_ack_at,
+    'acknowledgement alone does not confirm that work started or finished');
+  else add('No agent acknowledgement recorded yet');
+  for (const reply of receipt.linked_replies || []) add('Explicit reply linked to this message', reply.created_at,
+    'the reply itself does not imply task completion');
+  add('Task progress', null, 'no exact per-message running or completion status is recorded');
+  const note = node('p', 'delivery-timeline-note', 'Status last observed by Agent Chat at ');
+  const observed = node('time', '', timeFormat.format(new Date(observedAt * 1000)));
+  observed.dateTime = new Date(observedAt * 1000).toISOString();
+  observed.title = new Date(observedAt * 1000).toLocaleString();
+  note.append(observed, '. Agent Chat records delivery evidence; it does not infer task progress from message text or an idle agent.');
+  panel.append(list, note);
+  details.append(panel);
+  return details;
+}
+
+// A typed, user-supplied message convention; this is display, not verification.
+function isObservationReport(text) {
+  return text === 'OBSERVATION_REPORT_V1' || text.startsWith('OBSERVATION_REPORT_V1\n') || text.startsWith('OBSERVATION_REPORT_V1\r\n');
+}
+
+function renderObservationReport(text) {
+  if (!isObservationReport(text)) return null;
+  const lines = text.replaceAll('\r\n', '\n').split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const root = node('section', 'observation-report');
+  const owner = lines[1]?.split('\t');
+  const action = lines[2]?.split('\t');
+  const rows = lines.slice(3).map(line => line.split('\t'));
+  const valid = owner?.length === 2 && owner[0] === 'owner' && owner[1].trim() &&
+    action?.length === 2 && action[0] === 'action' && action[1].trim() && rows.length > 0 &&
+    rows.every(row => row.length === 7 && row[0] === 'observation' && row.slice(1).every(value => value.trim()));
+  if (!valid) {
+    root.append(node('strong', '', 'Invalid observation report — no launch clearance.'), node('pre', '', text));
+    return root;
+  }
+  root.append(node('strong', '', 'Unresolved observations — No launch clearance.'),
+    node('p', '', 'Reported by the message author; not independently verified.'));
+  const list = node('ol');
+  const labels = ['Source', 'Component', 'Version', 'Observed at', 'Provenance', 'Finding'];
+  for (const row of rows) {
+    const item = node('li');
+    labels.forEach((label, index) => item.append(node('p', '', `${label}: ${row[index + 1]}`)));
+    list.append(item);
+  }
+  root.append(list, node('p', '', `Reconciliation owner: ${owner[1]}`), node('p', '', `Next diagnostic: ${action[1]}`));
+  return root;
+}
+
 function messageCard(message, videos) {
   const sender = messageAuthor(message);
   const deliveries = messageDeliveries(message);
@@ -1009,7 +1176,28 @@ function messageCard(message, videos) {
   time.dateTime = new Date(message.created_at * 1000).toISOString();
   time.title = new Date(message.created_at * 1000).toLocaleString();
   meta.append(name, target, time);
+  if (message.decision) {
+    const stateLabel = message.decision.status === 'answer_recorded'
+      ? `Author-recorded classification · ${message.decision.answer_outcome}`
+      : message.decision.status === 'reply_received' ? 'Decision reply received'
+      : message.decision.answer_outcome === 'clarification' ? 'Author-recorded clarification; final answer pending' : 'Decision requested';
+    meta.append(node('span', 'decision-message-state', stateLabel));
+  }
   const card = node('div', 'message-card');
+  if (message.retained_child_diagnostic) {
+    const diagnostic = message.retained_child_diagnostic;
+    const details = node('details', 'decision-dependency');
+    details.append(node('summary', '', 'Inspect retained child-review dependency'));
+    details.append(node('p', '', `Author-recorded classification: ${diagnostic.author_classification}`));
+    details.append(node('p', '', `Operator reply provenance: ${diagnostic.provenance}`));
+    details.append(node('p', '', `Expiry: ${diagnostic.expiration}`));
+    details.append(node('p', '', `Independently verified consent: ${diagnostic.verified_consent}`));
+    details.append(node('p', '', `Selected capability: ${diagnostic.capability} · ${diagnostic.eligibility}. ${diagnostic.reason}`));
+    details.append(node('p', '', `Native review outcome: ${diagnostic.review_outcome}. No action is granted or retried. Preserve any existing refusal.`));
+    card.append(details);
+  }
+  const timeline = deliveryTimeline(message.delivery_receipt, state.snapshot?.server_time ?? message.created_at);
+  if (timeline) card.append(timeline);
   if (message.reply_to) {
     const original = message.reply_preview || state.messages.get(message.reply_to) || state.originals.get(message.reply_to);
     const quote = node('button', 'reply-quote');
@@ -1020,16 +1208,56 @@ function messageCard(message, videos) {
     quote.addEventListener('click', () => jumpToMessage(message.reply_to));
     card.append(quote);
   }
-  const long = message.body.length > 900 || message.body.split('\n').length > 8;
-  const expanded = state.expanded.has(message.id);
+  const publicationPlan = message.body.startsWith('Publication plan v1\n');
+  const long = !publicationPlan && (message.body.length > 900 || message.body.split('\n').length > 8);
+  const expanded = publicationPlan || state.expanded.has(message.id);
   const body = node('div', `message-body markdown${long && !expanded ? ' collapsed' : ''}`);
+  if (publicationPlan) body.style.whiteSpace = 'pre-wrap';
   const renderBody = (open) => {
     const text = !open && message.body.length > MESSAGE_PREVIEW_LENGTH
       ? message.body.slice(0, MESSAGE_PREVIEW_LENGTH) + '\n…' : message.body;
-    body.replaceChildren(CoordMarkdown.render(text));
+    if (publicationPlan) body.replaceChildren(document.createTextNode(text));
+    else if (!open && message.body.length > MESSAGE_PREVIEW_LENGTH && isObservationReport(message.body)) {
+      const preview = node('section', 'observation-report');
+      preview.append(node('strong', '', 'Unverified observation report preview — No launch clearance.'), node('pre', '', text));
+      body.replaceChildren(preview);
+    } else body.replaceChildren(renderObservationReport(message.body) || CoordMarkdown.render(text));
   };
   renderBody(expanded);
   card.append(body);
+  if (state.config?.operator_ack_enabled && Array.isArray(message.artifact_decisions)) {
+    for (const item of message.artifact_decisions) {
+      const section = node('section', 'artifact-decision');
+      section.append(node('strong', '', 'Artifact decision'),
+        node('p', '', `Request ${item.request_id}; artifact ${item.artifact_name}; SHA-256 ${item.after_sha256}`),
+        node('p', '', 'This records a decision on these delivered bytes only; it does not complete the task or grant publication authority.'));
+      if (item.outcome) section.append(node('p', '', `Recorded: ${item.outcome}`));
+      else {
+        const status = node('span', 'artifact-decision-status');
+        const buttons = [];
+        const epoch = state.epoch;
+        for (const [outcome, label] of [['accepted', 'Accept artifact'], ['declined', 'Decline artifact']]) {
+          const button = node('button', 'artifact-decision-action', label);
+          button.type = 'button'; buttons.push(button);
+          button.addEventListener('click', async () => {
+            if (epoch !== state.epoch) return;
+            buttons.forEach(control => { control.disabled = true; });
+            try {
+              const body = new URLSearchParams({work_id:item.work_id, request_id:item.request_id, delivery_id:item.id, outcome});
+              const response = await fetch(projectURL('/api/artifact-acceptance', 'POST'), {method:'POST', headers:{'Content-Type':'application/x-www-form-urlencoded', 'X-Agent-Chat-CSRF':state.config.csrf_token}, body});
+              if (!response.ok) throw new Error('action rejected');
+              status.textContent = `Recorded: ${outcome}`;
+            } catch {
+              status.textContent = 'Action not confirmed. Reload before taking any further action.';
+            }
+          });
+          section.append(button);
+        }
+        section.append(status);
+      }
+      card.append(section);
+    }
+  }
   if (long) {
     const toggle = node('button', 'expand-message', expanded ? 'Show less' : 'Read full message');
     toggle.type = 'button';
@@ -1067,6 +1295,24 @@ function messageCard(message, videos) {
         expand.setAttribute('aria-label', `View ${attachment.name} in attachment viewer`);
         expand.addEventListener('click', () => openMediaViewer(message, attachment, expand));
         tile.append(preview, expand, download);
+        images.append(tile);
+        continue;
+      }
+      if (AUDIO_MIMES.has(attachment.mime)) {
+        const tile = node('div', 'message-attachment');
+        const source = projectURL(`/api/attachments/${encodeURIComponent(attachment.id)}`);
+        const player = node('audio', 'message-attachment-audio');
+        player.controls = true;
+        player.preload = 'metadata';
+        player.src = source;
+        player.setAttribute('aria-label', `Play ${attachment.name}`);
+        player.addEventListener('error', () => {
+          if (player.isConnected) player.replaceWith(node('span', 'attachment-document-type', attachmentType(attachment)));
+        }, {once: true});
+        const download = node('a', 'attachment-name', `Download ${attachment.name}`);
+        download.href = source;
+        download.download = attachment.name;
+        tile.append(player, download);
         images.append(tile);
         continue;
       }
@@ -1424,6 +1670,11 @@ function applySnapshot(data) {
   $('bridge-caption').title = clients.length
     ? clients.map(client => `${client.host_id}: ${client.error || (client.recent ? 'connected' : 'offline')}`).join('\n')
     : bridge?.error || 'Only loaded, idle, bound Codex agents can be woken.';
+  const outdated = clients.filter(client => client.recent && !client.error && client.running_version && client.installed_version && client.running_version !== client.installed_version);
+  if (outdated.length) {
+    $('bridge-caption').textContent += ' · Codex update: restart service';
+    $('bridge-caption').title += '\n' + outdated.map(client => `${client.host_id}: running ${client.running_version}, installed ${client.installed_version}. Restart the service manually to use the installed version.`).join('\n');
+  }
   renderUsage(data.usage);
   if (state.paused) { state.pending = data; return; }
   const initial = !state.snapshot;
@@ -1438,6 +1689,7 @@ function applySnapshot(data) {
   const labels = (sessions) => JSON.stringify((sessions || []).map(({ id, agent, model, reasoning_effort }) => [id, agent, model, reasoning_effort]));
   const labelsChanged = labels(data.sessions) !== labels(state.snapshot?.sessions);
   state.snapshot = data;
+  renderDecisionNotifications(data.pending_decisions || [], data.pending_decision_count);
   if (state.selected || state.toMe) {
     if (initial && state.rootView) state.hasOlder = data.history_truncated;
     const scoped = data.messages.filter(matchesConversation);
@@ -1712,6 +1964,21 @@ async function provisionRootProject(project) {
   finally { state.busy = false; projectControls(); }
 }
 
+function activityLabel(project) {
+  const activity = project.activity;
+  if (!activity) return 'Tracked work: unavailable';
+  if (!activity.active) return 'Tracked work: none';
+  return activity.blocked ? `Tracked work: ${activity.blocked} blocked` : 'Tracked work: unfinished';
+}
+
+function nativeGoalLabel(project) {
+  const labels = { active: 'active', blocked: 'blocked', paused: 'paused',
+    none: 'none', usageLimited: 'usage limited', budgetLimited: 'budget limited',
+    complete: 'complete' };
+  const status = project?.native_goal?.status;
+  return `Native goal: ${Object.hasOwn(labels, status) ? labels[status] : 'unavailable'}`;
+}
+
 function renderProjects(data) {
   if ('root_orchestrator' in data) state.root = data.root_orchestrator;
   if ('root_overview' in data) {
@@ -1733,12 +2000,47 @@ function renderProjects(data) {
     fillWorkspaceList($('project-workspace-path'), workspaces, 'No workspace is configured for this project.');
   }
   if (state.rootView && data.root_overview && $('root-projects')) {
-    const key = JSON.stringify(data.root_overview);
+    const key = JSON.stringify([data.root_overview, state.activeProjectsOnly]);
     if (state.rootOverviewKey !== key) {
       state.rootOverviewKey = key;
-      const cards = (data.root_overview.projects || []).map(project => {
+      const cards = (data.root_overview.projects || []).filter(project => !state.activeProjectsOnly || project.activity?.active).map(project => {
         const card = node('article', 'root-project');
         card.append(node('h3', '', project.name), node('p', 'root-project-state', project.setup.replaceAll('_', ' ')));
+        card.dataset.projectId = project.project_id;
+        const goalBadge = node('p', 'project-native-goal-badge', nativeGoalLabel(project));
+        card.append(node('p', 'project-activity-badge', activityLabel(project)), goalBadge);
+        const goalCheck = node('button', 'quiet-button', 'Check native goal');
+        goalCheck.type = 'button';
+        goalCheck.addEventListener('click', async () => {
+          goalCheck.disabled = true; goalBadge.textContent = 'Native goal: unavailable';
+          try {
+            const result = await fetchJSON('/api/root/goal-status?project=' + encodeURIComponent(project.project_id), {}, {projectScoped: false});
+            if (typeof result.observed_at === 'number' && Number.isFinite(result.observed_at) &&
+                Date.now() / 1000 >= result.observed_at && Date.now() / 1000 - result.observed_at <= 5) {
+              goalBadge.textContent = nativeGoalLabel({native_goal: result});
+              setTimeout(() => { goalBadge.textContent = 'Native goal: unavailable'; }, Math.max(0, 5000 - (Date.now() - result.observed_at * 1000)));
+            }
+          } catch (_) { goalBadge.textContent = 'Native goal: unavailable'; }
+          finally { goalCheck.disabled = false; }
+        });
+        card.append(goalCheck);
+        const objectives = node('section', 'project-objectives');
+        objectives.append(node('h4', '', 'PO backlog objectives'));
+        if (!Array.isArray(project.objectives)) {
+          objectives.append(node('p', '', 'Backlog objectives: unavailable'));
+        } else if (!project.objectives.length) {
+          objectives.append(node('p', '', 'No recorded backlog objectives.'));
+        } else {
+          for (const item of project.objectives) {
+            const entry = node('article', 'project-objective');
+            entry.append(node('h5', '', item.title),
+              node('p', '', `Source: ${item.source_request_id} · Owner: ${item.owner_session} · State: ${item.state}`),
+              node('p', '', `Dependencies: ${Array.isArray(item.dependencies) ? (item.dependencies.join(', ') || 'none') : 'unknown'}`),
+              node('p', '', `Next action: ${item.next_action ?? 'unknown'}`));
+            objectives.append(entry);
+          }
+        }
+        card.append(objectives);
         const currentWorkspaces = workspaceMembers(project, ['workspaces', 'cwd']);
         const savedWorkspaces = workspaceMembers(project, ['creation_workspaces', 'creation_workspace', 'workspace']);
         const directory = node('div', 'root-project-directory');
@@ -1784,7 +2086,7 @@ function renderProjects(data) {
         open.addEventListener('click', () => switchProject(project.project_id));
         card.append(open); return card;
       });
-      $('root-projects').replaceChildren(...cards);
+      $('root-projects').replaceChildren(...(cards.length ? cards : [node('p', 'empty-state', 'No projects have unfinished tracked work.')]));
     }
   }
   if ($('root-conversation')) {
@@ -1794,11 +2096,11 @@ function renderProjects(data) {
   }
   if (!data.projects) { if (communication.active) communicationContext(); return; }
   state.projects = data.projects;
-  const projectButtons = data.projects.map(project => {
+  const projectButtons = data.projects.filter(project => !state.activeProjectsOnly || project.activity?.active).map(project => {
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'room-button project-nav-button';
     button.dataset.projectId = project.id;
-    button.textContent = project.name;
+    button.append(node('span', '', project.name), node('span', 'project-activity-badge', activityLabel(project)), node('span', 'project-native-goal-badge', nativeGoalLabel(project)));
     const selected = !communication.active && !state.rootView && project.id === state.project;
     button.classList.toggle('selected', selected);
     button.setAttribute('aria-current', selected ? 'page' : 'false');
@@ -1812,11 +2114,187 @@ function renderProjects(data) {
   $('measurement-button').title = measuring ? 'Usage measurement is active' : 'Measure usage for this project';
   projectControls();
   if (communication.active) communicationContext();
+  refreshRootAckPlan();
 }
+
+// Native action review is separate from chat-message decisions and acknowledgements.
+const actionReview = { epoch: -1, rows: new Map(), cards: new Map(), sending: new Set(),
+  uncertain: new Set(), submitted: new Set(), loading: false, stale: true, lastPoll: 0, sequence: 0 };
+const actionLabels = { accept: 'Allow once', decline: 'Decline', cancel: 'Cancel action', deny: 'Deny',
+  network_turn: 'Allow network for turn', network_session: 'Allow network for session',
+  fileSystem_turn: 'Allow files for turn', fileSystem_session: 'Allow files for session',
+  all_turn: 'Allow all for turn', all_session: 'Allow all for session' };
+const actionStates = { pending: 'Awaiting your decision', proposed: 'Decision submitted · awaiting agent response',
+  response_sent: 'Response sent to the requesting agent', response_uncertain: 'Response delivery is uncertain',
+  resolved: 'Request resolved', completed: 'Item ended · outcome not verified', expired: 'Request expired', disconnected: 'Request disconnected' };
+
+function actionItemOutcome(row) {
+  const item = row.item_outcome;
+  if (row.status !== 'completed' || !item || !['commandExecution', 'fileChange'].includes(item.type)) return actionStates[row.status];
+  if (item.status === 'declined') return 'Action declined by provider';
+  if (item.status === 'failed') return 'Action failed';
+  if (item.status === 'completed') {
+    if (item.type === 'fileChange') return 'File change completed';
+    if (Number.isInteger(item.exitCode)) return item.exitCode === 0 ? 'Command completed · exit 0' : `Command failed · exit ${item.exitCode}`;
+  }
+  return actionStates.completed;
+}
+
+function resetActionReview() {
+  actionReview.epoch = state.epoch; actionReview.sequence++;
+  actionReview.rows.clear(); actionReview.cards.clear(); actionReview.sending.clear(); actionReview.uncertain.clear(); actionReview.submitted.clear();
+  actionReview.loading = false; actionReview.stale = true; actionReview.lastPoll = 0;
+  $('action-review-list').replaceChildren();
+  $('action-review-status').textContent = 'Loading current project requests…';
+  if ($('action-review-dialog').open) $('action-review-dialog').close();
+  renderActionReview();
+}
+
+function actionRemaining(row) {
+  return Math.max(0, row.remaining - (performance.now() - row.observedAt) / 1000);
+}
+
+function renderActionReview() {
+  const ready = state.config?.operator_ack_enabled === true && actionReview.epoch === state.epoch;
+  $('action-review-button').disabled = !ready;
+  let pending = 0;
+  for (const row of actionReview.rows.values()) {
+    const remaining = actionRemaining(row);
+    if (row.status === 'pending' && remaining > 0) pending++;
+    let card = actionReview.cards.get(row.handle);
+    if (!card) {
+      card = node('article', 'action-review-card');
+      const heading = document.createElement('h3');
+      heading.textContent = `${row.agent} · ${row.preview.kind}`;
+      card.append(heading);
+      const fields = [['reason','Reason'],['command','Command'],['cwd','Directory'],['environment','Environment'],['grantRoot','Requested file scope'],['host','Host'],['protocol','Protocol'],['permissions','Requested permissions']];
+      for (const [key, label] of fields) {
+        if (typeof row.preview[key] !== 'string' || !row.preview[key]) continue;
+        const field = node('div', 'action-review-field');
+        const caption = document.createElement('strong');
+        caption.textContent = label;
+        const preview = document.createElement('pre');
+        preview.textContent = row.preview[key];
+        field.append(caption, preview);
+        card.append(field);
+      }
+      const status = node('p', 'action-review-outcome'); status.setAttribute('role', 'status');
+      const actions = node('div', 'action-review-actions');
+      if (row.choices.includes('custom') && Array.isArray(row.permission_items)) {
+        const selections = node('div', 'action-review-selections');
+        const epoch = state.epoch;
+        for (const item of row.permission_items) {
+          const label = document.createElement('label');
+          const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.value = item.id;
+          label.append(checkbox, document.createTextNode(item.label)); selections.append(label);
+        }
+        card.append(selections);
+        for (const scope of ['turn', 'session']) {
+          const button = node('button', 'quiet-button', `Allow selected for ${scope}`);
+          button.type = 'button';
+          button.addEventListener('click', () => decideAction(row.handle, {scope, selection: Array.from(selections.querySelectorAll('input:checked'), input => input.value)}, epoch));
+          actions.append(button);
+        }
+      }
+      for (const choice of row.choices) {
+        if (!Object.hasOwn(actionLabels, choice)) continue;
+        const button = node('button', 'quiet-button', actionLabels[choice]);
+        button.type = 'button'; button.dataset.decision = choice;
+        const epoch = state.epoch;
+        button.addEventListener('click', () => decideAction(row.handle, choice, epoch));
+        actions.append(button);
+      }
+      card.append(status, actions); card.outcome = status; card.actions = actions;
+      actionReview.cards.set(row.handle, card); $('action-review-list').append(card);
+    }
+    const uncertain = actionReview.uncertain.has(row.handle);
+    const sending = actionReview.sending.has(row.handle), submitted = actionReview.submitted.has(row.handle);
+    card.outcome.textContent = uncertain ? 'Decision delivery uncertain. Waiting for the request to resolve; it will not be resent.'
+      : sending ? 'Submitting decision…' : submitted ? actionStates.proposed : actionItemOutcome(row) || 'Request unavailable';
+    if (row.status === 'pending' && remaining > 0 && !uncertain && !sending && !submitted) {
+      card.outcome.textContent += ` · expires in ${Math.ceil(remaining)}s`;
+    }
+    if (row.status === 'pending' && remaining <= 0) card.outcome.textContent = 'Request expired · refreshing outcome';
+    for (const button of card.actions.children) {
+      button.disabled = !ready || actionReview.stale || sending || uncertain || submitted || row.status !== 'pending' || remaining <= 0;
+    }
+  }
+  $('action-review-count').textContent = pending ? String(pending) : '';
+  $('action-review-button').setAttribute('aria-label', pending ? `Action review: ${pending} requests awaiting a decision` : 'Action review');
+  $('action-review-empty').hidden = actionReview.rows.size > 0;
+}
+
+async function loadActionReview() {
+  if (!state.config?.operator_ack_enabled || actionReview.loading || actionReview.epoch !== state.epoch) return;
+  const epoch = state.epoch, sequence = ++actionReview.sequence;
+  actionReview.loading = true; actionReview.lastPoll = performance.now();
+  try {
+    const result = await fetchJSON('/api/approvals');
+    if (epoch !== state.epoch || sequence !== actionReview.sequence) return;
+    if (!Array.isArray(result.requests)) throw new Error('Action review response is unavailable');
+    const next = new Map();
+    for (const row of result.requests) {
+      if (!row || typeof row.handle !== 'string' || typeof row.agent !== 'string'
+          || !row.preview || typeof row.preview.kind !== 'string' || !Array.isArray(row.choices)
+          || !Number.isFinite(row.remaining) || !Object.hasOwn(actionStates, row.status)) {
+        throw new Error('Action review response is unavailable');
+      }
+      next.set(row.handle, { ...row, observedAt: performance.now() });
+      if (row.status !== 'pending') { actionReview.uncertain.delete(row.handle); actionReview.submitted.delete(row.handle); }
+    }
+    for (const [handle, card] of actionReview.cards) {
+      if (!next.has(handle)) { card.remove(); actionReview.cards.delete(handle); actionReview.uncertain.delete(handle); actionReview.submitted.delete(handle); }
+    }
+    actionReview.rows = next; actionReview.stale = false;
+    $('action-review-status').textContent = 'Only the offered decision for this current project request will be sent. A submitted decision is not proof that the action completed.';
+  } catch (error) {
+    if (epoch !== state.epoch || sequence !== actionReview.sequence) return;
+    actionReview.stale = true;
+    $('action-review-status').textContent = `Action review unavailable: ${error.message}. Decisions are disabled until refreshed.`;
+  } finally {
+    if (epoch === state.epoch && sequence === actionReview.sequence) {
+      actionReview.loading = false; renderActionReview();
+    }
+  }
+}
+
+async function decideAction(handle, decision, epoch) {
+  const row = actionReview.rows.get(handle);
+  if (epoch !== state.epoch || actionReview.epoch !== epoch || !state.config?.operator_ack_enabled
+      || actionReview.stale || !row || row.status !== 'pending' || actionRemaining(row) <= 0
+      || !(typeof decision === 'string' ? row.choices.includes(decision) : row.choices.includes('custom')) || actionReview.sending.has(handle) || actionReview.uncertain.has(handle) || actionReview.submitted.has(handle)) return;
+  actionReview.sending.add(handle); renderActionReview();
+  try {
+    await fetchJSON('/api/approvals/decision', {
+      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Agent-Chat-CSRF': state.config.csrf_token },
+      body: JSON.stringify({ handle, decision }),
+    });
+    if (epoch !== state.epoch) return;
+    actionReview.submitted.add(handle);
+    const current = actionReview.rows.get(handle);
+    if (current) current.status = 'proposed';
+  } catch (error) {
+    if (epoch !== state.epoch) return;
+    // A lost HTTP response is not permission to retry a one-use decision.
+    actionReview.uncertain.add(handle);
+    $('action-review-status').textContent = error.message;
+  } finally {
+    if (epoch === state.epoch) {
+      actionReview.sending.delete(handle); renderActionReview(); await loadActionReview();
+    }
+  }
+}
+
+$('action-review-button').addEventListener('click', () => {
+  $('action-review-dialog').showModal(); loadActionReview();
+});
+$('action-review-close').addEventListener('click', () => $('action-review-dialog').close());
+$('action-review-refresh').addEventListener('click', loadActionReview);
 
 async function connect() {
   state.resourceOffset = 0; state.resourceBusy = false; state.resourceRenderKey = null;
   const epoch = ++state.epoch;
+  resetActionReview();
   state.loadingHistory = false;
   state.historyDirection = null; state.historyError = null;
   state.snapshot = null; state.messages.clear(); state.originals.clear(); state.expanded.clear();
@@ -1833,6 +2311,7 @@ async function connect() {
     state.config = await fetchJSON('/api/config');
     if (state.rootView) state.project = state.config.project.id;
     renderProjects(state.config);
+    renderActionReview(); loadActionReview();
     if (!state.rootView && !localStorage.getItem(SETUP_STORAGE_KEY)) openSetupGuide();
     applySnapshot(await fetchJSON(resourceSnapshotURL()));
     $('message-input').disabled = state.rootView && !state.root;
@@ -1862,6 +2341,7 @@ function switchProject(id, rootView = false) {
   state.measurementSaving = false;
   state.project = id;
   state.rootView = rootView; state.rootOverviewKey = null;
+  renderRootAck();
   state.viewGeneration++; state.viewLoading = false;
   const url = new URL(location.href);
   url.pathname = rootView ? '/root' : '/';
@@ -1941,7 +2421,8 @@ $('media-dialog').addEventListener('close', () => {
   const id = opener?.dataset.attachmentId;
   mediaViewer = null;
   const currentOpener = opener?.isConnected ? opener
-    : [...$('messages').querySelectorAll('[data-attachment-id]')].find(item => item.dataset.attachmentId === id);
+    : [...document.querySelectorAll('#messages [data-attachment-id], #communication-messages .communication-image-viewer[data-attachment-id]')]
+      .find(item => item.dataset.attachmentId === id);
   if (currentOpener) currentOpener.focus({ preventScroll: true });
 });
 $('usage-threshold').addEventListener('input', () => { state.usageDialogDirty = true; usageError(); });
@@ -2136,7 +2617,12 @@ $('composer').addEventListener('submit', async (event) => {
     if (state.attachments.length) {
       payload = new FormData();
       payload.append('message', JSON.stringify(message));
-      for (const attachment of state.attachments) payload.append('images', attachment.file, attachment.file.name);
+      for (const attachment of state.attachments) {
+        const upload = fileExtension(attachment.file.name) === 'eml'
+          ? new Blob([attachment.file], { type: 'application/octet-stream' })
+          : attachment.file;
+        payload.append('images', upload, attachment.file.name);
+      }
     } else {
       headers['Content-Type'] = 'application/json';
       payload = JSON.stringify(message);
@@ -2162,6 +2648,8 @@ $('composer').addEventListener('submit', async (event) => {
 $('resource-previous').addEventListener('click', () => changeResourcePage(-1));
 $('resource-next').addEventListener('click', () => changeResourcePage(1));
 setInterval(() => {
+  renderActionReview();
+  if (!document.hidden && performance.now() - actionReview.lastPoll >= 2000) loadActionReview();
   if (!state.paused) updateResourceCountdowns();
   if (communication.active && !communication.updating) loadCommunication('update');
 }, 1000);
@@ -2170,14 +2658,33 @@ connect();
 
 
 // This history is independent of the conversation's loaded message window.
-const gallery = { items: [], cursor: null, request: 0, root: false, timer: null, selectedProject: '' };
+const gallery = { items: [], cursor: null, pendingMatches: [], request: 0, root: false, timer: null, selectedProject: '', partial: false };
+function galleryTypeKey(attachment) {
+  const extension = fileExtension(typeof attachment?.name === 'string' ? attachment.name : '');
+  const mime = typeof attachment?.mime === 'string' ? attachment.mime.split(';', 1)[0].trim().toLowerCase() : '';
+  if (IMAGE_EXTENSIONS.has(extension) || IMAGE_MIMES.has(mime)) return 'image';
+  if (VIDEO_EXTENSIONS.has(extension) || VIDEO_MIMES.has(mime)) return 'video';
+  if (AUDIO_EXTENSIONS.has(extension) || AUDIO_MIMES.has(mime)) return 'audio';
+  if (MODEL_EXTENSIONS.has(extension)) return 'model';
+  if (DOCUMENT_EXTENSIONS.has(extension) || mime.startsWith('text/') ||
+      ['application/pdf', 'application/json', 'application/xml', 'message/rfc822'].includes(mime)) return 'document';
+  if (extension || (mime && mime !== 'application/octet-stream')) return 'other';
+  return 'unknown';
+}
 function renderGalleryItems(items) {
   for (const attachment of items) {
     const card = node('article', 'gallery-card');
     const visual = node('button', 'gallery-preview');
     visual.type = 'button';
     visual.setAttribute('aria-label', `Open ${attachment.name}`);
-    if (IMAGE_MIMES.has(attachment.mime)) {
+    let audio = null;
+    if (AUDIO_MIMES.has(attachment.mime)) {
+      audio = node('audio', 'gallery-audio');
+      audio.controls = true;
+      audio.preload = 'metadata';
+      audio.src = attachment.url;
+      audio.setAttribute('aria-label', `Play ${attachment.name}`);
+    } else if (IMAGE_MIMES.has(attachment.mime)) {
       const image = node('img'); image.src = attachment.url; image.alt = attachment.name; image.loading = 'lazy';
       visual.append(image);
     } else if (VIDEO_MIMES.has(attachment.mime)) {
@@ -2193,32 +2700,62 @@ function renderGalleryItems(items) {
     name.href = attachment.url; name.download = attachment.name; name.title = attachment.name;
     const details = node('p', 'gallery-file-meta', `${attachment.project_name} · ${attachment.size >= 1048576 ? (attachment.size / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(attachment.size / 1024)) + ' KB'} · ${dateFormat.format(new Date(attachment.created_at * 1000))}`);
     const download = attachmentDownload(attachment, 'quiet-button gallery-download', true);
-    card.append(visual, name, download, details); $('gallery-grid').append(card);
+    card.append(audio || visual, name, download, details); $('gallery-grid').append(card);
   }
 }
 async function loadGallery(reset = true) {
   const request = ++gallery.request;
-  if (reset) { gallery.items = []; gallery.cursor = null; $('gallery-grid').replaceChildren(); }
+  if (reset) { gallery.items = []; gallery.cursor = null; gallery.pendingMatches = []; gallery.partial = false; $('gallery-grid').replaceChildren(); }
+  const filter = $('gallery-type').value;
   $('gallery-status').textContent = 'Loading attachments…';
   $('gallery-more').disabled = true;
   if (reset) $('gallery-more').hidden = true;
-  const query = new URLSearchParams();
-  if (!gallery.root && $('gallery-project').value) query.set('project', $('gallery-project').value);
-  if ($('gallery-search').value) query.set('q', $('gallery-search').value);
-  if (gallery.cursor) query.set('before', gallery.cursor);
   const path = gallery.root ? '/api/root/attachment-gallery' : '/api/attachment-gallery';
+  let hasMore = gallery.pendingMatches.length > 0 || Boolean(gallery.cursor);
   try {
-    const result = await fetchUsage(`${path}?${query}`, { cache: 'no-store' });
-    if (request !== gallery.request || !$('attachment-gallery').open) return;
-    if (!gallery.root) fillGalleryProjects(result.projects);
-    gallery.items.push(...result.attachments); gallery.cursor = result.next_cursor;
-    renderGalleryItems(result.attachments);
-    $('gallery-more').hidden = !result.has_more;
-    $('gallery-status').textContent = gallery.items.length ? `${gallery.items.length} files${result.has_more ? ' · More available' : ''}` : 'No attachments found.';
-    if (result.partial) $('gallery-status').textContent += ' Some project attachments are unavailable. Refresh to retry.';
+    let foundThisLoad = 0;
+    if (filter !== 'all' && gallery.pendingMatches.length) {
+      const visible = gallery.pendingMatches.splice(0, 48);
+      gallery.items.push(...visible); foundThisLoad += visible.length; renderGalleryItems(visible);
+      hasMore = gallery.pendingMatches.length > 0 || Boolean(gallery.cursor);
+    }
+    let firstFetch = reset || filter === 'all';
+    while (firstFetch || (filter !== 'all' && foundThisLoad < 48 && hasMore)) {
+      firstFetch = false;
+      const query = new URLSearchParams();
+      if (!gallery.root && $('gallery-project').value) query.set('project', $('gallery-project').value);
+      if ($('gallery-search').value) query.set('q', $('gallery-search').value);
+      if (gallery.cursor) query.set('before', gallery.cursor);
+      query.set('limit', '48');
+      const result = await fetchUsage(`${path}?${query}`, { cache: 'no-store' });
+      if (request !== gallery.request || !$('attachment-gallery').open) return;
+      if (!gallery.root) fillGalleryProjects(result.projects);
+      const pageItems = Array.isArray(result.attachments) ? result.attachments : [];
+      const matches = filter === 'all' ? pageItems : pageItems.filter(item => galleryTypeKey(item) === filter);
+      const room = filter === 'all' ? matches.length : Math.max(0, 48 - foundThisLoad);
+      const visible = matches.slice(0, room);
+      if (filter !== 'all' && matches.length > visible.length) gallery.pendingMatches.push(...matches.slice(visible.length));
+      gallery.items.push(...visible); foundThisLoad += visible.length;
+      gallery.cursor = result.next_cursor; hasMore = Boolean(result.has_more) || gallery.pendingMatches.length > 0;
+      gallery.partial ||= Boolean(result.partial);
+      renderGalleryItems(visible);
+      // Keep the existing 48-card page size, but continue scanning metadata-only
+      // pages so a filter can find matches beyond the first unfiltered page.
+    }
+    $('gallery-more').hidden = !hasMore;
+    if (filter === 'all') {
+      $('gallery-status').textContent = gallery.items.length ? `${gallery.items.length} files${hasMore ? ' · More available' : ''}` : 'No attachments found.';
+    } else if (!gallery.items.length) {
+      const typeLabel = $('gallery-type').selectedOptions[0].textContent.toLowerCase();
+      const search = $('gallery-search').value.trim();
+      $('gallery-status').textContent = search ? `No attachments match ${typeLabel} and “${search}”.` : `No attachments match ${typeLabel}.`;
+    } else {
+      $('gallery-status').textContent = `${gallery.items.length} matching files${hasMore ? ' · More matches may be available' : ''}`;
+    }
+    if (gallery.partial) $('gallery-status').textContent += ' Some project attachments are unavailable. Refresh to retry.';
   } catch (error) {
     if (request !== gallery.request || !$('attachment-gallery').open) return;
-    $('gallery-status').textContent = `Could not load attachments. ${error.message}. Refresh to retry.`;
+    $('gallery-status').textContent = `${gallery.items.length ? `${gallery.items.length} matching files. ` : ''}Could not load attachments. ${error.message}. Refresh to retry.`;
   } finally {
     if (request === gallery.request) $('gallery-more').disabled = false;
   }
@@ -2235,9 +2772,16 @@ function selectGalleryScope() {
   $('gallery-title').textContent = gallery.root ? 'Root attachments' : 'Attachments';
   $('gallery-scope').textContent = gallery.root ? 'Files sent in your private Root conversation.' : 'Files sent in project rooms. Private Root attachments stay in Root.';
 }
+function positionGallery() {
+  const left = Math.max(0,document.querySelector('.main').getBoundingClientRect().left);
+  const right = Math.min(innerWidth,document.querySelector('.workspace').getBoundingClientRect().right);
+  $('attachment-gallery').style.setProperty('--gallery-content-center',`${(left+right)/2}px`);
+  $('attachment-gallery').style.setProperty('--gallery-content-width',`${right-left}px`);
+}
+window.addEventListener('resize', () => { if ($('attachment-gallery').open) positionGallery(); });
 $('open-attachments').addEventListener('click', () => {
-  fillGalleryProjects(state.projects); selectGalleryScope(); $('gallery-search').value = '';
-  closePanels(); $('attachment-gallery').showModal(); loadGallery();
+  fillGalleryProjects(state.projects); selectGalleryScope(); $('gallery-search').value = ''; $('gallery-type').value = 'all';
+  closePanels(); positionGallery(); $('attachment-gallery').showModal(); loadGallery();
 });
 $('close-gallery').addEventListener('click', () => $('attachment-gallery').close());
 $('attachment-gallery').addEventListener('close', () => {
@@ -2245,17 +2789,19 @@ $('attachment-gallery').addEventListener('close', () => {
   for (const video of $('gallery-grid').querySelectorAll('video')) video.pause();
 });
 $('gallery-project').addEventListener('change', () => {
+  clearTimeout(gallery.timer);
   gallery.selectedProject = $('gallery-project').value; selectGalleryScope(); loadGallery();
 });
 $('gallery-search').addEventListener('input', () => {
   gallery.request++; clearTimeout(gallery.timer); gallery.timer = setTimeout(() => loadGallery(), 250);
 });
-$('gallery-refresh').addEventListener('click', () => loadGallery());
-$('gallery-more').addEventListener('click', () => loadGallery(false));
+$('gallery-type').addEventListener('change', () => { clearTimeout(gallery.timer); loadGallery(); });
+$('gallery-refresh').addEventListener('click', () => { clearTimeout(gallery.timer); loadGallery(); });
+$('gallery-more').addEventListener('click', () => { clearTimeout(gallery.timer); loadGallery(false); });
 
 // Aggregate navigation stays in this authenticated document; it does not
 // turn visibility into recipient authority or discard the current draft.
-const communication = {active:false, generation:0, messages:new Map(), busy:false, updating:false, expanded:new Set(),
+const communication = {active:false, generation:0, observedAt:null, messages:new Map(), busy:false, updating:false, expanded:new Set(),
   hasOlder:false, hasNewer:false, historyLoaded:false, loadingHistory:false, historyDirection:null, historyError:null,
   scrollTop:0, newCount:0, pollSeen:new Set(), get items() { return [...this.messages.values()]; }};
 function attachmentDownload(attachment, className, iconOnly = false) {
@@ -2312,6 +2858,177 @@ function operatorAckButton(message, project = state.project, rootView = state.ro
   });
   return button;
 }
+function rootAckScope() {
+  if (!state.rootView || communication.active || !state.config?.operator_ack_enabled || !state.root?.home_session) return null;
+  return [state.epoch,state.root.home_project,state.root.home_session,state.root.thread_id,state.config.sender.id].join(':');
+}
+function decisionScope() {
+  if (!state.rootView || communication.active || !state.root?.home_session || !state.config?.sender?.id) return null;
+  return `${state.root.home_project}:${state.root.home_session}:${state.config.sender.id}`;
+}
+function decisionStorageKey(kind, scope, id = '') {
+  return `agent-chat.operator-decisions.v1:${kind}:${encodeURIComponent(scope)}${id ? `:${encodeURIComponent(id)}` : ''}`;
+}
+function decisionStorageGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
+function decisionStorageSet(key, value) { try { localStorage.setItem(key, value); return true; } catch { return false; } }
+function renderDecisionNotifications(pending, total = null) {
+  const panel = $('decision-notifications');
+  if (!panel) return;
+  const scope = decisionScope();
+  panel.hidden = !scope;
+  if (!scope) return;
+  if (decisionAlerts.scope !== scope) decisionAlerts.scope = scope;
+  decisionAlerts.pending = Array.isArray(pending) ? pending.filter(item => typeof item?.message_id === 'string') : [];
+  decisionAlerts.total = Number.isInteger(total) && total >= decisionAlerts.pending.length ? total : decisionAlerts.pending.length;
+  $('decision-count').textContent = String(decisionAlerts.total);
+  $('decision-list-summary').textContent = decisionAlerts.total > decisionAlerts.pending.length
+    ? `Showing the ${decisionAlerts.pending.length} most recent of ${decisionAlerts.total} pending decisions.`
+    : decisionAlerts.total ? `${decisionAlerts.total} pending decision${decisionAlerts.total === 1 ? '' : 's'}.` : 'No pending decisions.';
+  const list = $('decision-list'); list.replaceChildren();
+  for (const item of decisionAlerts.pending) {
+    const row = node('li', 'decision-item');
+    row.dataset.messageId = item.message_id;
+    const status = item.reply_received ? 'Reply received; author outcome not recorded'
+      : item.clarification_recorded ? 'Clarification recorded; final answer pending' : 'Waiting for your reply';
+    row.append(node('span', 'decision-item-status', status));
+    const open = node('button', 'quiet-button decision-open', 'Open message');
+    open.type = 'button';
+    open.addEventListener('click', () => { panel.open = false; jumpToMessage(item.message_id); });
+    row.append(open); list.append(row);
+  }
+  const optIn = $('decision-notification-opt-in');
+  const enabled = decisionStorageGet(decisionStorageKey('enabled', scope)) === '1';
+  const available = typeof window.Notification === 'function';
+  if (!available) {
+    optIn.textContent = 'Desktop alerts unavailable'; optIn.disabled = true;
+    $('decision-status').textContent = 'Browser notifications are unavailable. The in-app decision list remains available.';
+    return;
+  }
+  optIn.disabled = false;
+  optIn.textContent = enabled ? 'Disable desktop alerts' : 'Enable desktop alerts';
+  optIn.setAttribute('aria-pressed', String(enabled));
+  if (window.Notification.permission === 'denied') {
+    $('decision-status').textContent = 'Browser notifications are blocked. The in-app decision list remains available.';
+  } else if (enabled && window.Notification.permission === 'granted') {
+    $('decision-status').textContent = 'Desktop alerts are enabled for new decisions while this page is open.';
+  } else {
+    $('decision-status').textContent = 'In-app decision list is available. Desktop alerts are optional.';
+  }
+  const baselineKey = decisionStorageKey('baseline', scope);
+  const hasBaseline = decisionStorageGet(baselineKey) === '1';
+  for (const item of decisionAlerts.pending) {
+    const seenKey = decisionStorageKey('seen', scope, item.message_id);
+    if (decisionStorageGet(seenKey) !== null) continue;
+    if (!decisionStorageSet(seenKey, '1')) continue;
+    if (!hasBaseline || !enabled || window.Notification.permission !== 'granted') continue;
+    try {
+      const notification = new window.Notification('Decision requested', {
+        body: 'A message needs your decision.', tag: `agent-chat-decision-${item.message_id}`,
+      });
+      notification.onclick = () => { window.focus(); jumpToMessage(item.message_id); };
+    } catch {
+      $('decision-status').textContent = 'A desktop alert could not be shown. The in-app decision list remains available.';
+    }
+  }
+  if (!hasBaseline) decisionStorageSet(baselineKey, '1');
+}
+async function toggleDecisionNotifications() {
+  const scope = decisionScope(); if (!scope) return;
+  const enabledKey = decisionStorageKey('enabled', scope);
+  if (decisionStorageGet(enabledKey) === '1') {
+    try { localStorage.removeItem(enabledKey); } catch {}
+    $('decision-status').textContent = 'Desktop alerts are off. The in-app decision list remains available.';
+    renderDecisionNotifications(decisionAlerts.pending, decisionAlerts.total); return;
+  }
+  if (typeof window.Notification !== 'function') {
+    $('decision-status').textContent = 'Browser notifications are unavailable. The in-app decision list remains available.'; return;
+  }
+  let permission = window.Notification.permission;
+  if (permission === 'default') {
+    try { permission = await window.Notification.requestPermission(); }
+    catch { permission = 'denied'; }
+  }
+  if (permission !== 'granted') {
+    $('decision-status').textContent = 'Browser notifications were not enabled. The in-app decision list remains available.';
+    return;
+  }
+  if (!decisionStorageSet(enabledKey, '1') || !decisionStorageSet(decisionStorageKey('baseline', scope), '1')) {
+    $('decision-status').textContent = 'Desktop alert preferences could not be saved. The in-app decision list remains available.';
+    return;
+  }
+  for (const item of decisionAlerts.pending) {
+    if (!decisionStorageSet(decisionStorageKey('seen', scope, item.message_id), '1')) {
+      try { localStorage.removeItem(enabledKey); } catch {}
+      $('decision-status').textContent = 'Desktop alert deduplication could not be saved. The in-app decision list remains available.';
+      return;
+    }
+  }
+  renderDecisionNotifications(decisionAlerts.pending, decisionAlerts.total);
+}
+if ($('decision-notification-opt-in')) $('decision-notification-opt-in').addEventListener('click', toggleDecisionNotifications);
+function renderRootAck() {
+  const scope = rootAckScope(), button = $('root-ack-all'), status = $('root-ack-status');
+  if (rootAck.scope !== scope) {
+    rootAck.scope = scope; rootAck.pending = null; rootAck.loading = false; rootAck.error = ''; rootAck.request++;
+  }
+  button.hidden = status.hidden = !scope;
+  button.disabled = rootAck.running || state.busy || state.sending || rootAck.pending === 0 || (rootAck.pending == null && (rootAck.loading || !rootAck.error));
+  button.textContent = rootAck.running ? `Acknowledging ${rootAck.done}/${rootAck.total}…`
+    : rootAck.error ? `Retry Ack all${rootAck.pending == null ? '' : ` (${rootAck.pending})`}`
+      : rootAck.pending == null ? 'Checking acknowledgements…' : `Ack all${rootAck.pending ? ` (${rootAck.pending})` : ''}`;
+  button.title = rootAck.error || (rootAck.pending === 0 ? 'No pending Root messages addressed to you' : 'Acknowledge every pending message addressed to you in this Root conversation, including older history');
+  status.textContent = rootAck.error || (rootAck.running ? button.textContent : rootAck.pending == null ? '' : `${rootAck.pending} pending Root messages addressed to you`);
+}
+async function rootAckPlan(scope) {
+  const plan = await fetchJSON('/api/root/messages/ack-plan',{}, {projectScoped:false});
+  if (scope !== rootAckScope()) throw new DOMException('Root conversation changed','AbortError');
+  if (plan.project_id !== state.root.home_project || plan.recipient_session !== state.config.sender.id) throw new Error('Root acknowledgement context changed. Retry.');
+  return plan;
+}
+async function refreshRootAckPlan() {
+  renderRootAck();
+  const scope = rootAckScope();
+  if (!scope || rootAck.loading || rootAck.running) return;
+  const request = ++rootAck.request; rootAck.loading = true; renderRootAck();
+  try {
+    const plan = await rootAckPlan(scope);
+    if (request !== rootAck.request) return;
+    rootAck.pending = plan.count;
+    if (!plan.count) rootAck.error = '';
+  } catch(error) {
+    if (request === rootAck.request && error.name !== 'AbortError') rootAck.error = rootAck.error || error.message;
+  } finally {
+    if (request === rootAck.request) { rootAck.loading = false; renderRootAck(); }
+  }
+}
+$('root-ack-all').addEventListener('click',async () => {
+  const scope = rootAckScope();
+  if (!scope || rootAck.running || state.busy || state.sending) return;
+  rootAck.running = true; rootAck.loading = false; rootAck.request++;
+  rootAck.done = rootAck.total = 0; rootAck.error = ''; renderRootAck();
+  try {
+    const plan = await rootAckPlan(scope); rootAck.total = plan.count; rootAck.pending = plan.count; renderRootAck();
+    for (const id of plan.ids) {
+      if (scope !== rootAckScope()) throw new DOMException('Root conversation changed','AbortError');
+      await fetchJSON('/api/root/messages/ack',{method:'POST',headers:{'Content-Type':'application/json','X-Agent-Chat-CSRF':state.config.csrf_token},body:JSON.stringify({id})},{projectScoped:false});
+      rootAck.done++; rootAck.pending = Math.max(0,rootAck.total-rootAck.done);
+      for (const message of [...state.messages.values(),...state.originals.values(),...(state.snapshot?.messages || [])]) {
+        if (message.id === id) {
+          message.acked_at = Date.now()/1000;
+          if (message.operator_ack) message.operator_ack.acked_at = message.acked_at;
+        }
+      }
+      renderRootAck();
+    }
+  } catch(error) {
+    if (scope === rootAckScope() && error.name !== 'AbortError') rootAck.error = `${rootAck.done} acknowledged. ${error.message}`;
+  } finally {
+    rootAck.running = false;
+    if (scope === rootAckScope()) { rootAck.pending = null; renderMessages(false); }
+    await refreshRootAckPlan();
+  }
+});
+
 function communicationURL() {
   const url = new URL(location.href); url.pathname = '/communications'; return url;
 }
@@ -2324,7 +3041,7 @@ function showCommunication(push = true) {
   document.body.classList.remove('root-screen');
   $('composer').inert = true;
   for (const dialog of document.querySelectorAll('dialog[open]')) dialog.close();
-  closePanels(); renderAgents(); communicationContext();
+  closePanels(); renderAgents(); communicationContext(); renderRootAck();
   document.title = 'All communication · Agent chat';
   $('all-communication-view')?.classList.add('selected');
   $('all-communication-view')?.setAttribute('aria-current', 'page');
@@ -2376,17 +3093,25 @@ function renderCommunication() {
     time.dateTime = new Date(message.created_at * 1000).toISOString(); time.title = new Date(message.created_at * 1000).toLocaleString();
     const operator = message.operator_ack?.recipient_session;
     const recipients = messageDeliveries(message).map(item => operator && item.recipient_session === operator ? 'You' : item.recipient_agent || item.recipient_session).join(', ');
-    meta.append(node('span', 'sender-button', sender), node('span', 'recipient', recipients), time);
+    const projectName = typeof message.project_name === 'string' ? message.project_name.trim() : '';
+    meta.append(node('span', 'sender-button', sender),
+      node('span', 'recipient', projectName && recipients ? `${recipients} (${projectName})` : recipients));
+    meta.append(time);
     const card = node('div', 'message-card');
+    const timeline = deliveryTimeline(message.delivery_receipt, communication.observedAt ?? message.created_at);
+    if (timeline) card.append(timeline);
     if (message.reply_preview) {
       const quote = node('div', 'reply-quote');
       quote.append(node('strong', '', `↩ ${message.reply_preview.sender_agent || 'Original message'}`), node('span', '', message.reply_preview.body));
       card.append(quote);
     }
-    const long = message.body_truncated || message.body.length > 900 || message.body.split('\n').length > 8;
+    const publicationPlan = message.body.startsWith('Publication plan v1\n');
+    const long = message.body_truncated || (!publicationPlan && (message.body.length > 900 || message.body.split('\n').length > 8));
     const body = node('div', 'message-body markdown');
+    if (publicationPlan) body.style.whiteSpace = 'pre-wrap';
     const renderBody = () => {
-      body.replaceChildren(CoordMarkdown.render(message.body));
+      if (publicationPlan) body.replaceChildren(document.createTextNode((message.body_truncated ? 'Incomplete plan — load the full message before deciding.\n' : '') + message.body));
+      else body.replaceChildren((!message.body_truncated && renderObservationReport(message.body)) || CoordMarkdown.render(message.body));
       body.classList.toggle('collapsed', long && !communication.expanded.has(key));
     };
     renderBody(); card.append(body);
@@ -2410,11 +3135,47 @@ function renderCommunication() {
     if (message.attachments?.length) {
       const files = node('div', 'message-attachments');
       for (const attachment of message.attachments) {
+        const item = node('div', 'communication-attachment');
+        const imageAttachment = IMAGE_MIMES.has(attachment.mime);
+        const audioAttachment = AUDIO_MIMES.has(attachment.mime);
+        if (imageAttachment) {
+          const opener = node('button', 'communication-image-viewer');
+          opener.type = 'button';
+          opener.dataset.attachmentId = attachment.id;
+          opener.setAttribute('aria-label', `View ${attachment.name} in attachment viewer`);
+          opener.setAttribute('aria-haspopup', 'dialog');
+          const preview = node('img', 'communication-attachment-preview');
+          preview.src = attachment.url;
+          preview.alt = attachment.name;
+          preview.loading = 'lazy';
+          preview.addEventListener('error', () => {
+            if (preview.isConnected) preview.replaceWith(node('span', 'attachment-document-type', attachmentType(attachment)));
+          }, {once: true});
+          opener.append(preview);
+          opener.addEventListener('click', () => {
+            const viewerMessage = {attachments: message.attachments.map(item => ({...item, galleryURL: item.url}))};
+            openMediaViewer(viewerMessage, attachment, opener);
+          });
+          item.append(opener);
+        } else if (audioAttachment) {
+          const player = node('audio', 'communication-attachment-audio');
+          player.controls = true;
+          player.preload = 'metadata';
+          player.src = attachment.url;
+          player.setAttribute('aria-label', `Play ${attachment.name}`);
+          player.addEventListener('error', () => {
+            if (player.isConnected) player.replaceWith(node('span', 'attachment-document-type', attachmentType(attachment)));
+          }, {once: true});
+          item.append(player);
+        }
         const download = attachmentDownload(attachment, 'message-attachment');
         download.setAttribute('aria-label', `Download ${attachment.name}`);
-        download.replaceChildren(node('span', 'attachment-document-type', attachment.name.split('.').pop().toUpperCase()),
-          node('span', 'attachment-name', `Download ${attachment.name}`));
-        files.append(download);
+        download.replaceChildren(...(imageAttachment || audioAttachment
+          ? [node('span', 'attachment-name', `Download ${attachment.name}`)]
+          : [node('span', 'attachment-document-type', attachmentType(attachment)),
+            node('span', 'attachment-name', `Download ${attachment.name}`)]));
+        item.append(download);
+        files.append(item);
       }
       card.append(files);
     }
@@ -2433,7 +3194,7 @@ function renderCommunication() {
       } catch { if (generation === communication.generation) copy.textContent = 'Copy failed'; }
       finally { copy.disabled = false; }
     });
-    actions.append(node('span', 'message-id communication-project-label', message.project_name), copy, node('span', 'message-id', message.id.slice(-8)));
+    actions.append(copy, node('span', 'message-id', message.id.slice(-8)));
     bottom.append(actions); content.append(meta, card, bottom); article.append(content); fragment.append(article);
   }
   $('communication-messages').replaceChildren(fragment);
@@ -2478,6 +3239,7 @@ async function loadCommunication(mode = 'reset') {
   try {
     const result = await fetchJSON('/api/communications?' + params,{}, {projectScoped:false});
     if (generation !== communication.generation || !communication.active) return;
+    communication.observedAt = result.observed_at;
     const anchor = communicationAnchor();
     const following = !communication.hasNewer && feed.scrollHeight-feed.scrollTop-feed.clientHeight < 90;
     if (mode === 'reset') {
@@ -2541,3 +3303,10 @@ $('all-conversations').addEventListener('click', () => {
   if (communication.active) { hideCommunication(); const url = new URL(location.href); url.pathname = state.rootView ? '/root' : '/'; history.pushState(null, '', url); }
 });
 window.addEventListener('popstate', () => { if (location.pathname === '/communications') showCommunication(false); else hideCommunication(); });
+
+$('project-activity-filter').addEventListener('change', (event) => {
+  state.activeProjectsOnly = event.target.checked;
+  state.rootOverviewKey = null;
+  renderProjects({projects: state.projects, root_overview: state.rootOverviewData,
+                  root_orchestrator: state.root, project: state.config?.project});
+});

@@ -7,6 +7,7 @@ import time
 
 from .core import CoordError
 from .rpc import RpcError, TransportError
+from .agent_control import parse_po_status_action
 
 
 class ControlWorker:
@@ -15,6 +16,103 @@ class ControlWorker:
 
     def update(self, job, status, **values):
         return self.state.control_update(job['id'], job['status'], status, **values)
+
+    @staticmethod
+    def _investigation_settings(settings, thread_id):
+        if not isinstance(settings, dict):
+            raise CoordError('metadata preload returned no settings object')
+        thread = settings.get('thread')
+        if not isinstance(thread, dict) or thread.get('id') != thread_id:
+            raise CoordError('metadata preload returned a different thread')
+        required = ('model', 'reasoningEffort', 'cwd', 'activePermissionProfile',
+                    'approvalPolicy', 'approvalsReviewer', 'sandbox', 'runtimeWorkspaceRoots')
+        if any(key not in settings or settings[key] is None for key in required):
+            raise CoordError('metadata preload omitted a protected settings field')
+        workspaces = settings['runtimeWorkspaceRoots']
+        if not isinstance(workspaces, list) or any(not isinstance(path, str) for path in workspaces):
+            raise CoordError('metadata preload workspace settings are invalid')
+        return {
+            'model': settings['model'],
+            'reasoning_effort': settings['reasoningEffort'],
+            'cwd': settings['cwd'],
+            'workspaces': workspaces,
+            'permissions': {
+                'activePermissionProfile': settings['activePermissionProfile'],
+                'approvalPolicy': settings['approvalPolicy'],
+                'approvalsReviewer': settings['approvalsReviewer'],
+                'runtimeWorkspaceRoots': workspaces,
+                'sandbox': settings['sandbox'],
+            },
+        }
+
+    def advance_investigation_preload(self, job):
+        scope = job.get('investigation_preload')
+        if not scope:
+            self.update(job, 'failed', error='Exact settings preload association is missing.')
+            return
+        if job['status'] in ('completed', 'failed', 'uncertain'):
+            return
+        if job['status'] == 'preloading':
+            self.update(job, 'uncertain', error='Metadata preload outcome is uncertain after interruption; no retry or task delivery.')
+            return
+        if job['status'] != 'pending' or not scope.get('scope_current'):
+            self.update(job, 'failed', error=scope.get('reason') or 'Settings preload scope is no longer current.')
+            return
+        thread_id = job['thread_id']
+        try:
+            before = self.rpc.request('thread/read', {'threadId': thread_id, 'includeTurns': False})
+            thread = before.get('thread') if isinstance(before, dict) else None
+            if not isinstance(thread, dict) or thread.get('id') != thread_id:
+                raise CoordError('preload admission returned a different thread')
+            state = thread.get('status', {}).get('type')
+            direct = thread.get('canAcceptDirectInput') is True
+            if state not in ('notLoaded', 'idle') or (state == 'idle' and not direct):
+                self.update(job, 'failed', error='Exact thread is active or does not accept direct input; preload withheld.')
+                return
+            if self.bridge.queue(thread_id):
+                self.update(job, 'failed', error='Exact native queue is nonempty; preload withheld without task delivery.')
+                return
+            job = self.update(job, 'preloading')
+            try:
+                settings = self.rpc.request('thread/resume', {'threadId': thread_id, 'excludeTurns': True})
+            except (RpcError, TransportError) as error:
+                self.update(job, 'uncertain', error='Metadata-only thread load outcome is uncertain; no retry or task delivery: ' + str(error)[:400])
+                return
+            try:
+                observed = self._investigation_settings(settings, thread_id)
+                expected = json.loads(scope['baseline']['expected_json'])
+            except (CoordError, TypeError, ValueError) as error:
+                self.update(job, 'failed', error='Protected settings are unavailable; task remains held: ' + str(error)[:300])
+                return
+            after = self.rpc.request('thread/read', {'threadId': thread_id, 'includeTurns': False})
+            current_thread = after.get('thread') if isinstance(after, dict) else None
+            if (not isinstance(current_thread, dict) or current_thread.get('id') != thread_id
+                    or current_thread.get('status', {}).get('type') != 'idle'
+                    or current_thread.get('canAcceptDirectInput') is not True
+                    or self.bridge.queue(thread_id)):
+                self.update(job, 'failed', error='Post-load thread/queue gate changed; task remains held.',
+                            observed_settings=json.dumps(observed, sort_keys=True, separators=(',', ':')))
+                return
+            fresh = self.state.control_job(job['id'])
+            if not fresh.get('investigation_preload', {}).get('scope_current'):
+                self.update(job, 'failed', error='PO, binding, host, stop, admission or expiry changed during preload; task remains held.',
+                            observed_settings=json.dumps(observed, sort_keys=True, separators=(',', ':')))
+                return
+            observed_json = json.dumps(observed, sort_keys=True, separators=(',', ':'))
+            from .root_lifecycle import canonical_expected_settings
+            expected_json, _ = canonical_expected_settings(expected)
+            if observed_json != expected_json:
+                self.update(job, 'failed', error='Protected settings differ from the immutable PO-attested expected baseline; no settings were changed.',
+                            observed_settings=observed_json)
+                return
+            self.update(job, 'completed', observation={'state':'idle','turn_id':None,'queue_count':0,
+                'direct_input':True}, direct_input=True, observed_settings=observed_json)
+        except (CoordError, RpcError, TransportError, KeyError, TypeError) as error:
+            current = self.state.control_job(job['id'])
+            if current['status'] == 'preloading':
+                self.update(current, 'uncertain', error='Metadata preload did not complete cleanly; no retry or task delivery: ' + str(error)[:400])
+            elif current['status'] == 'pending':
+                self.update(current, 'failed', error='Metadata preload was withheld before native load: ' + str(error)[:400])
 
     def observe(self, job, *, require_settings=False):
         thread = self.rpc.request('thread/read', {'threadId':job['thread_id'], 'includeTurns':False})['thread']
@@ -43,8 +141,10 @@ class ControlWorker:
             settings = self.rpc.request('thread/resume', {'threadId':job['thread_id'], 'excludeTurns':True})
             if not isinstance(settings, dict):
                 raise CoordError('app-server returned invalid thread settings')
+            if not isinstance(settings.get('thread'), dict) or settings['thread'].get('id') != job['thread_id']:
+                raise CoordError('app-server returned settings for a different thread')
             observation.update(model=settings.get('model'), reasoning_effort=settings.get('reasoningEffort'), cwd=settings.get('cwd'),
-                permissions={key:settings.get(key) for key in ('sandbox','approvalPolicy','approvalsReviewer','activePermissionProfile','runtimeWorkspaceRoots')})
+                permissions={key:settings.get(key) for key in ('modelProvider','sandbox','approvalPolicy','approvalsReviewer','activePermissionProfile','runtimeWorkspaceRoots')})
         except RpcError:
             if require_settings or job['action'] == 'inspect': raise
         return observation, thread.get('canAcceptDirectInput') is True, turns, settings
@@ -405,6 +505,12 @@ class ControlWorker:
 
     def advance(self, job):
         try:
+            if job.get('action') == 'investigation-preload':
+                self.advance_investigation_preload(job)
+                return
+            if parse_po_status_action(job.get('action')):
+                self.advance_po_status(job)
+                return
             if not job.get('root_team_stop'):
                 current = self.state.control_job(job['id'])
                 if current.get('root_team_barrier_active'):
@@ -440,10 +546,20 @@ class ControlWorker:
                                   error='Exact interrupt recorded; external processes and reservations remain owned.')
                 self.rpc.request('turn/interrupt', {'threadId':job['thread_id'], 'turnId':job['turn_id']})
                 return  # Require a later readback; response alone is not closure.
+            wait_error = 'Waiting for idle/direct-input admission and empty app-server queue. Existing queued inputs are preserved; no queue deletion or further interrupt.'
+            if job.get('root_team_stop'):
+                wait_error = (f"Waiting: native state={observation['state']!r}; "
+                              f"direct input={'available' if direct else 'not confirmed'}; "
+                              f"native queue count={observation['queue_count']}; "
+                              f"active turn={'observed' if observation.get('turn_id') else 'not observed'}. "
+                              'Queued inputs are preserved; no queue deletion or further interrupt.')
             self.update(job, 'interrupting' if job['status'] == 'interrupting' else 'waiting',
                 turn_id=job.get('turn_id'), observation=observation,
-                error='Waiting for idle/direct-input admission and empty app-server queue. Existing queued inputs are preserved; no queue deletion or further interrupt.')
+                error=wait_error)
         except (RpcError, CoordError, TransportError, KeyError, TypeError) as error:
+            if parse_po_status_action(job.get('action')):
+                if isinstance(error, TransportError): raise
+                return
             current = self.state.control_job(job['id'])
             if current['status'] not in ('completed','failed','cancelled'):
                 if current['action'] == 'model':
@@ -460,3 +576,34 @@ class ControlWorker:
                     self.update(current, 'interrupting' if current['status'] == 'interrupting' else 'waiting',
                                 turn_id=current.get('turn_id'), error=str(error))
             if isinstance(error, TransportError): raise
+
+    def advance_po_status(self, job):
+        """Read exact thread status and bounded queue count without resume/history calls."""
+        try:
+            # Re-read the durable request and its project-local scope immediately
+            # before the native read. Drift is terminalized as withheld without
+            # a native call so the exact request cannot become a zombie blocker.
+            current = self.state.control_job(job['id'])
+            if current.get('action') != job.get('action') or current.get('status') != 'pending':
+                return
+            if current.get('po_status_scope_current') is not True:
+                self.update(current, 'failed')
+                return
+            thread_id = current['thread_id']
+            result = self.rpc.request('thread/read', {'threadId': thread_id, 'includeTurns': False})
+            thread = result.get('thread') if isinstance(result, dict) else None
+            if not isinstance(thread, dict) or thread.get('id') != thread_id:
+                raise CoordError('PO status inspection returned a different native thread')
+            state = thread.get('status', {}).get('type') if isinstance(thread.get('status'), dict) else None
+            if state not in ('idle', 'active'):
+                state = 'unknown'
+            self.update(current, 'completed', observation={'state': state, 'turn_id': None,
+                                                           'queue_count': None})
+        except (RpcError, CoordError, TransportError, KeyError, TypeError):
+            try:
+                current = self.state.control_job(job['id'])
+                if current.get('status') == 'pending':
+                    self.update(current, 'failed')
+            except (RpcError, CoordError, TransportError, KeyError, TypeError):
+                pass
+            raise

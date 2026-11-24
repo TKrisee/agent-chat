@@ -5,9 +5,11 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
+import re
 from pathlib import Path
 import secrets
 import signal
@@ -16,12 +18,40 @@ import sys
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 
 from .bridge import Bridge
 from .core import CoordError
 from .remote import HttpClient, host_id
 from .rpc import RpcClient, RpcError, TransportError
 from .usage_guard import UsageGuard
+
+
+def version_observation(response, executable):
+    """Compare the initialized peer with the configured executable on disk."""
+    agent = response.get('userAgent', '') if isinstance(response, dict) else ''
+    running = re.match(r'^[^/\s]+/(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)\s*\(', agent) if isinstance(agent, str) else None
+    try:
+        result = subprocess.run([executable, '--version'], capture_output=True, text=True, timeout=3, check=True)
+        installed = re.fullmatch(r'codex-cli\s+(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?)\s*', result.stdout) if isinstance(result.stdout, str) else None
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        installed = None
+    def bounded(match):
+        value = match.group(1) if match else None
+        return value if value and len(value) <= 64 else None
+    return bounded(running), bounded(installed)
+
+
+def local_http_endpoint(server):
+    try:
+        url = urlsplit(server)
+        if url.scheme != 'http' or not url.hostname or url.username is not None or url.password is not None:
+            return False
+        if url.hostname.lower() == 'localhost':
+            return True
+        return ipaddress.ip_address(url.hostname).is_loopback
+    except ValueError:
+        return False
 
 
 class RemoteBridgeState:
@@ -40,15 +70,31 @@ class RemoteBridgeState:
     def policy_pending(self): return self.call('policy-pending')
     def policy_receipt(self, offer, turn_id): return self.call('policy-receipt',offer=offer,turn_id=turn_id)
     def pending(self): return self.call('pending')
+    def manager_update_candidate(self, thread_id, message_id):
+        return self.call('manager-update-candidate', thread_id=thread_id, message_id=message_id)
+    def manager_update_prior(self, thread_id, message_id, task_id, original_job_id, turn_id):
+        return self.call('manager-update-prior', thread_id=thread_id, message_id=message_id, task_id=task_id, original_job_id=original_job_id, turn_id=turn_id)
+    def manager_update_claim(self, thread_id, message_id, task_id, original_job_id, turn_id, payload):
+        return self.call('manager-update-claim', thread_id=thread_id, message_id=message_id, task_id=task_id, original_job_id=original_job_id, turn_id=turn_id, payload=payload)
+    def investigation_tasks(self): return self.call('investigation-tasks')
     def jobs(self): return self.call('jobs')
     def job(self, job_id): return self.call('job', job_id=job_id)
+    def native_stage_record(self, job_id, observation):
+        return self.call('native-stage-record', job_id=job_id, observation=observation)
+    def native_stage_censor(self, job_id, reason):
+        return self.call('native-stage-censor', job_id=job_id, reason=reason)
     def resolve(self, session_id): return self.call('resolve', session_id=session_id)
     def still_unread(self, job_id): return self.call('still_unread', job_id=job_id)
     def wake_messages(self, thread_id, message_ids):
         return self.call('wake-messages', thread_id=thread_id, message_ids=message_ids)
     def connection_metadata(self): return {'server': self.server_url, 'project': self.client.project}
-    def prepare(self, thread_id, messages, payload):
-        return self.call('prepare', thread_id=thread_id, messages=messages, payload=payload)
+    def prepare(self, thread_id, messages, payload, *, investigation_request_id=None, eligibility_observation=None):
+        params = dict(thread_id=thread_id, messages=messages, payload=payload)
+        if investigation_request_id is not None:
+            params['investigation_request_id'] = investigation_request_id
+        if eligibility_observation is not None:
+            params['eligibility_observation'] = eligibility_observation
+        return self.call('prepare', **params)
     def update(self, job_id, status, queue_id=None, error=None):
         return self.call('update', job_id=job_id, status=status, queue_id=queue_id, error=error)
     def observe(self, thread_id, state, error=None):
@@ -62,12 +108,16 @@ class RemoteBridgeState:
                          settings_digest=settings_digest, model=model, reasoning_effort=reasoning_effort, owner=owner)
     def capacity_update(self, job_id, expected, status, now, **values):
         return self.call('capacity-update', job_id=job_id, expected=expected, status=status, now=now, **values)
-    def heartbeat(self, server, pid, error=None):
-        return self.call('heartbeat', server=server, pid=pid, error=error, capabilities=['project-scope-v1', 'project-workspaces-v1'])
+    def heartbeat(self, server, pid, error=None, versions=None):
+        return self.call('heartbeat', server=server, pid=pid, error=error, versions=versions, capabilities=['project-scope-v1', 'project-workspaces-v1'])
     def root_fresh_jobs(self): return self.call('root-fresh-jobs')
     def root_fresh_job(self, job_id): return self.call('root-fresh-job', job_id=job_id)
     def root_fresh_update(self, job_id, expected, status, **values):
         return self.call('root-fresh-update', job_id=job_id, expected=expected, status=status, **values)
+    def root_fresh_recovery_event(self, attempt_id, event, detail=None):
+        return self.call('root-fresh-recovery-event', attempt_id=attempt_id, event=event, detail=detail)
+    def root_fresh_replacement_event(self, request_id, reconciliation_id, event, **values):
+        return self.call('root-fresh-replacement-event', request_id=request_id, reconciliation_id=reconciliation_id, event=event, **values)
     def control_jobs(self): return self.call('control-jobs')
     def control_job(self, job_id): return self.call('control-job', job_id=job_id)
     def control_update(self, job_id, expected, status, **values):
@@ -75,15 +125,15 @@ class RemoteBridgeState:
     def supervisor_jobs(self): return self.call('supervisor-jobs')
     def supervisor_observe(self, job, report): return self.call('supervisor-observe', job=job, report=report)
     def reset_jobs(self):
-        jobs = self.call('reset-jobs', capabilities=['project-scope-v1', 'project-workspaces-v1'])
-        self.scoped_resets.update(job['id'] for job in jobs if job.get('project_scope'))
+        jobs = self.call('reset-jobs', capabilities=['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1', 'turnover-bootstrap-v1', 'parked-durability-v1'])
+        self.scoped_resets.update(job['id'] for job in jobs if job.get('project_scope') or job.get('parked'))
         return jobs
     def reset_job(self, job_id):
-        job = self.call('reset-job', job_id=job_id, capabilities=['project-scope-v1', 'project-workspaces-v1'])
-        if job.get('project_scope'): self.scoped_resets.add(job_id)
+        job = self.call('reset-job', job_id=job_id, capabilities=['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1', 'turnover-bootstrap-v1', 'parked-durability-v1'])
+        if job.get('project_scope') or job.get('parked'): self.scoped_resets.add(job_id)
         return job
     def reset_update(self, job_id, expected, status, **values):
-        if job_id in self.scoped_resets: values['capabilities'] = ['project-scope-v1', 'project-workspaces-v1']
+        if job_id in self.scoped_resets: values['capabilities'] = ['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1', 'turnover-bootstrap-v1', 'parked-durability-v1']
         return self.call('reset-update', job_id=job_id, expected=expected, status=status, **values)
 
 
@@ -169,7 +219,10 @@ def _stop_codex(process):
 def _codex_environment(args, api_token):
     environment = os.environ.copy()
     environment['AGENT_CHAT_SERVER'] = args.server
-    environment['AGENT_CHAT_API_TOKEN'] = api_token
+    if api_token:
+        environment['AGENT_CHAT_API_TOKEN'] = api_token
+    else:
+        environment.pop('AGENT_CHAT_API_TOKEN', None)
     if args.project:
         environment['AGENT_CHAT_PROJECT'] = args.project
     else:
@@ -237,12 +290,15 @@ class HostPolicyScheduler:
 
 
 def main(argv=None):
+    approval_pump = None
     parser = argparse.ArgumentParser(description=__doc__, prog='agent-chat-client bridge')
     parser.add_argument('--server', default=os.environ.get('AGENT_CHAT_SERVER'))
     parser.add_argument('--api-token', '--token', dest='api_token', default=os.environ.get('AGENT_CHAT_API_TOKEN'))
     parser.add_argument('--codex-server', default=os.environ.get('AGENT_CHAT_CODEX_SERVER', 'ws://127.0.0.1:4500'))
     parser.add_argument('--codex-bin', default='codex')
     parser.add_argument('--connect-only', action='store_true', help='attach to an existing local Codex app-server')
+    parser.add_argument('--managed-provider-manifest')
+    parser.add_argument('--managed-provider-sha256')
     parser.add_argument('--project', default=os.environ.get('AGENT_CHAT_PROJECT'))
     parser.add_argument('--state-file', help='private persistent worker identity; do not share between machines')
     parser.add_argument('--interval', type=float, default=2)
@@ -258,14 +314,16 @@ def main(argv=None):
         parser.error('--recover requires --confirm-stopped, and vice versa')
     if args.state_file and not args.project and not args.recover:
         parser.error('--state-file requires --project when bridging all projects')
+    if bool(args.managed_provider_manifest) != bool(args.managed_provider_sha256) or (args.connect_only and args.managed_provider_manifest):
+        parser.error('managed provider requires both manifest pins and owning bridge mode')
     previous, stop, stack = {}, threading.Event(), contextlib.ExitStack()
-    rpc, codex = None, None
+    rpc, codex, managed_provider = None, None, None
     records = {}
     policy_scheduler = HostPolicyScheduler()
     usage_notice = None
     try:
         registry = HttpClient(args.server, args.api_token, project='default')
-        if not isinstance(registry.token, str) or not registry.token.strip():
+        if (not isinstance(registry.token, str) or not registry.token.strip()) and not local_http_endpoint(args.server):
             raise CoordError('an API token is required to run the bridge client')
         if args.recover:
             project = args.project or 'default'
@@ -274,13 +332,25 @@ def main(argv=None):
                 RemoteBridgeState(client, args.server.rstrip('/'), identity).call('reset', confirm_stopped=True)
             print(json.dumps({'dispatcher': 'released', 'project': project}))
             return 0
-        rpc = RpcClient(args.codex_server)
+        from .approvals import ApprovalPump, METHODS
+        rpc = RpcClient(args.codex_server, server_request_methods=METHODS, server_request_timeout=120)
+        version_cache = (0, None, None)
+        approval_states = []
+        approval_lock = threading.Lock()
+        def acquired_states():
+            with approval_lock: return tuple(approval_states)
+        approval_pump = ApprovalPump(rpc, acquired_states).start()
         usage_guard = UsageGuard(registry, host_id())
         if not args.connect_only:
-            codex = subprocess.Popen(
-                [args.codex_bin, 'app-server', '--listen', args.codex_server],
-                cwd=os.getcwd(), env=_codex_environment(args, registry.token), stdout=sys.stderr, stderr=sys.stderr,
-                start_new_session=True)
+            if args.managed_provider_manifest:
+                from .provider_owner import OwnedProvider
+                managed_provider = OwnedProvider(args.managed_provider_manifest, args.managed_provider_sha256, args.codex_server)
+                codex = managed_provider.start(_codex_environment(args, registry.token), sys.stderr)
+            else:
+                codex = subprocess.Popen(
+                    [args.codex_bin, 'app-server', '--listen', args.codex_server],
+                    cwd=os.getcwd(), env=_codex_environment(args, registry.token), stdout=sys.stderr, stderr=sys.stderr,
+                    start_new_session=True)
         for sig in (signal.SIGINT, signal.SIGTERM):
             previous[sig] = signal.signal(sig, lambda *_: stop.set())
         command = 'codex --remote ' + args.codex_server
@@ -360,9 +430,21 @@ def main(argv=None):
                     # that a recovered server still recognizes this dispatcher.
                     state.call('acquire')
                     record['acquired'] = True
+                    with approval_lock:
+                        if state not in approval_states: approval_states.append(state)
+                    if stop.is_set():
+                        break
                     rpc.connect()
+                    if managed_provider is not None:
+                        managed_provider.attest_connected(rpc)
+                    response = getattr(rpc, 'initialize_response', None)
+                    if not args.connect_only and (response is not version_cache[2] or time.monotonic() - version_cache[0] >= 60):
+                        executable = managed_provider.config['Image'] if managed_provider else args.codex_bin
+                        version_cache = (time.monotonic(), version_observation(response, executable), response)
+                    if stop.is_set():
+                        break
                     record['bridge'].tick(observe_policies=False)
-                    state.heartbeat(args.codex_server, os.getpid())
+                    state.heartbeat(args.codex_server, os.getpid(), versions=version_cache[1] if not args.connect_only else None)
                     if codex is not None and codex.poll() is not None:
                         raise CoordError('local Codex app-server exited with status ' + str(codex.returncode))
                     if not record['ready']:
@@ -386,6 +468,10 @@ def main(argv=None):
         print(json.dumps({'error': str(error)}), file=sys.stderr)
         return 2
     finally:
+        if approval_pump:
+            try: approval_pump.close()
+            except (TransportError, OSError, ValueError):
+                if rpc: rpc.close()
         try:
             if rpc:
                 rpc.close()
@@ -407,7 +493,10 @@ def main(argv=None):
                 print(json.dumps({'bridge': 'identity_cleanup_failed', 'error': str(error)}), file=sys.stderr)
             finally:
                 try:
-                    _stop_codex(codex)
+                    if managed_provider is not None:
+                        managed_provider.close()
+                    else:
+                        _stop_codex(codex)
                 finally:
                     for sig, handler in previous.items():
                         signal.signal(sig, handler)

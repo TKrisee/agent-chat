@@ -4,9 +4,156 @@ import hashlib
 import time
 import uuid
 import contextlib
+import sqlite3
 
 from .core import CoordError
 from .session_reset import SessionResetState
+
+
+_PO_STATUS_ACTION = 'root_po_status_inspect'
+
+
+def po_status_action(project_id, project_root, home_project, home_session, home_thread, stop_id):
+    values = (project_id, project_root, home_project, home_session, home_thread, stop_id)
+    if any(not isinstance(value, str) or not value or '|' in value or any(ord(c) < 32 for c in value)
+           for value in values):
+        raise CoordError('invalid canonical PO status inspection scope')
+    return '|'.join((_PO_STATUS_ACTION, *values))
+
+
+def parse_po_status_action(action):
+    if not isinstance(action, str):
+        return None
+    parts = action.split('|')
+    if len(parts) != 7 or parts[0] != _PO_STATUS_ACTION or any(not part for part in parts[1:]):
+        return None
+    return dict(zip(('project_id', 'project_root', 'home_project', 'home_session', 'home_thread', 'stop_id'), parts[1:]))
+
+
+def _require_po_inspection_schema(db):
+    required = {
+        'sessions': {'id'}, 'meta': {'key', 'value'}, 'root_projections': {'session_id', 'home_project', 'home_session', 'thread_id'},
+        'project_orchestrators': {'session_id', 'root_session'}, 'bridge_bindings': {'session_id', 'thread_id', 'parent_session'},
+        'remote_session_hosts': {'session_id', 'host_id'}, 'agent_controls': {'target_session', 'mode'},
+        'agent_control_observations': {'target_session', 'thread_id', 'state', 'turn_id', 'queue_count', 'checked_at'},
+        'agent_control_requests': {'id', 'requester_session', 'target_session', 'host_id', 'thread_id', 'action',
+                                   'interrupt', 'status', 'turn_id', 'error', 'created_at', 'updated_at',
+                                   'requested_model', 'requested_effort', 'previous_admission_mode', 'allow_cold_resume'},
+        'session_resets': {'target_session', 'status'}, 'root_team_stops': {'id', 'root_session', 'active'},
+        'root_team_stop_targets': {'stop_id', 'requester_session', 'target_session', 'thread_id', 'host_id', 'status'},
+        'root_team_stop_po_admissions': {'stop_id', 'root_session', 'target_session', 'thread_id', 'host_id'},
+    }
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    for table, columns in required.items():
+        info = list(db.execute(f'PRAGMA table_info({table})')) if table in tables else []
+        if table not in tables or not columns <= {row[1] for row in info}:
+            raise CoordError('PO status inspection requires the complete existing project schema')
+        primary = {row[1] for row in info if row[5]}
+        if ((table == 'agent_control_requests' and 'id' not in primary)
+                or (table == 'agent_control_observations' and 'target_session' not in primary)):
+            raise CoordError('PO status inspection requires immutable existing request and observation keys')
+
+
+def _validate_po_status_scope(db, scope, *, request_id=None, own_request=None):
+    metadata = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('project_id','schema_version')"))
+    if metadata.get('project_id') is None or metadata.get('schema_version') != '1':
+        raise CoordError('PO status inspection project metadata is missing')
+    project = metadata['project_id']
+    registered = db.execute('SELECT 1 FROM sessions WHERE id=?', (scope['target_session'],)).fetchone()
+    project_root_registered = db.execute('SELECT 1 FROM sessions WHERE id=?', (scope['project_root'],)).fetchone()
+    root = db.execute('SELECT home_project,home_session,thread_id FROM root_projections WHERE session_id=?',
+                      (scope['project_root'],)).fetchone()
+    role = db.execute('SELECT 1 FROM project_orchestrators WHERE session_id=? AND root_session=?',
+                      (scope['target_session'], scope['project_root'])).fetchone()
+    binding = db.execute('SELECT thread_id,parent_session FROM bridge_bindings WHERE session_id=?',
+                         (scope['target_session'],)).fetchone()
+    host = db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?',
+                      (scope['target_session'],)).fetchone()
+    stop = db.execute('SELECT root_session,active FROM root_team_stops WHERE id=?', (scope['stop_id'],)).fetchone()
+    target = db.execute('''SELECT requester_session,thread_id,host_id,status FROM root_team_stop_targets
+        WHERE stop_id=? AND target_session=?''', (scope['stop_id'], scope['target_session'])).fetchone()
+    admission = db.execute('''SELECT root_session,target_session,thread_id,host_id
+        FROM root_team_stop_po_admissions WHERE stop_id=?''', (scope['stop_id'],)).fetchone()
+    if (project != scope['project_id'] or not registered or not project_root_registered or not root
+            or tuple(root) != (scope['home_project'], scope['home_session'], scope['home_thread'])
+            or not role or not binding or tuple(binding) != (scope['thread_id'], None)
+            or not host or host['host_id'] != scope['host_id']
+            or not stop or stop['active'] != 1 or stop['root_session'] != scope['project_root']
+            or not target or tuple(target[:3]) != (scope['project_root'], scope['thread_id'], scope['host_id'])
+            or target['status'] not in ('pending', 'waiting', 'completed')
+            or not admission or tuple(admission) != (scope['project_root'], scope['target_session'],
+                                                    scope['thread_id'], scope['host_id'])):
+        raise CoordError('PO status inspection ownership, binding or original admission changed')
+    pending = db.execute('''SELECT id FROM agent_control_requests WHERE target_session=?
+        AND status NOT IN ('completed','failed','cancelled','resolved_unchanged')
+        AND (? IS NULL OR id<>?) LIMIT 1''', (scope['target_session'], own_request, own_request)).fetchone()
+    if pending:
+        raise CoordError('PO status inspection withheld while another control request is unresolved')
+    reset = db.execute('''SELECT id FROM session_resets WHERE target_session=?
+        AND status NOT IN ('completed','cancelled','failed') LIMIT 1''', (scope['target_session'],)).fetchone()
+    if reset:
+        raise CoordError('PO status inspection withheld while a session reset is unresolved')
+    from .root_team_reset import quarantined
+    if quarantined(db, session=scope['target_session']):
+        raise CoordError('PO status inspection withheld for a quarantined target')
+    if request_id is not None:
+        existing = db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
+        if existing:
+            wanted_action = po_status_action(scope['project_id'], scope['project_root'], scope['home_project'],
+                                             scope['home_session'], scope['home_thread'], scope['stop_id'])
+            if existing['status'] not in ('pending', 'completed', 'failed'):
+                raise CoordError('PO status inspection request has an unsupported current state')
+            if (existing['requester_session'], existing['target_session'], existing['host_id'], existing['thread_id'],
+                    existing['action'], existing['interrupt'], existing['requested_model'], existing['requested_effort'],
+                    existing['allow_cold_resume']) != (scope['project_root'], scope['target_session'], scope['host_id'],
+                                                       scope['thread_id'], wanted_action, 0, None, None, 0):
+                raise CoordError('PO status inspection request ID is already bound to a different immutable scope')
+            return dict(existing)
+    return None
+
+
+def request_po_status_inspection(db, scope, request_id, *, scope_guard=None):
+    """Persist one exact, nonproductive PO status inspection without schema setup."""
+    try:
+        request_id = str(uuid.UUID(request_id))
+        uuid.UUID(scope['stop_id'])
+    except (ValueError, TypeError, AttributeError, KeyError) as error:
+        raise CoordError('PO status inspection requires exact request and stop UUIDs') from error
+    _require_po_inspection_schema(db)
+    db.execute('BEGIN IMMEDIATE')
+    try:
+        if request_id == scope['stop_id'] or any(db.execute(f'SELECT 1 FROM {table} WHERE id=?',
+                (request_id,)).fetchone() for table in ('root_team_stops', 'root_team_stop_targets', 'session_resets')):
+            raise CoordError('PO status inspection request ID conflicts with an existing lifecycle request')
+        existing = _validate_po_status_scope(db, scope, request_id=request_id, own_request=request_id)
+        if existing:
+            if scope_guard:
+                scope_guard()
+            db.commit()
+            return _po_status_public(existing, scope)
+        action = po_status_action(scope['project_id'], scope['project_root'], scope['home_project'],
+                                  scope['home_session'], scope['home_thread'], scope['stop_id'])
+        now = time.time()
+        db.execute('''INSERT INTO agent_control_requests(
+            id,requester_session,target_session,host_id,thread_id,action,interrupt,status,turn_id,error,
+            created_at,updated_at,requested_model,requested_effort,previous_admission_mode,allow_cold_resume)
+            VALUES(?,?,?,?,?,?,0,'pending',NULL,NULL,?,?,NULL,NULL,NULL,0)''',
+            (request_id, scope['project_root'], scope['target_session'], scope['host_id'], scope['thread_id'], action, now, now))
+        if scope_guard:
+            scope_guard()
+        db.commit()
+        return {'request_id': request_id, 'status': 'pending', 'project_id': scope['project_id'],
+                'po_session': scope['target_session'], 'thread': scope['thread_id'], 'host': scope['host_id'],
+                'stop_id': scope['stop_id']}
+    except BaseException:
+        db.rollback()
+        raise
+
+
+def _po_status_public(row, scope):
+    return {'request_id': row['id'], 'status': row['status'], 'project_id': scope['project_id'],
+            'po_session': scope['target_session'], 'thread': scope['thread_id'], 'host': scope['host_id'],
+            'stop_id': scope['stop_id']}
 
 
 class AgentControlState:
@@ -47,6 +194,41 @@ class AgentControlState:
         self.db.execute('DROP INDEX IF EXISTS one_agent_control')
         self.db.execute('CREATE UNIQUE INDEX IF NOT EXISTS one_model_resolution_id ON agent_control_requests(resolution_id) WHERE resolution_id IS NOT NULL')
 
+    @classmethod
+    def existing_schema(cls, coord):
+        """Bind existing control tables without running schema setup or migrations."""
+        _require_po_inspection_schema(coord.db)
+        instance = cls.__new__(cls)
+        instance.coord, instance.db, instance.compactions = coord, coord.db, None
+        return instance
+
+    @staticmethod
+    def request_po_status_inspection(db, scope, request_id, *, scope_guard=None):
+        """First-party, existing-schema-only factory for one scoped inspection."""
+        return request_po_status_inspection(db, scope, request_id, scope_guard=scope_guard)
+
+    @staticmethod
+    def is_po_status_action(action):
+        return parse_po_status_action(action) is not None
+
+    @staticmethod
+    def _po_status_scope_from_job(job):
+        parsed = parse_po_status_action(job.get('action'))
+        if not parsed:
+            return None
+        return dict(parsed, target_session=job['target_session'], thread_id=job['thread_id'],
+                    host_id=job['host_id'])
+
+    def _po_status_scope_current(self, job):
+        scope = self._po_status_scope_from_job(job)
+        if not scope or job.get('requester_session') != scope['project_root']:
+            return False
+        try:
+            _validate_po_status_scope(self.db, scope, own_request=job['id'])
+            return True
+        except (CoordError, sqlite3.Error, KeyError, TypeError):
+            return False
+
     def job(self, request_id):
         from .root_lifecycle import job as team_job
         bulk = team_job(self.db, request_id)
@@ -55,7 +237,21 @@ class AgentControlState:
         row = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
         if not row: raise CoordError('unknown agent control request')
         from .root_lifecycle import stopped
-        return self.public_request(dict(row, root_team_barrier_active=stopped(self.db,row['target_session'])))
+        result = self.public_request(dict(row, root_team_barrier_active=stopped(self.db,row['target_session'])))
+        from .root_lifecycle import task_inspection_admission
+        task_admission = task_inspection_admission(self.db, request_id)
+        if task_admission and row['action'] == 'inspect':
+            result['root_team_stop'] = True
+            result['investigation_admission_request_id'] = task_admission['request_id']
+        if row['action'] == 'investigation-preload':
+            from .root_lifecycle import task_preload_request
+            preload = task_preload_request(self.db, request_id)
+            if preload:
+                result['root_team_stop'] = True
+                result['investigation_preload'] = preload
+        if parse_po_status_action(result.get('action')):
+            result['po_status_scope_current'] = self._po_status_scope_current(result)
+        return result
 
     @staticmethod
     def public_request(row):
@@ -122,6 +318,12 @@ class AgentControlState:
             assert_local_lifecycle(self.db, target)
             assert_management_target(self.db, caller, target)
         with self.coord.tx():
+            if action != 'inspect':
+                from .root_lifecycle import stopped
+                if stopped(self.db, target):
+                    raise CoordError('root stop-all barrier requires explicit matching root resume-all')
+                assert_local_lifecycle(self.db, target)
+                assert_management_target(self.db, caller, target)
             existing = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
             if existing:
                 existing = dict(existing)
@@ -131,6 +333,8 @@ class AgentControlState:
                     raise CoordError('agent control retry payload differs from the original')
                 return self.public_request(existing)
             self.coord._fresh(self.db, caller)
+            if thread is None:
+                raise CoordError('agent control requires --expected-thread with the current bound main thread')
             binding = self.db.execute('SELECT * FROM bridge_bindings WHERE session_id=?', (target,)).fetchone()
             if not binding or not binding['thread_id'] or binding['thread_id'] != thread:
                 raise CoordError('agent control requires the exact current main thread; child routes are not independent agents')
@@ -164,6 +368,58 @@ class AgentControlState:
                 self.db.execute("UPDATE agent_control_requests SET model_route='ordinary_input' WHERE id=?", (request_id,))
             if action == 'stop' or (action == 'model' and not ordinary):
                 self.db.execute("INSERT INTO agent_controls VALUES(?,'stopping',?) ON CONFLICT(target_session) DO UPDATE SET mode='stopping',updated_at=excluded.updated_at", (target, now))
+        return self.job(request_id)
+
+    def request_investigation_preload(self, name, thread, continuation_id, request_id, confirmed):
+        """Let only the current admitted PO request one metadata-only same-thread preload."""
+        if confirmed is not True:
+            raise CoordError('investigation metadata preload requires explicit PO confirmation')
+        try:
+            continuation_id = str(uuid.UUID(continuation_id))
+            request_id = str(uuid.UUID(request_id))
+        except (ValueError, TypeError, AttributeError) as error:
+            raise CoordError('investigation preload IDs must be UUIDs') from error
+        caller = self.coord.require_session()
+        target = SessionResetState(self.coord).target(name)['id']
+        from .root_lifecycle import task_preload_scope
+        with self.coord.tx():
+            host = self.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?', (target,)).fetchone()
+            if not host:
+                raise CoordError('investigation preload target has no current registered host')
+            scope = task_preload_scope(self.db, continuation_id, caller, target, thread, host['host_id'])
+            if not scope:
+                raise CoordError('only the exact current PO may request the admitted metadata preload')
+            binding = self.db.execute('SELECT thread_id,parent_session FROM bridge_bindings WHERE session_id=?',
+                                      (target,)).fetchone()
+            if not binding or binding['thread_id'] != thread or binding['parent_session'] is not None or not host:
+                raise CoordError('investigation preload requires the exact current worker main thread and host')
+            self.coord._fresh(self.db, caller)
+            existing = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
+            if existing:
+                if (existing['requester_session'], existing['target_session'], existing['thread_id'],
+                    existing['host_id'], existing['action'], bool(existing['interrupt'])) != (
+                    caller, target, thread, host['host_id'], 'investigation-preload', False):
+                    raise CoordError('investigation preload retry differs from its immutable request')
+                association = self.db.execute('SELECT continuation_id FROM root_team_stop_task_preload_requests WHERE control_request_id=?',
+                                              (request_id,)).fetchone()
+                if not association or association['continuation_id'] != continuation_id:
+                    raise CoordError('investigation preload request is bound to a different continuation')
+                return self.job(request_id)
+            if self.db.execute("""SELECT 1 FROM agent_control_requests WHERE target_session=?
+                AND status NOT IN ('completed','failed','cancelled','resolved_unchanged')""", (target,)).fetchone():
+                raise CoordError('another control is unresolved; no metadata preload was queued')
+            now = time.time()
+            self.db.execute('''INSERT INTO agent_control_requests(
+                id,requester_session,target_session,host_id,thread_id,action,interrupt,status,turn_id,error,
+                created_at,updated_at) VALUES(?,?,?,?,?,'investigation-preload',0,'pending',NULL,NULL,?,?)''',
+                (request_id, caller, target, host['host_id'], thread, now, now))
+            self.db.execute('''INSERT INTO root_team_stop_task_preload_requests(
+                control_request_id,continuation_id,admission_request_id,requester_session,created_at)
+                VALUES(?,?,?,?,?)''', (request_id, continuation_id, scope['request_id'], caller, now))
+            self.db.execute('''INSERT INTO root_team_stop_task_preload_events(
+                attempt_id,sequence,continuation_id,admission_request_id,state,observed_json,
+                observed_sha256,reason,created_at) VALUES(?,1,?,?, 'requested',NULL,NULL,NULL,?)''',
+                (request_id, continuation_id, scope['request_id'], now))
         return self.job(request_id)
 
 
@@ -200,8 +456,9 @@ class AgentControlState:
                     requests=requests, wakes=wakes, ownership=self.ownership(target['id']))
 
     def roster(self):
+        """Compact registration metadata; unavailable compaction counts are unknown."""
         from .management import manager
-        return [dict(manager_session=manager(self.db,row['id']), id=row['id'], agent=row['agent'], thread_id=row['thread_id'], compaction_count=self.compactions.count(row['thread_id']), parent_session=row['parent_session'],
+        return [dict(manager_session=manager(self.db,row['id']), id=row['id'], agent=row['agent'], thread_id=row['thread_id'], compaction_count=self.compactions.cached_count(row['thread_id']), parent_session=row['parent_session'],
                      admission=row['mode'] or 'running', state=row['state'], checked_at=row['checked_at'])
                 for row in self.db.execute('''SELECT s.id,s.agent,b.thread_id,b.parent_session,c.mode,o.state,o.checked_at
                     FROM sessions s LEFT JOIN bridge_bindings b ON b.session_id=s.id
@@ -211,13 +468,38 @@ class AgentControlState:
     def jobs(self, host):
         from .root_lifecycle import jobs as team_jobs, stopped
         priority = [dict(row, ownership=self.ownership(row['target_session'])) for row in team_jobs(self.db, host)]
-        return priority + [dict(row, ownership=self.ownership(row['target_session'])) for row in self.db.execute(
-            "SELECT * FROM agent_control_requests WHERE host_id=? AND status NOT IN ('completed','failed','cancelled','resolved_unchanged') ORDER BY created_at", (host,))
-            if not stopped(self.db, row['target_session'])]
+        for row in self.db.execute(
+                "SELECT * FROM agent_control_requests WHERE host_id=? AND status NOT IN ('completed','failed','cancelled','resolved_unchanged') ORDER BY created_at", (host,)):
+            is_po_inspection = parse_po_status_action(row['action']) is not None
+            from .root_lifecycle import task_inspection_admission
+            task_admission = task_inspection_admission(self.db, row['id']) if row['action'] == 'inspect' else None
+            from .root_lifecycle import task_preload_request
+            preload = task_preload_request(self.db, row['id']) if row['action'] == 'investigation-preload' else None
+            if stopped(self.db, row['target_session']) and not is_po_inspection and not task_admission and not preload:
+                continue
+            item = dict(row)
+            if task_admission and row['action'] == 'inspect':
+                item['root_team_stop'] = True
+                item['investigation_admission_request_id'] = task_admission['request_id']
+            if preload:
+                item['root_team_stop'] = True
+                item['investigation_preload'] = preload
+            if not is_po_inspection:
+                item['ownership'] = self.ownership(row['target_session'])
+            if is_po_inspection:
+                item['po_status_scope_current'] = self._po_status_scope_current(item)
+            priority.append(item)
+        return priority
 
     def update(self, request_id, expected, status, *, turn_id=None, error=None, observation=None,
                baseline_settings=None, observed_settings=None, direct_input=None, native_response=None, resolution_evidence=None,
                input_job_id=None, input_evidence=None):
+        row = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (request_id,)).fetchone()
+        if row and row['action'] == 'investigation-preload':
+            return self._update_investigation_preload(dict(row), expected, status,
+                observation=observation, observed_settings=observed_settings, direct_input=direct_input, error=error)
+        if row and parse_po_status_action(row['action']):
+            return self._update_po_status_inspection(dict(row), expected, status, observation, error)
         from .root_lifecycle import job as team_job, update as team_update
         if team_job(self.db, request_id):
             return team_update(self.coord, request_id, expected, status, turn_id=turn_id, error=error, observation=observation)
@@ -225,6 +507,12 @@ class AgentControlState:
             raise CoordError('invalid agent control status')
         with contextlib.nullcontext() if self.db.in_transaction else self.coord.tx():
             job = self.job(request_id)
+            # Stop/inspect and accepted-operation settlement are not new work.
+            if job['action'] not in ('stop', 'inspect') and status in ('changing', 'interrupting', 'submitting'):
+                from .core import assert_original_owner_admission
+                assert_original_owner_admission(self.db, job['target_session'])
+                from .core import execution_epoch_native_check
+                execution_epoch_native_check(self.db,thread=job.get('thread_id'),actor=job['target_session'])
             if job['status'] != expected: raise CoordError('agent control changed; inspect its current request')
             if job.get('root_team_barrier_active') and ((job['action']=='model' and expected=='pending' and status=='changing') or job['action']=='resume'):
                 raise CoordError('root stop-all barrier withheld pending native lifecycle action')
@@ -376,6 +664,139 @@ class AgentControlState:
                  input_evidence,
                  status, time.time(), time.time(), request_id))
         return self.job(request_id)
+
+    def _update_investigation_preload(self, row, expected, status, *, observation=None,
+                                      observed_settings=None, direct_input=None, error=None):
+        import hashlib
+        if status not in ('preloading', 'completed', 'failed', 'uncertain'):
+            raise CoordError('invalid investigation preload transition')
+        from .root_lifecycle import task_preload_request, canonical_expected_settings
+        with self.coord.tx():
+            current = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (row['id'],)).fetchone()
+            if (not current or current['action'] != 'investigation-preload' or current['status'] != expected
+                    or current['requester_session'] != row['requester_session']
+                    or current['target_session'] != row['target_session']
+                    or current['thread_id'] != row['thread_id'] or current['host_id'] != row['host_id']):
+                raise CoordError('investigation preload request changed before its transition')
+            if status == 'preloading':
+                from .core import assert_original_owner_admission
+                assert_original_owner_admission(self.db, current['target_session'])
+            scope = task_preload_request(self.db, row['id'])
+            if not scope:
+                raise CoordError('investigation preload association is missing')
+            if status == 'preloading':
+                if expected != 'pending' or not scope['scope_current']:
+                    raise CoordError('stale investigation preload cannot enter its native metadata phase')
+                event_state, observed_json, observed_digest, event_error = 'preloading', None, None, None
+            elif status == 'completed':
+                if expected != 'preloading' or not scope['scope_current']:
+                    raise CoordError('stale investigation preload cannot release the original message')
+                if (not isinstance(observation, dict)
+                        or observation != {'state':'idle','turn_id':None,'queue_count':0,'direct_input':True}
+                        or direct_input is not True or not isinstance(observed_settings, str)):
+                    raise CoordError('settings match requires fresh idle, direct-input and empty-queue evidence')
+                try:
+                    normalized = json.loads(observed_settings)
+                    encoded, observed_digest = canonical_expected_settings(normalized)
+                except (TypeError, ValueError, CoordError) as failure:
+                    raise CoordError('settings readback is incomplete or invalid') from failure
+                if encoded != observed_settings or observed_digest != scope['baseline']['expected_sha256']:
+                    raise CoordError('settings readback does not match the immutable expected baseline')
+                observed_json, event_error, event_state = encoded, None, 'matched'
+            else:
+                if expected not in ('pending','preloading'):
+                    raise CoordError('investigation preload can only fail before or during its one attempt')
+                if status == 'uncertain' and expected != 'preloading':
+                    raise CoordError('unstarted investigation preload cannot have an uncertain native outcome')
+                if observed_settings is not None:
+                    try:
+                        parsed = json.loads(observed_settings) if isinstance(observed_settings, str) else observed_settings
+                        observed_json = json.dumps(parsed, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+                        observed_digest = hashlib.sha256(observed_json.encode('utf-8')).hexdigest()
+                    except (TypeError, ValueError):
+                        observed_json = observed_digest = None
+                else:
+                    observed_json = observed_digest = None
+                event_state, event_error = ('uncertain' if status == 'uncertain' else 'blocked'), error
+            latest = self.db.execute('SELECT * FROM root_team_stop_task_preload_events WHERE attempt_id=? ORDER BY sequence DESC LIMIT 1',
+                                     (row['id'],)).fetchone()
+            if not latest or latest['state'] not in (('requested',) if expected == 'pending' else ('preloading',)):
+                raise CoordError('investigation preload evidence does not match its expected phase')
+            if status == 'preloading':
+                sequence = latest['sequence'] + 1
+                self.db.execute('''INSERT INTO root_team_stop_task_preload_events(
+                    attempt_id,sequence,continuation_id,admission_request_id,state,observed_json,
+                    observed_sha256,reason,created_at) VALUES(?,?,?,?,?,NULL,NULL,NULL,?)''',
+                    (row['id'], sequence, scope['continuation_id'], scope['admission_request_id'],
+                     event_state, time.time()))
+            else:
+                if status == 'completed':
+                    allowed = ('matched',)
+                elif expected == 'pending':
+                    allowed = ('blocked',)
+                else:
+                    allowed = ('blocked','uncertain')
+                if event_state not in allowed:
+                    raise CoordError('invalid investigation preload evidence outcome')
+                sequence = latest['sequence'] + 1
+                self.db.execute('''INSERT INTO root_team_stop_task_preload_events(
+                    attempt_id,sequence,continuation_id,admission_request_id,state,observed_json,
+                    observed_sha256,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)''',
+                    (row['id'], sequence, scope['continuation_id'], scope['admission_request_id'],
+                     event_state, observed_json, observed_digest, event_error, time.time()))
+            self.db.execute('UPDATE agent_control_requests SET status=?,error=?,observed_settings_json=?,updated_at=? WHERE id=? AND status=?',
+                (status, error, observed_json, time.time(), row['id'], expected))
+        return self.job(row['id'])
+
+    def _update_po_status_inspection(self, row, expected, status, observation, error=None):
+        scope = self._po_status_scope_from_job(row)
+        if status not in ('completed', 'failed') or expected != 'pending':
+            raise CoordError('PO status inspection has an invalid terminal transition')
+        if status == 'completed':
+            if (not isinstance(observation, dict) or set(observation) != {'state', 'turn_id', 'queue_count'}
+                    or observation['state'] not in ('idle', 'active', 'unknown')
+                    or observation['turn_id'] is not None
+                    or (observation['queue_count'] is not None and
+                        (type(observation['queue_count']) is not int
+                         or not 0 <= observation['queue_count'] <= 1000))):
+                raise CoordError('PO status inspection result is outside its narrow observation schema')
+        elif observation is not None:
+            raise CoordError('failed PO status inspection cannot persist native observation')
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            current = self.db.execute('SELECT * FROM agent_control_requests WHERE id=?', (row['id'],)).fetchone()
+            if (not current or current['status'] != expected or current['action'] != row['action']
+                    or current['requester_session'] != row['requester_session']
+                    or current['target_session'] != row['target_session']
+                    or current['host_id'] != row['host_id'] or current['thread_id'] != row['thread_id']):
+                raise CoordError('PO status inspection request changed before result persistence')
+            # A request that drifted after insertion is closed as withheld without
+            # another native call; this prevents a permanent pending blocker.
+            if status == 'completed' and not self._po_status_scope_current(dict(current)):
+                raise CoordError('PO status inspection scope changed before result persistence')
+            if status == 'completed':
+                checked_at = time.time()
+                self.db.execute('''INSERT INTO agent_control_observations
+                    (target_session,thread_id,state,turn_id,queue_count,checked_at)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(target_session) DO UPDATE SET
+                    thread_id=excluded.thread_id,state=excluded.state,turn_id=excluded.turn_id,
+                    queue_count=excluded.queue_count,checked_at=excluded.checked_at''',
+                    (row['target_session'], row['thread_id'], observation['state'], None,
+                     observation['queue_count'], checked_at))
+            if status == 'failed':
+                error = ('Withheld: exact PO status inspection scope changed; no native read performed.'
+                         if not self._po_status_scope_current(dict(current))
+                         else 'Non-resuming PO status inspection failed before an observation was stored.')
+            self.db.execute('''UPDATE agent_control_requests SET status=?,error=?,updated_at=?
+                WHERE id=? AND status=?''',
+                (status, None if status == 'completed' else error,
+                 time.time(), row['id'], expected))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+        return _po_status_public(dict(self.db.execute('SELECT * FROM agent_control_requests WHERE id=?',
+                                                       (row['id'],)).fetchone()), scope)
 
     def resolve_unchanged(self, request_id, expected_thread, resolution_id, confirmed):
         if confirmed is not True: raise CoordError('model resolution requires explicit confirmation')

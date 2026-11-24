@@ -39,7 +39,11 @@ class GroupDeliveryTests(RemoteWebFixture):
         self.assertNotEqual(first['id'], second['id'])
         self.call('acknowledge', id=first['id'])
         self.assertEqual(self.call('context')['messages'], [])
-        self.assertEqual(self.call('context', session='b')['messages'][0]['id'], second['id'])
+        # Both short context bodies were fully read; B's copy is no longer
+        # unread, but acknowledging A must not acknowledge B's independent copy.
+        self.assertEqual(self.call('context', session='b')['messages'], [])
+        self.assertIsNotNone(self.call('message', id=first['id'])['message']['acked_at'])
+        self.assertIsNone(self.call('message', session='b', id=second['id'])['message']['acked_at'])
         direct = self.operator.send('a', 'Please take action')
         self.bridge.tick()
         self.assertEqual(sum(name == 'thread/queue/start' for name, _ in self.rpc.calls), 1)

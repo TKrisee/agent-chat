@@ -253,7 +253,8 @@ class ProjectHttpTests(RemoteWebFixture):
         self.rpc('register', agent='other-agent'); self.rpc('register', session='b', agent='recipient')
         original = self.rpc('send', to='b', body='Private to project')
         image = b'\x89PNG\r\n\x1a\nfixture'
-        reply = self.rpc('send', session='b', to='a', body='Answer', reply_to=original['id'], attachments=[{'name':'test.png','content_base64':base64.b64encode(image).decode()}])
+        self.rpc('message', session='b', id=original['id'])
+        reply = self.rpc('send', session='b', to='a', body='Answer', reply_to=original['id'], ack_reply=True, attachments=[{'name':'test.png','content_base64':base64.b64encode(image).decode()}])
         self.assertIn('project='+self.project, reply['attachments'][0]['url'])
         self.assertEqual(self.request('GET', reply['attachments'][0]['url'])[1], image)
         self.assertEqual(self.request('GET', reply['attachments'][0]['url'].split('?')[0])[0], 404)

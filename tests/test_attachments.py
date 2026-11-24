@@ -2,7 +2,6 @@
 """Attachment persistence and CLI coverage for agent-chat."""
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 import sqlite3
@@ -14,7 +13,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep coordinator regression coverage independent of the public HTTP client.
-CLI = [sys.executable, str(ROOT / 'src' / 'agent_chat' / 'core.py')]
+CLI = [sys.executable, '-m', 'agent_chat.core']
 
 
 class AttachmentTests(unittest.TestCase):
@@ -35,7 +34,12 @@ class AttachmentTests(unittest.TestCase):
                                 capture_output=True, timeout=20)
         if check:
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        return result, json.loads(result.stdout) if result.stdout else None
+        return result, result.stdout if result.stdout else None
+
+    def query(self, raw, expression):
+        result = subprocess.run(['jq', '-ce', expression], input=raw, text=True,
+                                capture_output=True, check=True)
+        return result.stdout.strip()
 
     def image(self, name, payload):
         path = self.root / name
@@ -47,11 +51,11 @@ class AttachmentTests(unittest.TestCase):
         jpeg = self.image('two.jpeg', b'\xff\xd8\xffsecond')
         _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
                            '--attach', str(png), '--attach', str(jpeg))
-        self.assertEqual([item['mime'] for item in sent['attachments']], ['image/png', 'image/jpeg'])
-        self.assertEqual([item['name'] for item in sent['attachments']], ['one.png', 'two.jpeg'])
+        self.assertEqual(self.query(sent, '[.attachments[].mime]'), '["image/png","image/jpeg"]')
+        self.assertEqual(self.query(sent, '[.attachments[].name]'), '["one.png","two.jpeg"]')
         png.unlink(); jpeg.unlink()
         _, inbox = self.cli('inbox', session='beta')
-        self.assertEqual(inbox['messages'][0]['attachments'], sent['attachments'])
+        self.assertEqual(self.query(inbox, '.messages[0].attachments'), self.query(sent, '.attachments'))
         with sqlite3.connect(self.db) as db:
             stored = db.execute('SELECT content FROM attachments ORDER BY rowid').fetchall()
         self.assertEqual([row[0] for row in stored], [b'\x89PNG\r\n\x1a\nfirst', b'\xff\xd8\xffsecond'])
@@ -61,7 +65,7 @@ class AttachmentTests(unittest.TestCase):
         webp = self.image('image.webp', b'RIFF\x00\x00\x00\x00WEBPimage-data')
         _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body),
                            '--attach', str(gif), '--attach', str(webp))
-        self.assertEqual([item['mime'] for item in sent['attachments']], ['image/gif', 'image/webp'])
+        self.assertEqual(self.query(sent, '[.attachments[].mime]'), '["image/gif","image/webp"]')
 
     def test_video_containers_persist_and_mismatches_are_atomic(self):
         fixtures = ROOT / 'tests' / 'fixtures'
@@ -69,8 +73,8 @@ class AttachmentTests(unittest.TestCase):
         m4v = self.image('clip.m4v', videos[0].read_bytes())
         args = [arg for video in [*videos, m4v] for arg in ('--attach', str(video))]
         _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body), *args)
-        self.assertEqual([item['mime'] for item in sent['attachments']],
-                         ['video/mp4', 'video/quicktime', 'video/webm', 'video/mp4'])
+        self.assertEqual(self.query(sent, '[.attachments[].mime]'),
+                         '["video/mp4","video/quicktime","video/webm","video/mp4"]')
         before = self.count_messages(), self.count_attachments()
         invalid = [b'#!/bin/sh\necho fake', videos[1].read_bytes(),
                    b'\x00\x00\x00\x18ftypavif\x00\x00\x00\x00avifmif1']
@@ -116,8 +120,8 @@ class AttachmentTests(unittest.TestCase):
         paths = [large] + [self.image(f'file-{i}.txt', b'valid text') for i in range(49)]
         args = [value for path in paths for value in ('--attach', str(path))]
         _, sent = self.cli('send', '--to', 'beta', '--body-file', str(self.body), *args)
-        self.assertEqual(len(sent['attachments']), 50)
-        self.assertEqual(sent['attachments'][0]['size'], 10 * 1024 * 1024)
+        self.assertEqual(self.query(sent, '.attachments | length'), '50')
+        self.assertEqual(self.query(sent, '.attachments[0].size'), str(10 * 1024 * 1024))
         self.assertEqual(self.count_attachments(), 50)
 
     def test_invalid_and_oversize_attachments_are_atomic_and_plain_messages_stay_compatible(self):
@@ -131,9 +135,9 @@ class AttachmentTests(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(self.count_messages(), before)
         _, plain = self.cli('send', '--to', 'beta', '--body-file', str(self.body))
-        self.assertEqual(plain['attachments'], [])
+        self.assertEqual(self.query(plain, '.attachments'), '[]')
         _, inbox = self.cli('inbox', session='beta')
-        self.assertEqual(inbox['messages'][0]['attachments'], [])
+        self.assertEqual(self.query(inbox, '.messages[0].attachments'), '[]')
 
     def count_messages(self):
         with sqlite3.connect(self.db) as db:

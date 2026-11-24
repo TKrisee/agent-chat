@@ -17,7 +17,7 @@ import test_policy_observation as observation
 
 class HostState(observation.PolicyState):
     def __init__(self,path,project):
-        super().__init__(path);self.routes={project};self.owned_clients=None;self.fail_ready=False;self.fail_pending=False;self.events=[]
+        super().__init__(path);self.routes={project};self.owned_clients=None;self.fail_ready=False;self.fail_pending=False;self.events=[];self.epochs={}
 
     def policy_pending(self):
         if self.fail_pending: raise CoordError('metadata unavailable')
@@ -33,6 +33,14 @@ class HostState(observation.PolicyState):
     def call(self,op,**params):
         self.events.append((op,params))
         if op=='acquire' and self.fail_ready: raise CoordError('ready work unavailable')
+        if op=='execution-epoch-begin':
+            identifier='epoch-'+str(len(self.epochs));self.epochs[identifier]=dict(params=params,settled=False)
+            return {'id':identifier}
+        if op=='execution-epoch-settle':
+            epoch=self.epochs[params['id']]
+            if epoch['settled'] or params['outcome']!='submitted': raise AssertionError('invalid epoch settlement')
+            epoch['settled']=True
+            return {}
         return {}
 
     def heartbeat(self,server,pid,error=None): self.events.append(('heartbeat',dict(error=error)))
@@ -45,11 +53,15 @@ class HostPolicyCycleTests(unittest.TestCase):
         self.cycle_ends=[];self.output=io.StringIO()
 
     def offer(self,thread,client='offered'):
-        fixture=SimpleNamespace(state=self.states['a'])
-        observation.PolicyObservationTests.offer(fixture,thread,client)
+        return self.states['a'].policy_offer('wake',client,thread,observation.full_policy_payload())
 
     def run_host(self,cycles=1,once=True):
         parent=self
+        from agent_chat.approvals import METHODS
+        def rpc_factory(endpoint, *, server_request_methods, server_request_timeout):
+            if server_request_methods != METHODS or server_request_timeout != 120:
+                raise AssertionError('bridge must configure the supported approval request contract')
+            return self.rpc
         class Cycles:
             def __init__(self): self.waits=0
             def is_set(self): return self.waits>=cycles
@@ -60,9 +72,10 @@ class HostPolicyCycleTests(unittest.TestCase):
             value=Bridge(state,rpc);value._policy_clock=lambda:self.rpc.now
             return value
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch('agent_chat.approvals.ApprovalPump'))
             replacements={
                 'HttpClient':lambda server,token,project='default':SimpleNamespace(token='isolated-test',project=project),
-                'RpcClient':lambda _:self.rpc,'host_id':lambda:'host',
+                'RpcClient':rpc_factory,'host_id':lambda:'host',
                 'UsageGuard':lambda *_:SimpleNamespace(check=lambda _:dict(blocked=False)),
                 '_project_ids':lambda _:list(self.states),
                 'client_identity':lambda *_:contextlib.nullcontext(dict(owner='test',secret='not-used',host_id='host')),

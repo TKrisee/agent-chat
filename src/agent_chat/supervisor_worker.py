@@ -8,19 +8,23 @@ import time
 class SupervisorWorker:
     def __init__(self, bridge):
         self.bridge, self.state, self.rpc = bridge, bridge.state, bridge.rpc
+        self._phase = 'unknown'
 
 
-    def _snapshot(self, job):
+    def _snapshot(self, job, scope=''):
         started_at = time.time()
+        self._phase = scope + 'thread/read:before'
         before = self.rpc.request('thread/read', {'threadId': job['thread_id'], 'includeTurns': False})['thread']
         before_at = time.time()
+        self._phase = scope + 'thread/queue/list'
         queue = self.bridge.queue(job['thread_id'])
         queue_at = time.time()
         history_state, history_error = 'available', None
         try:
             from .native_history import turns_page
+            self._phase = scope + 'thread/turns/list'
             turns = turns_page(self.rpc, {
-                'threadId': job['thread_id'], 'limit': 1, 'itemsView': 'summary', 'sortDirection': 'desc'})['data']
+                'threadId': job['thread_id'], 'limit': 1, 'itemsView': 'notLoaded', 'sortDirection': 'desc'})['data']
         except (RpcError, HistoryUnavailable) as error:
             if isinstance(error, RpcError) and error.code != -32601:
                 raise
@@ -30,8 +34,10 @@ class SupervisorWorker:
             history_error = {'code': error.code if isinstance(error, RpcError) else -32601,
                              'message': (error.message if isinstance(error, RpcError) else str(error))[:256]}
         turns_at = time.time()
+        self._phase = scope + 'thread/read:after'
         after = self.rpc.request('thread/read', {'threadId': job['thread_id'], 'includeTurns': False})['thread']
         after_at = time.time()
+        self._phase = scope + 'snapshot:interpret'
         before_status, after_status = before.get('status', {}).get('type'), after.get('status', {}).get('type')
         contradictory = (before.get('id') != job['thread_id'] or after.get('id') != job['thread_id']
                          or before.get('status') != after.get('status')
@@ -47,12 +53,18 @@ class SupervisorWorker:
             turn_read_at=turns_at, read_after_at=after_at,
             turn_id=turns[0].get('id') if turns and isinstance(turns[0], dict) else None,
             turn_status=turns[0].get('status') if turns and isinstance(turns[0], dict) else None,
+            turn_error=turns[0].get('error') if turns and isinstance(turns[0], dict) else None,
+            turn_error_fields=(turns[0].get('error_field_status') if turns and isinstance(turns[0], dict)
+                else dict(error='unknown' if history_state == 'unavailable' else 'absent',
+                    **{key: 'unknown' if history_state == 'unavailable' else 'absent'
+                       for key in ('message', 'additionalDetails', 'codexErrorInfo')})),
             direct_input=after.get('canAcceptDirectInput'))
 
     def _report(self, job, state, summary):
         return self.state.supervisor_observe(job, dict(state=state, summary=summary, source='native'))
 
     def _recover(self, job, summary):
+        self._phase = 'recovery:claim'
         claim = self._report(job, 'recovery_claim', summary)
         if not claim.get('claimed'):
             return
@@ -60,6 +72,7 @@ class SupervisorWorker:
         wake_id = recovery['wake_id']
         try:
             if wake_id is None:
+                self._phase = 'recovery:prepare-wake'
                 messages = recovery['messages']
                 # Preparation uses the existing ordinary inbox journal and only
                 # the pre-existing messages pinned by the atomic incident claim.
@@ -68,21 +81,31 @@ class SupervisorWorker:
                 if not wake:
                     return  # Durable claim remains incomplete; no replay.
                 wake_id = wake['id']
-            fresh = dict(self._snapshot(job), recovery_id=recovery['id'], wake_id=wake_id)
+            fresh = dict(self._snapshot(job, 'recovery-before-resume:'), recovery_id=recovery['id'], wake_id=wake_id)
+            self._phase = 'recovery:attempt-admission'
             admitted = self._report(job, 'recovery_attempt', fresh)
             if not admitted.get('resume_allowed'):
                 return
+            self._phase = 'recovery:thread/resume'
             result = self.rpc.request('thread/resume', {'threadId': job['thread_id'], 'excludeTurns': True})
             if not isinstance(result, dict) or result.get('thread', {}).get('id') != job['thread_id']:
                 raise ValueError('exact recovery thread identity missing')
-            loaded = dict(self._snapshot(job), recovery_id=recovery['id'], wake_id=wake_id)
+            loaded = dict(self._snapshot(job, 'recovery-after-resume:'), recovery_id=recovery['id'], wake_id=wake_id)
+            self._phase = 'recovery:ready-report'
             self._report(job, 'recovery_ready', loaded)
             # Resume/load is only readiness. Ordinary Bridge.advance owns the
             # eventual queue/start; completion awaits the exact native client ID.
-        except (RpcError, TransportError, CoordError, OSError, ValueError, KeyError, TypeError):
+        except (RpcError, TransportError, CoordError, OSError, ValueError, KeyError, TypeError) as original:
             if wake_id is not None:
-                self._report(job, 'recovery_uncertain', {
-                    'recovery_id': recovery['id'], 'wake_id': wake_id})
+                original_phase = self._phase
+                self._phase = 'recovery:uncertain-report'
+                try:
+                    self._report(job, 'recovery_uncertain', {
+                        'recovery_id': recovery['id'], 'wake_id': wake_id})
+                except (RpcError, TransportError, CoordError, OSError, ValueError, KeyError, TypeError):
+                    self._prior_failure = {'phase': original_phase, 'error': str(original)[:512]}
+                    raise
+                self._phase = original_phase
             raise
 
     def _consumption(self, job, summary):
@@ -110,8 +133,13 @@ class SupervisorWorker:
 
     def advance(self, job):
         """Healthy/default-disabled supervision stays passive; recovery is incident-linked."""
+        self._prior_failure = None
+        if job.get('cold_message') is True:
+            self._cold_message(job)
+            return
         try:
             summary = self._snapshot(job)
+            self._phase = 'observation:classify'
             after_status, contradictory = summary['after'], summary['contradictory']
             if job['admission'] != 'running':
                 state = 'intentional_gated'
@@ -129,14 +157,43 @@ class SupervisorWorker:
                 state = after_status
             else:
                 state = 'inconclusive'
+            self._phase = 'observation:report'
             result = self._report(job, state, summary)
             if result.get('recovery_candidate'):
                 self._recover(job, summary)
             else:
+                self._phase = 'recovery:consumption-check'
                 self._consumption(job, summary)
         except (RpcError, TransportError, CoordError, OSError, ValueError, KeyError, TypeError) as error:
-            self.state.supervisor_observe(job, {'state': 'error', 'summary': {
+            details = {
                 'error': str(error)[:512], 'admission': job.get('admission'),
+                'phase': self._phase,
                 'wake': job.get('wake_summary'), 'holds': job.get('holds'),
                 'open_guards': job.get('open_guards'),
-            }, 'source': 'native'})
+            }
+            if self._prior_failure is not None:
+                details['prior_failure'] = self._prior_failure
+            self.state.supervisor_observe(job, {'state': 'error', 'summary': details, 'source': 'native'})
+
+    def _cold_message(self, job):
+        summary = self._snapshot(job)
+        if (summary['before'] not in ('notLoaded','unloaded') or summary['after'] != summary['before']
+                or summary['contradictory'] or summary['history_state'] != 'available'
+                or summary['queue_count'] or summary['turn_status'] == 'inProgress'):
+            return
+        wake_id = job.get('wake_id')
+        if not wake_id:
+            messages = [dict(id=job['source_id'], recipient_session=job['target_session'])]
+            wake = self.state.prepare(job['thread_id'], messages, self.bridge.payload(job['thread_id'],messages))
+            if not wake:
+                return
+            wake_id = wake['id']
+        fresh = dict(self._snapshot(job), wake_id=wake_id)
+        admitted = self._report(job, 'cold_message_attempt', fresh)
+        if not admitted.get('resume_allowed'):
+            return
+        context = dict(job, id=wake_id)
+        result = self.bridge.epoch_request(context, 'thread/resume', {'threadId':job['thread_id'], 'excludeTurns':True})
+        if not isinstance(result, dict) or result.get('thread', {}).get('id') != job['thread_id']:
+            raise ValueError('exact cold message thread identity missing')
+        self._report(job, 'cold_message_ready', dict(self._snapshot(job), wake_id=wake_id))

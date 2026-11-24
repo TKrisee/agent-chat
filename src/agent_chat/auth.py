@@ -113,6 +113,25 @@ class RequestOrigins:
         except ValueError:
             return False
 
+    def direct_local(self, headers, peer, *, require_origin=True):
+        """Accept only direct local authority, never proxy-forwarded traffic."""
+        try:
+            if not peer_address(peer).is_loopback:
+                return False
+            if any(name.lower() == 'forwarded' or name.lower().startswith('x-forwarded-')
+                   for name in headers.keys()):
+                return False
+            hosts, origins = headers.get_all('Host', []), headers.get_all('Origin', [])
+            if len(hosts) != 1 or len(origins) > 1 or (require_origin and len(origins) != 1):
+                return False
+            sites = headers.get_all('Sec-Fetch-Site', [])
+            if len(sites) > 1 or (sites and sites[0] not in ('same-origin', 'none')):
+                return False
+            effective = authority_origin('http', hosts[0])
+            return effective in self.local_origins and (not origins or browser_origin(origins[0]) == effective)
+        except ValueError:
+            return False
+
 
 def authorized(header, token, bearer_only=False):
     if not token:

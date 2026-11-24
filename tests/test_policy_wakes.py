@@ -1,5 +1,6 @@
 """Actual authenticated wake delivery: policy omission requires native evidence."""
 import copy
+import hashlib
 import json
 import uuid
 import sqlite3
@@ -156,6 +157,9 @@ class RootPolicyBootstrapTests(root_tests.RootFreshStartTests):
         self.assertTrue(self.state.policy_consumed(job['new_thread_id']))
         alias,bridge=self.project_bridge(project)
         self.assertTrue(alias.policy_consumed(job['new_thread_id']))
+        with sqlite3.connect(self.server.projects.db_path(project)) as db:
+            db.execute('UPDATE root_projections SET home_session=?',('different-synthetic-root',))
+        self.assertFalse(alias.policy_consumed(job['new_thread_id']))
         with self.server.projects.connection() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM native_policy_receipts WHERE thread=?',(job['new_thread_id'],)).fetchone()[0],1)
 
@@ -166,13 +170,27 @@ class ResetPolicyBootstrapTests(reset_tests.SessionResetTests):
         self.request_reset();self.bridge.tick()
         self.assertEqual(self.reset()['status'],'completed')  # Existing lifecycle contract remains unchanged.
         self.assertFalse(self.state.policy_consumed(self.rpc.new))
+        payload=next(params['input'][0]['text'] for method,params in self.rpc.calls if method=='thread/queue/add' and params['threadId']==self.rpc.new)
+        offers=[offer for offer in self.state.policy_pending() if offer['thread']==self.rpc.new]
+        self.assertEqual(len(offers),1)
+        self.assertEqual(offers[0]['version'],communication.policy_version())
+        self.assertEqual(offers[0]['payload_sha256'],hashlib.sha256(payload.encode()).hexdigest())
+        isolated=PolicyStore(self.db.with_name('policy-negative.sqlite3'))
+        self.assertEqual(isolated.offer('mac','default','reset','tampered-policy',self.rpc.new,payload.replace(communication.STANDING_POLICY,'altered policy'))['offered'],False)
+        self.assertEqual(isolated.offer('mac','default','reset','tampered-version',self.rpc.new,payload.replace(communication.policy_version(),'not-the-current-version'))['offered'],False)
         original=self.rpc.request
+        wrong_client=[True]
         def proof(method,params):
             result=original(method,params)
             if method=='thread/turns/list' and params['threadId']==self.rpc.new:
-                for turn in result['data']: turn['id']='native-reset-bootstrap-turn'
+                for turn in result['data']:
+                    turn['id']='native-reset-bootstrap-turn'
+                    if wrong_client[0]:
+                        for item in turn['items']: item['clientId']='unrelated-client'
             return result
         self.rpc.request=proof;clock[0]+=31;self.bridge.observe_policies()
+        self.assertFalse(self.state.policy_consumed(self.rpc.new))
+        wrong_client[0]=False;clock[0]+=31;self.bridge.observe_policies()
         self.assertTrue(self.state.policy_consumed(self.rpc.new))
         self.assertEqual(len([item for item in self.rpc.calls if item[0]=='thread/start']),1)
         self.assertEqual(len([item for item in self.rpc.calls if item[0]=='thread/queue/add']),1)

@@ -8,6 +8,7 @@ import time
 
 from .core import Coordinator, CoordError
 from .bridge_state import BridgeState
+from .approvals import ApprovalInbox
 
 
 class BridgeManager:
@@ -19,6 +20,7 @@ class BridgeManager:
         self.project_id = 'default'
         self.mutex = threading.RLock()
         self.lock = None
+        self.approvals = ApprovalInbox()
         c = Coordinator(db_path)
         try:
             BridgeState(c)
@@ -33,6 +35,8 @@ class BridgeManager:
                     c.db.execute('''INSERT INTO bridge_dispatcher
                         SELECT host_id,owner,secret_hash,acquired_at FROM bridge_dispatcher_legacy''')
                     c.db.execute('DROP TABLE bridge_dispatcher_legacy')
+            from .goal_selection_generation import install as install_goal_generation, PROJECT as GOAL_PROJECT
+            install_goal_generation(c.db, GOAL_PROJECT)
             if c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
                 self._hold_lock()
         finally:
@@ -47,6 +51,8 @@ class BridgeManager:
 
     def close(self):
         with self.mutex:
+            for host in list(self.approvals.epochs):
+                self.approvals.invalidate(host)
             if self.lock:
                 self.lock.__exit__(None, None, None)
                 self.lock = None
@@ -93,6 +99,7 @@ class BridgeManager:
         if op == 'reset':
             if params != {'confirm_stopped': True}:
                 raise CoordError('verify the previous bridge client is stopped before confirming recovery')
+            self.approvals.invalidate(host)
             c.db.execute('DELETE FROM bridge_dispatcher WHERE host_id=?', (host,))
             c.db.execute('DELETE FROM bridge_client_runtime WHERE host_id=?', (host,))
             if not c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
@@ -110,18 +117,33 @@ class BridgeManager:
         if not same:
             raise CoordError('dispatcher ownership is absent or has changed; reacquire before dispatch')
         if op == 'release':
+            self.approvals.invalidate(host)
             c.db.execute('DELETE FROM bridge_dispatcher WHERE host_id=?', (host,))
             c.db.execute('UPDATE bridge_client_runtime SET pid=0,error=? WHERE host_id=?', ('bridge stopped', host))
             if not c.db.execute('SELECT 1 FROM bridge_dispatcher').fetchone():
                 self.close()
             return {'released': True}
+        if op.startswith('approval-'):
+            fields = {'approval-sync': {'epoch'}, 'approval-route': {'thread'},
+                      'approval-publish': {'epoch','key','method','context','preview','choices','remaining'},
+                      'approval-poll': {'epoch','handles'}, 'approval-finish': {'epoch','handle','outcome'}}
+            valid_fields = op in fields and (set(params) == fields[op] or
+                (op == 'approval-finish' and set(params) == fields[op] | {'item_outcome'}) or
+                (op == 'approval-publish' and set(params) == fields[op] | {'requested_permissions'}))
+            if not valid_fields:
+                raise CoordError('invalid approval operation or parameters')
+            if op == 'approval-sync': return self.approvals.sync(host, owner, params['epoch'])
+            if op == 'approval-route': return {'route': bool(self.approvals.route(c, host, params['thread']))}
+            if op == 'approval-publish': return self.approvals.publish(c, host, owner, params)
+            if op == 'approval-poll': return self.approvals.poll(host, owner, **params)
+            return self.approvals.finish(host, owner, **params)
         from .root_team_reset import quarantined,handoff_begin,handoff_settling,handoff_settle,handoff_pending,handoff_retry_verified
         def reset_fence(*,session=None,thread=None,job=None):
             if quarantined(c.db,session=session,thread=thread,job=job):
                 raise CoordError('team reset quarantined this former actor or journal; native calls withheld')
         def native_update(kind,job,status,values,write):
             phase = ('interrupting:'+str(values.get('turn_id'))) if kind=='control' and status=='interrupting' else status
-            native = status in (('changing','interrupting') if kind=='control' else ('creating','adding','starting'))
+            native = status in (('changing','interrupting') if kind=='control' else ('creating','materializing','adding','starting'))
             begin = native and (job['status']!=status or (status=='interrupting' and job.get('turn_id')!=values.get('turn_id')))
             if begin: handoff_begin(c.db,kind,job,host,phase)
             try:
@@ -138,6 +160,55 @@ class BridgeManager:
             if kind=='control' and status=='interrupting' and job['status']=='interrupting' and params.get('turn_id')==job.get('turn_id') and any(row['kind']==kind and row['job_id']==job['id'] and row['host_id']==host for row in handoff_pending(c.db)): return True
             return kind=='control' and status=='changing' and params.get('native_response') is not None and any(
                 row['kind']==kind and row['job_id']==job['id'] and row['host_id']==host for row in handoff_pending(c.db))
+        if op == 'control-update':
+            from .agent_control import AgentControlState, parse_po_status_action
+            table = c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_control_requests'").fetchone()
+            columns = {row['name'] for row in c.db.execute('PRAGMA table_info(agent_control_requests)')} if table else set()
+            candidate = (c.db.execute('SELECT * FROM agent_control_requests WHERE id=?',
+                                      (params.get('job_id'),)).fetchone()
+                         if {'id', 'action'} <= columns else None)
+            if candidate and parse_po_status_action(candidate['action']):
+                controls = AgentControlState.existing_schema(c)
+                job = controls.job(candidate['id'])
+                if job['host_id'] != host:
+                    raise CoordError('PO status inspection belongs to another host')
+                if set(params) - {'job_id','expected','status','observation'}:
+                    raise CoordError('invalid PO status inspection completion fields')
+                return controls.update(job['id'], params.get('expected'), params.get('status'),
+                                       observation=params.get('observation'))
+        # The scoped status request is carried by the existing control route,
+        # but must not reach BridgeState's schema initializer on readback.
+        if op in ('control-jobs', 'control-job'):
+            from .agent_control import AgentControlState, parse_po_status_action
+            table = c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_control_requests'").fetchone()
+            columns = {row['name'] for row in c.db.execute('PRAGMA table_info(agent_control_requests)')} if table else set()
+            candidate = None
+            if {'id', 'action'} <= columns and op == 'control-job':
+                candidate = c.db.execute('SELECT * FROM agent_control_requests WHERE id=?',
+                                         (params.get('job_id'),)).fetchone()
+            if {'host_id', 'action'} <= columns and op == 'control-jobs':
+                candidate = next((row for row in c.db.execute(
+                    'SELECT * FROM agent_control_requests WHERE host_id=?', (host,))
+                    if parse_po_status_action(row['action'])), None)
+            if candidate and parse_po_status_action(candidate['action']):
+                controls = AgentControlState.existing_schema(c)
+                if op == 'control-job':
+                    job = controls.job(candidate['id'])
+                    if job['host_id'] != host:
+                        raise CoordError('agent control belongs to another host')
+                    reset_fence(session=job['target_session'])
+                    return job
+                jobs = controls.jobs(host)
+                for pending in handoff_pending(c.db):
+                    if pending['kind'] == 'control' and pending['host_id'] == host and not any(
+                            item['id'] == pending['job_id'] for item in jobs):
+                        retained = controls.job(pending['job_id'])
+                        if retained['status'] not in ('completed', 'failed', 'cancelled', 'resolved_unchanged'):
+                            item = dict(retained)
+                            if not parse_po_status_action(item.get('action')):
+                                item['ownership'] = controls.ownership(retained['target_session'])
+                            jobs.append(item)
+                return jobs
         usage = self.usage_store.status(host) if self.usage_store else None
         state = BridgeState(c)
         if self.roots:
@@ -157,6 +228,22 @@ class BridgeManager:
             if usage and usage['blocked']: raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             values = {key:value for key,value in params.items() if key not in ('job_id','expected','status')}
             return restart.update(self.project_id,host,job['id'],params.get('expected'),params.get('status'),**values)
+        if op=='root-fresh-recovery-event':
+            from .root_restart import RootRestart
+            attempt_id=params.get('attempt_id')
+            with self.roots.projects.connection() as db:
+                row=db.execute('SELECT home_project,host_id FROM root_fresh_recovery_attempts WHERE attempt_id=?',(attempt_id,)).fetchone()
+            if not row or (row['home_project'],row['host_id'])!=(self.project_id,host):
+                raise CoordError('candidate recovery attempt belongs to another owning host or project')
+            return RootRestart(self.roots).recovery_event(attempt_id,params.get('event'),params.get('detail'))
+        if op=='root-fresh-replacement-event':
+            request_id=params.get('request_id')
+            with self.roots.projects.connection() as db:
+                row=db.execute('SELECT home_project,host_id FROM root_fresh_replacements WHERE request_id=?',(request_id,)).fetchone()
+            if not row or (row['home_project'],row['host_id'])!=(self.project_id,host):
+                raise CoordError('candidate replacement belongs to another owning host or project')
+            values={key:value for key,value in params.items() if key not in ('request_id','reconciliation_id','event')}
+            return RootRestart(self.roots).replacement_event(request_id,params.get('reconciliation_id'),params.get('event'),**values)
         if op in ('supervisor-jobs','supervisor-observe'):
             from .supervisor import SupervisorState
             supervisor = SupervisorState(c)
@@ -165,15 +252,21 @@ class BridgeManager:
             if not isinstance(job, dict): raise CoordError('invalid supervisor job')
             return supervisor.observe(job, report, host)
         if op in ('control-jobs','control-job','control-update'):
-            from .agent_control import AgentControlState
-            controls = AgentControlState(c)
+            from .agent_control import AgentControlState, parse_po_status_action
+            has_po_status = any(parse_po_status_action(row['action']) for row in c.db.execute(
+                'SELECT action FROM agent_control_requests WHERE host_id=?', (host,)))
+            controls = (AgentControlState.existing_schema(c) if has_po_status
+                        else AgentControlState(c))
             if op == 'control-jobs':
                 jobs=controls.jobs(host)
                 for pending in handoff_pending(c.db):
                     if pending['kind']=='control' and pending['host_id']==host and not any(j['id']==pending['job_id'] for j in jobs):
                         retained=controls.job(pending['job_id'])
                         if retained['status'] not in ('completed','failed','cancelled','resolved_unchanged'):
-                            jobs.append(dict(retained,ownership=controls.ownership(retained['target_session'])))
+                            item = dict(retained)
+                            if not parse_po_status_action(item.get('action')):
+                                item['ownership'] = controls.ownership(retained['target_session'])
+                            jobs.append(item)
                 return jobs
             job = controls.job(params.get('job_id'))
             if op!='control-job' or not any(row['kind']=='control' and row['job_id']==job['id'] and row['host_id']==host for row in handoff_pending(c.db)):
@@ -197,11 +290,120 @@ class BridgeManager:
             from .session_reset import SessionResetState
             resets = SessionResetState(c)
             capabilities = params.get('capabilities')
-            scoped_worker = capabilities in (['project-scope-v1'], ['project-scope-v1', 'project-workspaces-v1'])
-            workspace_worker = capabilities == ['project-scope-v1', 'project-workspaces-v1']
+            durable_worker = capabilities == ['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1', 'turnover-bootstrap-v1', 'parked-durability-v1']
+            turnover_worker = durable_worker or capabilities == ['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1', 'turnover-bootstrap-v1']
+            parked_worker = turnover_worker or capabilities == ['project-scope-v1', 'project-workspaces-v1', 'parked-provision-v1']
+            scoped_worker = parked_worker or capabilities in (['project-scope-v1'], ['project-scope-v1', 'project-workspaces-v1'])
+            workspace_worker = parked_worker or capabilities == ['project-scope-v1', 'project-workspaces-v1']
+            def parked_pending_epoch(job):
+                if not c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_epoch_handoffs'").fetchone():
+                    return None
+                rows = c.db.execute('''SELECT id,dispatcher FROM execution_epoch_handoffs WHERE actor=? AND thread=?
+                    AND host=? AND method='thread/start' AND settled_at IS NULL AND started_at>=?''',
+                    (job['target_session'],job['old_thread_id'],host,job['created_at'])).fetchall()
+                if len(rows) > 1 or (rows and rows[0]['dispatcher'] != owner):
+                    raise CoordError('parked native creation epoch is ambiguous or belongs to another dispatcher')
+                return rows[0]['id'] if rows else None
+            def materialization_pending_epoch(job):
+                if not c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_epoch_handoffs'").fetchone():
+                    return None
+                rows = c.db.execute('''SELECT id,dispatcher FROM execution_epoch_handoffs WHERE actor=? AND thread=?
+                    AND host=? AND method='thread/name/set' AND settled_at IS NULL AND started_at>=?''',
+                    (job['target_session'],job['old_thread_id'],host,job['created_at'])).fetchall()
+                if len(rows) > 1 or (rows and rows[0]['dispatcher'] != owner):
+                    raise CoordError('parked materialization epoch is ambiguous or belongs to another dispatcher')
+                return rows[0]['id'] if rows else None
+            def parked_registry_valid(job, registry):
+                from .management import parked_creation
+                proof = parked_creation(c.db,job['id'])
+                if not proof or not self.roots or self.project_id != proof['project_id']:
+                    return False
+                if 'bootstrap_id' in proof.keys():
+                    from .turnover_bootstrap import authorize_subordinate
+                    try:
+                        authorize_subordinate(c.db, registry, proof['bootstrap_id'], job['requester_session'],
+                                              job['old_thread_id'], job['host_id'], job['requested_model'], job['requested_effort'])
+                        return True
+                    except CoordError:
+                        return False
+                row = registry.execute('SELECT session_id,orchestrator_session,joined,request_id FROM root_projects WHERE project_id=?', (self.project_id,)).fetchone()
+                stops = registry.execute('SELECT id,root_session FROM root_team_operations WHERE resumed_at IS NULL').fetchall()
+                original = registry.execute('SELECT root_session FROM root_team_operation_projects WHERE request_id=? AND project_id=?', (proof['stop_id'],self.project_id)).fetchone()
+                root = c.db.execute('SELECT home_session FROM root_projections WHERE session_id=?', (proof['root_session'],)).fetchone()
+                return bool(row and original and root and row['joined'] and row['session_id'] == proof['root_session']
+                    and row['orchestrator_session'] == proof['target_session'] and row['request_id'] == proof['request_id']
+                    and len(stops) == 1 and tuple(stops[0]) == (proof['stop_id'],root['home_session'])
+                    and original['root_session'] == proof['root_session'])
             if op == 'reset-jobs':
-                return [] if usage and usage['blocked'] else resets.jobs(host, project_scope=scoped_worker, project_workspaces=workspace_worker)
+                if parked_worker:
+                    from .management import parked_creation
+                    for pending in handoff_pending(c.db):
+                        if pending['kind'] != 'reset' or pending['host_id'] != host:
+                            continue
+                        if not parked_creation(c.db, pending['job_id']):
+                            continue
+                        outcome = c.db.execute('''SELECT r.status,r.target_session,r.new_thread_id,r.settings_digest,r.new_settings_digest,
+                            x.code,b.thread_id AS bound_thread FROM session_resets r
+                            LEFT JOIN parked_native_rejections x ON x.request_id=r.id
+                            LEFT JOIN bridge_bindings b ON b.session_id=r.target_session WHERE r.id=? AND r.host_id=?''',
+                            (pending['job_id'],host)).fetchone()
+                        if outcome and outcome['status'] == 'failed' and outcome['code'] == -32602:
+                            handoff_settle(c.db,'reset',pending['job_id'],host,'provider-rejected')
+                        elif (outcome and outcome['status'] == 'parked' and outcome['new_thread_id']
+                              and outcome['bound_thread'] == outcome['new_thread_id'] and outcome['settings_digest']
+                              and outcome['settings_digest'] == outcome['new_settings_digest']):
+                            epoch_id = parked_pending_epoch(resets.job(pending['job_id']))
+                            if epoch_id:
+                                from .core import execution_epoch_settle
+                                with c.tx() as db:
+                                    execution_epoch_settle(db,epoch_id,host,'submitted',owner)
+                            handoff_settle(c.db,'reset',pending['job_id'],host,'created')
+                            metadata_epoch = materialization_pending_epoch(resets.job(pending['job_id']))
+                            if metadata_epoch:
+                                from .core import execution_epoch_settle
+                                with c.tx() as db:
+                                    execution_epoch_settle(db,metadata_epoch,host,'submitted',owner)
+                            handoff_settle(c.db,'reset',pending['job_id'],host,'parked')
+                    # A crash may happen after the parked transaction settled
+                    # its root handoff but before the native epoch settlement.
+                    # Recover only a positively committed exact binding.
+                    if c.db.execute("SELECT 1 FROM sqlite_master WHERE name='execution_epoch_handoffs'").fetchone():
+                        committed = c.db.execute('''SELECT DISTINCT r.id FROM session_resets r
+                            JOIN bridge_bindings b ON b.session_id=r.target_session AND b.thread_id=r.new_thread_id
+                            JOIN execution_epoch_handoffs e ON e.actor=r.target_session AND e.thread=r.old_thread_id
+                                AND e.host=r.host_id AND e.method='thread/name/set' AND e.settled_at IS NULL AND e.started_at>=r.created_at
+                            WHERE r.host_id=? AND r.status='parked' AND r.settings_digest IS NOT NULL
+                                AND r.settings_digest=r.new_settings_digest''', (host,)).fetchall()
+                        for row in committed:
+                            if not parked_creation(c.db, row['id']):
+                                continue
+                            metadata_epoch = materialization_pending_epoch(resets.job(row['id']))
+                            if metadata_epoch:
+                                from .core import execution_epoch_settle
+                                with c.tx() as db:
+                                    execution_epoch_settle(db,metadata_epoch,host,'submitted',owner)
+                jobs = [] if usage and usage['blocked'] else resets.jobs(host, project_scope=scoped_worker, project_workspaces=workspace_worker, parked_worker=parked_worker)
+                if any(job.get('parked') for job in jobs):
+                    if not self.roots:
+                        return [job for job in jobs if not job.get('parked')]
+                    with self.roots.projects.connection() as registry:
+                        def allowed(job):
+                            if not job.get('parked'): return True
+                            if not durable_worker and job['status'] in ('pending','creating','created','materializing'): return False
+                            if not parked_registry_valid(job,registry): return False
+                            if job.get('turnover_bootstrap'):
+                                if not turnover_worker: return False
+                                from .turnover_bootstrap import authorized
+                                try: authorized(c.db,registry,job['id'])
+                                except CoordError: return False
+                            return True
+                        jobs = [job for job in jobs if allowed(job)]
+                return jobs
             job = resets.job(params.get('job_id'))
+            if job.get('parked') and not parked_worker:
+                raise CoordError('upgrade the owning bridge for parked provisioning')
+            if job.get('parked') and op == 'reset-update' and params.get('status') in ('materializing','parked') and not durable_worker:
+                raise CoordError('upgrade the owning bridge for durable parked provisioning')
             if not (op=='reset-update' and settlement_allowed('reset',job,params.get('status'))):
                 reset_fence(session=job['target_session'])
                 reset_fence(session=job['requester_session'])
@@ -214,15 +416,48 @@ class BridgeManager:
             if op == 'reset-job':
                 return job
             status = params.get('status')
-            if status in ('creating','ready','adding','starting'):
+            if status in ('creating','ready','adding','starting') and not job.get('parked'):
                 from .core import assert_agent_running
                 assert_agent_running(c.db, job['target_session'])
-            if usage and usage['blocked'] and status in ('creating', 'ready', 'adding', 'starting'):
+            if usage and usage['blocked'] and status in ('creating', 'ready', 'parked', 'adding', 'starting'):
                 raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             with self.measurements.lock if self.measurements else contextlib.nullcontext():
-                if self.measurements and status in ('creating', 'ready', 'adding', 'starting') and self.measurements.status(self.project_id)['active']:
+                if self.measurements and status in ('creating', 'ready', 'parked', 'adding', 'starting') and self.measurements.status(self.project_id)['active']:
                     raise CoordError('finish the active project measurement before resetting a conversation')
                 values = {key: value for key, value in params.items() if key not in ('job_id', 'expected', 'status', 'capabilities')}
+                if '_turnover' in values:
+                    raise CoordError('turnover authority is server-derived')
+                if job.get('parked'):
+                    if not self.roots:
+                        raise CoordError('parked provisioning registry unavailable')
+                    with self.roots.projects.connection() as registry:
+                        registry.execute('BEGIN IMMEDIATE')
+                        if job['status'] != 'creating' and not parked_registry_valid(job,registry):
+                            registry.rollback()
+                            raise CoordError('parked provisioning registry scope changed')
+                        turnover = bool(job.get('turnover_bootstrap'))
+                        if turnover:
+                            if not turnover_worker: raise CoordError('upgrade bridge for turnover bootstrap')
+                            from .turnover_bootstrap import authorized
+                            authorized(c.db,registry,job['id'])
+                        epoch_id = parked_pending_epoch(job) if job['status'] == 'created' and status == 'materializing' else None
+                        result = native_update('reset',job,status,values,lambda: resets.update(job['id'], params.get('expected'), status, _turnover=turnover, **values))
+                        if job['status'] == 'creating' and status == 'failed' and values.get('native_error_code') == -32602:
+                            handoff_settle(c.db,'reset',job['id'],host,'provider-rejected')
+                        if job['status'] == 'created' and status == 'materializing':
+                            if epoch_id:
+                                from .core import execution_epoch_settle
+                                with c.tx() as db:
+                                    execution_epoch_settle(db,epoch_id,host,'submitted',owner)
+                            handoff_settle(c.db,'reset',job['id'],host,'created')
+                        if job['status'] == 'materializing' and status == 'parked':
+                            metadata_epoch = materialization_pending_epoch(job)
+                            if metadata_epoch:
+                                from .core import execution_epoch_settle
+                                with c.tx() as db:
+                                    execution_epoch_settle(db,metadata_epoch,host,'submitted',owner)
+                        registry.commit()
+                        return result
                 return native_update('reset',job,status,values,lambda: resets.update(job['id'], params.get('expected'), status, **values))
 
         def route_for(session_id):
@@ -310,14 +545,37 @@ class BridgeManager:
             from .policy_store import PolicyStore
             state.policy_store=PolicyStore(self.roots.projects.path if self.roots else str(self.db_path)+'.policies.sqlite3')
             state.policy_host,state.policy_project=host,self.project_id
+            def policy_scope(thread):
+                root=self.roots.config() if self.roots else None
+                if not root or (root['thread_id'],root['host_id'])!=(thread,host):
+                    return self.project_id
+                exists=c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_projections'").fetchone()
+                if not exists: return self.project_id
+                columns={row['name'] for row in c.db.execute('PRAGMA table_info(root_projections)')}
+                if not {'session_id','home_project','home_session','thread_id'} <= columns:
+                    return self.project_id
+                projection=c.db.execute('''SELECT 1 FROM root_projections p
+                    JOIN bridge_bindings b ON b.session_id=p.session_id
+                    JOIN remote_session_hosts h ON h.session_id=p.session_id
+                    WHERE p.home_project=? AND p.home_session=? AND p.thread_id=?
+                      AND b.thread_id=? AND b.parent_session IS NULL AND h.host_id=?''',
+                    (root['home_project'],root['home_session'],thread,thread,host)).fetchone()
+                return root['home_project'] if projection else self.project_id
             if op=='policy-pending':
-                return [offer for offer in state.policy_pending() if c.db.execute('SELECT 1 FROM bridge_bindings b JOIN remote_session_hosts h ON h.session_id=b.session_id WHERE b.thread_id=? AND h.host_id=?',(offer['thread'],host)).fetchone()]
+                bound=c.db.execute('SELECT DISTINCT b.thread_id FROM bridge_bindings b JOIN remote_session_hosts h ON h.session_id=b.session_id WHERE h.host_id=?',(host,)).fetchall()
+                result=[]
+                for row in bound:
+                    thread=row['thread_id'];state.policy_project=policy_scope(thread)
+                    result.extend(offer for offer in state.policy_pending() if offer['thread']==thread)
+                return result
             if op=='policy-receipt':
                 offer=params.get('offer')
                 if not isinstance(offer,dict) or any(not isinstance(offer.get(key),str) or not offer[key] for key in ('thread','client_id','version')): raise CoordError('invalid policy offer proof')
                 thread_allowed(offer.get('thread'))
+                state.policy_project=policy_scope(offer['thread'])
                 return state.policy_receipt(offer,params.get('turn_id'))
             thread=params.get('thread_id');thread_allowed(thread)
+            state.policy_project=policy_scope(thread)
             if op=='policy-consumed':
                 from .communication import policy_version
                 return {'consumed':params.get('version')==policy_version() and state.policy_consumed(thread)}
@@ -339,6 +597,17 @@ class BridgeManager:
             if usage and usage['blocked']:
                 return []
             return [m for m in state.pending() if route_for(m['recipient_session'])]
+        if op == 'investigation-tasks':
+            if usage and usage['blocked']:
+                return []
+            tasks = []
+            for item in state.investigation_tasks(host_id=host):
+                admission, message = item['admission'], item['message']
+                route = route_for(message['recipient_session'])
+                if route and route['thread_id'] == admission['thread_id']:
+                    thread_allowed(admission['thread_id'])
+                    tasks.append(item)
+            return tasks
         if op == 'resolve':
             sid = params.get('session_id')
             if not isinstance(sid, str):
@@ -361,6 +630,17 @@ class BridgeManager:
                     continue
                 jobs.append(job)
             return jobs
+        if op in ('native-stage-record', 'native-stage-censor'):
+            if set(params) != ({'job_id','observation'} if op == 'native-stage-record' else {'job_id','reason'}):
+                raise CoordError('invalid native stage request')
+            with c.tx():
+                current = c.db.execute('SELECT owner,secret_hash,acquired_at FROM bridge_dispatcher WHERE host_id=?', (host,)).fetchone()
+                if not current or current['owner'] != owner or not secrets.compare_digest(current['secret_hash'], digest):
+                    raise CoordError('dispatcher ownership changed')
+                job = job_allowed(params['job_id'])
+                if op == 'native-stage-record':
+                    return state.record_native_stage(job, host, params['observation'], current)
+                return state.censor_native_stage(job, host, params['reason'], current)
         if op in ('job', 'still_unread', 'update'):
             settlement = op=='update' and params.get('status') in ('queued','dispatched','uncertain','failed','cancelled') and handoff_settling(c.db,'wake',params.get('job_id'),host,params.get('status'))
             job = job_allowed(params.get('job_id'), settlement=settlement)
@@ -387,14 +667,45 @@ class BridgeManager:
             if status not in ('adding','starting'):
                 handoff_settle(c.db,'wake',job['id'],host,status)
             return {'updated': True}
+        if op == 'manager-update-candidate':
+            if set(params) != {'thread_id','message_id'}:
+                raise CoordError('invalid manager update candidate request')
+            thread_allowed(params['thread_id'])
+            return state.manager_update_candidate(params['thread_id'], params['message_id'])
+        if op == 'manager-update-prior':
+            if set(params) != {'thread_id','message_id','task_id','original_job_id','turn_id'}:
+                raise CoordError('invalid manager update prior request')
+            thread_allowed(params['thread_id'])
+            return state.manager_update_prior(params['thread_id'], params['message_id'], params['task_id'],
+                                              params['original_job_id'], params['turn_id'])
+        if op == 'manager-update-claim':
+            if set(params) != {'thread_id','message_id','task_id','original_job_id','turn_id','payload'}:
+                raise CoordError('invalid manager update claim request')
+            if usage and usage['blocked']:
+                raise CoordError(usage['reason'] or 'weekly usage reserve is active')
+            thread_allowed(params['thread_id'])
+            return state.manager_update_claim(params['thread_id'], params['message_id'], params['task_id'],
+                                              params['original_job_id'], params['turn_id'], params['payload'])
         if op == 'prepare':
             if usage and usage['blocked']:
                 raise CoordError(usage['reason'] or 'weekly usage reserve is active')
             thread_id, messages, payload = params.get('thread_id'), params.get('messages'), params.get('payload')
             thread_allowed(thread_id)
+            investigation_request_id = params.get('investigation_request_id')
+            if investigation_request_id is not None and (not isinstance(investigation_request_id, str)
+                    or len(investigation_request_id) > 128):
+                raise CoordError('invalid investigation admission request ID')
             if not isinstance(messages, list) or not 1 <= len(messages) <= 100 or not isinstance(payload, str) or len(payload) > 262144:
                 raise CoordError('invalid dispatch payload')
-            pending = {m['id']: m for m in state.pending() if route_for(m['recipient_session'])}
+            if investigation_request_id is not None:
+                if len(messages) != 1:
+                    raise CoordError('investigation admission permits exactly one original message')
+                authorized = {item['message']['id']: item for item in state.investigation_tasks(host_id=host)
+                              if item['admission']['request_id'] == investigation_request_id
+                              and item['admission']['thread_id'] == thread_id}
+                pending = {message_id: item['message'] for message_id, item in authorized.items()}
+            else:
+                pending = {m['id']: m for m in state.pending() if route_for(m['recipient_session'])}
             valid = []
             for message in messages:
                 actual = c.db.execute('SELECT recipient_session FROM messages WHERE id=?',
@@ -404,7 +715,12 @@ class BridgeManager:
                     raise CoordError('dispatch message is no longer pending or does not match its recipient')
                 if message not in valid:
                     valid.append(message)
-            return state.prepare(thread_id, valid, payload)
+            if 'eligibility_observation' in params and params['eligibility_observation'] is None:
+                raise CoordError('invalid eligibility observation')
+            return state.prepare(thread_id, valid, payload,
+                                 investigation_request_id=investigation_request_id,
+                                 eligibility_observation=params.get('eligibility_observation'),
+                                 eligibility_lease=existing)
         if op == 'observe':
             thread_allowed(params.get('thread_id'))
             if not isinstance(params.get('state'), str) or not 1 <= len(params['state']) <= 256:
@@ -418,9 +734,94 @@ class BridgeManager:
             if not isinstance(params.get('server'), str) or not isinstance(params.get('pid'), int) or isinstance(params['pid'], bool):
                 raise CoordError('invalid heartbeat')
             error = params.get('error')
+            versions = params.get('versions')
+            if versions is not None and (not isinstance(versions, list) or len(versions) != 2 or any(v is not None and (not isinstance(v, str) or len(v) > 64) for v in versions)):
+                raise CoordError('invalid version observation')
             if error is not None and not isinstance(error, str):
                 raise CoordError('invalid heartbeat error')
             state.heartbeat(params['server'], params['pid'], error, host_id=host, project_scope_worker=params.get('capabilities') in (['project-scope-v1'], ['project-scope-v1', 'project-workspaces-v1']),
-                            project_workspaces_worker=params.get('capabilities') == ['project-scope-v1', 'project-workspaces-v1'])
+                            project_workspaces_worker=params.get('capabilities') == ['project-scope-v1', 'project-workspaces-v1'], versions=versions)
             return {'heartbeat': True}
+        if op == 'execution-epoch-begin':
+            from .core import execution_epoch_handoff
+            from .bridge import _ExecutionEpochRpc
+            if set(params)!={'method','thread','actor','job_id'} or params['method'] not in _ExecutionEpochRpc.MUTATING:
+                raise CoordError('invalid native epoch admission')
+            thread,actor=params['thread'],params['actor']
+            try:
+                grant = c.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='root_turnover_bootstraps'").fetchone()
+                grant = grant and c.db.execute('SELECT 1 FROM root_turnover_bootstraps WHERE request_id=?', (params['job_id'],)).fetchone()
+                metadata = params['method'] == 'thread/name/set'
+                if grant and not metadata:
+                    if not self.roots or params['method'] not in ('thread/queue/add','thread/queue/start'):
+                        raise CoordError('invalid turnover bootstrap native epoch')
+                if thread:
+                    try: thread_allowed(thread)
+                    except CoordError:
+                        reset=c.db.execute("SELECT target_session,host_id,old_thread_id FROM session_resets WHERE new_thread_id=? AND status NOT IN ('completed','cancelled','failed')",(thread,)).fetchone() if c.db.execute("SELECT 1 FROM sqlite_master WHERE name='session_resets'").fetchone() else None
+                        pinned=c.db.execute('SELECT host_id FROM remote_session_hosts WHERE session_id=?',(reset['target_session'],)).fetchone() if reset else None
+                        if not reset or reset['host_id']!=host or not pinned or pinned['host_id']!=host:
+                            raise
+                        thread_allowed(reset['old_thread_id'])
+                        actor=reset['target_session']
+                else:
+                    if not actor or not route_for(actor): raise CoordError('native epoch new-thread owner host unavailable')
+                    row=c.db.execute('SELECT target_session FROM session_resets WHERE id=?',(params['job_id'],)).fetchone() if c.db.execute("SELECT 1 FROM sqlite_master WHERE name='session_resets'").fetchone() else None
+                    if not row or row['target_session']!=actor: raise CoordError('native epoch new-thread job association unavailable')
+                def issue_epoch(registry=None):
+                    with c.tx() as db:
+                        from .parked_retirement import retired
+                        if retired(db, session=actor, request_id=params['job_id']):
+                            raise CoordError('retired or quarantined native actor or job; new native input withheld')
+                        if metadata:
+                            from .management import assert_parked_active, parked_creation
+                            scope = db.execute('SELECT * FROM session_resets WHERE id=?', (params['job_id'],)).fetchone()
+                            proof = parked_creation(db, params['job_id'])
+                            if not self.roots or not registry or not scope or not proof or self.project_id != proof['project_id'] or (scope['status'],scope['target_session'],scope['new_thread_id'],scope['host_id']) != ('materializing',actor,thread,host):
+                                raise CoordError('parked materialization native epoch scope changed')
+                            assert_parked_active(db, params['job_id'])
+                            if 'bootstrap_id' in proof.keys():
+                                from .turnover_bootstrap import authorize_subordinate
+                                authorize_subordinate(db, registry, proof['bootstrap_id'], scope['requester_session'], scope['old_thread_id'], host, scope['requested_model'], scope['requested_effort'])
+                            else:
+                                row = registry.execute('SELECT session_id,orchestrator_session,joined,request_id FROM root_projects WHERE project_id=?', (self.project_id,)).fetchone()
+                                stops = registry.execute('SELECT id,root_session FROM root_team_operations WHERE resumed_at IS NULL').fetchall()
+                                original = registry.execute('SELECT root_session FROM root_team_operation_projects WHERE request_id=? AND project_id=?', (proof['stop_id'],self.project_id)).fetchone()
+                                root = db.execute('SELECT home_session FROM root_projections WHERE session_id=?', (proof['root_session'],)).fetchone()
+                                if not (row and original and root and row['joined'] and row['session_id'] == proof['root_session'] and row['orchestrator_session'] == proof['target_session'] and row['request_id'] == proof['request_id'] and len(stops) == 1 and tuple(stops[0]) == (proof['stop_id'],root['home_session']) and original['root_session'] == proof['root_session']):
+                                    raise CoordError('parked materialization registry scope changed')
+                        if grant and not metadata:
+                            from .turnover_bootstrap import authorized
+                            scope = authorized(db, registry, params['job_id'])
+                            expected = 'adding' if params['method'] == 'thread/queue/add' else 'starting'
+                            if (scope['status'],scope['target_session'],scope['new_thread_id'],scope['host_id']) != (expected,actor,thread,host):
+                                raise CoordError('turnover bootstrap native epoch scope changed')
+                        from .supervisor import cold_epoch_check
+                        cold_epoch_check(c, db, method=params['method'], thread=thread, actor=actor,
+                                         host=host, wake_id=params['job_id'])
+                        state.manager_update_epoch_check(thread, params['job_id'], actor, params['method'])
+                        return execution_epoch_handoff(db,params['method'],thread,actor,host,owner)
+                if grant or metadata:
+                    with self.roots.projects.connection() as registry:
+                        registry.execute('BEGIN IMMEDIATE')
+                        identifier = issue_epoch(registry)
+                        registry.commit()
+                else:
+                    identifier = issue_epoch()
+            except CoordError as error:
+                from .supervisor import reject_cold_epoch
+                with c.tx() as db:
+                    rejected=reject_cold_epoch(db, method=params['method'],thread=params['thread'],actor=params['actor'],
+                                               host=host,wake_id=params['job_id'],reason=error)
+                    claimed = bool(c.db.execute('SELECT 1 FROM manager_update_claims WHERE job_id=?',
+                                                 (params['job_id'],)).fetchone())
+                if rejected or claimed:
+                    return {'rejected':str(error)}
+                raise
+            return {'id':identifier}
+        if op == 'execution-epoch-settle':
+            from .core import execution_epoch_settle
+            if set(params)!={'id','outcome'}: raise CoordError('invalid native epoch settlement')
+            with c.tx() as db: execution_epoch_settle(db,params['id'],host,params['outcome'],owner)
+            return {'settled':True}
         raise CoordError('unsupported bridge operation')

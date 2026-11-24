@@ -38,8 +38,18 @@ class SupervisorNoticeTests(fixtures.SupervisorWorkflowTests):
         self.call('supervisor-configure',session='root-notice',enabled=True)
         self.call('supervisor-configure',session='root-notice',recovery_enabled=True)
         self.rpc.status[self.owner_thread]='notLoaded'
-        self.sample();self.sample(61)
+        self.sample()
+        if already_enabled:
+            self.assertEqual(self.rpc.status[self.owner_thread], 'notLoaded')
+            self.sample(61)  # Confirm persistence before admission.
+        self.assertEqual(self.rpc.status[self.owner_thread], 'idle')
+        self.assertTrue(any(method=='thread/resume' and params.get('threadId')==self.owner_thread for method,params in self.rpc.calls))
+        if not already_enabled:
+            self.rpc.status[self.owner_thread]='notLoaded'  # Simulate a later unload before delivery.
+            self.sample(61);self.sample(61)
         before=self.root_target()['recovery']
+        if already_enabled:
+            self.assertEqual(before['wake_id'], self.prepared['id'])
         self.assertEqual(before['native_consumption'],'pending')
         self.assertNotIn('source_reporting',before)
         self.bridge.tick();self.sample(61)
@@ -100,7 +110,18 @@ class SupervisorNoticeTests(fixtures.SupervisorWorkflowTests):
                 coord.db.execute('INSERT INTO sessions(id,agent,registered_at) VALUES(?,?,?)',('system:supervisor','legacy-shadow',self.now))
 
     def test_legacy_authentic_notice_ack_without_message_or_native_replay(self):
-        notice=self.consumed_notice();self.ack_notice(notice)
+        notice=self.consumed_notice()
+        evidence=self.root_target()['recovery']['source_reporting_evidence']
+        self.assertTrue(evidence['complete'])
+        self.assertEqual(evidence['state'],'complete')
+        self.assertEqual(evidence['deliveries'][0]['original_message_id'],notice['id'])
+        self.assertEqual(evidence['deliveries'][0]['recipient_session'],'b')
+        self.assertEqual(evidence['deliveries'][0]['factual_result'],'UNRECORDED')
+        self.assertNotIn('Original independent worker task',str(evidence))
+        self.ack_notice(notice)
+        evidence=self.root_target()['recovery']['source_reporting_evidence']
+        self.assertEqual(evidence['deliveries'][0]['transport_ack']['state'],'acknowledged')
+        self.assertEqual(evidence['deliveries'][0]['ack_reply']['state'],'unrecorded')
         with contextlib.closing(Coordinator(self.db)) as coord:
             before=tuple(coord.db.execute('SELECT id,body,acked_at FROM messages WHERE id=?',(notice['id'],)).fetchone())
         calls=list(self.rpc.calls)

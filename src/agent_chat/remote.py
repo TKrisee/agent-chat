@@ -11,9 +11,10 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from .core import CoordError, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE
+from .core import CoordError, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE, MAX_MODEL_ATTACHMENT_SIZE
 
 MAX_RESPONSE_BYTES = 60 * 1024 * 1024
+MAX_ATTACHMENT_DOWNLOAD_RESPONSE_BYTES = 4 * ((MAX_MODEL_ATTACHMENT_SIZE + 2) // 3) + 1024 * 1024
 # Each file expands to four base64 bytes per three input bytes, plus RPC metadata.
 MAX_COORD_REQUEST_BYTES = MAX_ATTACHMENTS * (4 * ((MAX_ATTACHMENT_SIZE + 2) // 3)) + 1024 * 1024
 INBOX_TRACE_HEADER = 'X-Agent-Chat-Inbox-Trace'
@@ -21,6 +22,12 @@ INBOX_TRACE_HEADER = 'X-Agent-Chat-Inbox-Trace'
 
 class RemoteCoordError(CoordError):
     """The remote coordinator could not safely complete a request."""
+
+
+class RemoteCurrentnessNoEffect(RemoteCoordError):
+    def __init__(self, message, recovery):
+        super().__init__(message)
+        self.recovery = recovery
 
 
 def _loopback(host: str) -> bool:
@@ -130,11 +137,14 @@ class HttpClient:
             headers[INBOX_TRACE_HEADER] = inbox_trace_id
         if self.token:
             headers["Authorization"] = "Bearer " + self.token
+        response_limit = (MAX_ATTACHMENT_DOWNLOAD_RESPONSE_BYTES
+            if path == '/api/coord' and payload.get('op') == 'attachment-download'
+            else MAX_RESPONSE_BYTES)
         request = urllib.request.Request(self.server_url + path, data=encoded, headers=headers, method="POST")
         self._event('operation_start', run_id=run_id, inbox_trace_id=inbox_trace_id)
         try:
             with self._opener.open(request, timeout=self.timeout) as response:
-                data = response.read(MAX_RESPONSE_BYTES + 1)
+                data = response.read(response_limit + 1)
         except RemoteCoordError as error:
             self._error('operation_failed', error, run_id=run_id, inbox_trace_id=inbox_trace_id)
             raise
@@ -142,10 +152,28 @@ class HttpClient:
             with error:
                 data = error.read(MAX_RESPONSE_BYTES + 1)
             try:
-                message = json.loads(data.decode("utf-8")).get("error", error.reason)
+                response = json.loads(data.decode("utf-8"))
+                message = response.get("error", error.reason)
             except (ValueError, UnicodeDecodeError, AttributeError):
-                message = error.reason
-            wrapped = RemoteCoordError("remote coordinator rejected request: " + str(message))
+                response, message = {}, error.reason
+            recovery = response.get('recovery') if isinstance(response, dict) else None
+            expected = payload.get('params', {})
+            valid = (error.code == 400 and path == '/api/coord' and payload.get('op') == 'exact-file-request'
+                     and isinstance(expected, dict) and isinstance(recovery, dict)
+                     and isinstance(expected.get('binding_id'), str) and bool(expected.get('binding_id'))
+                     and recovery.get('kind') == 'inbox_currentness'
+                     and recovery.get('action') == 'exact-file-request'
+                     and recovery.get('owner_session') == payload.get('session')
+                     and recovery.get('host_id') == payload.get('host_id')
+                     and recovery.get('project_id') == self.project
+                     and recovery.get('binding_id') == expected.get('binding_id')
+                     and recovery.get('path') == expected.get('path')
+                     and recovery.get('minutes') == expected.get('minutes')
+                     and recovery.get('eligibility_unverified') is True
+                     and recovery.get('requested_effect_absent') is True
+                     and isinstance(recovery.get('next_action'), str))
+            description = "remote coordinator rejected request: " + str(message)
+            wrapped = RemoteCurrentnessNoEffect(description, recovery) if valid else RemoteCoordError(description)
             category = {400: 'validation', 401: 'authentication', 403: 'authorization'}.get(error.code, 'coordination')
             self._event('operation_failed', level='ERROR', run_id=run_id,
                         inbox_trace_id=inbox_trace_id, error_category=category)
@@ -155,7 +183,7 @@ class HttpClient:
             logged_error = error.reason if isinstance(error, urllib.error.URLError) and isinstance(error.reason, BaseException) else error
             self._error('transport_failed', logged_error, run_id=run_id, inbox_trace_id=inbox_trace_id)
             raise wrapped from error
-        if len(data) > MAX_RESPONSE_BYTES:
+        if len(data) > response_limit:
             error = RemoteCoordError("remote coordinator response is too large")
             self._event('operation_failed', level='ERROR', run_id=run_id,
                         inbox_trace_id=inbox_trace_id, error_category='validation')

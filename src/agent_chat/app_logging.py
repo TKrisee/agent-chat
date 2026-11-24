@@ -19,7 +19,9 @@ COMPONENTS = frozenset(('agent_chat.server', 'agent_chat.web', 'agent_chat.coord
                         'agent_chat.service', 'agent_chat.cli', 'agent_chat.remote'))
 EVENTS = frozenset(('startup', 'shutdown', 'request_start', 'request_complete',
                     'request_rejected', 'operation_start', 'operation_complete',
-                    'operation_failed', 'transport_failed', 'configuration_invalid', 'sink_failure'))
+                    'operation_failed', 'transport_failed', 'configuration_invalid', 'sink_failure',
+                    'approval_response_sent', 'approval_response_uncertain', 'approval_resolved',
+                    'approval_completed', 'approval_expired', 'approval_disconnected'))
 ERROR_CATEGORIES = frozenset(('timeout', 'transport', 'authentication', 'authorization',
                             'validation', 'coordination', 'io', 'internal'))
 RECORD_BYTES = 4096

@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import os
+import subprocess
 from pathlib import Path
 import uuid
 from unittest import mock
@@ -106,6 +107,8 @@ class CreationWorkspaceTests(RemoteWebFixture):
             return dict(coord.db.execute('SELECT * FROM session_resets WHERE id=?', (job_id,)).fetchone())
 
     def legacy_created(self):
+        # This scenario needs a readable candidate to reach settings revalidation.
+        self.rpc.unmaterialized = False
         job = self.create()
         source, _ = settings_data(self.rpc.original)
         desired = creation_settings(source, job, job['requested_cwd'])
@@ -156,8 +159,24 @@ class CreationWorkspaceTests(RemoteWebFixture):
     def status_exists(self):
         return any(row['agent'] == 'world' for row in self.call('agents')['agents'])
 
+    def capture_candidate_readback(self):
+        # The fake provider's later readback starts as its actual start result.
+        original_request = self.rpc.request
+        started = {}
+        def readback(method, params):
+            result = original_request(method, params)
+            if method == 'thread/start':
+                started.update(copy.deepcopy(result))
+            elif method == 'thread/resume' and params.get('threadId') == self.rpc.new:
+                result = copy.deepcopy(started)
+            return result
+        self.rpc.request = readback
+        return started
+
     def test_owner_cli_recovers_same_created_candidate_once_without_replacement(self):
+        started = self.capture_candidate_readback()
         job = self.legacy_created()
+        self.assertEqual(started['thread']['id'], job['new_thread_id'])
         self.assertEqual(self.run_cli(), 0)
         self.assertTrue(self.status()['resets'][0]['workspace_revalidated'])
         self.assertEqual(self.run_cli(), 0)  # Lost response/repeated command is read-only.
@@ -168,12 +187,32 @@ class CreationWorkspaceTests(RemoteWebFixture):
         self.assertEqual(len(self.rpc.history[self.rpc.new]), 1)
         self.assertEqual(sum(method == 'thread/start' for method, _ in self.rpc.calls), 1)
 
+    def test_changed_candidate_readback_after_revalidation_stays_withheld(self):
+        started = self.capture_candidate_readback()
+        job = self.legacy_created()
+        self.assertEqual(self.run_cli(), 0)
+        # Explicitly synthetic drift must still trip the real worker guard.
+        started['sandbox'] = {'type': 'dangerFullAccess'}
+        self.bridge.tick()
+        self.assertEqual(self.status()['resets'][0]['status'], 'created')
+        self.assertIn('settings differ', self.status()['resets'][0]['error'])
+        self.assertIsNone(self.status()['thread_id'])
+        self.assertFalse(any(method == 'thread/queue/add' for method, _ in self.rpc.calls))
+        self.assertEqual(sum(method == 'thread/start' for method, _ in self.rpc.calls), 1)
+        self.assertEqual(self.rpc.new, job['new_thread_id'])
+
     def test_project_orchestrator_revalidates_its_own_unbound_created_candidate(self):
         job = self.legacy_created()
         self.mark_project_orchestrator()
         before = self.creation_row(job['id'])
         self.assertIsNone(self.status()['thread_id'])
         proof = self.proof(job)
+        self.assertNotEqual(proof['source']['model'],job['requested_model'])
+        from agent_chat.core import Coordinator
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            observed = coord.db.execute('SELECT permissions_json FROM agent_control_observations WHERE target_session=? AND thread_id=?',('a',self.old)).fetchone()[0]
+        checked = subprocess.run(['jq','-e','--arg','provider',proof['source']['modelProvider'],'.modelProvider == $provider'],input=observed,text=True,capture_output=True)
+        self.assertEqual(checked.returncode,0,checked.stderr or checked.stdout)
         before_mutations = self.mutation_calls()
         self.revalidate(proof)
         after = self.creation_row(job['id'])
@@ -282,6 +321,76 @@ class CreationWorkspaceTests(RemoteWebFixture):
             self.revalidate(self.proof(job))
         self.assertFalse(self.rpc.history[self.rpc.new])
 
+    def assert_source_observation_withholds(self, field, value):
+        job = self.legacy_created()
+        proof = self.proof(job)
+        before = self.mutation_calls()
+        self.rpc.original[field] = value
+        self.call('agent-status', refresh=True, expected_thread=self.old, request_id=str(uuid.uuid4()))
+        self.bridge.tick()
+        if field == 'modelProvider':
+            from agent_chat.core import Coordinator
+            with contextlib.closing(Coordinator(self.db)) as coord:
+                raw = coord.db.execute('SELECT permissions_json FROM agent_control_observations WHERE target_session=? AND thread_id=?',('a', self.old)).fetchone()[0]
+            expected = 'null' if value is None else value
+            expression = '.modelProvider == null' if value is None else '.modelProvider == $provider'
+            checked = subprocess.run(['jq','-e','--arg','provider',expected,expression], input=raw, text=True, capture_output=True)
+            self.assertEqual(checked.returncode,0,checked.stderr or checked.stdout)
+        reason = 'refresh the original requester inspection' if field == 'modelProvider' and value is None else 'source settings do not match'
+        with self.assertRaisesRegex(RemoteCoordError, reason):
+            self.revalidate(proof)
+        self.assertEqual(self.mutation_calls(), before)
+        self.assertFalse(self.status()['resets'][0]['workspace_revalidated'])
+        self.assertIsNone(self.status()['thread_id'])
+
+    def test_changed_authenticated_source_provider_is_rejected(self):
+        self.assert_source_observation_withholds('modelProvider', 'other-provider')
+
+    def test_missing_authenticated_source_provider_is_rejected(self):
+        self.assert_source_observation_withholds('modelProvider', None)
+
+    def test_changed_authenticated_source_model_is_rejected(self):
+        self.assert_source_observation_withholds('model', 'other-model')
+
+    def test_changed_authenticated_source_effort_is_rejected(self):
+        self.assert_source_observation_withholds('reasoningEffort', 'low')
+
+    def test_changed_authenticated_source_sandbox_is_rejected(self):
+        self.assert_source_observation_withholds('sandbox', {'type':'dangerFullAccess'})
+
+    def test_changed_authenticated_source_roots_are_rejected(self):
+        self.assert_source_observation_withholds('runtimeWorkspaceRoots', ['/tmp/other-root'])
+
+    def test_legacy_observation_without_provider_requires_fresh_inspection(self):
+        from agent_chat.core import Coordinator
+        job = self.legacy_created(); proof = self.proof(job); before = self.mutation_calls()
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            raw = coord.db.execute('SELECT permissions_json FROM agent_control_observations WHERE target_session=? AND thread_id=?',('a', self.old)).fetchone()[0]
+            legacy = subprocess.run(['jq','-c','del(.modelProvider)'],input=raw,text=True,capture_output=True,check=True).stdout
+            coord.db.execute('UPDATE agent_control_observations SET permissions_json=? WHERE target_session=? AND thread_id=?',(legacy,'a',self.old))
+        with self.assertRaisesRegex(RemoteCoordError, 'refresh the original requester inspection'):
+            self.revalidate(proof)
+        self.assertEqual(self.mutation_calls(),before)
+        self.assertIsNone(self.status()['thread_id'])
+
+    def test_missing_source_proof_provider_cannot_revalidate(self):
+        job = self.legacy_created(); proof = self.proof(job); before = self.mutation_calls()
+        proof['source']['modelProvider'] = None
+        with self.assertRaisesRegex(RemoteCoordError, 'complete settings'):
+            self.revalidate(proof)
+        self.assertEqual(self.mutation_calls(),before)
+        self.assertIsNone(self.status()['thread_id'])
+
+    def test_legacy_null_permissions_require_fresh_inspection(self):
+        from agent_chat.core import Coordinator
+        job = self.legacy_created(); proof = self.proof(job); before = self.mutation_calls()
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            coord.db.execute('UPDATE agent_control_observations SET permissions_json=NULL WHERE target_session=? AND thread_id=?',('a',self.old))
+        with self.assertRaisesRegex(RemoteCoordError, 'refresh the original requester inspection'):
+            self.revalidate(proof)
+        self.assertEqual(self.mutation_calls(),before)
+        self.assertIsNone(self.status()['thread_id'])
+
     def test_existing_input_busy_or_unknown_history_withholds_cli_revalidation(self):
         job = self.legacy_created()
         self.rpc.queues[self.rpc.new] = [{'id': 'other'}]
@@ -331,7 +440,24 @@ class WorkspaceProfileCreationTests(RemoteWebFixture):
     def status(self):
         return self.call('session-reset-status', to='world')
 
+    def readable_started_thread(self, field=None, value=None):
+        self.rpc.unmaterialized = False
+        request = self.rpc.request
+        started = {}
+        def observed(method, params):
+            result = request(method, params)
+            if method == 'thread/start':
+                if field is not None:
+                    result[field] = copy.deepcopy(value)
+                started.update(copy.deepcopy(result))
+            elif method == 'thread/resume' and params.get('threadId') == self.rpc.new:
+                result = copy.deepcopy(started)
+            return result
+        self.rpc.request = observed
+        return started
+
     def test_singleton_workspace_child_completes_without_parent_secondary_roots(self):
+        self.readable_started_thread()
         job = self.create()
         self.bridge.tick()
         status = self.status()
@@ -352,13 +478,9 @@ class WorkspaceProfileCreationTests(RemoteWebFixture):
         ):
             with self.subTest(field=field):
                 self.setUp()
-                request = self.rpc.request
-                def mismatched_start(method, params):
-                    result = request(method, params)
-                    if method == 'thread/start': result[field] = copy.deepcopy(value)
-                    return result
-                self.rpc.request = mismatched_start
+                started = self.readable_started_thread(field, value)
                 self.create(); self.bridge.tick()
+                self.assertEqual(started[field], value)
                 self.assertEqual(self.status()['resets'][0]['status'], 'created')
                 self.assertIn('settings differ', self.status()['resets'][0]['error'])
                 self.assertIsNone(self.status()['thread_id'])

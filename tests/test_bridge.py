@@ -122,6 +122,9 @@ class BridgeTests(unittest.TestCase):
         self.rpc = FakeRpc()
         self.bridge = Bridge(self.state, self.rpc)
 
+    def test_normal_epoch_check_never_requires_optional_activity_schema(self):
+        self.state.manager_update_epoch_check(self.thread, 'ordinary-job', 'worker', 'turn/steer')
+
     def coord(self, session, label):
         coord = Coordinator(self.db, session)
         coord.register(label)
@@ -136,6 +139,25 @@ class BridgeTests(unittest.TestCase):
 
     def job(self):
         return dict(self.agent.db.execute('SELECT * FROM bridge_jobs ORDER BY created_at DESC LIMIT 1').fetchone())
+
+    def test_original_owner_fence_blocks_queued_wake_before_native_rpc(self):
+        from agent_chat.original_owner_disposition import _schema
+        self.send()
+        pending = self.state.pending()
+        job = self.state.prepare(self.thread, pending, self.bridge.payload(self.thread, pending))
+        self.state.update(job['id'], 'queued', queue_id='existing-native-queue')
+        self.rpc.entries = [{'id': 'existing-native-queue', 'clientUserMessageId': job['id']}]
+        # Deny-only state fixture: real custody/API creation is separately tested.
+        _schema(self.agent.db)
+        self.agent.db.execute('INSERT INTO original_owner_dispositions VALUES(?,?,?,?,?,?,?,?)',
+            ('deny-fixture', 'worker', 'deny-rid', '{}', '{}', '{}', '{}', 0))
+        before = self.job()
+        with self.assertRaisesRegex(CoordError, 'quarantine is active'):
+            self.bridge.advance(self.state.job(job['id']))
+        self.assertEqual(self.job(), before)
+        self.assertEqual(self.count('thread/queue/add'), 0)
+        self.assertEqual(self.count('thread/queue/start'), 0)
+        self.assertEqual(self.count('turn/start'), 0)
 
     def test_pristine_proof_survives_neither_native_attempt_nor_explicit_retry(self):
         self.send()
@@ -278,6 +300,131 @@ class BridgeTests(unittest.TestCase):
         self.bridge.tick()
         self.assertEqual(self.count('thread/queue/start'), 1)
         self.assertFalse(any(m in ('turn/start', 'turn/steer', 'thread/resume') for m, _ in self.rpc.calls))
+
+    def test_warm_idle_recipient_dispatches_before_an_unrelated_slow_busy_job(self):
+        other = self.coord('other', 'other')
+        other_thread = str(uuid.uuid4())
+        other_state = BridgeState(other)
+        other_state.bind(thread_id=other_thread)
+        self.operator.send('other', 'deferred work')
+        other_state.prepare(other_thread, other_state.pending(), 'deferred payload')
+        self.send()
+        original, events = self.rpc.request, []
+        def request(method, params):
+            events.append((method, params.get('threadId')))
+            if method == 'thread/read' and params.get('threadId') == other_thread:
+                return {'thread': {'status': {'type': 'active'}, 'canAcceptDirectInput': True}}
+            return original(method, params)
+        self.rpc.request = request
+        self.bridge.tick()
+        warm_start = next(index for index, event in enumerate(events)
+                          if event == ('thread/queue/start', self.thread))
+        slow_busy_read = next(index for index, event in enumerate(events)
+                              if event == ('thread/read', other_thread))
+        self.assertLess(warm_start, slow_busy_read)
+        self.assertEqual(other_state.jobs()[0]['status'], 'prepared')
+
+    def test_interleaved_parent_child_messages_batch_before_unrelated_busy_job(self):
+        child = self.coord('child', 'worker/child')
+        BridgeState(child).bind(parent_session='worker', agent_path='/root/child')
+        other = self.coord('other', 'other')
+        other_thread = str(uuid.uuid4())
+        other_state = BridgeState(other)
+        other_state.bind(thread_id=other_thread)
+        self.operator.send('other', 'deferred work')
+        other_state.prepare(other_thread, other_state.pending(), 'deferred payload')
+        first = self.send()
+        middle = self.send('child')
+        last = self.send()
+        original, events = self.rpc.request, []
+        def request(method, params):
+            events.append((method, params.get('threadId')))
+            if method == 'thread/read' and params.get('threadId') == other_thread:
+                return {'thread': {'status': {'type': 'active'}, 'canAcceptDirectInput': True}}
+            return original(method, params)
+        self.rpc.request = request
+        self.bridge.tick()
+        metadata = self.job()['payload'].split('\n')[-1]
+        deliveries = subprocess.run(['jq', '-er', '.deliveries[].message_id'], input=metadata,
+                                   text=True, capture_output=True, check=True).stdout.splitlines()
+        self.assertEqual(deliveries, [first, middle, last])
+        self.assertLess(next(i for i, event in enumerate(events) if event == ('thread/queue/start', self.thread)),
+                        next(i for i, event in enumerate(events) if event == ('thread/read', other_thread)))
+
+    def test_existing_same_thread_job_remains_ahead_of_later_inbox_work(self):
+        first = self.send()
+        self.state.prepare(self.thread, self.state.pending(), self.bridge.payload(
+            self.thread, self.state.pending()))
+        second = self.send()
+        self.bridge.tick()
+        self.assertEqual(self.count('thread/queue/add'), 1)
+        self.assertEqual(self.count('thread/queue/start'), 1)
+        payload = next(params for method, params in self.rpc.calls
+                       if method == 'thread/queue/add')['input'][0]['text']
+        self.assertIn(first, payload)
+        self.assertNotIn(second, payload)
+
+    def test_grouping_resolves_each_recipient_once_before_native_eligibility(self):
+        for _ in range(3):
+            self.send()
+        original, calls, boundary = self.state.resolve, [], []
+        def resolve(session):
+            calls.append(session)
+            return original(session)
+        def idle(thread):
+            boundary.append(list(calls))
+            return self.rpc.status == 'idle' and self.rpc.direct
+        with mock.patch.object(self.state, 'resolve', side_effect=resolve), \
+                mock.patch.object(self.bridge, 'idle', side_effect=idle):
+            self.bridge.tick(observe_policies=False)
+        self.assertEqual(boundary[0], ['worker'])
+        self.assertEqual(self.job()['status'], 'dispatched')
+
+    def test_rebind_after_grouping_is_rechecked_before_prepare(self):
+        self.send(); self.send()
+        old_thread, new_thread = self.thread, str(uuid.uuid4())
+        original_idle, changed = self.bridge.idle, []
+        def rebind(thread):
+            if thread == old_thread and not changed:
+                self.agent.db.execute('UPDATE bridge_bindings SET thread_id=? WHERE session_id=?',
+                                      (new_thread, 'worker'))
+                changed.append(True)
+            return original_idle(thread)
+        with mock.patch.object(self.bridge, 'idle', side_effect=rebind):
+            self.bridge.tick(observe_policies=False)
+        self.assertTrue(changed)
+        self.assertEqual(self.state.jobs(), [])
+        self.assertEqual(self.count('thread/queue/start'), 0)
+        self.bridge.tick(observe_policies=False)
+        self.assertEqual(self.job()['thread_id'], new_thread)
+        self.assertEqual(self.job()['status'], 'dispatched')
+
+    def test_stop_after_grouping_is_rechecked_before_prepare(self):
+        self.send(); self.send()
+        original_idle, changed = self.bridge.idle, []
+        def stop(thread):
+            if not changed:
+                self.agent.db.execute("INSERT INTO agent_controls VALUES('worker','stopping',0) "
+                                      "ON CONFLICT(target_session) DO UPDATE SET mode='stopping'")
+                changed.append(True)
+            return original_idle(thread)
+        with mock.patch.object(self.bridge, 'idle', side_effect=stop):
+            with self.assertRaises(CoordError):
+                self.bridge.tick(observe_policies=False)
+        self.assertTrue(changed)
+        self.assertEqual(self.state.jobs(), [])
+        self.assertEqual(self.count('thread/queue/start'), 0)
+
+    def test_grouping_retries_a_missing_route_instead_of_caching_it(self):
+        self.send(); self.send()
+        original, calls = self.state.resolve, []
+        def resolve(session):
+            calls.append(session)
+            return None if len(calls) == 1 else original(session)
+        with mock.patch.object(self.state, 'resolve', side_effect=resolve):
+            self.bridge.tick(observe_policies=False)
+        self.assertEqual(calls[:2], ['worker', 'worker'])
+        self.assertEqual(self.job()['status'], 'dispatched')
 
     def test_unknown_thread_does_not_starve_other_recipients(self):
         self.send()
@@ -422,8 +569,10 @@ class BridgeTests(unittest.TestCase):
         BridgeState(other).bind(thread_id=tid)
         other_message = self.send('other')
         if prepare_other:
-            self.state.prepare(tid, [{'id': other_message, 'recipient_session': 'other'}], 'payload')
+            messages = [{'id': other_message, 'recipient_session': 'other'}]
+            self.state.prepare(tid, messages, Bridge(self.state, self.rpc).payload(tid, messages))
         connections = []
+        corrupted_threads, healthy_history_threads = [], []
         def handler(sock):
             connections.append(True)
             _initialize(sock)
@@ -432,12 +581,23 @@ class BridgeTests(unittest.TestCase):
                 if opcode == 8:
                     return
                 request = json.loads(body)
-                if request['method'] == 'thread/turns/list':
+                if request['method'] == 'thread/turns/list' and request['params']['threadId'] == self.thread:
+                    corrupted_threads.append(request['params']['threadId'])
                     # Leave unread body bytes on the rejected connection.
                     sock.sendall(b'\x81\x7f' + struct.pack('!Q', _MAX_MESSAGE + 1) + b'{"id":')
-                    self.assertEqual(_frame(sock)[0], 8)
+                    # Fatal reader errors abort the socket immediately; an
+                    # explicit graceful close may instead supply a close frame.
+                    try:
+                        opcode = _frame(sock)[0]
+                    except EOFError:
+                        return
+                    self.assertEqual(opcode, 8)
                     return
                 result = self.rpc.request(request['method'], request['params'])
+                if request['method'] == 'thread/turns/list':
+                    healthy_history_threads.append(request['params']['threadId'])
+                    # A healthy policy-history response is not another injected fault.
+                    result['data'][0].update(id='healthy-history', status='completed', error=None)
                 _send(sock, 1, json.dumps({'id': request['id'], 'result': result}).encode())
         server = FakeServer(handler, connections=2)
         try:
@@ -447,6 +607,8 @@ class BridgeTests(unittest.TestCase):
         finally:
             server.join()
         self.assertEqual(len(connections), 2)
+        self.assertEqual(corrupted_threads, [self.thread])
+        self.assertEqual(healthy_history_threads, [tid])
         self.assertEqual(self.state.job(broken['id'])['status'], 'queued')
         other_job = self.agent.db.execute('SELECT status FROM bridge_jobs WHERE thread_id=?', (tid,)).fetchone()
         self.assertEqual(other_job['status'], 'dispatched')

@@ -1,4 +1,4 @@
-import json
+import subprocess
 import os
 import tempfile
 import threading
@@ -22,8 +22,12 @@ class InboxDiagnosticsTests(unittest.TestCase):
     def wait_lines(self, path, count=1):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
-            if path.exists() and len(path.read_text().splitlines()) >= count:
-                return [json.loads(line) for line in path.read_text().splitlines()]
+            if path.exists():
+                result = subprocess.run(['jq', '-s', '-e', '--argjson', 'count', str(count),
+                    'length >= $count and all(.[]; type == "object")', str(path)],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode == 0:
+                    return
             time.sleep(.01)
         self.fail('diagnostic sink did not drain')
 
@@ -36,14 +40,18 @@ class InboxDiagnosticsTests(unittest.TestCase):
         trace.mark('dispatch', 'start')
         trace.mark('dispatch', 'end')
         sink.close()
-        rows = self.wait_lines(self.path, 3)
-        required = {'request_id', 'sequence', 'phase', 'edge', 'outcome', 'wall_time', 'monotonic_time', 'elapsed_ms'}
-        self.assertTrue(all(required <= set(row) <= required | {'dropped'} for row in rows))
-        self.assertEqual([row['sequence'] for row in rows], [1, 2, 3])
-        self.assertTrue(all(row['request_id'] == trace_id for row in rows))
+        self.wait_lines(self.path, 3)
+        predicate = '''
+          [.[].sequence] == [1,2,3] and
+          all(.[]; .request_id == $id and
+            ((keys - ["request_id","sequence","phase","edge","outcome","wall_time","monotonic_time","elapsed_ms","dropped"]) | length == 0) and
+            (["request_id","sequence","phase","edge","outcome","wall_time","monotonic_time","elapsed_ms"] - keys | length == 0) and
+            (has("header") | not) and (has("payload") | not)) and
+          ([.. | strings, (objects | keys[])] | all(.[]; (contains("header") or contains("payload")) | not))
+        '''
+        subprocess.run(['jq', '-s', '-e', '--arg', 'id', trace_id, predicate, str(self.path)],
+                       check=True, stdout=subprocess.DEVNULL)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
-        self.assertNotIn('header', self.path.read_text())
-        self.assertNotIn('payload', self.path.read_text())
 
     def test_ttl_queue_drop_rotation_and_sink_failure_are_isolated(self):
         now = [0.0]
@@ -67,7 +75,13 @@ class InboxDiagnosticsTests(unittest.TestCase):
 
         bounded = InboxDiagnostics(Path(self.temp.name) / 'bounded.jsonl')
         release = threading.Event()
-        bounded._write = lambda _raw: release.wait(1)
+        entered = threading.Event()
+        def block_write(_raw):
+            entered.set()
+            release.wait(3)
+        bounded._write = block_write
+        bounded._queue.put_nowait(b'x')
+        self.assertTrue(entered.wait(2), 'private sink did not enter the bounded write')
         for _ in range(QUEUE_CAPACITY):
             bounded._queue.put_nowait(b'x')
         bounded.record({'request_id': str(uuid.uuid4()), 'sequence': 1, 'phase': 'handler', 'edge': 'start',

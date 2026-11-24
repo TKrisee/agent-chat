@@ -4,6 +4,12 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import html
+import hashlib
+import json
+import math
+import re
+import time
+import urllib.request
 import os
 from pathlib import Path
 import platform
@@ -20,6 +26,11 @@ from .app_logging import LoggingConfig, configure, new_correlation_id
 LABEL = "com.agent-chat"
 COMPONENTS = ("server", "client")
 LSREGISTER = "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+
+
+class _NoMaintenanceRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
 
 
 class ServiceError(RuntimeError):
@@ -221,6 +232,8 @@ class ServiceManager:
             ])
             command = [self.python, self.client_bin or _absolute_executable("agent-chat-client"), "bridge", "--codex-bin", args.codex_bin,
                        "--codex-server", args.codex_server]
+            if getattr(args, 'connect_only', False):
+                command.append('--connect-only')
             if args.project:
                 lines.append("export AGENT_CHAT_PROJECT=" + _quote(args.project))
                 command.extend(["--project", args.project])
@@ -321,9 +334,106 @@ class ServiceManager:
             else: self._call(["systemctl", "--user", "stop", "agent-chat-" + item + ".service"])
 
     def restart(self, component: str) -> None:
+        connect_only = False
+        if component == 'all':
+            try:
+                wrapper = self.paths('client')['wrapper'].read_text()
+                commands = [shlex.split(line[5:]) for line in wrapper.splitlines() if line.startswith('exec ')]
+                connect_only = (len(commands) == 1 and len(commands[0]) >= 3
+                                and commands[0][2] == 'bridge' and commands[0].count('--connect-only') == 1)
+            except (OSError, UnicodeError, ValueError):
+                pass  # Reporting must not change the existing restart behavior.
         for item in self._components(component):
             if self._platform() == "launchd": self._call(["launchctl", "kickstart", "-k", "gui/" + str(os.getuid()) + "/" + LABEL + "." + item])
             else: self._call(["systemctl", "--user", "restart", "agent-chat-" + item + ".service"])
+        if connect_only:
+            print('Configured client: connect-only. This command targets Agent Chat server/client; it does not request an external Codex-provider restart.', file=sys.stderr)
+
+    def _drain_binding(self):
+        config = _installed_server_config()
+        if self._platform() != 'launchd' or os.geteuid() != config.uid or config.uid != 501:
+            raise ServiceError('drain requires fixed installed macOS server account')
+        if configured_server_database(config.plist) != config.master:
+            raise ServiceError('drain fixed provider/store mismatch')
+        paths = (config.plist, config.wrapper, config.executable)
+        pins = tuple((str(path), hashlib.sha256(_trusted_regular_file(path, description='provider', uid=config.uid).read_bytes()).hexdigest()) for path in paths)
+        master = _trusted_regular_file(config.master, description='database', uid=config.uid).stat()
+        if stat.S_IMODE(master.st_mode) & 0o077:
+            raise ServiceError('drain database must be owner-private')
+        pins += (('store_identity', master.st_dev, master.st_ino, master.st_uid, stat.S_IMODE(master.st_mode)),)
+        token_path = Path(str(config.master) + '.api-token')
+        token_file = _trusted_regular_file(token_path, description='token sidecar', uid=config.uid)
+        if stat.S_IMODE(token_file.stat().st_mode) & 0o077:
+            raise ServiceError('drain token sidecar must be owner-private')
+        token = token_file.read_text().strip()
+        if not token:
+            raise ServiceError('drain token sidecar is empty')
+        return config, pins, token
+
+    def _maintenance_call(self, config, token, action, epoch=None):
+        data = dict(action=action)
+        if epoch is not None: data['epoch'] = epoch
+        request = urllib.request.Request('http://127.0.0.1:' + str(config.port) + '/api/server-maintenance',
+            data=json.dumps(data).encode(), headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json'}, method='POST')
+        # No redirect, environment proxy or alternate endpoint fallback.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoMaintenanceRedirect())
+        try:
+            with opener.open(request, timeout=2) as response:
+                raw = response.read(8193)
+                if response.status != 200 or len(raw) > 8192: raise ValueError()
+                result = json.loads(raw)
+        except Exception as error:
+            if hasattr(error, 'close'): error.close()
+            raise ServiceError('maintenance unavailable or outcome uncertain; no restart; reconcile before retry') from error
+        if (not isinstance(result, dict) or set(result) != {'instance','pid','epoch','active','sealed','state'}
+                or not isinstance(result['instance'], str) or not re.fullmatch('[0-9a-f]{32}', result['instance'])
+                or type(result['pid']) is not int or result['pid'] <= 0
+                or type(result['active']) is not int or result['active'] < 0
+                or type(result['sealed']) is not bool
+                or result['state'] not in ('open','draining','sealed')
+                or (result['epoch'] is not None and (not isinstance(result['epoch'], str) or not re.fullmatch('[0-9a-f]{32}', result['epoch'])))):
+            raise ServiceError('invalid maintenance response; no restart')
+        return result
+
+    def drain(self, component, *, timeout=30, restart=False, resume=False, inspect=False):
+        if component != 'server':
+            raise ServiceError('drain targets only the fixed server component')
+        if not math.isfinite(timeout) or not 0 < timeout <= 60:
+            raise ServiceError('drain timeout must be greater than zero and at most 60 seconds')
+        config, pins, token = self._drain_binding()
+        first = self._maintenance_call(config, token, 'status')
+        def same(value):
+            if (value['instance'], value['pid']) != (first['instance'], first['pid']):
+                raise ServiceError('server instance changed; no restart')
+            return value
+        if inspect: return first
+        if restart and (first['sealed'] or first['state'] == 'sealed'):
+            raise ServiceError('server initially sealed; reconcile previous restart; no retry')
+        if resume:
+            if not first['epoch']: raise ServiceError('server is not draining')
+            return same(self._maintenance_call(config, token, 'resume', first['epoch']))
+        current = same(self._maintenance_call(config, token, 'start'))
+        epoch = current['epoch']; deadline = time.monotonic() + timeout
+        if not epoch: raise ServiceError('drain did not start; no restart')
+        while current['active']:
+            if time.monotonic() >= deadline:
+                raise ServiceError('drain timed out; admission remains closed; no restart')
+            time.sleep(min(.05, max(0, deadline-time.monotonic())))
+            current = same(self._maintenance_call(config, token, 'status'))
+            if current['epoch'] != epoch: raise ServiceError('drain epoch changed; no restart')
+        if not restart: return current
+        current = same(self._maintenance_call(config, token, 'seal', epoch))
+        if current['epoch'] != epoch or current['active'] != 0 or current['state'] != 'sealed' or not current['sealed']:
+            raise ServiceError('server is not sealed and empty; no restart')
+        new_config, new_pins, new_token = self._drain_binding()
+        if config != new_config or pins != new_pins or token != new_token:
+            raise ServiceError('provider changed after drain; server remains sealed; no restart')
+        status = self.run(['launchctl', 'print', 'gui/501/' + LABEL + '.server'], check=True, capture_output=True, text=True)
+        pid = re.findall(r'^\s*pid = (\d+)\s*$', status.stdout, re.MULTILINE)
+        if pid != [str(current['pid'])]:
+            raise ServiceError('provider PID differs from sealed HTTP instance; no restart')
+        self._call(['launchctl', 'kickstart', '-k', 'gui/501/' + LABEL + '.server'])
+        return dict(current, restart_requested=True)
 
     def status(self, component: str) -> None:
         for item in self._components(component):
@@ -367,9 +477,19 @@ class ServiceManager:
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="agent-chat-service")
-    p.add_argument("action", choices=("install", "start", "stop", "restart", "status", "uninstall"))
+    p.add_argument("action", choices=("install", "start", "stop", "restart", "status", "uninstall", "drain", "drain-restart", "drain-resume", "drain-status", "graceful-inspect", "graceful-restart", "graceful-status", "provider-handoff-run", "provider-handoff-status", "provider-handoff-reconcile", "provider-handoff-force", "provider-handoff-force-run", "provider-image-baseline", "provider-image-admit", "provider-image-rollover", "provider-image-upgrade"))
     p.add_argument("--component", choices=("server", "client", "all"), default="all")
     p.add_argument("--no-start", action="store_true")
+    p.add_argument("--drain-timeout", type=float, default=30)
+    p.add_argument('--request-id', help='durable graceful client request UUID; never change it to retry an uncertain signal')
+    p.add_argument('--provider-manifest')
+    p.add_argument('--provider-manifest-sha256')
+    p.add_argument('--previous-provider-sha256')
+    p.add_argument('--provider-source-id')
+    p.add_argument('--expected-pid', type=int)
+    p.add_argument('--expected-start', help='exact process start returned by graceful-inspect')
+    p.add_argument('--expected-config-sha', help='exact config_sha256 returned by graceful-inspect')
+    p.add_argument('--graceful-timeout', type=float, default=30)
     home = Path.home()
     p.add_argument("--db", default=str(home / ".local" / "share" / "agent-chat" / "state.sqlite3"))
     p.add_argument("--server", default="http://127.0.0.1:8765")
@@ -377,6 +497,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--state-dir", default=str(home / ".local" / "state" / "agent-chat"))
     p.add_argument("--codex-bin", default=shutil.which("codex") or "codex")
     p.add_argument("--codex-server", default="ws://127.0.0.1:4500")
+    p.add_argument("--connect-only", action="store_true", help="attach the client to an existing Codex app-server without starting or owning it")
     p.add_argument("--token-file")
     p.add_argument("--inbox-diagnostics")
     p.add_argument("--log-level", choices=("OFF", "ERROR", "WARNING", "INFO", "DEBUG"), default="OFF")
@@ -399,12 +520,88 @@ def _main(argv=None) -> int:
     for name in ("db", "project_root", "state_dir", "token_file"):
         if getattr(args, name, None): setattr(args, name, _absolute(getattr(args, name)))
     try:
-        if args.action == "install" and args.component in ("client", "all"):
+        if args.action == "install" and args.component in ("client", "all") and not args.connect_only:
             codex = shutil.which(args.codex_bin) if not Path(args.codex_bin).is_absolute() else args.codex_bin
             if not codex: raise ServiceError("cannot find codex; pass --codex-bin with an absolute path")
             args.codex_bin = _absolute(codex)
         manager = ServiceManager()
-        getattr(manager, args.action)(args if args.action == "install" else args.component)
+        if args.action in ('provider-image-baseline','provider-image-admit','provider-image-rollover','provider-image-upgrade'):
+            if manager._platform() != 'launchd':
+                raise ServiceError('provider image admission requires launchd')
+            from . import provider_image_admission, provider_service
+            try:
+                directory=provider_service.home_directory()
+                if args.action=='provider-image-baseline':
+                    path=provider_image_admission.enroll_baseline(directory)
+                    print('baseline='+str(path))
+                else:
+                    _,command=provider_service.configured(manager)
+                    address=provider_service.option(command,'--codex-server')
+                    if args.action=='provider-image-upgrade':
+                        result=provider_image_admission.upgrade(manager,directory,address)
+                        print('provider image '+result['state']+' sha256='+result['sha256'])
+                    elif not args.provider_manifest or not args.provider_manifest_sha256:
+                        raise ServiceError('exact template manifest and SHA-256 required')
+                    elif args.action=='provider-image-admit':
+                        path,pin=provider_image_admission.admit(directory,args.provider_manifest,args.provider_manifest_sha256,address)
+                        print('manifest='+str(path)+' sha256='+pin)
+                    else:
+                        if not args.previous_provider_sha256:
+                            raise ServiceError('exact previous provider manifest SHA-256 required')
+                        result=provider_image_admission.activate(manager,directory,args.provider_manifest,
+                            args.provider_manifest_sha256,args.previous_provider_sha256,address)
+                        print('provider manifest activated while stopped; start separately: '+result['sha256'])
+            except provider_service.Blocked as error:
+                raise ServiceError(str(error)) from error
+        elif args.action.startswith('provider-handoff-') or (args.action == 'restart' and args.component == 'all' and manager._platform() == 'launchd'):
+            if manager._platform() != 'launchd':
+                raise ServiceError('managed provider handoff currently requires launchd; no components restarted')
+            from . import provider_service
+            try:
+                if args.action in ('provider-handoff-force','provider-handoff-force-run'):
+                    from . import provider_force_continuation
+                    if args.action == 'provider-handoff-force-run':
+                        output = provider_force_continuation.run(manager,args.request_id)
+                    else:
+                        output = provider_force_continuation.submit(manager,args.request_id)
+                        if provider_service.field(output,'.state') not in ('completed','outcome_unknown'):
+                            output = provider_service.wait(args.request_id)
+                elif args.action == 'provider-handoff-run':
+                    output = provider_service.run_worker(manager, args.request_id)
+                elif args.action == 'provider-handoff-reconcile':
+                    output = provider_service.reconcile(manager, args.request_id)
+                elif args.action == 'provider-handoff-status':
+                    output = provider_service.status(args.request_id)
+                else:
+                    output = provider_service.submit(manager, args)
+                    output = provider_service.wait(provider_service.field(output, ".request_id"))
+                print(output)
+                if args.action in ("restart", "provider-handoff-force") and provider_service.field(output, ".state") != "completed":
+                    return 2
+            except provider_service.Blocked as error:
+                raise ServiceError(str(error)) from error
+        elif args.action.startswith('graceful-'):
+            if args.component != 'client':
+                raise ServiceError('graceful continuity supports only --component client')
+            from .client_continuity import ClientContinuity
+            controller = ClientContinuity(manager)
+            if args.action == 'graceful-inspect':
+                result = controller.inspect()
+            elif args.action == 'graceful-status':
+                result = controller.status(args.request_id)
+            else:
+                result = controller.restart(args.request_id, expected_pid=args.expected_pid,
+                    expected_start=args.expected_start, expected_config_sha=args.expected_config_sha,
+                    timeout=args.graceful_timeout)
+            print(json.dumps(result, sort_keys=True))
+            if args.action == 'graceful-restart' and result['phase'] != 'new_generation_observed':
+                return 2
+        elif args.action in ('drain', 'drain-restart', 'drain-resume', 'drain-status'):
+            result = manager.drain(args.component, timeout=args.drain_timeout,
+                                   restart=args.action == 'drain-restart', resume=args.action == 'drain-resume', inspect=args.action == 'drain-status')
+            print(json.dumps(result, sort_keys=True))
+        else:
+            getattr(manager, args.action)(args if args.action == "install" else args.component)
         service_log.event('operation_complete', correlation_id=correlation_id)
         return 0
     except BaseException as error:

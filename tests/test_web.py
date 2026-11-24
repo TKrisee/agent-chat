@@ -35,7 +35,7 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(claim["state"], "owned")
         coordinator = self.coordinator(self.beta)
         try:
-            coordinator.inbox()
+            coordinator.context()
             queued = coordinator.request("web-test-resource", 5)
         finally:
             coordinator.close()
@@ -680,3 +680,25 @@ class WorkspaceBrowserRouteTests(unittest.TestCase):
         self.server.roots.reconfigure_workspaces.assert_called_with('default','synthetic-root','synthetic-host',self.project,
             data['expected_thread'],data['workspaces'],data['prompt'],data['request_id'],True)
 
+
+
+class HttpAdmissionSerializationTests(unittest.TestCase):
+    def test_admission_and_start_share_lock_and_all_tickets_count(self):
+        from agent_chat.web import WebServer
+        server = object.__new__(WebServer)
+        server.http_admission = threading.Condition()
+        server.http_active = set()
+        server.http_drain_epoch = None
+        server.http_sealed = False
+        server.http_instance = 'a' * 32
+        ticket = server.http_begin()
+        self.assertTrue(server.http_admit())
+        drain = server.http_maintenance('start')
+        self.assertEqual(drain['active'], 1)
+        self.assertFalse(server.http_admit())
+        with self.assertRaises(ValueError): server.http_maintenance('seal', drain['epoch'])
+        server.http_end(ticket)
+        self.assertTrue(server.http_maintenance('seal', drain['epoch'])['sealed'])
+        with self.assertRaisesRegex(ValueError, 'already sealed'):
+            server.http_maintenance('seal', drain['epoch'])
+        self.assertFalse(server.http_admit())

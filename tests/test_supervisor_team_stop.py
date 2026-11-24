@@ -83,6 +83,51 @@ class SupervisorTeamStopTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordError, 'stop-all barrier is active'):
             assert_agent_running(self.coord.db, 'po')
 
+    def test_effective_current_po_admission_allows_unloaded_pending_incident_and_recovery_candidate(self):
+        self.pause()
+        admission = root_lifecycle.admit_po(
+            self.coord, 'root', self.stop_id, 'po', self.target_thread, 'host')
+        self.assertTrue(admission['effective'])
+        self.assertFalse(root_lifecycle.stopped(self.coord.db, 'po'))
+        self.assertFalse(self.supervisor._intentional_team_stop(self.job))
+
+        first = self.observe()
+        self.assertFalse(first['recovery_candidate'])  # Existing incident-age gate is preserved.
+        self.assertEqual(self.coord.db.execute(
+            "SELECT state FROM supervisor_observations").fetchone()[0], 'unloaded_pending')
+        self.now += 61
+        self.bridge.heartbeat('http://isolated.invalid', os.getpid(), host_id='host')
+        aged = self.observe()
+        self.assertTrue(aged['recovery_candidate'])
+        incident = self.coord.db.execute('''SELECT active,condition FROM supervisor_incidents
+            WHERE owner_session='root' AND target_session='po' AND condition='unloaded_pending' ''').fetchone()
+        self.assertEqual((incident['active'], incident['condition']), (1, 'unloaded_pending'))
+        self.assertEqual(len(self.notices()), 1)
+        self.assertEqual(self.coord.db.execute(
+            'SELECT COUNT(*) FROM supervisor_recoveries').fetchone()[0], 0)  # Observation is not a recovery claim or wake.
+        self.assertEqual(self.coord.db.execute(
+            'SELECT status FROM bridge_jobs WHERE id=?', (self.wake['id'],)).fetchone()[0], 'prepared')
+
+    def test_stale_po_admission_does_not_exempt_mismatched_current_host(self):
+        self.pause()
+        admission = root_lifecycle.admit_po(
+            self.coord, 'root', self.stop_id, 'po', self.target_thread, 'host')
+        self.assertTrue(admission['effective'])
+        self.coord.db.execute("UPDATE remote_session_hosts SET host_id='changed-host' WHERE session_id='po'")
+        self.assertFalse(root_lifecycle.po_admitted(self.coord.db, self.stop_id, 'po'))
+        # The recorded stop target still matches the sampled job, so its stale
+        # admission cannot suppress the ordinary stopped-worker notice gate.
+        self.assertTrue(self.supervisor._intentional_team_stop(self.job))
+
+    def test_noncurrent_designated_role_does_not_exempt_stopped_target(self):
+        self.pause()
+        admission = root_lifecycle.admit_po(
+            self.coord, 'root', self.stop_id, 'po', self.target_thread, 'host')
+        self.assertTrue(admission['effective'])
+        self.coord.db.execute("UPDATE project_orchestrators SET root_session='another-root' WHERE session_id='po'")
+        self.assertFalse(root_lifecycle.po_admitted(self.coord.db, self.stop_id, 'po'))
+        self.assertTrue(self.supervisor._intentional_team_stop(self.job))
+
     def test_resume_restores_normal_notice_with_original_pending_input(self):
         self.pause()
         self.observe()

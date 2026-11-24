@@ -72,7 +72,7 @@ class RemoteCoordTests(unittest.TestCase):
         with self.assertRaisesRegex(CoordError, 'read your inbox'):
             self.call('supervisor-configure', session='b', recovery_enabled=True)
         self.assertEqual(self.supervision_bits(), (1, 0))
-        self.call('inbox', session='b', all=True)
+        self.call('context', session='b')
         self.call('supervisor-configure', session='b', recovery_enabled=True)
         self.assertEqual(self.supervision_bits(), (1, 1))
 
@@ -100,6 +100,47 @@ class RemoteCoordTests(unittest.TestCase):
                   contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit)):
                 cli.main(['supervisor-configure', *flags])
         self.assertEqual(len(sent), before)
+
+    def test_batch_accepts_43_as_one_cohort(self):
+        self.assert_batch_count_accepted(43)
+
+    def test_batch_accepts_64_as_one_cohort(self):
+        self.assert_batch_count_accepted(64)
+
+    def assert_batch_count_accepted(self, count):
+        tuples = self.batch_claims(count)
+        try:
+            result = self.call('begin-guard-batch', tuples=tuples)
+        except CoordError as error:
+            self.fail('one-cohort count %s blocked: %s' % (count, error))
+        self.assertEqual(len(result['admissions']), count)
+        self.assertEqual(len({row['run_id'] for row in result['admissions']}), count)
+        with __import__('contextlib').closing(Coordinator(self.db)) as coord:
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guarded_runs').fetchone()[0], count)
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guard_batches').fetchone()[0], count)
+
+    def test_batch_rejects_65_before_any_admission(self):
+        tuples = self.batch_claims(65)
+        with self.assertRaises(CoordError):
+            self.call('begin-guard-batch', tuples=tuples)
+        with __import__('contextlib').closing(Coordinator(self.db)) as coord:
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guarded_runs').fetchone()[0], 0)
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guard_batches').fetchone()[0], 0)
+            self.assertEqual(coord.db.execute("SELECT count(*) FROM resources WHERE owner_session='a'").fetchone()[0], 65)
+
+    def test_batch_invalid_final_tuple_at_64_has_no_admission(self):
+        tuples = self.batch_claims(64)
+        for key, value in (('reservation_id', 'changed'), ('token', 'invalid'),
+                           ('session_id', 'other'), ('host_id', 'other')):
+            items = [dict(item) for item in tuples]
+            items[-1][key] = value
+            with self.assertRaises(CoordError):
+                self.call('begin-guard-batch', tuples=items)
+        with self.assertRaises(CoordError):
+            self.call('begin-guard-batch', tuples=tuples[:-1] + [tuples[0]])
+        with __import__('contextlib').closing(Coordinator(self.db)) as coord:
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guarded_runs').fetchone()[0], 0)
+            self.assertEqual(coord.db.execute('SELECT count(*) FROM remote_guard_batches').fetchone()[0], 0)
 
     def batch_claims(self, count=42):
         self.call('register', agent='alpha')

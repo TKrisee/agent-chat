@@ -5,23 +5,30 @@ import contextlib
 import copy
 import io
 import os
+import plistlib
 from pathlib import Path
+import shlex
 import subprocess
 import time
 import threading
 import uuid
 from unittest import mock
 
-from agent_chat import cli
+from agent_chat import cli, root_local, service
+from agent_chat.agent_control import AgentControlState
 from agent_chat.bridge import Bridge
 from agent_chat.bridge_client import RemoteBridgeState
 from agent_chat.bridge_state import BridgeState
 from agent_chat.core import Coordinator, CoordError
+from agent_chat.measurement import MeasurementStore
 from agent_chat.remote import HttpClient, RemoteCoordError
+from agent_chat.remote_service import dispatch
 from agent_chat.root_orchestrator import RootOrchestrator
 from agent_chat.rpc import TransportError
 from test_remote_web import RemoteWebFixture, TOKEN
 from test_session_reset import ResetRpc
+from agent_chat.projects import Projects
+from agent_chat.web import operator_session
 
 
 class ScopedRpc(ResetRpc):
@@ -31,11 +38,20 @@ class ScopedRpc(ResetRpc):
             activePermissionProfile={'id':'global-policy', 'extends':None},
             sandbox=dict(type='workspaceWrite', writableRoots=['/projects/other'], networkAccess=True))
         self.started = {}
+        self.named = {}
 
     def request(self, method, params):
+        if method == 'thread/name/set':
+            path = Path(self.original['cwd']) / ('fixture-rollout-' + params['threadId'])
+            path.write_bytes(b'metadata')
+            self.named[params['threadId']] = (params['name'], str(path))
+            self.calls.append((method, copy.deepcopy(params)))
+            return {}
         if method == 'thread/resume' and params['threadId'] in self.started:
             return copy.deepcopy(self.started[params['threadId']])
         result = super().request(method, params)
+        if method == 'thread/read' and params['threadId'] in self.named:
+            result['thread'].update(name=self.named[params['threadId']][0], path=self.named[params['threadId']][1])
         if method == 'thread/start':
             result.update(cwd=params['cwd'], runtimeWorkspaceRoots=params['runtimeWorkspaceRoots'],
                 model=params['model'], activePermissionProfile={'id':':workspace', 'extends':None},
@@ -49,8 +65,31 @@ class ScopedRpc(ResetRpc):
 
 
 class RootOrchestratorTests(RemoteWebFixture):
+    def start(self, **kwargs):
+        sessions = Path(self.tmp.name) / 'sessions'
+        sessions.mkdir(exist_ok=True)
+        kwargs.setdefault('sessions_root', sessions)
+        super().start(**kwargs)
+
     def setUp(self):
         super().setUp()
+        base = Path(self.tmp.name).resolve()
+        self.service_plist = base / 'server.plist'
+        wrapper, executable = base / 'wrapper', base / 'server-executable'
+        executable.write_text('#!/bin/sh\nexit 0\n')
+        wrapper.write_text('exec ' + ' '.join(shlex.quote(value) for value in (
+            str(executable), '--db', str(self.db.resolve()), '--host', '127.0.0.1',
+            '--port', str(self.server.server_port))) + '\n')
+        with self.service_plist.open('wb') as stream:
+            plistlib.dump(dict(Label='com.agent-chat.server', AssociatedBundleIdentifiers=['com.agent-chat.server'],
+                WorkingDirectory=str(base), RunAtLoad=True, KeepAlive=True, ThrottleInterval=10,
+                ProgramArguments=[str(wrapper)], EnvironmentVariables={}), stream)
+        config = service.InstalledServerConfig(self.service_plist, wrapper, executable,
+            self.db.resolve(), base, os.getuid(), '127.0.0.1', self.server.server_port)
+        for module in (service, root_local):
+            provider = mock.patch.object(module, '_installed_server_config', return_value=config)
+            provider.start()
+            self.addCleanup(provider.stop)
         self.call('register', agent='root')
         self.thread_id = str(uuid.uuid4())
         self.call('bind', thread=self.thread_id)
@@ -66,7 +105,13 @@ class RootOrchestratorTests(RemoteWebFixture):
         self.root('enroll', expected_thread=self.thread_id, confirm=True)
 
     def root(self, op, session='a', host='mac', **params):
-        return self.client.call('/api/root/rpc', dict(op=op, session=session, host_id=host, params=params))
+        return root_local.execute(op, params, master_db=self.db.resolve(), service_plist=self.service_plist,
+                                  home_project='default', session=session, host_id=host)
+
+    def test_shared_bearer_cannot_mutate_root(self):
+        with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+            self.client.call('/api/root/rpc', dict(op='enroll', session='a', host_id='mac',
+                             params=dict(expected_thread=self.thread_id, confirm=True)))
 
     def project(self, name='Project A'):
         result = self.client.call('/api/projects/rpc', dict(op='create', name=name))['project']['id']
@@ -90,6 +135,26 @@ class RootOrchestratorTests(RemoteWebFixture):
         state = RemoteBridgeState(client, self.url, self.identity)
         state.call('acquire')
         return state, Bridge(state, self.rpc)
+
+    def test_startup_plan_reports_only_existing_records_without_reconciliation(self):
+        with self.server.projects.connection() as db:
+            projects = [row['project_id'] for row in db.execute(
+                'SELECT project_id FROM root_projects ORDER BY project_id')]
+        root = RootOrchestrator.__new__(RootOrchestrator)
+        root.projects = self.server.projects
+        before = {path: path.read_bytes() for path in
+                  (self.server.projects.path, self.server.projects.database)}
+        with mock.patch.object(RootOrchestrator, 'sync', side_effect=AssertionError('no sync')), \
+                mock.patch.object(RootOrchestrator, 'join', side_effect=AssertionError('no join')), \
+                mock.patch.object(RootOrchestrator, 'notify_project', side_effect=AssertionError('no notice')):
+            result = root.startup_plan('default', 'a', 'mac', projects, self.thread_id)
+        self.assertEqual(result['operation'], 'startup-plan')
+        self.assertEqual(result['authority'], {'scope': 'machine_read', 'named_session_authentication': 'UNVERIFIED'})
+        self.assertEqual(result['source']['expected_thread'], self.thread_id)
+        self.assertEqual([row['project'] for row in result['projects']], projects)
+        self.assertEqual(result['consistency']['kind'], 'independent_read_only_store_snapshots_not_atomic')
+        self.assertEqual(result['startup_effects']['native_owner_and_runtime_effects'], 'unknown_not_inspected')
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
 
     def test_root_sidebar_follows_observed_model_without_changing_creation_settings(self):
         project = self.project()
@@ -139,7 +204,7 @@ class RootOrchestratorTests(RemoteWebFixture):
             status = self.routed(route['project'], 'bridge-status', mine=True)
             self.assertEqual(status['bindings'][0]['thread_id'], self.thread_id)
         self.assertEqual(self.root('route', project=first), routes[1])
-        self.assertEqual(len(self.call('inbox')['messages']), 2)
+        self.assertEqual(len(self.call('inbox', all=True)['messages']), 2)
         self.assertFalse(self.rpc.started)  # Registry onboarding never starts a model.
 
     def test_quiet_projection_excludes_broadcast_but_keeps_explicit_report_and_ack(self):
@@ -154,7 +219,7 @@ class RootOrchestratorTests(RemoteWebFixture):
         self.assertEqual(self.routed(project, 'message', id=report['id'])['message']['body'], 'Project A: decision needed; checkpoint /project-a/status.md')
         reply = self.routed(project, 'send', to='worker', body='Proceed within approved scope.', reply_to=report['id'], ack_reply=True)
         self.assertTrue(reply['acknowledged_reply'])
-        self.assertEqual(self.call('inbox')['messages'][0]['body'].split(':')[0], 'Project registered')
+        self.assertEqual(self.call('inbox', all=True)['messages'][0]['body'].split(':')[0], 'Project registered')
 
     def test_saved_ui_assignment_provisions_once_without_brief_in_root_notice(self):
         brief = 'Create a calendar.\nKeep literal $(do-not-execute) and 日本語.\n'
@@ -195,7 +260,7 @@ class RootOrchestratorTests(RemoteWebFixture):
         project = self.project()
         params = dict(project=project, agent='orchestrator', request_id=str(uuid.uuid4()),
             confirm=True, model=None, effort=None)
-        with self.assertRaisesRegex(RemoteCoordError, 'workspace and instructions'):
+        with self.assertRaisesRegex(CoordError, 'workspace and instructions'):
             self.root('provision', **params)
         with self.assertRaisesRegex(RemoteCoordError, 'neutral'):
             self.client.call('/api/projects/rpc', dict(op='create', name='Overlap',
@@ -206,10 +271,15 @@ class RootOrchestratorTests(RemoteWebFixture):
         project = self.client.call('/api/projects/rpc', dict(op='create', name='CLI project',
             workspace=str(self.workspace), instructions='Plan only.'))['project']['id']
         self.call('context')
+        request_id = str(uuid.uuid4())
         with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID':'mac'}), contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(['--server', self.url, '--api-token', TOKEN, '--session', 'a',
-                'root', 'provision', '--project-id', project, '--model', 'test-model',
-                '--reasoning-effort', 'high', '--request-id', str(uuid.uuid4()), '--confirm']), 0)
+            with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+                cli.main(['--server', self.url, '--api-token', TOKEN, '--session', 'a',
+                    'root', 'provision', '--project-id', project, '--model', 'test-model',
+                    '--reasoning-effort', 'high', '--request-id', request_id, '--confirm'])
+            self.assertEqual(cli.main(['root-local', '--home-project', 'default', '--home-session', 'a',
+                '--host-id', 'mac', 'provision', '--project-id', project, '--model', 'test-model',
+                '--effort', 'high', '--request-id', request_id, '--confirm']), 0)
         jobs = self.routed(project, 'session-reset-status', to='orchestrator')['resets']
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0]['status'], 'pending')
@@ -268,9 +338,9 @@ class RootOrchestratorTests(RemoteWebFixture):
 
     def test_root_never_borrows_peer_or_resource_ownership(self):
         project = self.project()
-        with self.assertRaisesRegex(RemoteCoordError, 'canonical home'):
+        with self.assertRaisesRegex(CoordError, 'local Root canonical identity differs'):
             self.root('route', session='worker', project=project)
-        with self.assertRaisesRegex(RemoteCoordError, 'canonical home'):
+        with self.assertRaisesRegex(CoordError, 'local Root canonical identity differs'):
             self.root('route', host='other-host', project=project)
         with self.assertRaisesRegex(RemoteCoordError, 'control-only'):
             self.routed(project, 'request', resource='shared', minutes=5)
@@ -288,11 +358,11 @@ class RootOrchestratorTests(RemoteWebFixture):
 
     def test_neutral_and_distinct_project_workspaces_are_required(self):
         project = self.project()
-        with self.assertRaisesRegex(RemoteCoordError, 'neutral'):
+        with self.assertRaisesRegex(CoordError, 'neutral'):
             self.configure(project, cwd=str(self.neutral))
         self.configure(project)
         second = self.project('Second')
-        with self.assertRaisesRegex(RemoteCoordError, 'overlaps'):
+        with self.assertRaisesRegex(CoordError, 'overlaps'):
             self.configure(second, cwd=str(self.workspace / 'child'))
 
     def test_stop_all_interrupts_parent_and_child_and_retains_work_until_resume(self):
@@ -314,7 +384,7 @@ class RootOrchestratorTests(RemoteWebFixture):
                           confirm=True,model='gpt-6.1-sol',reasoning_effort='high')
         message = self.call('send',to='child',body='Retained pending work')
         prepared = self.state.prepare(native_threads['child'],[dict(id=message['id'],recipient_session='child')], 'Retained wake')
-        self.call('inbox',session='child')
+        self.call('message',session='child',id=message['id'])
         claim = self.call('request',session='child',resource='held-during-stop',minutes=5)
         queued_thread=str(uuid.uuid4())
         self.call('register',session='queued',agent='queued'); self.call('bind',session='queued',thread=queued_thread)
@@ -369,7 +439,7 @@ class RootOrchestratorTests(RemoteWebFixture):
             self.call('bind',session='child',parent_session='po',agent_path='/child')
         with self.assertRaisesRegex(RemoteCoordError,'stop-all'):
             self.call('begin-guard',session='child',resource='held-during-stop',token=claim['token'])
-        with self.assertRaisesRegex(RemoteCoordError,'exact original'):
+        with self.assertRaisesRegex(CoordError,'exact original'):
             self.root('resume-all',request_id=str(uuid.uuid4()),confirm=True)
         self.root('resume-all',request_id=request,confirm=True)
         with contextlib.closing(Coordinator(self.db)) as coord: assert_agent_running(coord.db,'child')
@@ -383,13 +453,13 @@ class RootOrchestratorTests(RemoteWebFixture):
                                headers={'X-Agent-Chat-CSRF':self.server.csrf_token})
         self.assertEqual(code,200,sent)
         message_id=subprocess.run(['jq','-er','.id'],input=sent,capture_output=True,check=True).stdout.decode().strip()
+        payload=self.bridge.payload(self.thread_id,[dict(id=message_id,recipient_session='a')])
+        context=self.call('context',message_ids=[message_id])
+        self.assertEqual(context['messages'][0]['instruction_origin'],'authenticated_operator_ui')
         message=self.call('message',id=message_id)['message']
         self.assertEqual(message['instruction_origin'],'authenticated_operator_ui')
         self.assertEqual(message['sender_role'],'human_operator')
         self.assertEqual(message['recipient_role'],'agent')
-        context=self.call('context',message_ids=[message_id])
-        self.assertEqual(context['messages'][0]['instruction_origin'],'authenticated_operator_ui')
-        payload=self.bridge.payload(self.thread_id,[dict(id=message_id,recipient_session='a')])
         subprocess.run(['jq','-Rse','split("\n")[-1] | fromjson | .messages[] | select(.id == $id) | .instruction_origin == "authenticated_operator_ui"',
                         '--arg','id',message_id],input=payload,text=True,capture_output=True,check=True)
         code,visible,_=self.request('GET','/api/root/messages/'+message_id)
@@ -403,7 +473,9 @@ class RootOrchestratorTests(RemoteWebFixture):
         request=str(uuid.uuid4())
         with mock.patch.dict(os.environ,{'AGENT_CHAT_SERVER':self.url,'AGENT_CHAT_API_TOKEN':TOKEN,
                                        'AGENT_CHAT_SESSION':'a','AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(cli.main(['root','stop-all','--request-id',request,'--confirm']),0)
+            with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+                cli.main(['root','stop-all','--request-id',request,'--confirm'])
+        self.root('stop-all', request_id=request, confirm=True)
         self.assertTrue(self.root('stop-status',request_id=request)['barrier_complete'])
         self.root('resume-all',request_id=request,confirm=True)
 
@@ -420,9 +492,11 @@ class RootOrchestratorTests(RemoteWebFixture):
         self.assertIsNotNone(self.root('stop-status',request_id=request))
 
     def test_stop_scope_serializes_inflight_membership_and_freezes_new_projects(self):
+        from agent_chat.root_orchestrator import RootOrchestrator
         project=self.server.projects.create('Joining project')['id']
-        entered,release,stop_entered,done=(threading.Event() for _ in range(4))
-        original_join=self.server.roots.join; original_stop=self.server.roots.team_lifecycle
+        entered,release,stop_entered,done,stop_started=(threading.Event() for _ in range(5))
+        original_join=self.server.roots.join; original_stop=RootOrchestrator.team_lifecycle
+        original_preflight=root_local._preflight
         results=[]; errors=[]
         def joining(root,item):
             if item['project_id']==project:
@@ -431,6 +505,9 @@ class RootOrchestratorTests(RemoteWebFixture):
             return original_join(root,item)
         def stopping(*args,**kwargs):
             stop_entered.set(); return original_stop(*args,**kwargs)
+        def preflight(*args,**kwargs):
+            if args[5]=='stop-all': stop_started.set()
+            return original_preflight(*args,**kwargs)
         def run_sync():
             try: self.server.roots.sync()
             except Exception as error: errors.append(error)
@@ -438,23 +515,24 @@ class RootOrchestratorTests(RemoteWebFixture):
             try: results.append(self.root('stop-all',request_id=str(uuid.uuid4()),confirm=True))
             except Exception as error: errors.append(error)
             finally: done.set()
-        with mock.patch.object(self.server.roots,'join',side_effect=joining),mock.patch.object(self.server.roots,'team_lifecycle',side_effect=stopping):
+        with mock.patch.object(self.server.roots,'join',side_effect=joining),mock.patch.object(RootOrchestrator,'team_lifecycle',autospec=True,side_effect=stopping),mock.patch.object(root_local,'_preflight',side_effect=preflight):
             sync=threading.Thread(target=run_sync); stopper=threading.Thread(target=run_stop)
             sync.start()
             try:
                 self.assertTrue(entered.wait(2))
-                stopper.start(); self.assertTrue(stop_entered.wait(2))
+                stopper.start(); self.assertTrue(stop_started.wait(2))
                 self.assertFalse(done.wait(.1))
             finally:
                 release.set(); sync.join(4)
                 if stopper.ident: stopper.join(4)
         self.assertFalse(sync.is_alive()); self.assertFalse(stopper.is_alive()); self.assertEqual(errors,[])
+        self.assertTrue(stop_entered.is_set())
         self.assertIn(project,[row['project'] for row in results[0]['projects']])
         later=self.server.projects.create('Not enrolled while stopped')['id']
         self.server.roots.sync()
         with self.server.projects.connection() as db:
             self.assertIsNone(db.execute('SELECT 1 FROM root_projects WHERE project_id=?',(later,)).fetchone())
-        with self.assertRaisesRegex(RemoteCoordError,'stop-all'):
+        with self.assertRaisesRegex(CoordError,'stop-all'):
             self.configure(project)
 
     def test_root_stop_interrupts_during_measurement_without_enabling_other_controls(self):
@@ -492,12 +570,12 @@ class RootOrchestratorTests(RemoteWebFixture):
         row = next(p for p in snapshot['projects'] if p['project_id'] == project)
         self.assertTrue(row['joined'])
         self.assertEqual(self.root('route', project=project)['session'], row['session_id'])
-        self.assertEqual(len(self.call('inbox')['messages']), 1)
+        self.assertEqual(len(self.call('inbox', all=True)['messages']), 1)
 
     def test_missing_database_never_creates_replacement(self):
         project = self.project(); path = self.server.projects.db_path(project)
         path.unlink()
-        with self.assertRaisesRegex(RemoteCoordError, 'missing'):
+        with self.assertRaisesRegex(CoordError, 'missing'):
             self.root('route', project=project)
         self.assertFalse(path.exists())
 
@@ -508,15 +586,34 @@ class RootOrchestratorTests(RemoteWebFixture):
         target = str(uuid.uuid4()); call('bind', thread=target)
         self.rpc.status[target], self.rpc.queues[target], self.rpc.history[target] = 'idle', [], []
         observed = copy.deepcopy(self.rpc.original)
-        observed.update(cwd=str(self.workspace), runtimeWorkspaceRoots=[str(self.workspace)])
+        observed.update(thread={'id': target}, cwd=str(self.workspace), runtimeWorkspaceRoots=[str(self.workspace)])
         self.rpc.started[target] = observed
+        with self.assertRaisesRegex(CoordError, 'fresh agent-status observation'):
+            self.root('adopt', project=project, target='existing', expected_thread=target,
+                      cwd=str(self.workspace), confirm=True)
         self.routed(project, 'agent-status', to='existing', refresh=True, expected_thread=target, request_id=str(uuid.uuid4()))
         _, bridge = self.project_bridge(project); bridge.tick()
         claim = call('request', resource='existing-held', minutes=5)
-        status = self.root('adopt', project=project, target='existing', expected_thread=target, cwd=str(self.workspace), confirm=True)
+        for changed in ({'expected_thread': str(uuid.uuid4())}, {'target': 'absent'},
+                        {'cwd': str(self.workspace.parent / 'other-workspace')}):
+            with self.subTest(changed=changed), self.assertRaisesRegex(CoordError, 'fresh agent-status observation'):
+                values = dict(project=project, target='existing', expected_thread=target,
+                              cwd=str(self.workspace), confirm=True)
+                values.update(changed)
+                self.root('adopt', **values)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.main(['root-local', '--home-project', 'default', '--home-session', 'a',
+                '--host-id', 'mac', 'adopt', '--project-id', project, '--target', 'existing',
+                '--expected-thread', target, '--workspace', str(self.workspace), '--confirm']), 0)
+        status = self.root('status')
         self.assertEqual(next(p for p in status['projects'] if p['project_id'] == project)['setup'], 'adopted')
         self.assertEqual(call('check', resource='existing-held', token=claim['token'])['reservation_id'], claim['reservation_id'])
         self.assertEqual(call('bridge-status', mine=True)['bindings'][0]['thread_id'], target)
+        self.call('context')
+        retried = self.root('adopt', project=project, target='existing', expected_thread=target,
+                            cwd=str(self.workspace), confirm=True)
+        self.assertEqual(next(p for p in retried['projects'] if p['project_id']==project)['orchestrator_session'], 'existing')
+        self.assertEqual(call('check', resource='existing-held', token=claim['token'])['reservation_id'], claim['reservation_id'])
 
     def test_detach_with_unread_delivery_pauses_without_cancel_then_resume(self):
         project = self.project(); route = self.root('route', project=project)
@@ -525,7 +622,7 @@ class RootOrchestratorTests(RemoteWebFixture):
         msg = client.call('/api/coord', dict(op='send',session='worker',host_id='mac',params={'to':route['session'],'body':'Decision needed'}))
         # Consume the home notice too, but retain the target delivery untouched.
         for item in self.call('inbox')['messages']: self.call('acknowledge', id=item['id'])
-        with self.assertRaises(RemoteCoordError): self.root('detach', confirm=True)
+        with self.assertRaises(CoordError): self.root('detach', confirm=True)
         state, bridge = self.project_bridge(project)
         bridge.tick()
         self.assertEqual(self.rpc.queues[self.thread_id], [])
@@ -535,8 +632,11 @@ class RootOrchestratorTests(RemoteWebFixture):
 
     def test_clean_detach_retains_inboxes_and_home_binding_only(self):
         project = self.project(); route = self.root('route', project=project)
-        for item in self.call('inbox')['messages']: self.call('acknowledge', id=item['id'])
+        self.call('context')
+        for item in self.call('inbox', all=True)['messages']: self.call('acknowledge', id=item['id'])
         self.routed(project, 'context')
+        for item in self.routed(project, 'inbox', all=True)['messages']:
+            self.routed(project, 'acknowledge', id=item['id'])
         self.assertTrue(self.root('detach', confirm=True)['registrations_retained'])
         self.assertFalse(self.server.roots.status()['enabled'])
         self.assertEqual(self.call('bridge-status', mine=True)['bindings'][0]['thread_id'], self.thread_id)
@@ -549,9 +649,15 @@ class RootOrchestratorTests(RemoteWebFixture):
         args = argparse.Namespace(session='a', api_token=TOKEN, project='default')
         out = io.StringIO()
         with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID':'mac'}), contextlib.redirect_stdout(out):
-            self.assertEqual(cli._root_main(['in',project,'agents'], args, self.url, mock.Mock()), 0)
+            with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+                cli._root_main(['in',project,'agents'], args, self.url, mock.Mock())
+            self.assertEqual(cli.main(['root-local', '--home-project', 'default', '--home-session', 'a',
+                '--host-id', 'mac', 'in', '--project-id', project]), 0)
         checked = subprocess.run(['jq','-er','.project'], input=out.getvalue(), text=True, capture_output=True, check=True)
         self.assertEqual(checked.stdout.strip(), project)
+        selected = subprocess.run(['jq','-er','.session'], input=out.getvalue(), text=True, capture_output=True, check=True).stdout.strip()
+        self.assertEqual(selected, self.root('route',project=project)['session'])
+        self.assertIsInstance(self.routed(project,'agents')['agents'], list)
         with self.assertRaisesRegex(Exception, 'management only'):
             cli._root_main(['in',project,'register','--agent','borrowed'], args, self.url, mock.Mock())
 
@@ -696,9 +802,13 @@ class RootOrchestratorTests(RemoteWebFixture):
         from agent_chat.session_reset import SessionResetState
         project = self.project(); request = str(uuid.uuid4())
         with mock.patch.object(SessionResetState, 'create', side_effect=OSError('response boundary fixture')):
-            with self.assertRaises(RemoteCoordError): self.configure(project, request_id=request)
+            with self.assertRaisesRegex(OSError, 'response boundary fixture'): self.configure(project, request_id=request)
         row = next(p for p in self.root('status')['projects'] if p['project_id'] == project)
         self.assertEqual(row['setup'], 'awaiting_original_request_retry')
+        with self.assertRaisesRegex(CoordError, 'exact original'):
+            self.root('retry-setup', project=project, request_id=str(uuid.uuid4()), confirm=True)
+        with self.assertRaises(CoordError):
+            self.root('retry-setup', project=project, request_id=request, confirm=False)
         first = self.root('retry-setup', project=project, request_id=request, confirm=True)
         second = self.root('retry-setup', project=project, request_id=request, confirm=True)
         self.assertEqual(first['creation']['target_session'], second['creation']['target_session'])
@@ -734,7 +844,7 @@ class RootOrchestratorTests(RemoteWebFixture):
         project=self.project();before=self.root('route',project=project)
         self.stop();self.start()
         self.assertEqual(self.root('route',project=project),before)
-        self.assertEqual(len(self.call('inbox')['messages']),1)
+        self.assertEqual(len(self.call('inbox', all=True)['messages']),1)
         self.assertFalse(self.rpc.started)
 
     def test_status_distinguishes_missing_legacy_and_scoped_bridge(self):
@@ -757,9 +867,12 @@ class RootOrchestratorTests(RemoteWebFixture):
 
     def test_active_target_measurement_refuses_setup_without_intent_or_thread(self):
         project=self.project()
-        with mock.patch.object(self.server.measurements,'status',return_value={'active':{'id':'measurement-fixture'}}):
-            with self.assertRaisesRegex(RemoteCoordError,'target project measurement'):
-                self.configure(project)
+        # Own-local admission reads the actual private measurement store.
+        with self.server.measurements._db() as db:
+            db.execute('INSERT INTO usage_measurements(id,project_id,project_db_path,state,duration_seconds) VALUES(?,?,?,?,?)',
+                       ('measurement-fixture', project, str(self.server.projects.db_path(project)), 'running', 60))
+        with self.assertRaisesRegex(CoordError,'active project measurement'):
+            self.configure(project)
         row=next(p for p in self.root('status')['projects'] if p['project_id']==project)
         self.assertIsNone(row['request_id']);self.assertFalse(self.rpc.started)
 
@@ -767,8 +880,12 @@ class RootOrchestratorTests(RemoteWebFixture):
         project=self.project();self.configure(project)
         _,bridge=self.project_bridge(project);bridge.tick()
         before=next(p for p in self.root('status')['projects'] if p['project_id']==project)
-        for item in self.call('inbox')['messages']:self.call('acknowledge',id=item['id'])
-        self.routed(project,'context');self.root('detach',confirm=True)
+        self.call('context')
+        for item in self.call('inbox',all=True)['messages']:self.call('acknowledge',id=item['id'])
+        self.routed(project,'context')
+        for item in self.routed(project,'inbox',all=True)['messages']:
+            self.routed(project,'acknowledge',id=item['id'])
+        self.root('detach',confirm=True)
         # Simulate the ordinary, already-tested home reset binding boundary.
         new=str(uuid.uuid4());self.call('bind',thread=new)
         self.rpc.status[new],self.rpc.queues[new],self.rpc.history[new]='idle',[],[]
@@ -785,7 +902,7 @@ class RootOrchestratorTests(RemoteWebFixture):
     def test_root_queue_and_existing_holds_block_enrollment_without_transfers(self):
         self.root('detach',confirm=True)
         claim=self.call('request',resource='held',minutes=5)
-        with self.assertRaisesRegex(RemoteCoordError,'held reservation'):
+        with self.assertRaisesRegex(CoordError,'held reservation'):
             self.root('enroll',expected_thread=self.thread_id,confirm=True)
         self.assertEqual(self.call('check',resource='held',token=claim['token'])['reservation_id'],claim['reservation_id'])
 
@@ -803,14 +920,26 @@ class RootOrchestratorTests(RemoteWebFixture):
         with mock.patch.object(self.rpc,'request',side_effect=become_busy):self.bridge.tick()
         before=self.state.jobs()[0]
         self.call('context')
-        with self.assertRaises(RemoteCoordError):self.root('detach',confirm=True)
+        with self.assertRaises(CoordError):self.root('detach',confirm=True)
         self.bridge.tick()
         after=self.state.job(before['id'])
         self.assertEqual(after['status'],'prepared')
         self.assertEqual(self.rpc.queues[self.thread_id],[])
         self.root('resume-routing',confirm=True)
         self.rpc.status[self.thread_id]='idle';self.bridge.tick()
-        self.assertEqual(self.state.job(before['id'])['status'],'dispatched')
+        # Full context consumption makes the original wake ineligible: preserve
+        # the cancelled ledger entry without submitting its old input.
+        self.assertEqual(self.state.job(before['id'])['status'],'cancelled')
+        self.assertEqual(self.rpc.queues[self.thread_id],[])
+        self.assertFalse(any(method=='thread/queue/add' and params.get('clientUserMessageId')==before['id']
+                             for method,params in self.rpc.calls))
+        new = self.call('send',session='reporter',to='root',body='New decision after routing resumed')
+        self.bridge.tick()
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            next_job=coord.db.execute('SELECT j.* FROM bridge_jobs j JOIN bridge_deliveries d ON d.job_id=j.id WHERE d.message_id=?',(new['id'],)).fetchone()
+            self.assertIsNotNone(next_job)
+            self.assertNotEqual(next_job['id'],before['id'])
+            self.assertEqual(next_job['status'],'dispatched')
 
     def test_project_measurement_excludes_global_root_and_keeps_project_main(self):
         self.assertEqual(self.server.measurements._bindings(self.db),[])
@@ -862,13 +991,32 @@ class WorkspaceWorkflowTests(unittest.TestCase):
         return [str(path) for path in paths]
 
     def consume(self):
-        with contextlib.closing(Coordinator(self.base, 'root')) as coord: coord.inbox()
+        with contextlib.closing(Coordinator(self.base, 'root')) as coord:
+            for message in coord.inbox()['messages']:
+                coord.message(message['id'])
 
     def provision(self, name, members):
         project = self.projects.create(name, instructions='Synthetic bounded assignment.', workspaces=members)['id']
         self.consume()
         result = self.roots.provision('default', 'root', self.host, project, 'orchestrator', str(uuid.uuid4()), True)
         return project, result['creation']
+
+    def test_consume_uses_full_recipient_read_without_acknowledging(self):
+        members = self.members(['read-provenance'])
+        self.projects.create('Read provenance', instructions='Synthetic fixture.', workspaces=members)
+        with contextlib.closing(Coordinator(self.base, 'root')) as coord:
+            unread = coord.inbox()['messages']
+            self.assertTrue(unread)
+            message_id = unread[-1]['id']
+            before = coord.db.execute('SELECT acked_at FROM messages WHERE id=?', (message_id,)).fetchone()
+            self.assertIsNone(before['acked_at'])
+            self.assertIsNone(coord.db.execute('SELECT provenance FROM message_reads WHERE message_id=? AND reader_session=?', (message_id,'root')).fetchone())
+        self.consume()
+        with contextlib.closing(Coordinator(self.base, 'root')) as coord:
+            read = coord.db.execute('SELECT provenance FROM message_reads WHERE message_id=? AND reader_session=?', (message_id,'root')).fetchone()
+            after = coord.db.execute('SELECT acked_at FROM messages WHERE id=?', (message_id,)).fetchone()
+            self.assertEqual(read['provenance'], 'recipient_full_message')
+            self.assertIsNone(after['acked_at'])
 
     def advance(self, project, job):
         from types import SimpleNamespace
@@ -877,7 +1025,7 @@ class WorkspaceWorkflowTests(unittest.TestCase):
         route = self.roots.route('default', 'root', self.host, project)
         with contextlib.closing(Coordinator(self.projects.db_path(project), route['session'])) as coord:
             resets = SessionResetState(coord)
-            state = SimpleNamespace(reset_update=resets.update, reset_job=resets.job,
+            state = SimpleNamespace(coord=coord, reset_update=resets.update, reset_job=resets.job,
                                     connection_metadata=lambda: {'server':'synthetic', 'project':project})
             ResetWorker(Bridge(state, self.rpc)).advance(resets.job(job['id']))
             return resets.job(job['id'])
@@ -1082,3 +1230,64 @@ class LifecycleAuthorityTests(unittest.TestCase):
             assert_management_target(self.coord.db, 'po', 'foreign')
         with self.assertRaisesRegex(CoordError, 'own lifecycle'):
             assert_management_target(self.coord.db, 'child', 'sibling')
+
+
+class StartupPlanUnitTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='root-startup-plan-')
+        self.addCleanup(temporary.cleanup)
+        self.base = Path(temporary.name).resolve()
+        self.master = self.base / 'state.sqlite3'
+        self.neutral = self.base / 'neutral'
+        self.neutral.mkdir()
+        self.workspace = self.base / 'workspace'
+        self.workspace.mkdir()
+        self.thread = str(uuid.uuid4())
+        with contextlib.closing(Coordinator(self.master)) as coord:
+            dispatch(coord, {'op': 'register', 'session': 'root', 'host_id': 'host',
+                             'params': {'agent': 'root'}})
+            coord.session = 'root'
+            BridgeState(coord).bind(self.thread)
+            AgentControlState(coord)
+            coord.db.execute('INSERT INTO agent_control_observations VALUES(?,?,?,?,?,?,?,?,?,?)',
+                ('root', self.thread, 'idle', None, 0, None, None, str(self.neutral), '{}', time.time()))
+            coord.context()
+        measurement = MeasurementStore(self.master)
+        measurement.close()
+        operator_session(self.master)
+        self.projects = Projects(self.master)
+        self.roots = RootOrchestrator(self.projects)
+        with contextlib.closing(Coordinator(self.master)) as home_db:
+            home_db.db.execute('INSERT OR REPLACE INTO agent_controls VALUES(?,?,?)',
+                ('root', 'running', time.time()))
+        self.roots.enroll('default', 'root', 'host', self.thread, True)
+        self.target = self.projects.create('Startup plan target')['id']
+        self.roots.sync()
+        with self.projects.connection() as db:
+            target_session = db.execute('SELECT session_id FROM root_projects WHERE project_id=?',
+                (self.target,)).fetchone()['session_id']
+        with contextlib.closing(Coordinator(self.projects.db_path(self.target))) as target_db:
+            AgentControlState(target_db)
+            target_db.db.execute('INSERT OR REPLACE INTO agent_controls VALUES(?,?,?)',
+                (target_session, 'running', time.time()))
+
+    def test_exact_projection_is_readonly_and_never_reconciles(self):
+        with self.projects.connection() as db:
+            selected = [row['project_id'] for row in db.execute(
+                'SELECT project_id FROM root_projects ORDER BY project_id')]
+        root = RootOrchestrator.__new__(RootOrchestrator)
+        root.projects = self.projects
+        durable_before = {path: path.read_bytes() for path in (self.projects.path, self.master)}
+        with mock.patch.object(RootOrchestrator, 'sync', side_effect=AssertionError('no sync')), \
+                mock.patch.object(RootOrchestrator, 'join', side_effect=AssertionError('no join')), \
+                mock.patch.object(RootOrchestrator, 'notify_project', side_effect=AssertionError('no notice')):
+            result = root.startup_plan('default', 'root', 'host', selected, self.thread)
+        self.assertEqual(result['operation'], 'startup-plan')
+        self.assertEqual(result['authority'], {'scope': 'machine_read', 'named_session_authentication': 'UNVERIFIED'})
+        self.assertEqual(result['source']['expected_thread'], self.thread)
+        target = next(row for row in result['projects'] if row['project'] == self.target)
+        self.assertEqual(target['notice']['state'], 'associated')
+        self.assertTrue(target['registration']['binding_matches'])
+        self.assertEqual(result['consistency']['kind'], 'independent_read_only_store_snapshots_not_atomic')
+        self.assertEqual(result['startup_effects']['native_owner_and_runtime_effects'], 'unknown_not_inspected')
+        self.assertEqual({path: path.read_bytes() for path in durable_before}, durable_before)

@@ -1,0 +1,3 @@
+# Historical Characters selector audit
+
+characters_selection_historical.py is the unchanged original historical audit source, retained outside current required discovery. Its exact author-provided FROZEN_HASHES.txt and DELTA_HASHES_v2.txt remain an unavailable independent historical prerequisite; no reconstructed hashes are substituted. The legacy no-binding selector has been retired for new/effectful operations. Current App INL-2063/2061 coverage is the generic explicit binding and completion workflow, its authorization/revocation tests, and test_characters_retired_selector.py. Historical audit records, custody and unknown effects remain unchanged. This archive does not assert any historical outcome or permit current execution.

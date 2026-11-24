@@ -3,12 +3,13 @@ import io
 import os
 import subprocess
 import sqlite3
+import unittest
 from unittest import mock
 from agent_chat import cli
 from test_remote_web import TOKEN
 import time
 import uuid
-from agent_chat.core import Coordinator
+from agent_chat.core import Coordinator, CoordError
 from agent_chat.remote import RemoteCoordError
 from test_root_orchestrator import RootOrchestratorTests
 
@@ -41,12 +42,10 @@ class RetainedManagementTests(RootOrchestratorTests):
         with self.assertRaisesRegex(RemoteCoordError,'delegate-management'):
             self.call('agent-resume',session='po',to='retained',expected_thread=self.worker_thread,request_id=str(uuid.uuid4()),confirm=True)
         rid=str(uuid.uuid4());out=io.StringIO()
-        with mock.patch.dict(os.environ,{'AGENT_CHAT_HOST_ID':'mac'}),contextlib.redirect_stdout(out):
-            self.assertEqual(cli.main(['--server',self.url,'--api-token',TOKEN,'--session','a','root',
+        with self.assertRaisesRegex(RemoteCoordError,'shared bearer permits only exact root status readbacks'):
+            cli.main(['--server',self.url,'--api-token',TOKEN,'--session','a','root',
                 'delegate-management','--project-id','default','--po-session','po','--target-session','retained',
-                '--expected-thread',self.worker_thread,'--expected-host','mac','--request-id',rid,'--confirm']),0)
-        subprocess.run(['jq','-e','--arg','rid',rid,'.id == $rid and .target_session == "retained"'],
-                       input=out.getvalue(),text=True,capture_output=True,check=True)
+                '--expected-thread',self.worker_thread,'--expected-host','mac','--request-id',rid,'--confirm'])
         audit=self.grant(request_id=rid)
         self.assertEqual(self.grant(request_id=rid),audit)
         with contextlib.closing(Coordinator(self.db)) as coord:
@@ -68,30 +67,35 @@ class RetainedManagementTests(RootOrchestratorTests):
         self.assertFalse(any(method in ('thread/start','turn/start','turn/interrupt') for method,_ in self.rpc.calls))
 
     def test_unbound_reviewer_grant_is_not_native_restoration(self):
-        self.grant(target='reviewer',expected_thread=None)
-        with self.assertRaisesRegex(RemoteCoordError,'exact current main thread'):
+        with self.assertRaisesRegex(CoordError,'invalid local Root expected_thread'):
+            self.grant(target='reviewer',expected_thread=None)
+        with self.assertRaisesRegex(RemoteCoordError,'need explicit root delegate-management'):
             self.call('agent-resume',session='po',to='reviewer',expected_thread=str(uuid.uuid4()),request_id=str(uuid.uuid4()),confirm=True)
-        with self.assertRaisesRegex(RemoteCoordError,'exact current main-conversation binding'):
+        with self.assertRaisesRegex(RemoteCoordError,'need explicit root delegate-management'):
             self.call('session-reset',session='po',to='reviewer',expected_thread=str(uuid.uuid4()),prompt='Review',request_id=str(uuid.uuid4()),confirm=True)
         self.assertIsNone(self.call('agent-status',session='po',to='reviewer')['thread_id'])
 
     def test_exact_authority_binding_and_immutable_retry(self):
         rid=str(uuid.uuid4());self.grant(request_id=rid)
         for values,pattern in ((dict(expected_host='other'),'differs'),(dict(target='reviewer'),'differs')):
-            with self.assertRaisesRegex(RemoteCoordError,pattern):self.grant(request_id=rid,**values)
-        with self.assertRaisesRegex(RemoteCoordError,'binding/host changed'):self.grant(expected_thread=str(uuid.uuid4()))
-        with self.assertRaisesRegex(RemoteCoordError,'designated PO'):self.grant(po='retained')
-        with self.assertRaisesRegex(RemoteCoordError,'canonical home'):self.root('delegate-management',session='po',project='default',po='po',target='retained',expected_thread=self.worker_thread,expected_host='mac',request_id=str(uuid.uuid4()),confirm=True)
+            with self.assertRaisesRegex(CoordError,pattern):self.grant(request_id=rid,**values)
+        with self.assertRaisesRegex(CoordError,'binding/host changed'):self.grant(expected_thread=str(uuid.uuid4()))
+        with self.assertRaisesRegex(CoordError,'designated'):self.grant(po='retained')
+        with self.assertRaisesRegex(CoordError,'canonical'):self.root('delegate-management',session='po',project='default',po='po',target='retained',expected_thread=self.worker_thread,expected_host='mac',request_id=str(uuid.uuid4()),confirm=True)
 
     def test_excluded_identity_and_child_cannot_gain_edge(self):
         for target in ('a','po',self.server.sender_session):
-            with self.assertRaisesRegex(RemoteCoordError,'cannot be delegated'):
-                self.grant(target=target,expected_thread=None,expected_host=None)
+            with self.assertRaisesRegex(CoordError,'cannot be delegated'):
+                self.grant(target=target)
         self.call('register',session='child-route',agent='child-route')
         self.call('bind',session='child-route',parent_session='po',agent_path='/child-route')
-        with self.assertRaisesRegex(RemoteCoordError,'native child routes'):
-            self.grant(target='child-route',expected_thread=None)
+        with self.assertRaisesRegex(CoordError,'native child routes'):
+            self.grant(target='child-route')
         with contextlib.closing(Coordinator(self.db)) as coord:
             coord.db.execute('CREATE TABLE IF NOT EXISTS agent_management (target_session TEXT PRIMARY KEY,manager_session TEXT NOT NULL,request_id TEXT NOT NULL)')
             coord.db.execute('INSERT INTO agent_management VALUES(?,?,?)',('retained','different-po',str(uuid.uuid4())))
-        with self.assertRaisesRegex(RemoteCoordError,'conflicting explicit manager'):self.grant()
+        with self.assertRaisesRegex(CoordError,'conflicting explicit manager'):self.grant()
+
+
+def load_tests(loader, tests, pattern):
+    return unittest.TestSuite(RetainedManagementTests(name) for name in RetainedManagementTests.__dict__ if name.startswith('test_'))

@@ -2,15 +2,19 @@ import base64
 import contextlib
 import hashlib
 import json
+import subprocess
 import unittest
 import copy
 from pathlib import Path
 import tempfile
 import time
 import uuid
+from unittest.mock import patch
 
 from agent_chat.bridge import Bridge
 from agent_chat.bridge_client import RemoteBridgeState
+from agent_chat.control_worker import ControlWorker
+from agent_chat.agent_control import po_status_action
 from agent_chat.core import CoordError
 from agent_chat.remote import RemoteCoordError
 from agent_chat.rpc import TransportError
@@ -191,6 +195,31 @@ class AgentControlTests(RemoteWebFixture):
         with self.assertRaisesRegex(RemoteCoordError,'another host'):
             other.control_job(first['id'])
 
+    def test_refresh_missing_thread_is_actionable_and_mismatch_still_refused(self):
+        self.call('send', to='b', body='Unread fixture source')
+        with self.assertRaisesRegex(RemoteCoordError, 'read your inbox'):
+            self.call('agent-status', session='b', to='worker', refresh=True,
+                      request_id=str(uuid.uuid4()))
+        self.assertEqual(self.status()['requests'], [])
+        self.call('context', session='b')
+        child_thread = str(uuid.uuid4())
+        self.call('register', session='child', agent='child')
+        self.call('bind', session='child', parent_session='a', agent_path='/worker/child')
+        with self.assertRaisesRegex(RemoteCoordError, '--expected-thread.*current bound main thread'):
+            self.call('agent-status', session='b', to='worker', refresh=True, request_id=str(uuid.uuid4()))
+        self.assertEqual(self.status()['requests'], [])
+        for thread, expected in ((None, '--expected-thread.*current bound main thread'),
+                                 (str(uuid.uuid4()), 'exact current main thread'),
+                                 (child_thread, 'exact current main thread')):
+            with self.subTest(thread=thread), self.assertRaisesRegex(RemoteCoordError, expected):
+                self.call('agent-status', session='b', to='worker', refresh=True,
+                          expected_thread=thread, request_id=str(uuid.uuid4()))
+            self.assertEqual(self.status()['requests'], [])
+        result = self.call('agent-status', session='b', to='worker', refresh=True,
+                           expected_thread=self.old, request_id=str(uuid.uuid4()))
+        self.assertEqual(result['refresh']['status'], 'pending')
+        self.assertEqual(result['refresh']['thread_id'], self.old)
+
     def test_refresh_is_durable_read_only_and_roster_compact(self):
         result = self.call('agent-status', session='b', to='worker', refresh=True,
                            expected_thread=self.old, request_id=str(uuid.uuid4()))
@@ -309,7 +338,17 @@ class AdminRecoveryStateTests(unittest.TestCase):
 
     def qualified_pin(self, sender, label, packet):
         message_id, attachment_id = 'message-' + label, 'attachment-' + label
-        content = json.dumps(packet, sort_keys=True, separators=(',', ':')).encode()
+        original=packet['original']
+        args=['jq','-cSnj','--arg','kind',packet['kind']]
+        for key,value in original.items(): args += ['--arg',key,str(value)]
+        base='{version:1,kind:$kind,original:{resource:$resource,reservation_id:$reservation_id,owner_session:$owner_session,remote_run_id:$remote_run_id,refusal:$refusal}}'
+        if label == 'current':
+            for key,value in packet['current'].items(): args += ['--arg',key,str(value)]
+            program=base+' + {current:{instance_id:$instance_id,closure_fact_id:$closure_fact_id,host_id:$host_id,closure_authority:$closure_authority,closure_digest:$closure_digest},known_instances:[$instance_id]}'
+        else:
+            for key in ('closure_attachment_id','closure_packet_sha256'): args += ['--arg',key,packet[key]]
+            program=base+' + {closure_attachment_id:$closure_attachment_id,closure_packet_sha256:$closure_packet_sha256}'
+        content=subprocess.run(args+[program],capture_output=True,check=True).stdout
         self.coord.db.execute('INSERT INTO messages(id,sender_session,recipient_session,body,created_at) VALUES(?,?,?,?,?)',
                               (message_id, sender, 'root', label, time.time()))
         self.coord.db.execute('INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)',
@@ -376,7 +415,8 @@ class AdminRecoveryStateTests(unittest.TestCase):
             'current_closure': current_pin,
             'reviewer_closure': self.qualified_pin('po', 'reviewer', reviewer),
             'historical_uncertainty': ['historical descendant frontier was never captured']}}
-        self.coord.session = 'root'; self.coord.inbox()
+        self.coord.session = 'root'
+        self.coord.message('message-current'); self.coord.message('message-reviewer')
         request_id = str(uuid.uuid4())
         self.coord.db.execute('UPDATE messages SET recipient_session=? WHERE id=?', ('po', 'message-current'))
         with self.assertRaisesRegex(CoordError, 'delivered'):
@@ -398,7 +438,8 @@ class AdminRecoveryStateTests(unittest.TestCase):
         audit = self.coord.db.execute('SELECT * FROM admin_qualified_dispositions WHERE request_id=?',
                                       (request_id,)).fetchone()
         self.assertEqual(audit['original_refusal'], evidence['qualified_current_disposition']['original_refusal'])
-        self.assertEqual(json.loads(audit['historical_uncertainty_json']), evidence['qualified_current_disposition']['historical_uncertainty'])
+        subprocess.run(['jq','-e','. == ["historical descendant frontier was never captured"]'],
+                       input=audit['historical_uncertainty_json'],text=True,capture_output=True,check=True)
         self.assertIsNone(self.coord.db.execute('SELECT 1 FROM receipts WHERE reservation_id=?',
                                                 (claim['reservation_id'],)).fetchone())
         self.assertIsNone(self.coord.db.execute('SELECT owner_session FROM resources WHERE name=?',
@@ -477,3 +518,73 @@ class AdminRecoveryHttpTests(RemoteWebFixture):
         with self.assertRaisesRegex(RemoteCoordError, 'exact server-authenticated project'):
             self.call('admin-recover', session='root', project='other-project', **params)
         self.assertEqual(self.call('admin-recover', session='root', project='default', **params)['outcome'], 'cleared')
+
+
+class POStatusWorkerTests(unittest.TestCase):
+    def test_existing_inspect_action_keeps_its_shared_observe_behavior(self):
+        job = dict(id=str(uuid.uuid4()), action='inspect', target_session='po', thread_id='thread',
+                   host_id='host', status='pending', root_team_stop=False)
+        class State:
+            def __init__(self): self.updates=[]
+            def control_job(self, request_id): return dict(job)
+            def control_update(self, request_id, expected, status, **values):
+                self.updates.append((expected, status, values))
+                return dict(job, status=status)
+        class BridgeStub:
+            def __init__(self): self.state=State(); self.rpc=None
+        bridge = BridgeStub()
+        worker = ControlWorker(bridge)
+        with patch.object(ControlWorker, 'observe', return_value=(
+                {'state':'idle','turn_id':None,'queue_count':0}, True, [], {'model':'existing'})) as observed:
+            worker.advance(job)
+        observed.assert_called_once_with(job)
+        self.assertEqual(bridge.state.updates, [('pending','completed',
+            {'observation': {'state':'idle','turn_id':None,'queue_count':0}})])
+
+    def test_worker_uses_only_nonresuming_thread_status_without_reading_queue_payloads(self):
+        thread = str(uuid.uuid4())
+        action = po_status_action('project-a', 'project-root', 'default', 'canonical-root',
+                                  str(uuid.uuid4()), str(uuid.uuid4()))
+        job = dict(id=str(uuid.uuid4()), action=action, requester_session='project-root',
+                   target_session='po', host_id='host', thread_id=thread, status='pending',
+                   po_status_scope_current=True)
+        class StatusState:
+            def __init__(self): self.updates=[]
+            def control_job(self, request_id): return dict(job)
+            def control_update(self, request_id, expected, status, **values):
+                self.updates.append((request_id, expected, status, copy.deepcopy(values)))
+                return dict(job, status=status, **values)
+        class StatusRpc:
+            def __init__(self): self.calls=[]
+            def request(self, method, params, **kwargs):
+                self.calls.append((method, copy.deepcopy(params)))
+                if method == 'thread/read':
+                    return {'thread': {'id': thread, 'status': {'type': 'active'}, 'canAcceptDirectInput': False}}
+                raise AssertionError('unexpected native API method: ' + method)
+        class StatusBridge:
+            def __init__(self, state, rpc): self.state, self.rpc = state, rpc
+            def queue(self, target): raise AssertionError('inspection must not enumerate queued payloads')
+        state, rpc = StatusState(), StatusRpc()
+        ControlWorker(StatusBridge(state, rpc)).advance(job)
+        self.assertEqual([call[0] for call in rpc.calls], ['thread/read'])
+        self.assertEqual(rpc.calls[0][1], {'threadId': thread, 'includeTurns': False})
+        self.assertEqual(state.updates[0][1:], ('pending', 'completed',
+            {'observation': {'state': 'active', 'turn_id': None, 'queue_count': None}}))
+
+    def test_worker_fails_closed_on_scope_drift_before_native_calls(self):
+        thread = str(uuid.uuid4())
+        job = dict(id=str(uuid.uuid4()), action=po_status_action('project-a', 'project-root', 'default',
+            'canonical-root', str(uuid.uuid4()), str(uuid.uuid4())), target_session='po', host_id='host',
+            thread_id=thread, status='pending', po_status_scope_current=False)
+        class DriftState:
+            def __init__(self): self.updates=[]
+            def control_job(self, request_id): return dict(job)
+            def control_update(self, *args, **kwargs): self.updates.append(args); return dict(job, status='failed')
+        class NeverRpc:
+            def request(self, *args, **kwargs): raise AssertionError('drifted scope must not reach native API')
+        class DriftBridge:
+            def __init__(self): self.state, self.rpc = DriftState(), NeverRpc()
+            def queue(self, target): raise AssertionError('drifted scope must not read native queue')
+        bridge = DriftBridge()
+        ControlWorker(bridge).advance(job)
+        self.assertEqual(bridge.state.updates, [(job['id'], 'pending', 'failed')])

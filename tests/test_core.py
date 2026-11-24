@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -17,9 +17,51 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 # Keep coordinator regression coverage independent of the public HTTP client.
-CLI = [sys.executable, str(ROOT / 'src' / 'agent_chat' / 'core.py')]
+CLI = [sys.executable, '-m', 'agent_chat.core']
 sys.path.insert(0, str(ROOT / 'src'))
 import agent_chat.core
+
+
+def jq(raw, expression, *args, check=True):
+    """All JSON parsing, selection and structural comparison stays in jq."""
+    return subprocess.run(['jq', '-c', *args, expression], input=raw, text=True,
+                          capture_output=True, check=check)
+
+
+def jq_value(raw):
+    kind = jq(raw, 'type', '-r').stdout.strip()
+    if kind in ('object', 'array'):
+        return JqValue(raw, kind)
+    if kind == 'null': return None
+    if kind == 'boolean': return jq(raw, '.').stdout.strip() == 'true'
+    if kind == 'number':
+        text = jq(raw, '.').stdout.strip()
+        return float(text) if any(char in text for char in '.eE') else int(text)
+    return subprocess.run(['jq', '-r', '.'], input=raw, text=True, capture_output=True, check=True).stdout[:-1]
+
+
+class JqValue:
+    """Opaque JSON container; jq owns each selection and structural equality."""
+    def __init__(self, raw, kind): self.raw, self.kind = raw, kind
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            selected = jq(self.raw, '.[$key]', '--argjson', 'key', str(key)).stdout
+        else:
+            present = jq(self.raw, 'has($key)', '--arg', 'key', key).stdout.strip()
+            if present != 'true': raise KeyError(key)
+            selected = jq(self.raw, '.[$key]', '--arg', 'key', key).stdout
+        return jq_value(selected)
+    def __iter__(self):
+        if self.kind != 'array': raise TypeError('not an array')
+        for raw in jq(self.raw, '.[]').stdout.splitlines(): yield jq_value(raw)
+    def __len__(self): return int(jq(self.raw, 'length').stdout.strip())
+    def __contains__(self, key): return jq(self.raw, 'has($key)', '--arg', 'key', key).stdout.strip() == 'true'
+    def __eq__(self, other):
+        if isinstance(other, JqValue):
+            return jq(self.raw, '. == $other', '--argjson', 'other', other.raw).stdout.strip() == 'true'
+        if isinstance(other, list) and not other:
+            return jq(self.raw, '. == []').stdout.strip() == 'true'
+        return NotImplemented
 
 
 class CoordTests(unittest.TestCase):
@@ -31,6 +73,8 @@ class CoordTests(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.pop('AGENT_CHAT_TOKEN', None)
         self.env.pop('AGENT_CHAT_SERVER', None)
+        inherited_path = self.env.get('PYTHONPATH')
+        self.env['PYTHONPATH'] = str(ROOT / 'src') + (os.pathsep + inherited_path if inherited_path else '')
         self.env.update(AGENT_CHAT_DB=str(self.db), AGENT_CHAT_SESSION='a',
                         AGENT_CHAT_STATE_DIR=str(self.root / 'client-state'))
         self.cli('register', '--agent', 'alpha')
@@ -46,10 +90,8 @@ class CoordTests(unittest.TestCase):
         )
         if check:
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        try:
-            value = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            value = None
+        parsed = jq(result.stdout, '.', check=False)
+        value = jq_value(parsed.stdout) if parsed.returncode == 0 and parsed.stdout.strip() else None
         return result, value
 
     def request(self, name='shared', session='a'):
@@ -68,15 +110,27 @@ class CoordTests(unittest.TestCase):
     def receipt(self, claim, **changes):
         evidence = self.root / 'restoration.txt'
         evidence.write_text('Verified baseline restoration and owned process closure.\n')
-        data = {
-            'version': 1, 'resource': claim['resource'],
-            'reservation_id': claim['reservation_id'], 'restored': True,
-            'processes_closed': True, 'closed_at': time.time(),
-            'evidence': str(evidence), 'pids': [],
-        }
-        data.update(changes)
+        args = ['jq', '-cn', '--arg', 'resource', claim['resource'], '--arg', 'reservation', claim['reservation_id'],
+                '--arg', 'evidence', str(evidence), '--argjson', 'closed', str(time.time())]
+        data = subprocess.run([*args, '{version:1,resource:$resource,reservation_id:$reservation,restored:true,processes_closed:true,closed_at:$closed,evidence:$evidence,pids:[]}'],
+                              text=True, capture_output=True, check=True).stdout
+        nonfinite = False
+        for key, value in changes.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                encoded = subprocess.run(['jq','-cn','--arg','v','__NONFINITE__','$v'],text=True,capture_output=True,check=True).stdout
+                nonfinite = True
+            elif isinstance(value, str):
+                encoded = subprocess.run(['jq','-cn','--arg','v',value,'$v'],text=True,capture_output=True,check=True).stdout
+            elif isinstance(value, list):
+                encoded = subprocess.run(['jq','-cn','$ARGS.positional|map(tonumber)','--args',*[str(item) for item in value]],text=True,capture_output=True,check=True).stdout
+            else:
+                scalar = str(value).lower() if isinstance(value, bool) else str(value)
+                encoded = subprocess.run(['jq','-cn','--argjson','v',scalar,'$v'],text=True,capture_output=True,check=True).stdout
+            data = jq(data, '.[$key]=$value', '--arg', 'key', key, '--argjson', 'value', encoded).stdout
+        if nonfinite:
+            data = subprocess.run(['jq','-r','tojson | sub("\\\"__NONFINITE__\\\"";"NaN")'],input=data,text=True,capture_output=True,check=True).stdout
         path = self.root / ('receipt-' + str(time.time_ns()) + '.json')
-        path.write_text(json.dumps(data))
+        path.write_text(data)
         return path
 
     def release(self, claim, session='a', receipt=None, check=True):
@@ -254,7 +308,7 @@ class CoordTests(unittest.TestCase):
         with sqlite3.connect(self.db) as db:
             row = db.execute('SELECT evidence_sha256,receipt_json FROM receipts').fetchone()
         self.assertEqual(len(row[0]), 64)
-        self.assertEqual(json.loads(row[1])['reservation_id'], claim['reservation_id'])
+        self.assertEqual(jq_value(row[1])['reservation_id'], claim['reservation_id'])
 
     def test_wrong_session_token_and_named_file_aliases(self):
         name = 'file:project/../project/src/example.py'
@@ -273,17 +327,13 @@ class CoordTests(unittest.TestCase):
     def test_run_preserves_stdout_exit_status_and_effective_environment(self):
         claim = self.request()
         self.env.update(AGENT_CHAT_ROOT=str(ROOT))
-        code = ('import json,os; print(json.dumps({name: os.environ[name] for name in '
-                '("AGENT_CHAT_DB", "AGENT_CHAT_SESSION", "AGENT_CHAT_TOKEN", "AGENT_CHAT_ROOT")})); '
+        code = ('import os; print("\\n".join(os.environ[name] for name in '
+                '("AGENT_CHAT_DB", "AGENT_CHAT_SESSION", "AGENT_CHAT_TOKEN", "AGENT_CHAT_ROOT"))); '
                 'raise SystemExit(7)')
         result, _ = self.cli('run', 'shared', '--token', claim['token'], '--',
                              sys.executable, '-c', code, check=False)
         self.assertEqual(result.returncode, 7, result.stderr)
-        environment = json.loads(result.stdout)
-        self.assertEqual(environment['AGENT_CHAT_SESSION'], 'a')
-        self.assertEqual(environment['AGENT_CHAT_TOKEN'], claim['token'])
-        self.assertEqual(environment['AGENT_CHAT_DB'], str(self.db.resolve()))
-        self.assertEqual(environment['AGENT_CHAT_ROOT'], str(ROOT.resolve()))
+        self.assertEqual(result.stdout.splitlines(), [str(self.db.resolve()), 'a', claim['token'], str(ROOT.resolve())])
         self.release(claim)
 
     def test_live_run_prevents_release_and_signal_closes_child(self):

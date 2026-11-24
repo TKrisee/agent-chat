@@ -8,6 +8,7 @@ import io
 import os
 from pathlib import Path
 import stat
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -70,6 +71,30 @@ class AttachmentDownloadServiceTests(unittest.TestCase):
             "sha256": hashlib.sha256(content).hexdigest(), "source_project": "home",
             "project": "home", "recipient_session": "home-root", "host_id": "root-host",
         })
+
+    def test_canonical_root_exact_current_po_report_is_owned_but_other_agents_are_not(self):
+        for session in ('project-po','worker'):
+            self.call('register',session=session,host=session+'-host',agent=session)
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            coord.db.execute('CREATE TABLE project_orchestrators(session_id TEXT PRIMARY KEY,root_session TEXT NOT NULL)')
+            coord.db.execute('INSERT INTO project_orchestrators VALUES(?,?)', ('project-po','home-root'))
+            reports = {}
+            for sender in ('project-po','worker'):
+                coord.session = sender
+                sent = coord._send_prepared('home-root','Task report',[coord._prepare_attachment('status.txt',b'exact report bytes')])
+                reports[sender] = (sent['id'],sent['attachments'][0]['id'])
+        message,attachment = reports['project-po']
+        got = self.call('attachment-download',source_project='home',message_id=message,attachment_id=attachment)
+        self.assertEqual(base64.b64decode(got['content_base64']),b'exact report bytes')
+        for changed in (dict(message_id=reports['worker'][0],attachment_id=reports['worker'][1]),
+                        dict(message_id='message_wrong',attachment_id=attachment),
+                        dict(attachment_id=attachment)):
+            with self.assertRaises(CoordError):
+                self.call('attachment-download',source_project='home',**changed)
+        with contextlib.closing(Coordinator(self.db)) as coord:
+            coord.db.execute('DELETE FROM project_orchestrators')
+        with self.assertRaises(CoordError):
+            self.call('attachment-download',source_project='home',message_id=message,attachment_id=attachment)
 
     def test_wrong_project_owner_id_and_private_pair_are_rejected_without_mutation(self):
         attachment_id = self.sent["attachments"][0]["id"]
@@ -264,7 +289,9 @@ class AttachmentDownloadClientTests(unittest.TestCase):
             stream.write(b"x")
         with (mock.patch.object(HttpClient, "call") as rpc,
               mock.patch("agent_chat.remote.client_host_id", return_value="root-host"),
-              self.assertRaisesRegex(CoordError, "10 MiB")):
+              self.assertRaisesRegex(CoordError, "format-specific size limit")):
+            # The CLI's existing format-aware error is generic; the actual
+            # ordinary 10 MiB+1 file and pre-RPC refusal remain the contract.
             cli.main([*common, "--attach", str(oversized)])
         rpc.assert_not_called()
 
@@ -292,6 +319,24 @@ class AttachmentTransferEndToEndTests(RemoteWebFixture):
         self.server.roots.enroll("default", "a", "mac", self.thread_id, True)
         self.home_route = self.server.roots.route("default", "a", "mac", "default")
         self.destination_route = self.server.roots.route("default", "a", "mac", self.destination)
+
+    def test_diff_authenticated_round_trip_preserves_bytes_and_recipient_access(self):
+        self.call('register', agent='ordinary-worker', session='ordinary-worker')
+        content = b'--- a/example.txt\n+++ b/example.txt\n@@ -1 +1 @@\n-old\n+new\n'
+        sent = self.call('send', to='ordinary-worker', body='Patch',
+                         attachments=[{'name': 'change.diff',
+                                       'content_base64': base64.b64encode(content).decode()}])
+        attachment_id = sent['attachments'][0]['id']
+        params = {'source_project': 'default', 'attachment_id': attachment_id,
+                  'message_id': sent['id']}
+        result = self.call('attachment-download', session='ordinary-worker', **params)
+        self.assertEqual(base64.b64decode(result['content_base64'], validate=True), content)
+        self.assertEqual(result['sha256'], hashlib.sha256(content).hexdigest())
+        self.assertEqual(result['mime'], 'text/plain')
+        with self.assertRaises(RemoteCoordError):
+            self.call('attachment-download', **params)
+        with self.assertRaises(RemoteCoordError):
+            self.call('attachment-download', session='ordinary-worker', host='wrong-host', **params)
 
     def test_shared_bearer_route_and_enroll_remain_denied_before_root_dispatch(self):
         with (mock.patch.object(self.server.roots, 'route') as route,
@@ -389,6 +434,58 @@ class ManagedOperatorAttachmentTests(AttachmentTransferEndToEndTests):
             'session': self.home_route['session'], 'host_id': 'mac',
             'params': dict(self.params, **changes)})
 
+    def test_bounded_code_attachments_preserve_mime_and_original_bytes_on_private_download(self):
+        cases = (
+            ('Example.cs', 'text/plain', b'using System;\nclass Example { }\n'),
+            ('Example.meta', 'application/yaml', b'fileFormatVersion: 2\nguid: 00112233445566778899aabbccddeeff\n'),
+            ('change.patch', 'text/plain', b'--- a/Example.cs\n+++ b/Example.cs\n@@ -1 +1 @@\n-old\n+new\n'),
+            ('Example.csproj', 'application/xml', b'<Project Sdk="Microsoft.NET.Sdk"><PropertyGroup /></Project>\n'),
+        )
+        with contextlib.closing(Coordinator(self.source_db)) as coord:
+            operator = coord.db.execute('SELECT session_id FROM operator_identities').fetchone()[0]
+            coord.session = operator
+            coord._operator_message_origin = True
+            for name, mime, content in cases:
+                with self.subTest(name=name):
+                    prepared = coord._prepare_attachment(name, content)
+                    self.assertEqual(prepared, (name, mime, content))
+                    sent = coord._send_prepared(self.po, 'synthetic bounded code fixture', [prepared])
+                    message_id = sent['id']
+                    attachment_id = sent['attachments'][0]['id']
+                    result = self.download(message_id=message_id, attachment_id=attachment_id)
+                    downloaded = base64.b64decode(result.pop('content_base64'), validate=True)
+                    self.assertEqual(downloaded, content)
+                    self.assertEqual((result['message_id'], result['attachment_id'],
+                                      result['recipient_session'], result['name'],
+                                      result['mime'], result['size']),
+                                     (message_id, attachment_id, self.home_route['session'],
+                                      name, mime, len(content)))
+                    self.assertEqual(result['sha256'], hashlib.sha256(content).hexdigest())
+                    with self.assertRaises(RemoteCoordError):
+                        self.download(message_id='message_wrong', attachment_id=attachment_id)
+                    wrong_mime = 'application/octet-stream' if mime == 'text/plain' else 'text/plain'
+                    coord.db.execute('UPDATE attachments SET mime=? WHERE id=?', (wrong_mime, attachment_id))
+                    try:
+                        with self.assertRaises(RemoteCoordError):
+                            self.download(message_id=message_id, attachment_id=attachment_id)
+                    finally:
+                        coord.db.execute('UPDATE attachments SET mime=? WHERE id=?', (mime, attachment_id))
+
+    def test_code_text_formats_keep_utf8_control_shebang_and_per_file_bounds(self):
+        names = ('Example.cs', 'Example.meta', 'change.patch', 'change.diff', 'Example.csproj')
+        for name in names:
+            with self.subTest(name=name, invalid='binary'):
+                with self.assertRaisesRegex(CoordError, 'UTF-8 text'):
+                    Coordinator._prepare_attachment(name, b'\xff')
+            with self.subTest(name=name, invalid='control'):
+                with self.assertRaisesRegex(CoordError, 'control bytes'):
+                    Coordinator._prepare_attachment(name, b'valid text\x00')
+            with self.subTest(name=name, invalid='size'):
+                with self.assertRaisesRegex(CoordError, 'exceeds 10 MiB'):
+                    Coordinator._prepare_attachment(name, b'x' * (MAX_ATTACHMENT_SIZE + 1))
+        with self.assertRaisesRegex(CoordError, 'executable scripts'):
+            Coordinator._prepare_attachment('Example.cs', b'#!/bin/sh\necho no\n')
+
     def test_managed_po_operator_download_server(self):
         before_source = self.source_db.read_bytes()
         before_directory = self.server.projects.path.read_bytes()
@@ -399,6 +496,34 @@ class ManagedOperatorAttachmentTests(AttachmentTransferEndToEndTests):
                          ('default', self.destination, self.sent['id'], self.home_route['session']))
         self.assertEqual(self.source_db.read_bytes(), before_source)
         self.assertEqual(self.server.projects.path.read_bytes(), before_directory)
+
+    def test_managed_po_download_revalidates_larger_model_bytes_on_exact_message(self):
+        size = MAX_ATTACHMENT_SIZE + 4
+        chunk_size = size - 20
+        content = (b'glTF' + struct.pack('<II', 2, size)
+                   + struct.pack('<II', chunk_size, 0x4E4F534A) + b' ' * chunk_size)
+        with contextlib.closing(Coordinator(self.source_db)) as coord:
+            operator = coord.db.execute('SELECT session_id FROM operator_identities').fetchone()[0]
+            coord.session = operator
+            coord._operator_message_origin = True
+            sent = coord._send_prepared(self.po, 'large model input',
+                [coord._prepare_attachment('candidate.glb', content)])
+        result = self.download(message_id=sent['id'], attachment_id=sent['attachments'][0]['id'])
+        downloaded = base64.b64decode(result.pop('content_base64'), validate=True)
+        self.assertEqual(downloaded, content)
+        self.assertEqual(result['message_id'], sent['id'])
+        self.assertEqual(result['recipient_session'], self.home_route['session'])
+        self.assertEqual((result['name'], result['mime'], result['size']),
+                         ('candidate.glb', 'model/gltf-binary', len(content)))
+        self.assertEqual(result['sha256'], hashlib.sha256(content).hexdigest())
+        output = Path(self.tmp.name).resolve() / 'candidate.glb'
+        with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID': 'mac'}), contextlib.redirect_stdout(io.StringIO()):
+            exit_code = cli.main(['--server', self.url, '--api-token', TOKEN, '--project', 'default',
+                '--session', self.home_route['session'], 'attachment-download', '--source-project', self.destination,
+                '--message-id', sent['id'], '--attachment-id', sent['attachments'][0]['id'], '--output', str(output)])
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(output.read_bytes(), content)
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
 
     def test_authenticated_operator_ui_stamp_is_required_and_downloadable(self):
         metadata = subprocess.run(['jq', '-cn', '--arg', 'to', self.po,
@@ -598,3 +723,99 @@ class ManagedOperatorAttachmentTests(AttachmentTransferEndToEndTests):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def write_model_fixture(path, size, extension):
+    """Incrementally create opaque, pipeline-format-valid synthetic bytes."""
+    path = Path(path)
+    if extension == 'glb':
+        header = b'glTF' + struct.pack('<II', 2, size) + struct.pack('<II', size-20, 0x4E4F534A) + b'{}'
+        padding = b' '
+    else:
+        header = b'Kaydara FBX Binary  \x00\x1a\x00' + struct.pack('<I', 7400)
+        padding = b'\x00'
+    with path.open('wb') as stream:
+        stream.write(header)
+        remaining = size-len(header)
+        block = padding * (1024*1024)
+        while remaining:
+            length = min(len(block), remaining)
+            stream.write(block[:length]); remaining -= length
+    return path
+
+
+class ModelTransferResourceBoundaryTests(unittest.TestCase):
+    def test_success_download_only_gets_larger_response_budget(self):
+        from agent_chat.remote import MAX_RESPONSE_BYTES, MAX_ATTACHMENT_DOWNLOAD_RESPONSE_BYTES
+        self.assertEqual(MAX_RESPONSE_BYTES, 60*1024*1024)
+        self.assertEqual(MAX_ATTACHMENT_DOWNLOAD_RESPONSE_BYTES, 90527064)
+        client = HttpClient('http://127.0.0.1:1', 'synthetic')
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def read(self, count):
+                self.count = count
+                return b'{"value":"0123456789"}'
+        with mock.patch('agent_chat.remote.MAX_RESPONSE_BYTES', 16):
+            for op in ('context', 'attachment-download'):
+                response = Response()
+                with mock.patch.object(client._opener, 'open', return_value=response):
+                    if op == 'context':
+                        with self.assertRaisesRegex(RemoteCoordError, 'response is too large'):
+                            client.call('/api/coord', {'op':op})
+                    else:
+                        self.assertEqual(client.call('/api/coord', {'op':op})['value'], '0123456789')
+                self.assertEqual(response.count, 17 if op=='context' else MAX_ATTACHMENT_DOWNLOAD_RESPONSE_BYTES+1)
+
+    def test_cli_batch_stat_preflight_and_file_growth_final_check(self):
+        from agent_chat import core
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'synthetic.glb'
+            with path.open('wb') as stream: stream.truncate(64*1024*1024)
+            args = ['--server','http://127.0.0.1:1','--session','synthetic','send','--to','recipient',
+                    '--body-file',str(path)]
+            # Body uses a small actual UTF-8 file; the large files are never read.
+            body = Path(directory)/'body.txt'; body.write_text('synthetic')
+            args[-1] = str(body)
+            with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID':'fixture-host'}, clear=True), \
+                    mock.patch.object(HttpClient, 'call', side_effect=AssertionError('no transport')):
+                with self.assertRaisesRegex(CoordError, '500 MiB total'):
+                    cli.main(args + ['--attach',str(path)]*8)
+                with self.assertRaisesRegex(CoordError, 'at most 50'):
+                    cli.main(args + ['--attach',str(body)]*51)
+            # Actual bytes remain authoritative if files grow after preflight.
+            other = Path(directory)/'other.txt'; other.write_bytes(b'x'*40)
+            with mock.patch.dict(os.environ, {'AGENT_CHAT_HOST_ID':'fixture-host'}, clear=True), \
+                    mock.patch.object(core, 'MAX_ATTACHMENT_TOTAL_SIZE', 64), \
+                    mock.patch.object(Path, 'stat', return_value=type('Size', (), {'st_size':1})()), \
+                    mock.patch.object(HttpClient, 'call', side_effect=AssertionError('no transport')):
+                with self.assertRaisesRegex(CoordError, '500 MiB total'):
+                    cli.main(args + ['--attach',str(other)]*2)
+
+    def test_remote_raw_budget_precedes_decoding_without_changing_format_checks(self):
+        from agent_chat import remote_service
+        from agent_chat.core import Coordinator
+        with tempfile.TemporaryDirectory() as directory, contextlib.closing(Coordinator(Path(directory)/'state.sqlite3')) as coord:
+            attachments = [{'name':'a.txt','content_base64':base64.b64encode(b'a'*20).decode()},
+                           {'name':'b.txt','content_base64':base64.b64encode(b'b'*20).decode()}]
+            with mock.patch.object(remote_service, 'MAX_ATTACHMENT_TOTAL_SIZE', 32):
+                with self.assertRaisesRegex(CoordError, '500 MiB total'):
+                    remote_service._prepare_attachments(coord, attachments)
+
+
+    def test_download_error_body_retains_general_read_bound(self):
+        import urllib.error
+        import email.message
+        from io import BytesIO
+        class ErrorBody(BytesIO):
+            def read(self, count=-1):
+                self.requested = count
+                return super().read(count)
+        stream = ErrorBody(b'{"error":"synthetic rejection"}')
+        error = urllib.error.HTTPError('http://127.0.0.1:1/api/coord', 400, 'bad', email.message.Message(), stream)
+        client = HttpClient('http://127.0.0.1:1', 'synthetic')
+        with mock.patch('agent_chat.remote.MAX_RESPONSE_BYTES', 16), \
+                mock.patch.object(client._opener, 'open', side_effect=error):
+            with self.assertRaises(RemoteCoordError):
+                client.call('/api/coord', {'op':'attachment-download'})
+        self.assertEqual(stream.requested, 17)

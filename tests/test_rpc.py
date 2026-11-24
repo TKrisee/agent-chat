@@ -5,6 +5,7 @@ import json
 import select
 import socket
 import struct
+import subprocess
 import threading
 import time
 import unittest
@@ -98,6 +99,22 @@ def _initialize(sock, result=None):
     assert json.loads(_frame(sock)[2])["method"] == "initialized"
 
 
+def _jq_wire(payload, expression):
+    return subprocess.run(['jq', '-er', expression], input=payload, capture_output=True, check=True).stdout.strip()
+
+def _jq_initialize(sock):
+    opcode, _, payload = _frame(sock)
+    assert opcode == 1 and _jq_wire(payload, '.method') == b'initialize'
+    ident = _jq_wire(payload, '.id | numbers')
+    response = subprocess.run(['jq', '-cn', '--argjson', 'id', ident.decode(), '{id:$id,result:{}}'], capture_output=True, check=True).stdout
+    _send(sock, 1, response)
+    assert _jq_wire(_frame(sock)[2], '.method') == b'initialized'
+
+def _jq_result(sock, payload):
+    ident = _jq_wire(payload, '.id | numbers')
+    return subprocess.run(['jq', '-cn', '--argjson', 'id', ident.decode(), '{id:$id,result:{}}'], capture_output=True, check=True).stdout
+
+
 class RpcClientTests(unittest.TestCase):
     def test_initializes_and_handles_partial_fragment_ping_and_notification(self):
         def handler(sock):
@@ -162,23 +179,28 @@ class RpcClientTests(unittest.TestCase):
 
     def test_pre_dispatch_boundary_excludes_stale_buffered_wire_notification(self):
         sent = threading.Event()
+        release = threading.Event()
         stale = dict(method='thread/settings/updated', params=dict(threadId='fixture-thread', threadSettings={'model': 'old'}))
         fresh = dict(method='thread/settings/updated', params=dict(threadId='fixture-thread', threadSettings={'model': 'new'}))
 
         def handler(sock):
-            _initialize(sock)
-            _send(sock, 1, json.dumps(stale).encode())
+            _jq_initialize(sock)
+            self.assertTrue(release.wait(2))
+            _send(sock, 1, b'{"method":"thread/settings/updated","params":{"threadId":"fixture-thread","threadSettings":{"model":"old"}}}')
             sent.set()
-            request = json.loads(_frame(sock)[2])
-            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
-            _send(sock, 1, json.dumps(fresh).encode())
+            request = _frame(sock)[2]
+            _send(sock, 1, _jq_result(sock, request))
+            _send(sock, 1, b'{"method":"thread/settings/updated","params":{"threadId":"fixture-thread","threadSettings":{"model":"new"}}}')
             _frame(sock)
 
         server = FakeServer(handler)
         with RpcClient(server.endpoint) as client:
-            self.assertTrue(sent.wait(1))
-            # sendall completion is not a receive boundary (e.g. TCP buffering).
-            self.assertTrue(select.select([client._sock], [], [], 1)[0])
+            # Freeze the reader before releasing the peer: prove bytes are in
+            # the socket buffer, rather than racing the asynchronous reader.
+            with client._state:
+                release.set()
+                self.assertTrue(sent.wait(1))
+                self.assertTrue(select.select([client._sock], [], [], 1)[0])
             deadline = time.monotonic() + client.timeout
             boundary = client.notification_boundary(deadline=deadline)
             self.assertEqual([value for _, value in client.notifications_since(0)], [stale])
@@ -189,10 +211,10 @@ class RpcClientTests(unittest.TestCase):
 
     def test_ack_and_notification_wait_share_one_bounded_deadline(self):
         def handler(sock):
-            _initialize(sock)
-            request = json.loads(_frame(sock)[2])
+            _jq_initialize(sock)
+            request = _frame(sock)[2]
             time.sleep(.10)
-            _send(sock, 1, json.dumps({'id': request['id'], 'result': {}}).encode())
+            _send(sock, 1, _jq_result(sock, request))
             time.sleep(.50)
 
         server = FakeServer(handler)
@@ -201,9 +223,21 @@ class RpcClientTests(unittest.TestCase):
             deadline = started + client.timeout
             boundary = client.notification_boundary(deadline=deadline)
             client.request('thread/settings/update', {}, deadline=deadline)
-            with self.assertRaises(TransportError):
-                client.next_notification(boundary, deadline=deadline)
-            self.assertLess(time.monotonic() - started, .47)
+            requested = []
+            original_wait = client._state.wait
+            def delayed_wait(timeout=None):
+                requested.append((timeout, time.monotonic()))
+                result = original_wait(timeout)
+                if not result:
+                    time.sleep(.15)  # Caller can be scheduled late after a real timeout.
+                return result
+            with mock.patch.object(client._state, 'wait', side_effect=delayed_wait):
+                with self.assertRaisesRegex(TransportError, 'timed out'):
+                    client.next_notification(boundary, deadline=deadline)
+            self.assertTrue(requested)
+            for timeout, at in requested:
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, max(0, deadline-at) + .01)
         server.join()
 
     def test_disconnect_after_ack_and_lost_observation_window_are_uncertain(self):
@@ -236,6 +270,11 @@ class RpcClientTests(unittest.TestCase):
     def test_failed_connect_closes_created_socket(self):
         class BrokenSocket:
             closed = False
+            shutdown_calls = []
+
+            def shutdown(self, how):
+                self.shutdown_calls.append(how)
+                raise OSError("not connected")
 
             def settimeout(self, _):
                 pass
@@ -243,7 +282,7 @@ class RpcClientTests(unittest.TestCase):
             def connect(self, _):
                 raise OSError("dropped")
 
-            def sendall(self, _):
+            def send(self, _):
                 raise OSError("not connected")
 
             def close(self):
@@ -251,10 +290,12 @@ class RpcClientTests(unittest.TestCase):
 
         sock = BrokenSocket()
         with mock.patch("agent_chat.rpc.socket.getaddrinfo", return_value=[(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", 9))]), \
-                mock.patch("agent_chat.rpc.socket.socket", return_value=sock):
+                mock.patch("agent_chat.rpc.socket.socket", return_value=sock), \
+                mock.patch("agent_chat.rpc.select.select", return_value=([], [sock], [])):
             with self.assertRaises(TransportError):
                 RpcClient("ws://127.0.0.1:9").connect()
         self.assertTrue(sock.closed)
+        self.assertEqual(sock.shutdown_calls, [socket.SHUT_RDWR])
 
     def test_message_limit(self):
 
@@ -277,16 +318,33 @@ class RpcClientTests(unittest.TestCase):
 
     def test_notification_does_not_extend_request_deadline(self):
         def handler(sock):
-            _initialize(sock)
+            _jq_initialize(sock)
             _frame(sock)
             _send(sock, 1, b'{"method":"notice"}')
             time.sleep(0.15)
         server = FakeServer(handler)
-        with RpcClient(server.endpoint, timeout=0.05) as client:
-            started = time.monotonic()
-            with self.assertRaises(TransportError):
-                client.request("wait")
-            self.assertLess(time.monotonic() - started, 0.12)
+        # jq-backed handshake has process startup overhead outside the request
+        # under test. Preserve the original 50 ms request deadline below.
+        with RpcClient(server.endpoint, timeout=1.0) as client:
+            client.timeout = 0.05
+            requested = []
+            original_wait = threading.Event.wait
+            def delayed_wait(event, timeout=None):
+                at = time.monotonic()
+                result = original_wait(event, timeout)
+                if threading.current_thread() is threading.main_thread() and timeout is not None:
+                    requested.append((timeout, at))
+                    if not result:
+                        time.sleep(.15)  # Delayed caller return cannot extend the deadline.
+                return result
+            with mock.patch.object(threading.Event, 'wait', delayed_wait):
+                deadline = time.monotonic() + client.timeout
+                with self.assertRaisesRegex(TransportError, 'timed out'):
+                    client.request("wait", deadline=deadline)
+            self.assertTrue(requested)
+            for timeout, at in requested:
+                self.assertGreaterEqual(timeout, 0)
+                self.assertLessEqual(timeout, max(0, deadline-at) + .01)
         server.join()
 
     def test_rsv_server_frame_is_rejected(self):
