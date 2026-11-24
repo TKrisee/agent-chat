@@ -189,22 +189,14 @@ wake jobs before changing bindings so queued input cannot reach an old route.
   Child-routing instructions appear only when the wake includes a descendant.
   These are agent instructions, not runtime enforcement; use the
   [adoption prompt](agents.md#adoption-prompt) during setup.
-- Ordinary messages wait for a loaded, idle thread that accepts direct input.
-  The bridge adds its durable input with a stable `clientUserMessageId` and
-  starts its own item through the idle queue. Existing queued input keeps its place.
-- A project PO can send guidance for a worker's current assignment while its
-  tool is running with `agent-chat-client send --to WORKER --update-for TASK_ID
-  --body-file FILE`. An ordinary follow-up reply can also qualify when the
-  message relationship identifies that assignment. The usual full-read and
-  first-reply rules still apply.
-- For mid-task delivery the bridge checks the current manager, assignment and
-  native turn, then submits the update once with Codex's expected turn ID.
-  Queued work, a pending approval or an unverified assignment waits. A running
-  tool finishes normally. Codex can use the update on its next model step.
-  Delivery, recipient read, and substantive reply are recorded separately.
-  An uncertain native submission requires reconciliation before retry.
-- Root capacity recovery may attach metadata to an already loaded thread and
-  add its bounded continuation queue item.
+- A thread must be loaded, idle and accept direct input. Active,
+  approval-waiting, unloaded and non-input child threads wait. The bridge never
+  loads an unloaded thread, starts or steers a turn directly, or answers
+  approvals. Root capacity recovery above may attach metadata to an already
+  loaded thread and add its own bounded continuation queue item.
+- The bridge adds its durable input with a stable `clientUserMessageId` and
+  starts only its own queue item through the idle-only queue API. A busy race
+  leaves the item for later; existing Codex queued input keeps its place.
 - A successful wake is not repeated while its messages remain unacknowledged.
   If all those messages are acknowledged before dispatch, the bridge cancels
   its own pending input if present. New messages can trigger another wake.
@@ -396,18 +388,3 @@ state. A bridge started with `--connect-only` attaches to an independently manag
 app-server. Inspect the actual launch mode before planning activation. An owning
 bridge needs a coordinated ownership handoff or a quiet app-server restart;
 never stop it during active turns or abandon unmaterialized candidates.
-
-### Explicit ordinary-model input after terminal provider failure
-
-The generic wake path remains loaded-idle/direct-input-only. The sole additional
-ordinary-model admission is an existing explicit pending selection paired with
-real managed unread input on a loaded `systemError` thread: coherent current
-before/after metadata, empty queue and the same latest failed transient-provider
-turn are required twice, before job preparation and immediately before its one
-ordinary `turn/start`. Excluded errors and missing/contradictory evidence withhold
-input. No explicit selection means no exception; automatic root-capacity recovery
-and its native-owner/root-only scope are unchanged. No thread load, settings,
-permissions, active-turn interrupt, queue deletion, dummy task or failed-input
-replay is performed. Existing durable submission/uncertainty and current server
-admission/guard checks remain authoritative. This is not atomic against another
-native client and does not prove effective thread defaults from turn acceptance.

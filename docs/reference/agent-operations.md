@@ -98,33 +98,10 @@ pulses still verify the reservation owner, token and expiry; messages are
 delivered by the next inbox poll without automatic acknowledgement. Starting a
 new run, explicit `check`, and ownership changes still require inbox freshness.
 
-After full consumption, use `--reply-to ORIGINAL_MESSAGE_ID` for a substantive
-reply. Add `--ack-reply` when explicitly acknowledging the source with that
-reply. An ordinary reply does not mark the source read or acknowledged. An
-identical explicit ACK retry returns the same reply; changing its recipient,
-body, attachments, or assignment ID (including its absence) remains refused.
-An existing reply and its history are immutable, not an editable progress slot.
-
-Genuinely later, separately authorized progress or a final report is a new
-message. Its `--reply-to` may name the original source or another legitimate
-message from the same sender/recipient conversation. Use `--ack-reply` only
-when explicitly acknowledging its source.
-Fully consume any new substantive request before later progress. Retain the
-original assignment in task history and preserve each source association. This
-does not restamp the first ACK or
-replace the original result. Ordinary non-ACK sends are not idempotent: if
-transport outcome is uncertain, reconcile the actual delivery before any resend;
-never blindly repeat it. Preserve outstanding source reply obligations.
-
-This lifecycle is NOT permission to retry or evade a refused send by changing
-flags, actor, conversation, content packaging or transport. A system/tool refusal
-keeps that exact action/content/recipient/association STOPPED until the existing
-first-party/system/tool review genuinely resolves it. App support, operator
-labels or this documentation do not override that decision. Do not reconstruct
-or relay refused report bytes through another route.
-
+Use `--ack-reply` only after consuming the source message. Identical retries
+return the original reply; changing an already-sent reply's contents is rejected.
 For messages needing no reply, use `acknowledge MESSAGE_ID`; never send ACK-only
-or duplicate chatter. Use exact recipients and `--reply-to` for real replies. Use the recipient-aware [shared startup rules](../boot/shared.md): human replies
+chat messages. Use exact recipients and `--reply-to` for real replies. Use the recipient-aware [shared startup rules](../boot/shared.md): human replies
 use the user-requested Caveman full mode unless changed; interagent messages use
 concise normal grammar with complete coordination facts. Avoid duplicate updates
 across channels.
@@ -146,22 +123,6 @@ Use one direct recipient when the message needs that agent's attention:
 ```sh
 agent-chat-client send --to gameplay --body-file /absolute/request.md
 ```
-
-To include the provenance of an explicit current task in one same-team peer
-message, fully read your PO assignment, inspect `agent-chat-client activity-snapshot`
-and choose the exact task you own and its source. Then use:
-
-```bash
-agent-chat-client send --to EXACT_PEER_SESSION --body-file /absolute/request.md \
-  --assignment-id EXACT_OWNED_TASK_ID
-```
-
-The link shares task/source/owner/manager metadata, not the private assignment
-body or new authority. It is not inferred from the latest task. The same option
-works with a single-peer `--large-attach` and its stable `--transfer-id`; a changed
-or no-longer-current link is withheld before publication. Reconcile a published
-transfer using its original ID and exact inputs; never retry an unknown effect or
-bypass a refusal.
 
 Send a shared update once instead of looping over recipients:
 
@@ -192,29 +153,10 @@ Earlier standalone messages are not merged based on matching text.
 Historical groups retain their quiet delivery policy; upgrading does not replay
 old group messages as new wake requests.
 
-`send --attach PATH` accepts the same images, PCM WAV audio, MP4/M4V/MOV/WebM videos, PDFs and static text documents as the
+`send --attach PATH` accepts the same images, MP4/M4V/MOV/WebM videos, PDFs and static text documents as the
 [operator UI](../../README.md#use-the-browser), with up to 50 files of 10 MiB each.
 Review files before sending; attachments are copied into SQLite. Browser reads
-do not acknowledge your inbox deliveries. The authenticated attachment gallery
-plays PCM WAV files with browser controls while preserving their original bytes.
-
-A registered same-project recipient can download one attachment from its own
-direct inbox message using the IDs from normal inbox/context readback and a new
-private destination:
-
-```sh
-agent-chat-client --project PROJECT --session OWN_RECIPIENT_SESSION attachment-download \
-  --source-project PROJECT --message-id message_EXACT_ORIGINAL \
-  --attachment-id attachment_EXACT --output /absolute/private/new-file.png
-```
-
-The shared project bearer authenticates the request; the selected session is a
-selector. The server checks that this selected session is the direct recipient
-of the exact delivered message and that its supplied original message ID matches
-the attachment row. It does not authenticate an individual named session or
-caller. Body text and caller-supplied IDs do not grant access; group copies and
-another recipient's message are rejected. This same-project inbox route does
-not widen the separate canonical-Root/operator cross-project route below.
+do not acknowledge your inbox deliveries.
 
 Canonical root can transfer an operator attachment from its private home inbox
 through an explicit local file. Trusted-local application setup must first establish
@@ -242,9 +184,8 @@ agent-chat-client --project HOME_PROJECT --session OWN_HOME_ROOT_SESSION attachm
   --attachment-id attachment_EXACT --output /absolute/private/new-file.png
 ```
 
-`--message-id` is mandatory for this managed-project route and the direct same-project
-recipient route; it is optional only for the compatible direct-home Root route and,
-when supplied, must also match there. The server
+`--message-id` is mandatory for this managed-project route; it is optional for the
+compatible direct-home route and, when supplied, must also match there. The server
 checks its existing canonical Root owner/configuration, registration/binding/host,
 the source's current enrollment and matching Root projection, and the exact current
 designated PO's registered management association; retired/quarantined identities
@@ -577,52 +518,6 @@ guards and clear the hold atomically after verifying restoration and actual
 process closure. Retain the existing owner, queue and evidence until it succeeds.
 Do not use a raw close operation to bypass receipt checks.
 
-### Exact normal receipt schema and stale cleanup
-
-`--receipt` names a UTF-8 JSON file, not a token or an inline JSON argument.
-The parser accepts **exactly** these eight keys for v1; v2 requires the same
-keys plus `process_closures`. Extra or missing keys are rejected.
-
-| Key | Required value |
-| --- | --- |
-| `version` | Numeric `1` or `2`, never a boolean. |
-| `resource` | Exact resource name string. |
-| `reservation_id` | Exact currently held reservation ID string. |
-| `restored` | Boolean `true`, truthfully attesting agreed restoration. |
-| `processes_closed` | Boolean `true`, truthfully attesting owned process closure. |
-| `closed_at` | Positive Unix timestamp number, no later than now and no earlier than the reservation grant or most recent guarded closure. |
-| `evidence` | Nonempty path string to a nonempty closure report; relative paths resolve beside the receipt. Hosted reports must be at most 2 MiB. |
-| `pids` | Array of positive integer PIDs, never booleans; include every relevant owned process, including exited processes. `[]` is truthful only when none were started. |
-
-For v2, `process_closures` is an array (possibly empty). Each entry has exactly
-`pid`, `closed_at`, `evidence`, and `evidence_sha256`: a unique PID already in
-`pids`; a positive timestamp no later than resource `closed_at`; a nonempty
-report path; and exactly 64 lowercase hexadecimal SHA-256 characters. Each
-per-process report must be nonempty, at most 2 MiB, and match that hash. The
-complete v1 example and v2 extension later in this guide illustrate
-the shape; example timestamps, PIDs and paths are not evidence for a real hold.
-
-For an already STALE hold, the supported receipt-only hosted command is:
-
-```sh
-agent-chat-client recover RESOURCE --receipt /absolute/private/CLOSED.json
-```
-
-Run it only through the existing owning session and original registered host,
-with normal private HTTP authentication and a fresh own coordination context.
-`recover` takes no reservation token and does not renew execution authority.
-It verifies the current exact reservation and truthful restoration/closure
-proof, can atomically close receipt-covered stale remote guards, records the
-receipt, and clears ownership. Every nonzero open guard root must be listed;
-its attested closure must not predate that guard. A live process/group or
-unproved PID reuse remains a refusal. Ordinary `release RESOURCE --receipt
-CLOSED.json` instead requires the private reservation token (normally
-`AGENT_CHAT_TOKEN`); source permits receipt-backed stale cleanup too, but that
-never authorizes running or restoring with an expired token. Normal release
-still refuses any open remote guard. Missing closure/restoration evidence is a
-blocker, not a reason to invent a receipt, transfer owner or retry a stale run.
-Schema acceptance alone proves none of those physical facts.
-
 ### Recipient message consumption
 
 Only an exact recipient full-message read, or an untruncated recipient context
@@ -682,12 +577,7 @@ and `--project-id` deliberately avoid the ordinary client's global selectors.
 For the bounded nonmutating operator read, use [local readiness](../root-orchestrator.md#reduced-nonmutating-root-readiness-read). It reuses the exact machine-read projection and does not synchronize or resolve registrations.
 
 Only readiness, status, enroll, in/route, configure, provision, delegate-management,
-investigation-admit, team-lifecycle (stop-all/resume-all/stop-status only), fresh-start/fresh-status,
-fresh-retire (the exact local, guarded uncertain-request retirement),
-fresh-retire-settings-mismatch (the exact local, guarded retirement of the
-retained standard request whose original settings proof differs),
-fresh-cancel-pending (the exact local, guarded cancellation of one pending
-Root intent with native outcome preserved as unknown),
+team-lifecycle (stop-all/resume-all/stop-status only), fresh-start/fresh-status,
 stop-all/stop-status/resume-all are supported. Each method accepts only its
 explicit fields (`root-local METHOD --help`); there is no generic invoke, SQL,
 worker/native command, project-create, disposition or recovery route. Existing
@@ -697,44 +587,6 @@ and exact payload on replay; stop/resume use the retained stop UUID. Do not infe
 a generic immutable replay contract for all operations or completion merely
 because a pending request was recorded. Native execution remains with existing
 workers; this adapter does not start a native process.
-
-`investigation-admit` is one trusted-local request for one already-delivered
-message and its existing inspection control. It requires the configured
-`--home-project` Root identity and an explicit `--target-project-id`, current
-PO and worker selectors, worker thread/host, active stop UUID,
-immutable request UUID, exact message/control IDs, absolute Unix expiry, and
-`--confirm`. The backend revalidates those associations and the queue boundary;
-the adapter does not grant worker-wide resume. Successful recording reports
-`workers_released=false` and `native_execution_proven=false`. It does not edit
-the task input, reorder or replay queue items, release other project barriers,
-authorize fixes, or establish that the task ran.
-For a failed generic scope check, `investigation-preflight` accepts the same
-exact target project, PO, worker/thread/host, stop, message, inspection request,
-request UUID, and expiry selectors without `--confirm`. It returns only a
-status, named boolean checks, and failed check names; it does not create an
-admission or expose message/task content. A successful preflight is not an
-admission or evidence of execution.
-For reconciliation, use the same immutable request UUID and identical typed
-scope only. The supported stop readback is `team-lifecycle --operation
-stop-status --request-id <stop UUID>`; its `po_coordination.task_admissions`
-projection contains the exact admission identifiers, expiry, and revalidated
-`effective` flag, without message body. A recorded or effective admission is
-not proof of native start, message consumption, or investigation completion.
-
-`fresh-retire-settings-mismatch` accepts only `--expected-thread`, `--request-id`,
-`--retirement-id`, and `--confirm`. It is a trusted local disposition for the
-one retained settings-mismatch request; the backend rechecks the canonical
-binding and exact request gates. It preserves the candidate and unknown native
-outcome, makes no native closure claim, and does not alter project stops, holds,
-or queues. It is not a generic cancellation or recovery command.
-
-`fresh-cancel-pending` accepts only `--expected-thread`, `--request-id`,
-`--cancellation-id`, and `--confirm`. It is a trusted local disposition for the
-specified pending Root intent. The backend rechecks the canonical binding,
-candidate, request state, and request-local gates. It preserves candidate and
-history with native outcome explicitly unknown; it does not close native
-threads or alter project stops, holds, or queues. It is not a generic request
-cancellation or recovery command.
 
 Preflight reads canonical store metadata before schema-initializing application
 constructors. Every actual project open, including synchronization of other
@@ -923,15 +775,6 @@ AGENT_CHAT_TOKEN=$(jq -er '.token' "$CAPABILITY") \
   agent-chat-client release validation-clone --receipt /absolute/path/to/CLOSED.json
 ```
 
-For an ordinary run, omit `--restore` and `--max-seconds`. The request's
-`--minutes` lease bounds the reservation, not the child command's runtime; the
-ordinary run command has no general `--max-seconds` timeout. Select a command
-that is expected to finish within the owned lease. `--max-seconds` is reserved
-for `--restore`: it sets the restoration deadline (default 120 seconds, allowed
-range 1–900) and is rejected locally without restoration mode. A prospective
-`--process-evidence-file PATH` can retain the actual run/guard observations; it
-does not by itself establish that resources were restored or returned.
-
 `CLOSED.json` records restoration and process closure, with nonempty evidence:
 
 ```json
@@ -949,22 +792,7 @@ does not by itself establish that resources were restored or returned.
 
 Set `closed_at` to the actual Unix timestamp and list all process IDs you
 started, including processes that have since exited. An empty `pids` list is
-valid only if you started no processes. The receipt's process scope is the
-reserved resource task: each managed task root and every explicitly started
-independent or detached payload helper, including source readers such as `cat`
-and `rg`, tests, compilers and native jobs. Include exited payload processes.
-The surrounding Codex, agent and tool-service runtime and supported agent-chat
-control-plane operations for registration, messaging, admission, status, guards
-and receipt administration are outside that scope. A launcher is control-plane
-only when protected task work and source access occur entirely in recorded task
-execution, with no untracked payload helper outside it. Do not claim those services
-or their entire OS ancestry were terminated.
-
-Before acquisition, prepare a concrete supported capture and containment plan;
-future PIDs and reap records cannot yet exist. Capture actual task identities and
-closure evidence from task start through completion, and satisfy the existing
-receipt fields before return. Do not infer escaped-process absence or retrofit
-historical receipts. For a
+valid only if you started no processes. For a
 stale reservation, `agent-chat-client recover RESOURCE --receipt CLOSED.json`
 applies the same checks. Never stop unrelated processes or claim closure before
 restoring the agreed state.
@@ -1135,7 +963,7 @@ agent-chat-client context
 my_thread=$(agent-chat-client session-reset-status | jq -er .thread_id)
 request_id=$(python3 -c 'import uuid; print(uuid.uuid4())')
 agent-chat-client agent-create --agent coding --expected-thread "$my_thread" \
-  --model gpt-6.2-sol --reasoning-effort high --cwd /absolute/approved/workspace \
+  --model gpt-6.1-sol --reasoning-effort high --cwd /absolute/approved/workspace \
   --request-id "$request_id" --prompt-file /absolute/bounded-task.txt --confirm
 agent-chat-client session-reset-status --to coding
 agent-chat-client agents
@@ -1269,11 +1097,11 @@ agent-chat-client context
 target_thread=$(agent-chat-client agent-status --to orchestrator | jq -er .thread_id)
 request_id=$(uuidgen)
 agent-chat-client agent-model --to orchestrator --expected-thread "$target_thread" \
-  --model gpt-6.2-sol --reasoning-effort high --request-id "$request_id" --confirm
+  --model gpt-6.1-sol --reasoning-effort high --request-id "$request_id" --confirm
 agent-chat-client agent-status --to orchestrator
 # Global root uses its existing canonical identity and supported project route:
 agent-chat-client root in PROJECT_ID agent-model --to orchestrator \
-  --expected-thread EXACT_THREAD --model gpt-6.2-sol --reasoning-effort high \
+  --expected-thread EXACT_THREAD --model gpt-6.1-sol --reasoning-effort high \
   --request-id EXACT_UUID --confirm
 ~~~
 
@@ -1509,15 +1337,6 @@ continues to verify owner, token, state and RID. Batch manifests keep their
 existing exact tuple contract. Symlinks, hard links, nonregular files and unsafe
 file/directory modes are rejected; capture replaces files atomically with fsync.
 
-Ordinary `run --batch-manifest PATH batch -- COMMAND` accepts one cohort of
-1–64 exact, distinct same-caller/session/host tuples. Put run options before
-`batch`; the 64 KiB owner-private regular single-link/no-follow manifest contract
-is unchanged. Count 65 or any invalid final tuple refuses before admission rows
-are inserted. Later attach, pulse and close remain sequential per resource and
-may leave mixed states on failure. There is no hidden 42+22 split, rollback or
-new durable per-row close receipt. Authoritative per-row outcomes must remain
-separate from process waits and ordinary ownership return.
-
 Every app guarded runner retains a private prospective process journal. Remote
 run accepts `--process-evidence-file PATH` for a new file in a private directory;
 otherwise journals are retained under the client's `process-evidence` state
@@ -1533,129 +1352,6 @@ leave a partial journal, which supplies no inferred exit or closure claim.
 
 Coverage is the instrumented process group. Detached groups, native applications
 and unrelated processes are outside this evidence. Journals are observations,
-not release receipts or universal closure proof. Capture independent or detached
-payload helpers separately and include their actual identities and closure evidence;
-a group journal alone does not prove their absence or closure. Existing receipt and server
+not release receipts or universal closure proof. Existing receipt and server
 guard checks still govern closeout. Shared integration and activation require
 independent review.
-
-### Record and inspect operator decision outcomes
-
-`agent-chat-client decision-answer QUESTION --reply-id ANSWER --outcome OUTCOME`
-records the original author's explicit outcome for one marked question. Outcomes
-`accepted`, `declined`, and `conditional` are terminal for that question;
-`clarification` is nonterminal and leaves it pending. An outcome describes the
-answer, not operational approval or task completion. A later ordinary reply never
-reopens a terminal question; a genuinely new question needs its own decision mark.
-
-Direct replies retain the existing registered-operator contract, including
-unstamped CLI replies. These have weaker `registered_operator_direct` origin and
-never acquire authenticated UI provenance by being recorded. Nested replies must
-follow genuine direct-parent edges back to the exact original question, in the
-same project and exact original two-session conversation. Every operator edge
-must have server-stamped authenticated UI provenance; original-author edges must
-have the corresponding agent role/origin. Missing or contradictory nested origin
-has no direct-legacy fallback. No message, ancestry, first ACK, or old outcome row
-is rewritten.
-
-Clarifications and final outcomes form append-only event history alongside
-unchanged legacy answer rows. An identical event retry is idempotent; changing an
-existing reply's outcome, recording after a terminal outcome, switching branches,
-or recording an older answer behind a newer supported reply refuses. Progress
-after a clarification must descend from that clarification. Legacy direct
-terminal rows remain terminal, and legacy clarifications can progress through a
-valid authenticated nested dialogue without backfilling old tables or origins.
-
-`agent-chat-client decision-status QUESTION` reads only the current registered
-original author's exact decision in its original project. It returns metadata:
-question/recipient IDs, pending/reply-received/answer-recorded status, exact recorded
-outcome/reply/author/time, bounded outcome history, latest valid rooted operator
-reply ID/time, and any ancestry limit. It returns no body, attachment content,
-credential, unrelated question or inbox data; it does not ACK/read messages or
-record outcomes. Missing and foreign-author questions share an unavailable error.
-No participant, recipient, outcome, or project override parameter is accepted.
-This is read-only decision data: ordinary coordinator construction/migrations and
-remote dispatch host binding/heartbeat and expiry observations still have their
-existing effects. It is not a zero-write database or privileged inbox-read API.
-
-Reply paths are limited to 32 edges. Latest-reply projection visits at most 128
-nodes rooted at that exact question; history is bounded and validated separately.
-An unsupported, broken, cyclic, wrong-role/participant/project, batch, separately
-marked inner question or over-limit path cannot authorize a new terminal event.
-A projection limit leaves unresolved decisions pending with an explicit limit
-flag; it does not invalidate an already valid recorded terminal outcome. The
-operator's private notification list uses the same projection: clarification stays
-pending, a newer supported nested answer shows reply received, and only an
-explicit terminal author outcome clears that question. Other pending questions
-remain visible. Status metadata and source integration do not establish live UI
-consumption or adopt code into the running server.
-
-A newer valid operator reply directly to the original marked question can progress
-an earlier clarification even when both are sibling replies. Nested progression
-still requires the recorded clarification in its supported authenticated dialogue;
-unrelated nested branches cannot supersede a later recorded clarification. Shared
-status/notification projections show a newer eligible direct reply as received,
-without interpreting its body or recording an outcome automatically.
-
-The original author may explicitly give a terminal outcome to the **same** latest
-valid reply whose sole existing outcome is an immutable legacy clarification.
-This appends one distinct event and preserves the legacy row/history. It is an
-author classification (for example, `conditional` for a direction/variants request),
-not a fabricated new operator reply or approval of unrelated production work.
-Exact old/new outcome retries are idempotent; a different terminal classification,
-a stale reply with a newer valid reply, and same-reply reclassification of a new
-nonlegacy clarification remain refused. No schema/history rewrite or new flag is
-needed for this narrowly supported legacy case.
-
-An **explicit pending ordinary model selection** may also admit its one genuine
-managed input from a loaded `systemError` thread when fresh coherent native
-reads establish direct input, an empty queue and the same latest terminal failed
-provider-overload/transient-server turn. The bridge checks this before preparing
-the associated input and again before submission. Missing/contradictory history,
-active/unloaded/non-input threads, native queued work, unsupported errors and
-authentication/rate/billing/quota/context/approval/safety/permission failures stay
-withheld. Existing host/binding/admission/reset/stop/open-guard and uncertainty
-checks still apply. No selection means ordinary wakes keep their idle-only rule.
-
-This narrow explicit model-input admission is not automatic descendant capacity
-recovery, a failed-task replay, cold load, settings update or permission override.
-It uses only existing ordered genuine unread messages and preserves the original
-request and client UUID. Only model/effort accompany that one ordinary input;
-unknown/null permissions and configuration are not invented or overridden.
-A native client can still race the final observation; an ACK does not attest
-unchanged effective defaults or atomic cross-client no-steering. Ambiguous input
-outcomes retain their original durable identity and are never automatically replayed.
-
-
-### Bounded first-party model attachments
-
-GLB v2 containers and binary FBX 7400 files may be at most 64 MiB each. Other
-supported formats remain at 10 MiB, with at most 50 attachments and an explicit
-500 MiB total raw attachment ceiling per message. CLI/local preparation checks
-file sizes before buffering and actual bytes afterward; server and browser
-preparation enforce the same total. These ceilings do not promise that 50 maximum
-models fit, nor that a 500 MiB raw multipart batch leaves room for metadata.
-Existing multipart (500 MiB plus 64 KiB metadata) and remote JSON request bounds
-are unchanged. Format checks are container/header admission, not model quality,
-triangle, rig or Unity import validation.
-
-Only a successful `/api/coord` `attachment-download` response permits up to
-90,527,064 encoded bytes (one 64 MiB file in base64 plus 1 MiB metadata). General
-responses and HTTP error bodies retain their 60 MiB bound. Exact project/source,
-original message, recipient/host, attachment size/hash/MIME and normalized
-owner-private atomic no-overwrite destination checks remain mandatory.
-
-The buffered JSON/base64/storage path has real memory costs. A bounded synthetic
-validation envelope of one or at most two concurrent maximum-model transfer
-clients must fit the stated 3 GiB combined owned-process budget before source
-acceptance. That evidence is not a global service concurrency/QoS guarantee or a
-promise that maximum aggregate batches fit a particular host. Keep admission
-and deployment capacity decisions separate, and retain actual measured evidence.
-
-Source acceptance does not activate a running sender/server/receiver. Before a
-real delivery, verify the reviewed source/interpreter/static path association and
-select any necessary operational adoption through the legitimate custodian.
-This capability does not authorize retrying a previously refused action, changing
-its content/recipient/association/transport, extending an expired grant, making a
-paid call or importing an asset. The withheld original Characters result, its
-unknown other-file aggregate and separate >64k triangle failure remain separate.

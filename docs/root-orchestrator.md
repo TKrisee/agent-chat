@@ -115,7 +115,7 @@ project orchestrator without another operator confirmation round trip:
 
 ```sh
 agent-chat-client root provision --project-id EXACT_PROJECT_ID \
-  --model gpt-6.2-sol --reasoning-effort high --request-id SAVED_UUID --confirm
+  --model gpt-6.1-sol --reasoning-effort high --request-id SAVED_UUID --confirm
 ```
 
 Provisioning forwards the stored assignment to the independent project conversation
@@ -172,7 +172,7 @@ submission:
 agent-chat-client context
 agent-chat-client root configure --project-id EXACT_PROJECT_ID \
   --agent orchestrator --cwd /absolute/canonical/primary-workspace \
-  --model gpt-6.2-sol --reasoning-effort high \
+  --model gpt-6.1-sol --reasoning-effort high \
   --request-id SAVED_UUID --prompt-file /absolute/bounded-prompt.txt --confirm
 agent-chat-client root status
 agent-chat-client root in EXACT_PROJECT_ID session-reset-status --to orchestrator
@@ -378,51 +378,6 @@ of claiming every native process is closed. Use explicit resume with the matchin
 stop UUID; it removes only that operation's barrier, without enabling supervision
 or overriding a previously stopped/otherwise restricted admission policy.
 
-### Resume one stopped project
-
-Use the configured same-identity local adapter when only one enrolled project is
-authorized to resume:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT \
-  --home-session CANONICAL_ROOT_SESSION --host-id OWN_HOST \
-  resume-project --project-id EXACT_PROJECT_ID --request-id ORIGINAL_STOP_UUID --confirm
-```
-
-The project must belong to the original stop snapshot and still have its original
-joined Root projection. The operation releases only that project's barrier for
-the retained stop UUID. Other project barriers, pending inputs, ownership,
-registrations, native bindings and prior admission policies remain unchanged.
-It does not enable supervision or claim native execution. Inspect `stop-status`
-for every project's actual barrier state. The global journal remains active until
-all its original project barriers have been resumed. Repeating the same scoped
-resume returns the retained outcome. HTTP privileged Root access is unchanged.
-
-### Admit only the designated PO for coordination
-
-If the PO must resolve coordination blockers before its team can resume, keep the
-project barrier active and admit only that exact retained PO:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT \
-  --home-session CANONICAL_ROOT_SESSION --host-id OWN_HOST \
-  po-admit --project-id EXACT_PROJECT_ID --po CURRENT_DESIGNATED_PO \
-  --expected-thread RETAINED_PO_THREAD --expected-host PO_HOST \
-  --request-id ORIGINAL_STOP_UUID --confirm
-```
-
-This local-only administrative admission does not release the project's workers
-or any other project. It requires the original stop snapshot, unchanged Root
-projection, current designated PO, exact original main binding/host, and no
-unresolved stop interrupt or older native lifecycle request. The immutable
-admission remains effective only while
-that stop is active and the PO's role, main binding and host still match; native
-turnover invalidates it. It does not create an agent, reset a conversation, change
-permissions/models, delete queued inputs, or prove a native turn ran. Give the PO
-a bounded coordination-only continuation and obtain its blocker report before
-resuming the project. Worker creation and worker lifecycle remain stopped. The
-existing server must have loaded this implementation before operational use.
-
 ## Reduced, nonmutating Root readiness read
 
 The shared API bearer does **not** permit broad `root status`, enrollment,
@@ -593,124 +548,12 @@ exact boot prompt with the request UUID as native client ID. `starting` or
 history proved that client ID and turn ID, but durable gate release is still being
 reconciled. Only `completed` means consumption and every gate release finished.
 
-`fresh-status` is the operator notice for a retained request. Its CLI output
-includes `operator_notice` with `request_id`, `state`, `reason`, and
-`prerequisite`; read that summary with `handoff_state`, `boot_consumed`,
-`response_state`, `owner_state`,
-`handoff_ready`, `canonical_current_thread_id`, `candidate_thread_id`,
-`next_action`, and `blocker` together. The canonical thread field is the binding
-actually registered at the time of the read; it can still be the old thread
-before route switch and can be the candidate during `starting`. The candidate
-UUID (and legacy `new_thread_id` alias) is diagnostic before exact boot and
-terminal response proof. `boot_consumed`
-requires native history for the exact request client ID, candidate thread, and
-turn ID. `response_state=observed` additionally requires a terminal assistant
-response on that same turn. `owner_state=verified` requires the exact candidate
-to be resumed on the same app-server endpoint with matching UID, PID, process
-start time, and generation. None of these facts can be inferred from a binding
-change, queue acceptance, or heartbeat.
-
-Follow the `next_action` and `blocker` pair for each exact state. In
-`candidate_recovery_pending`, wait for the existing bridge attempt. In
-`candidate_recovery_required`, use `fresh-recover` only when
-`next_action=retry_exact_candidate_load_same_request`. It performs a metadata-only
-load of the retained candidate; it does not create another thread, change the
-route, or send boot input. Supply a new attempt UUID once and reuse that UUID for
-an exact retry. Do not include candidate/thread/path/history/settings values.
-In `boot_consumed_awaiting_response`, wait for the same turn's terminal response;
-do not resume the candidate. In `response_observed_owner_unverified`, use the
-single-CLI owner verification procedure only when
-`next_action=verify_candidate_cli_owner`. For `reconciliation_required`, follow
-only its exact reconciliation direction and do not replay an uncertain native
-effect. `ready` is the only state that provides `operator_report`.
-Legacy completed requests are returned as
-`completed_not_selected_for_verification` with
-`next_action=no_automatic_history_read`; native response history is not scanned
-for old requests in the background. For a specifically retained request whose
-canonical binding is already the candidate and whose exact boot consumption is
-proved, `fresh-verify` explicitly selects that request for bounded verification
-using a new immutable verification UUID. The same UUID is used for an exact
-retry. This local operation does not start, resume, route, or send input, and the
-dashboard only displays its status; it offers no verification or recovery button.
-
-If a retained candidate is proven unavailable and the operator has explicitly
-chosen a replacement within the same request, a single audited `fresh-replace`
-may record that reconciliation. It preserves the original request/client ID,
-boot prompt, failed candidate ID and all failure history. It does not create a
-new request or replay boot input during the replacement start. The trusted-local
-operation must pass its current binding and strict preflight checks; save the
-reconciliation UUID once and reuse it only for an exact idempotent retry. While
-replacement work is recorded, status suppresses the old same-candidate recovery
-action. If the result is `start_uncertain`, do not retry, create another
-candidate, change routing or replay input. Preflight failure stops before native
-start. The bridge validates the correlated candidate before normal boot
-processing resumes. The dashboard reports this state but has no mutation
-control. The supported local command is:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT --home-session CANONICAL_HOME_SESSION --host-id CURRENT_HOST fresh-replace --expected-thread CURRENT_CANONICAL_THREAD_UUID --request-id REQUEST_UUID --reconciliation-id RECONCILIATION_UUID --confirm
-```
-
-This operation accepts no candidate UUID, prompt, path, settings or history
-override. The previous failed candidate remains preserved as diagnostic
-evidence; no candidate UUID is a resume instruction.
-
-If a specifically authorized same-request replacement reaches
-`replacement_start_uncertain` before any boot is queued, use `fresh-retire` only
-when the exact current canonical binding is still the old thread, the request
-is still `created`, the native queue is empty, no boot/response/owner proof
-exists, and the matching replacement record has no correlated replacement
-candidate ID. This is an audited administrative retirement of that one Root
-request: it preserves the uncertain native outcome and all candidate/history
-evidence, asserts no native process or thread closure, and releases only that
-request's Root fresh-start delivery gates. It does not delete or kill a native
-candidate, alter routing, clear project stops, release holds, or touch other
-queues. Use a distinct saved-once retirement UUID; never reuse the replacement
-reconciliation ID. The trusted-local command is:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT --home-session CANONICAL_HOME_SESSION --host-id CURRENT_HOST fresh-retire --expected-thread CURRENT_OLD_CANONICAL_THREAD_UUID --request-id REQUEST_UUID --reconciliation-id RECONCILIATION_UUID --retirement-id RETIREMENT_UUID --confirm
-```
-
-The retired status remains `retired_uncertain`, not ready, and states that the
-native outcome is unknown. Only after that exact receipt is saved and current
-preflight passes may the same registered Root start a new fresh conversation
-with a new request UUID through the existing `fresh-start` workflow. There is
-no manual native-thread adoption or candidate-kill command. Do not resume or
-replay the uncorrelated candidate, and do not treat retirement as proof of
-native cleanup.
-For ordinary same-candidate loading recovery, the supported local command is:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT --home-session CANONICAL_HOME_SESSION --host-id CURRENT_HOST fresh-recover --expected-thread CURRENT_CANONICAL_THREAD_UUID --request-id REQUEST_UUID --attempt-id ATTEMPT_UUID --confirm
-```
-
-For an explicitly selected retained request, the local verification command is:
-
-```sh
-agent-chat-client root-local --home-project HOME_PROJECT --home-session CANONICAL_HOME_SESSION --host-id CURRENT_HOST fresh-verify --expected-thread CURRENT_CANONICAL_THREAD_UUID --request-id REQUEST_UUID --verification-id VERIFICATION_UUID --confirm
-```
-
-For `next_action=verify_candidate_cli_owner`, after boot consumption and the
-terminal response are proved, exit the existing CLI normally and relaunch that
-same CLI once against the same configured app-server endpoint, selecting the
-exact candidate thread:
-
-```sh
-codex --remote "CONFIGURED_APP_SERVER_ENDPOINT" resume "CANDIDATE_THREAD_UUID"
-```
-
-Never launch a second concurrent CLI. Do not resume the candidate earlier or
-create a replacement request. `handoff_ready` and `operator_report` appear only
-after the completed boot, response, and exact process-owner proofs all agree.
-
 Unknown native creation/add/start results remain journaled. The bridge never
 replays creation or an ambiguous queue-start call. Missing supported queue,
 settings or consumption evidence is a visible staged blocker; there is no fallback
-server-spawned process. `agent-chat-client root-local fresh-recover` is the
-same-UID configured-local recovery path. Loading these changes into an already
-running installation requires the documented server and bridge service adoption;
-these commands do not restart either service.
+server-spawned process. Loading these changes into an already running installation
+requires the documented server and bridge service adoption; these commands do not
+restart either service.
 
 ## Complete coordination messages
 

@@ -1,0 +1,114 @@
+name: Go distribution
+
+on:
+  push:
+    paths: ['rebuild/**', '.github/workflows/rebuild-distribution.yml']
+  pull_request:
+    paths: ['rebuild/**', '.github/workflows/rebuild-distribution.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-amd64
+          - os: macos-15
+            platform: darwin-arm64
+          - os: windows-2025
+            platform: windows-amd64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: rebuild
+        shell: pwsh
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: rebuild/go.mod
+          cache-dependency-path: rebuild/go.sum
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: rebuild/web/package-lock.json
+      - name: Build web UI
+        run: |
+          Push-Location web
+          npm ci
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+      - name: Test and build real runtime
+        run: |
+          jq --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          gcc --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test -tags codexruntime ./...
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = if ($IsWindows) { 'agentchat.exe' } else { 'agentchat' }
+          go build -tags codexruntime -trimpath -o "dist/$exe" ./cmd/agentchat
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -Recurse web/dist dist/web
+          Copy-Item -Recurse packaging dist/packaging
+          Copy-Item README.md dist/README.md
+      - name: Test Windows process containment
+        if: runner.os == 'Windows'
+        run: |
+          go test -tags codexruntime ./internal/codexruntime -run '^TestWindowsProcessStartsOnlyAfterContainment$' -count=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Smoke packaged binary and UI
+        run: |
+          $exe = if ($IsWindows) { 'agentchat.exe' } else { 'agentchat' }
+          $data = Join-Path $env:RUNNER_TEMP 'agentchat-smoke'
+          $ui = Join-Path $PWD 'dist/web'
+          $proc = Start-Process -FilePath (Join-Path $PWD "dist/$exe") -ArgumentList @('-data', "`"$data`"", '-static', "`"$ui`"", '-listen', '127.0.0.1:18877') -PassThru
+          try {
+            $response = $null
+            for ($i = 0; $i -lt 30; $i++) {
+              try { $response = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18877/'; break } catch { Start-Sleep -Seconds 1 }
+            }
+            if (!$response -or $response.StatusCode -ne 200 -or $response.Content -notmatch '<html') { throw 'UI smoke failed' }
+            $state = Invoke-WebRequest -UseBasicParsing 'http://127.0.0.1:18877/api/state'
+            if ($state.StatusCode -ne 200) { throw 'API smoke failed' }
+          } finally { if (!$proc.HasExited) { Stop-Process -Id $proc.Id -Force }; $proc.WaitForExit() }
+      - name: Smoke Windows service lifecycle
+        if: runner.os == 'Windows'
+        run: ./tests/windows-service-smoke.ps1
+      - name: Start Linux user manager
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo loginctl enable-linger "$USER"
+          sudo systemctl start "user@$(id -u).service"
+      - name: Smoke Linux user service
+        if: runner.os == 'Linux'
+        shell: bash
+        run: bash tests/linux-service-smoke.sh
+      - name: Create archive and checksum
+        run: |
+          $archive = if ($IsWindows) { 'agentchat-${{ matrix.platform }}.zip' } else { 'agentchat-${{ matrix.platform }}.tar.gz' }
+          if ($IsWindows) { Compress-Archive -Path dist/* -DestinationPath $archive }
+          else {
+            tar -czf $archive -C dist .
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: agentchat-${{ matrix.platform }}
+          path: |
+            rebuild/agentchat-${{ matrix.platform }}.*
+          if-no-files-found: error

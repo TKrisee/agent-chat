@@ -1,0 +1,626 @@
+package service
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	"agentchat/rebuild/internal/runtimeapi"
+)
+
+const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
+const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Wait for the final assignment before dispatching work. On assignment, use the finalized scope to emit queue_worker with actionable instructions and acceptance criteria. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
+const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Attach regular workspace files by their absolute paths. Role and scope come from the service."
+const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
+const groupChatGuide = "The operator explicitly mentioned you in the shared project group conversation. Your text and any attached regular workspace files will be shared with the project group. Use the shared history for context. Answer without orchestration actions or relays."
+
+func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, instructions string) error {
+	guide := workerGuide
+	switch a.Role {
+	case "root":
+		guide = rootGuide
+		if kind == "operator_message" || kind == "approval_approved" {
+			projects, err := querySlice(tx, "SELECT id FROM projects ORDER BY id", func(rows *sql.Rows) (string, error) {
+				var id string
+				err := rows.Scan(&id)
+				return id, err
+			})
+			if err != nil {
+				return err
+			}
+			guide += "\nExisting project IDs: " + strings.Join(projects, ", ")
+		}
+	case "po":
+		guide = poGuide
+	case "worker":
+		if kind == "operator_message" {
+			guide = workerChatGuide
+		}
+	}
+	if kind == groupMessageKind {
+		guide = groupChatGuide
+	} else if project != "" && project == a.Project {
+		guide += "\nMessages marked with a project group recipient are shared context. Follow the instructions for the current task or conversation."
+	}
+	workspace := s.workspace("_root")
+	if project != "" {
+		workspace = s.workspace(project)
+	}
+	var parent string
+	if kind == "operator_message" || kind == groupMessageKind {
+		err := tx.QueryRow("SELECT parent_id FROM message_replies WHERE message_id=?", source).Scan(&parent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	}
+	if parent != "" {
+		guide += "\nThe operator replied to message " + parent + ". Its exact text and attachments are included in the context."
+	}
+	history, err := s.runtimeContext(tx, a, project, task, parent, kind)
+	if err != nil {
+		return err
+	}
+	req := runtimeapi.Request{ID: newID(), AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
+		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history,
+		Instructions: guide + "\n\nEvent: " + kind + "\n" + instructions}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec("INSERT INTO jobs (id,agent_id,project_id,task_id,source_id,kind,status,request,next_at) VALUES (?,?,?,?,?,?,'pending',?,?)",
+		req.ID, a.ID, nullIfEmpty(project), nullIfEmpty(task), source, kind, body, now())
+	return err
+}
+
+func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kind string) ([]runtimeapi.Message, error) {
+	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient"
+	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient FROM messages m
+		WHERE m.project_id=? AND m.recipient=? AND m.task_id IS NULL
+		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + `) ORDER BY m.seq DESC LIMIT `
+	groupRecipient := groupPrefix + project
+	sharedArgs := []any{project, groupRecipient, operator}
+	query := "SELECT " + privateColumns + " FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 24"
+	args := []any{task}
+	if kind == groupMessageKind {
+		query = shared + "24"
+		args = sharedArgs
+	} else if task == "" {
+		query = "SELECT " + privateColumns + " FROM messages WHERE (sender=? OR recipient=?) AND project_id IS NULL ORDER BY seq DESC LIMIT 24"
+		args = []any{a.ID, a.ID}
+		if project != "" {
+			query = "SELECT " + privateColumns + " FROM messages WHERE project_id=? AND recipient<>? AND (sender=? OR recipient=?) ORDER BY seq DESC LIMIT 24"
+			args = []any{project, groupRecipient, a.ID, a.ID}
+		}
+	}
+	query = "SELECT * FROM (" + query + ")"
+	if kind != groupMessageKind && project != "" && project == a.Project {
+		query += " UNION SELECT * FROM (" + shared + "12)"
+		args = append(args, sharedArgs...)
+	}
+	if kind == "scope_review" {
+		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages
+			WHERE project_id=? AND task_id<>? AND (sender=? OR recipient=?) ORDER BY seq DESC LIMIT 12)`
+		args = append(args, project, task, a.ID, a.ID)
+	}
+	if kind == "scope_decision" {
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages m
+			WHERE m.id=(SELECT message_id FROM task_origins WHERE task_id=?)`
+		args = append(args, task)
+	}
+	if parent != "" {
+		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END
+			FROM messages WHERE id=?`
+		args = append(args, groupRecipient, project, parent)
+	}
+	query = "SELECT id,sender,role,text,group_recipient FROM (" + query + ") ORDER BY seq"
+	messages, err := querySlice(tx, query, func(rows *sql.Rows) (runtimeapi.Message, error) {
+		var m runtimeapi.Message
+		err := rows.Scan(&m.ID, &m.Sender, &m.Role, &m.Text, &m.GroupRecipient)
+		return m, err
+	}, args...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range messages {
+		messages[i].Attachments, err = querySlice(tx,
+			`SELECT a.id,a.name,a.media_type FROM message_attachments m
+			JOIN attachments a ON a.id=m.attachment_id WHERE m.message_id=? ORDER BY a.id`,
+			func(rows *sql.Rows) (runtimeapi.AttachmentRef, error) {
+				var ref runtimeapi.AttachmentRef
+				err := rows.Scan(&ref.ID, &ref.Name, &ref.MediaType)
+				ref.Path = filepath.Join(s.dir, "attachments", ref.ID)
+				return ref, err
+			}, messages[i].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return messages, nil
+}
+
+func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi.Attachment, files []attachmentData, invalid error) error {
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+	err = s.write(func(tx *sql.Tx) error {
+		var state string
+		if err := tx.QueryRow("SELECT status FROM jobs WHERE id=?", j.ID).Scan(&state); err != nil {
+			return err
+		}
+		if state == "completed" {
+			return nil
+		}
+		if state != "submitted" && state != "running" {
+			return fmt.Errorf("%w: result for %s job", errConflict, state)
+		}
+		if invalid == nil {
+			current, err := s.uploadAttachments(tx, j, result)
+			if err != nil {
+				return err
+			}
+			if !slices.Equal(uploads, current) {
+				invalid = fmt.Errorf("%w: attachment source changed before result commit", errWorkflow)
+			}
+		}
+		diagnostic := ""
+		if invalid == nil {
+			if _, err := tx.Exec("SAVEPOINT apply_result"); err != nil {
+				return err
+			}
+			invalid = s.applyResult(tx, j, result, files)
+			if invalid != nil && !errors.Is(invalid, errWorkflow) {
+				return invalid
+			}
+			if invalid != nil {
+				if _, err := tx.Exec("ROLLBACK TO apply_result"); err != nil {
+					return err
+				}
+			}
+			if _, err := tx.Exec("RELEASE apply_result"); err != nil {
+				return err
+			}
+		}
+		if invalid != nil {
+			diagnostic = invalid.Error()
+			if j.Task != "" {
+				if _, err := tx.Exec("UPDATE tasks SET status='blocked' WHERE id=? AND status!='completed'", j.Task); err != nil {
+					return err
+				}
+			}
+			if j.Kind != groupMessageKind {
+				if err := addMessage(tx, newID(), "service", operator, "system", diagnostic, j.Project, j.Task); err != nil {
+					return err
+				}
+			}
+		}
+		_, err := tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, nullIfEmpty(diagnostic), j.ID)
+		return err
+	})
+	if err == nil {
+		s.signal()
+	}
+	return err
+}
+
+func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files []attachmentData) error {
+	a, err := getAgent(tx, j.Agent)
+	if err != nil {
+		return err
+	}
+	if a.Role != j.Request.Role || (a.Role != "root" && a.Project != j.Project) {
+		return fmt.Errorf("%w: runtime owner scope changed", errWorkflow)
+	}
+	if len(result.Text) > 128*1024 || len(result.Actions) > 12 {
+		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
+	}
+	if j.Kind == groupMessageKind {
+		return groupMessageResult(tx, a, j, result, files)
+	}
+	if a.Role == "worker" {
+		return s.workerResult(tx, j, a, result, files)
+	}
+	if j.Kind == "scope_review" {
+		if len(result.Actions) != 0 || strings.TrimSpace(result.Text) == "" {
+			return fmt.Errorf("%w: PO scope review requires a text assessment before any assignment", errWorkflow)
+		}
+		id, err := outputMessage(tx, a, root, j, result.Text, files)
+		if err != nil {
+			return err
+		}
+		manager, err := getAgent(tx, root)
+		if err != nil {
+			return err
+		}
+		return s.enqueue(tx, manager, j.Project, j.Task, id, "scope_decision", "Use the original request, draft and PO assessment in the task history to finalize this assignment or explain the blocker to the operator.")
+	}
+	if j.Kind == "scope_decision" {
+		return s.finishScope(tx, a, j, result, files)
+	}
+
+	recipient := operator
+	if a.Role == "po" && j.Kind != "operator_message" && !strings.HasPrefix(j.Kind, "approval_") {
+		recipient = root
+	}
+	if a.Role == "root" && j.Kind == "project_report" {
+		if err := relayProjectReport(tx, a, j, result.Text, files); err != nil {
+			return err
+		}
+	} else if strings.TrimSpace(result.Text) != "" || len(files) > 0 {
+		if _, err := outputMessage(tx, a, recipient, j, result.Text, files); err != nil {
+			return err
+		}
+	}
+	for _, action := range result.Actions {
+		if j.Kind == "approval_denied" || action.Type == "request_approval" && len(result.Actions) != 1 {
+			return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
+		}
+		if err := s.applyAction(tx, a, j, action); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func groupMessageResult(tx *sql.Tx, a agent, j job, result runtimeapi.Result, files []attachmentData) error {
+	if (a.Role != "po" && a.Role != "worker") || j.Task != "" || len(result.Actions) != 0 ||
+		(strings.TrimSpace(result.Text) == "" && len(files) == 0) {
+		return fmt.Errorf("%w: project group response requires a mentioned agent and text or attachments without orchestration actions", errWorkflow)
+	}
+	recipient := groupPrefix + j.Project
+	var source string
+	err := tx.QueryRow(`SELECT m.id FROM messages m JOIN projects p ON p.id=m.project_id
+		JOIN message_mentions target ON target.message_id=m.id AND target.agent_id=?
+		WHERE m.id=? AND m.project_id=? AND m.recipient=? AND m.sender=? AND m.role='operator' AND m.task_id IS NULL
+		AND (?='worker' OR p.po_id=?)`, a.ID, j.Source, j.Project, recipient, operator, a.Role, a.ID).Scan(&source)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: exact project group source unavailable", errWorkflow)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = outputMessage(tx, a, recipient, j, result.Text, files)
+	return err
+}
+
+func relayProjectReport(tx *sql.Tx, a agent, j job, text string, files []attachmentData) error {
+	var report string
+	err := tx.QueryRow(`SELECT m.text FROM messages m JOIN projects p ON p.id=m.project_id
+		JOIN tasks t ON t.id=m.task_id AND t.project_id=p.id AND t.status='completed'
+		WHERE m.id=? AND m.task_id=? AND p.id=? AND m.sender=p.po_id AND m.recipient=? AND m.role='po'`,
+		j.Source, j.Task, j.Project, root).Scan(&report)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: exact PO report unavailable", errWorkflow)
+	}
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(text) == "" {
+		text = report
+	}
+	id, err := outputMessage(tx, a, operator, j, text, files)
+	if err != nil {
+		return err
+	}
+	return shareTaskAttachments(tx, j.Source, id)
+}
+
+func shareAcceptedWorkerAttachments(tx *sql.Tx, j job, po, reportID string) error {
+	var workerResultID string
+	err := tx.QueryRow(`SELECT m.id FROM messages m JOIN agents w ON w.id=m.sender AND w.project_id=m.project_id
+		JOIN messages report ON report.id=? AND report.task_id=m.task_id
+		  AND report.project_id=m.project_id AND report.sender=m.recipient AND report.seq>m.seq
+		WHERE m.task_id=? AND m.project_id=? AND m.recipient=? AND m.role='worker' AND w.role='worker'
+		ORDER BY m.seq DESC LIMIT 1`, reportID, j.Task, j.Project, po).Scan(&workerResultID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: exact accepted worker result unavailable", errWorkflow)
+	}
+	if err != nil {
+		return err
+	}
+	return shareTaskAttachments(tx, workerResultID, reportID)
+}
+
+func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Result, files []attachmentData) error {
+	if len(result.Actions) != 0 || (strings.TrimSpace(result.Text) == "" && len(files) == 0) {
+		return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
+	}
+	if j.Kind == "operator_message" && j.Task == "" {
+		var source string
+		err := tx.QueryRow(`SELECT id FROM messages WHERE id=? AND sender=? AND recipient=?
+			AND role='operator' AND project_id=? AND task_id IS NULL`, j.Source, operator, a.ID, j.Project).Scan(&source)
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: exact operator conversation source unavailable", errWorkflow)
+		}
+		if err != nil {
+			return err
+		}
+		_, err = outputMessage(tx, a, operator, j, result.Text, files)
+		return err
+	}
+	if j.Kind != "work" {
+		return fmt.Errorf("%w: unsupported worker event", errWorkflow)
+	}
+	var poID string
+	if err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", j.Project).Scan(&poID); err != nil {
+		return err
+	}
+	po, err := getAgent(tx, poID)
+	if err != nil {
+		return err
+	}
+	if err := moveTask(tx, j, "queued", "review", a.ID, po.ID); err != nil {
+		return err
+	}
+	id, err := outputMessage(tx, a, po.ID, j, result.Text, files)
+	if err != nil {
+		return err
+	}
+	return s.enqueue(tx, po, j.Project, j.Task, id, "review", "Check the worker result and its attachments before reporting.")
+}
+
+func outputMessage(tx *sql.Tx, a agent, recipient string, j job, text string, files []attachmentData) (string, error) {
+	id := newID()
+	if err := addMessage(tx, id, a.ID, recipient, a.Role, text, j.Project, j.Task); err != nil {
+		return "", err
+	}
+	for _, file := range files {
+		if _, err := tx.Exec("INSERT INTO attachments VALUES (?,?,?,?,?)", file.ID, id, file.Name, file.MediaType, file.Content); err != nil {
+			return "", err
+		}
+	}
+	return id, nil
+}
+
+func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
+	if len(action.Title) > 250 || len(action.Body) > 64*1024 {
+		return fmt.Errorf("%w: action title or body exceeds limits", errWorkflow)
+	}
+	if action.Type == "request_approval" && (a.Role == "root" || a.Role == "po") {
+		if action.Project != "" && action.Project != j.Project || action.Recipient != "" && action.Recipient != operator ||
+			strings.TrimSpace(action.Title) == "" || strings.TrimSpace(action.Body) == "" {
+			return fmt.Errorf("%w: invalid operator approval scope or reason", errWorkflow)
+		}
+		_, err := tx.Exec("INSERT INTO approvals VALUES (?,?,?,?,?,?,'pending')",
+			newID(), nullIfEmpty(j.Project), nullIfEmpty(j.Task), a.ID, action.Title, action.Body)
+		return err
+	}
+	if a.Role == "root" && (j.Kind == "operator_message" || j.Kind == "approval_approved") {
+		switch action.Type {
+		case "delegate", "create_project":
+			return s.rootAssignment(tx, a, j, action)
+		case "stop_project", "resume_project":
+			if !projectID.MatchString(action.Project) || action.Recipient != "" {
+				return fmt.Errorf("%w: stop or resume requires an exact project ID", errWorkflow)
+			}
+			_, err := updateStop(tx, action.Project, action.Type == "stop_project")
+			if errors.Is(err, errAbsent) {
+				err = fmt.Errorf("%w: project does not exist", errWorkflow)
+			}
+			return err
+		}
+	}
+	if a.Role != "po" || j.Task == "" || (action.Project != "" && action.Project != j.Project) {
+		return fmt.Errorf("%w: action %q outside role or task scope", errWorkflow, action.Type)
+	}
+	switch action.Type {
+	case "queue_worker":
+		return s.queueWorker(tx, j, a, action)
+	case "accept_result":
+		worker, err := activeReviewWorker(tx, j, a.ID)
+		if err != nil {
+			return err
+		}
+		if action.Recipient != "" && action.Recipient != worker {
+			return fmt.Errorf("%w: accept_result recipient differs from the active review worker", errWorkflow)
+		}
+		return moveTask(tx, j, "review", "accepted", a.ID, a.ID)
+	case "report":
+		if action.Recipient != "" && action.Recipient != root || strings.TrimSpace(action.Body) == "" {
+			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
+		}
+		if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
+			return err
+		}
+		id, err := outputMessage(tx, a, root, j, action.Body, nil)
+		if err != nil {
+			return err
+		}
+		if err := shareAcceptedWorkerAttachments(tx, j, a.ID, id); err != nil {
+			return err
+		}
+		manager, err := getAgent(tx, root)
+		if err != nil {
+			return err
+		}
+		return s.enqueue(tx, manager, j.Project, j.Task, id, "project_report", action.Body)
+	default:
+		return fmt.Errorf("%w: unsupported action %q", errWorkflow, action.Type)
+	}
+}
+
+func activeReviewWorker(tx *sql.Tx, j job, po string) (string, error) {
+	if j.Kind != "review" && j.Kind != "approval_approved" {
+		return "", fmt.Errorf("%w: accept_result requires the active review", errWorkflow)
+	}
+	var message, worker string
+	var seq int64
+	err := tx.QueryRow(`SELECT m.id,m.sender,m.seq FROM messages m
+		JOIN agents w ON w.id=m.sender AND w.project_id=m.project_id AND w.role='worker'
+		JOIN projects p ON p.id=m.project_id AND p.po_id=m.recipient
+		WHERE m.task_id=? AND m.project_id=? AND m.recipient=? AND m.role='worker'
+		ORDER BY m.seq DESC LIMIT 1`, j.Task, j.Project, po).Scan(&message, &worker, &seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", fmt.Errorf("%w: active worker result unavailable", errWorkflow)
+	}
+	if err != nil {
+		return "", err
+	}
+	if j.Kind == "review" {
+		if j.Source != message {
+			return "", fmt.Errorf("%w: review source differs from the current worker result", errWorkflow)
+		}
+	} else {
+		var approved int
+		err = tx.QueryRow(`SELECT 1 FROM messages WHERE id=? AND task_id=? AND project_id=?
+			AND sender=? AND recipient=? AND role='operator' AND seq>?`,
+			j.Source, j.Task, j.Project, operator, po, seq).Scan(&approved)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", fmt.Errorf("%w: approved review source differs from the current worker result", errWorkflow)
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+	return worker, nil
+}
+
+func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
+	if !projectID.MatchString(action.Project) || strings.TrimSpace(action.Title) == "" ||
+		strings.TrimSpace(action.Body) == "" {
+		return fmt.Errorf("%w: assignment needs project ID, title and body", errWorkflow)
+	}
+	var poID string
+	err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", action.Project).Scan(&poID)
+	if action.Type == "create_project" {
+		if err == nil {
+			return fmt.Errorf("%w: a new project requires an unused ID", errWorkflow)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// Creation always provisions a fresh PO. Only delegation uses a proposed recipient.
+		poID = newID()
+		if _, err := tx.Exec("INSERT INTO projects(id,name,po_id,workspace) VALUES (?,?,?,?)",
+			action.Project, action.Project, poID, s.workspace(action.Project)); err != nil {
+			return err
+		}
+		for _, member := range []agent{{ID: poID, Name: action.Project + " PO", Role: "po", Model: s.opts.POModel},
+			{ID: newID(), Name: action.Project + " Worker", Role: "worker", Model: s.opts.WorkerModel}} {
+			if _, err := tx.Exec("INSERT INTO agents VALUES (?,?,?,?,?,?)",
+				member.ID, member.Name, member.Role, action.Project, member.Model, s.opts.Effort); err != nil {
+				return err
+			}
+		}
+	} else {
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && action.Recipient != "" && action.Recipient != poID) {
+			return fmt.Errorf("%w: delegation requires the existing project and its PO", errWorkflow)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	po, err := getAgent(tx, poID)
+	if err != nil {
+		return err
+	}
+	task, id := newID(), newID()
+	if _, err := tx.Exec("INSERT INTO tasks VALUES (?,?,?,'assigned',?)", task, action.Project, action.Title, po.ID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO task_origins VALUES (?,?)", task, j.Source); err != nil {
+		return err
+	}
+	if err := addMessage(tx, id, a.ID, po.ID, a.Role, action.Body, action.Project, task); err != nil {
+		return err
+	}
+	return s.enqueue(tx, po, action.Project, task, id, "scope_review", action.Body)
+}
+
+func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Result, files []attachmentData) error {
+	var poID string
+	if err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", j.Project).Scan(&poID); err != nil {
+		return err
+	}
+	if len(result.Actions) == 0 && strings.TrimSpace(result.Text) != "" {
+		if err := moveTask(tx, j, "assigned", "blocked", poID, poID); err != nil {
+			return err
+		}
+		_, err := outputMessage(tx, a, operator, j, result.Text, files)
+		return err
+	}
+	if len(result.Actions) != 1 {
+		return fmt.Errorf("%w: Root must finalize the assignment once or explain the blocker", errWorkflow)
+	}
+	action := result.Actions[0]
+	if action.Type != "delegate" || action.Project != j.Project || action.Recipient != "" ||
+		strings.TrimSpace(action.Title) == "" || len(action.Title) > 250 ||
+		strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
+		return fmt.Errorf("%w: final assignment requires the same project, a title and a body", errWorkflow)
+	}
+	po, err := getAgent(tx, poID)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("UPDATE tasks SET title=? WHERE id=?", action.Title, j.Task); err != nil {
+		return err
+	}
+	if strings.TrimSpace(result.Text) != "" || len(files) > 0 {
+		if _, err := outputMessage(tx, a, operator, j, result.Text, files); err != nil {
+			return err
+		}
+	}
+	id, err := outputMessage(tx, a, po.ID, j, action.Body, nil)
+	if err != nil {
+		return err
+	}
+	return s.enqueue(tx, po, j.Project, j.Task, id, "assignment", action.Body)
+}
+
+func (s *Service) queueWorker(tx *sql.Tx, j job, po agent, action runtimeapi.Action) error {
+	var workerID, prior string
+	if strings.TrimSpace(action.Body) == "" {
+		return fmt.Errorf("%w: worker assignment needs instructions", errWorkflow)
+	}
+	query := "SELECT id FROM agents WHERE project_id=? AND role='worker'"
+	args := []any{j.Project}
+	if action.Recipient != "" {
+		query += " AND id=?"
+		args = append(args, action.Recipient)
+	}
+	if err := tx.QueryRow(query+" ORDER BY id LIMIT 1", args...).Scan(&workerID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: worker outside project", errWorkflow)
+		}
+		return err
+	}
+	if err := tx.QueryRow("SELECT status FROM tasks WHERE id=? AND project_id=? AND owner_id=?", j.Task, j.Project, po.ID).
+		Scan(&prior); err != nil {
+		return err
+	}
+	if prior != "assigned" && prior != "review" {
+		return fmt.Errorf("%w: worker assignment outside assigned or review phase", errWorkflow)
+	}
+	if err := moveTask(tx, j, prior, "queued", po.ID, workerID); err != nil {
+		return err
+	}
+	worker, err := getAgent(tx, workerID)
+	if err != nil {
+		return err
+	}
+	id := newID()
+	if err := addMessage(tx, id, po.ID, worker.ID, po.Role, action.Body, j.Project, j.Task); err != nil {
+		return err
+	}
+	return s.enqueue(tx, worker, j.Project, j.Task, id, "work", action.Body)
+}
+
+func moveTask(tx *sql.Tx, j job, from, to, oldOwner, newOwner string) error {
+	result, err := tx.Exec("UPDATE tasks SET status=?,owner_id=? WHERE id=? AND project_id=? AND status=? AND owner_id=?",
+		to, newOwner, j.Task, j.Project, from, oldOwner)
+	if err != nil {
+		return err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: task owner or status changed", errWorkflow)
+	}
+	return nil
+}
