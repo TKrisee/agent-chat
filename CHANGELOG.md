@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.0](https://github.com/TKrisee/agent-chat/compare/v0.3.0...v0.4.0) (2026-11-24)
+
+
+### Features
+
+* show confirmed work and team coordination in project rooms ([b52c895](https://github.com/TKrisee/agent-chat/commit/b52c895e0e6a43729a1a320cb29d144c25ad8b86))
+
+
+### Bug Fixes
+
+* preserve ordinary group history alongside work notices ([4e05d37](https://github.com/TKrisee/agent-chat/commit/4e05d37b1feb3cd3bfe3388fb20853c7e3cc8966))
+
 ## [0.3.0](https://github.com/TKrisee/agent-chat/compare/v0.2.4...v0.3.0) (2026-11-24)
 
 
