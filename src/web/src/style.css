@@ -107,9 +107,8 @@
 .sidebar-tools { display:flex; align-items:center; gap:6px; margin-top:auto; padding:12px 2px 0; border-top:1px solid #dfe3da; }
 .sidebar-tools button { display:flex; align-items:center; gap:8px; min-width:36px; min-height:36px; padding:6px 8px; border:0; border-radius:9px; background:transparent; color:#536f5d; font-size:14px; }
 .sidebar-tools button:hover,.sidebar-tools button:focus-visible { background:#dce8d8; outline:2px solid #769e7d; outline-offset:1px; }
-.sidebar-tools #weekly-control { font-size:22px; }
-.sidebar-tools #open-settings { justify-content:center; }
-.sidebar-tools #open-settings span { font-size:22px; line-height:1; }
+.sidebar-tools #weekly-control,.sidebar-tools #open-settings { justify-content:center; }
+.sidebar-tools #weekly-control span,.sidebar-tools #open-settings span { display:grid; place-items:center; flex:none; width:22px; height:22px; font-size:22px; line-height:1; }
 .rail-collapsed:not(.open) .sidebar-tools { flex-direction:column; }
 .weekly-tooltip { position:fixed; z-index:20; max-width:180px; padding:8px 10px; border-radius:8px; background:#284a3b; color:#f1f7e9; font-size:12px; font-weight:700; box-shadow:0 5px 16px #1b342430; pointer-events:none; }
 .settings-page { flex:1; min-height:0; overflow:auto; background:#fbfcf8; }

@@ -16,6 +16,14 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await page.goto(serviceURL);
   const weekly=page.getByRole('button', {name:'Weekly · 53% left, open settings'});
   await expect(weekly).toBeVisible();
+  for (const button of [weekly, page.getByRole('button', {name:'Settings', exact:true})]) {
+    await expect.poll(() => button.evaluateAll(elements => {
+      const target = elements[0]?.getBoundingClientRect();
+      const glyph = elements[0]?.querySelector('span')?.getBoundingClientRect();
+      return !!target && !!glyph && glyph.width === 22 && glyph.height === 22 &&
+        Math.abs((glyph.x + glyph.width/2) - (target.x + target.width/2)) < 1;
+    })).toBe(true);
+  }
   await weekly.focus();
   await expect(page.getByRole('tooltip')).toHaveText('Weekly · 53% left');
   await weekly.click();
