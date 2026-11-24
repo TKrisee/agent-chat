@@ -101,3 +101,15 @@ type WeeklyUsage struct {
 type WeeklyUsageReader interface {
 	ReadWeeklyUsage(context.Context) (WeeklyUsage, error)
 }
+
+// StartNotification is optional evidence that a provider execution has begun.
+type startNotificationKey struct{}
+
+func WithStartNotification(ctx context.Context, f func()) context.Context {
+	return context.WithValue(ctx, startNotificationKey{}, f)
+}
+func NotifyStart(ctx context.Context) {
+	if f, ok := ctx.Value(startNotificationKey{}).(func()); ok {
+		f()
+	}
+}

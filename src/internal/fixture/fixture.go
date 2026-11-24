@@ -55,6 +55,7 @@ func (f Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeapi
 		return got, err
 	}
 
+	runtimeapi.NotifyStart(ctx)
 	result, err := execute(req)
 	if err != nil {
 		return got, err

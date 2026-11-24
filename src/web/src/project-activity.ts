@@ -28,7 +28,7 @@ export function renderProjectActivity(state:ActivityState, projectId:string, roo
   return m.project_id===projectId && Number.isFinite(at) && at<=now && now-at<=60_000 &&
    ((m.sender===parent && m.recipient===child)||(m.sender===child && m.recipient===parent));
  });
- const who = (id:string) => id === 'operator' ? 'You' : byId.get(id)?.name || (id === 'root' ? 'Root' : id);
+ const who = (id:string) => id === 'operator' ? 'You' : id === 'service' ? 'Agent Chat' : byId.get(id)?.name || (id === 'root' ? 'Root' : id);
  const node = (agent:ActivityAgent, visited:Set<string>):string => {
   if (visited.has(agent.id)) return '';
   visited.add(agent.id);

@@ -12,9 +12,10 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
-const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
-const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Wait for the final assignment before dispatching work. On assignment, use the finalized scope to emit queue_worker with actionable instructions and acceptance criteria. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
-const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Attach regular workspace files by their absolute paths. Role and scope come from the service."
+const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: report only known receipts or uncertainty, and do not create a project or assignment. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
+const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment, use the finalized scope to emit queue_worker with actionable instructions and acceptance criteria. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
+const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
+const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
 const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
 const groupChatGuide = "The operator explicitly mentioned you in the shared project group conversation. Your text and any attached regular workspace files will be shared with the project group. Use the shared history for context. Answer without orchestration actions or relays."
 
@@ -33,6 +34,9 @@ func agentGuide(role, kind string, shared bool) string {
 		guide = rootGuide
 	case "po":
 		guide = poGuide
+		if kind == "operator_message" {
+			guide = poChatGuide
+		}
 	case "worker":
 		if kind == "operator_message" {
 			guide = workerChatGuide
@@ -93,7 +97,7 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient,recipient,room_id"
 	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
 		WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL
-		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + `) ORDER BY m.seq DESC LIMIT `
+		AND ((m.sender=? AND m.role='operator') OR ` + groupMemberSender + ` OR ` + groupNoticeSender + `) ORDER BY m.seq DESC LIMIT `
 	groupRecipient := groupPrefix + project
 	sharedArgs := []any{project, groupRecipient, operator}
 	query := "SELECT " + privateColumns + " FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 24"
@@ -212,6 +216,11 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 			}
 		}
 		if invalid != nil {
+			if j.Task != "" {
+				if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
+					return err
+				}
+			}
 			diagnostic = invalid.Error()
 			if j.Task != "" {
 				if _, err := tx.Exec("UPDATE tasks SET status='blocked' WHERE id=? AND status!='completed'", j.Task); err != nil {
@@ -251,8 +260,16 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return s.workerResult(tx, j, a, result, files)
 	}
 	if j.Kind == "scope_review" {
-		if len(result.Actions) != 0 || strings.TrimSpace(result.Text) == "" {
+		if strings.TrimSpace(result.Text) == "" {
 			return fmt.Errorf("%w: PO scope review requires a text assessment before any assignment", errWorkflow)
+		}
+		for _, action := range result.Actions {
+			if action.Type != "post_group" {
+				return fmt.Errorf("%w: scope review cannot dispatch work", errWorkflow)
+			}
+			if err := postGroupAction(tx, a, j, action); err != nil {
+				return err
+			}
 		}
 		id, err := outputMessage(tx, a, root, j, result.Text, files)
 		if err != nil {
@@ -352,7 +369,7 @@ func shareAcceptedWorkerAttachments(tx *sql.Tx, j job, po, reportID string) erro
 }
 
 func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Result, files []attachmentData) error {
-	if len(result.Actions) != 0 || (strings.TrimSpace(result.Text) == "" && len(files) == 0) {
+	if (j.Kind != "work" && len(result.Actions) != 0) || (strings.TrimSpace(result.Text) == "" && len(files) == 0) {
 		return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
 	}
 	if j.Kind == "operator_message" && j.Task == "" {
@@ -370,6 +387,14 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 	}
 	if j.Kind != "work" {
 		return fmt.Errorf("%w: unsupported worker event", errWorkflow)
+	}
+	for _, action := range result.Actions {
+		if action.Type != "post_group" {
+			return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
+		}
+		if err := postGroupAction(tx, a, j, action); err != nil {
+			return err
+		}
 	}
 	var poID string
 	if err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", j.Project).Scan(&poID); err != nil {
@@ -430,6 +455,9 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			return err
 		}
 	}
+	if a.Role == "po" && action.Type == "post_group" && j.Kind != "operator_message" {
+		return postGroupAction(tx, a, j, action)
+	}
 	if a.Role != "po" || j.Task == "" || (action.Project != "" && action.Project != j.Project) {
 		return fmt.Errorf("%w: action %q outside role or task scope", errWorkflow, action.Type)
 	}
@@ -450,6 +478,9 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
 		}
 		if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
+			return err
+		}
+		if err := workflowNotice(tx, j.Project, "complete:"+j.ID, "The project owner completed the task and sent the report to Root."); err != nil {
 			return err
 		}
 		id, err := outputMessage(tx, a, root, j, action.Body, nil)
@@ -560,6 +591,9 @@ func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.A
 	if err := addMessage(tx, id, a.ID, po.ID, a.Role, action.Body, action.Project, task); err != nil {
 		return err
 	}
+	if err := workflowNotice(tx, action.Project, "scope:"+task, "Root sent the project owner a request for scope assessment."); err != nil {
+		return err
+	}
 	return s.enqueue(tx, po, action.Project, task, id, "scope_review", action.Body)
 }
 
@@ -570,6 +604,9 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 	}
 	if len(result.Actions) == 0 && strings.TrimSpace(result.Text) != "" {
 		if err := moveTask(tx, j, "assigned", "blocked", poID, poID); err != nil {
+			return err
+		}
+		if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 			return err
 		}
 		_, err := outputMessage(tx, a, operator, j, result.Text, files)
@@ -598,6 +635,9 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 	}
 	id, err := outputMessage(tx, a, po.ID, j, action.Body, nil)
 	if err != nil {
+		return err
+	}
+	if err := workflowNotice(tx, j.Project, "assignment:"+j.ID, "Root sent the finalized assignment to the project owner."); err != nil {
 		return err
 	}
 	return s.enqueue(tx, po, j.Project, j.Task, id, "assignment", action.Body)
@@ -638,6 +678,9 @@ func (s *Service) queueWorker(tx *sql.Tx, j job, po agent, action runtimeapi.Act
 	if err := addMessage(tx, id, po.ID, worker.ID, po.Role, action.Body, j.Project, j.Task); err != nil {
 		return err
 	}
+	if err := workflowNotice(tx, j.Project, "queue:"+j.ID, "The project owner queued work for a worker."); err != nil {
+		return err
+	}
 	return s.enqueue(tx, worker, j.Project, j.Task, id, "work", action.Body)
 }
 
@@ -655,4 +698,19 @@ func moveTask(tx *sql.Tx, j job, from, to, oldOwner, newOwner string) error {
 		return fmt.Errorf("%w: task owner or status changed", errWorkflow)
 	}
 	return nil
+}
+
+// postGroupAction records an authored project-room message without dispatching new work.
+func postGroupAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
+	if (a.Role != "po" && a.Role != "worker") || j.Project == "" || a.Project != j.Project || action.Project != j.Project || action.Recipient != "" || action.Title != "" || strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
+		return fmt.Errorf("%w: group post outside project scope", errWorkflow)
+	}
+	var valid int
+	if err := tx.QueryRow(`SELECT count(*) FROM agents a JOIN projects p ON p.id=a.project_id WHERE a.id=? AND a.project_id=? AND a.role=? AND (a.role='worker' OR (a.role='po' AND p.po_id=a.id))`, a.ID, j.Project, a.Role).Scan(&valid); err != nil {
+		return err
+	}
+	if valid != 1 {
+		return fmt.Errorf("%w: group author not a project member", errWorkflow)
+	}
+	return addMessage(tx, newID(), a.ID, groupPrefix+j.Project, a.Role, action.Body, j.Project, "")
 }

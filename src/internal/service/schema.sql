@@ -68,3 +68,8 @@ CREATE TABLE IF NOT EXISTS usage_settings (
  warn INTEGER NOT NULL CHECK(warn BETWEEN 0 AND 100), reserve INTEGER NOT NULL CHECK(reserve BETWEEN 0 AND warn)
 );
 INSERT OR IGNORE INTO usage_settings VALUES (1,0,40,30);
+
+CREATE TABLE IF NOT EXISTS workflow_notices (
+ event_key TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ project_id TEXT NOT NULL REFERENCES projects(id)
+);

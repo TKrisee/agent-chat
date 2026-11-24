@@ -9,6 +9,9 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(project).toBeVisible({timeout: 20000});
   await project.click();
   const group = page.getByLabel('Message atlas chat');
+  const dispatchNotice = page.getByRole('article', {name:'Agent Chat workflow notice'}).filter({hasText:'The project owner queued work for a worker.'});
+  await expect(dispatchNotice).toBeVisible({timeout:20000});
+  await expect(dispatchNotice.locator('[data-reply]')).toHaveCount(0);
   await expect(page.locator('.composer-heading')).not.toContainText('Idle');
   await expect(page.locator('[data-agent]').first()).toHaveAttribute('aria-label', /(?:Idle|Working|Starting|Queued|Needs attention|Failed|Stopped|Status unavailable)/);
   await group.fill('Shared untagged message');
@@ -30,6 +33,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(page.locator('.chat').getByText('PO replied in the project group:', {exact:false})).toBeVisible({timeout:20000});
   await lead.click();
   const direct = page.locator('#message');
+  await expect(dispatchNotice).toHaveCount(0);
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toHaveCount(0);
   await expect(page.getByText('Shared tagged message', {exact:false})).toHaveCount(0);
   await expect(page.getByText('PO replied in the project group:', {exact:false})).toHaveCount(0);

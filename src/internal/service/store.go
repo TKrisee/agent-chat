@@ -365,7 +365,7 @@ func (s *Service) markOperatorRead(ids []string) error {
 		}
 	}
 	scope := ` FROM messages m WHERE ((m.recipient=? AND m.sender<>? AND m.room_id='dm:'||CASE WHEN m.sender<m.recipient THEN m.sender||':'||m.recipient ELSE m.recipient||':'||m.sender END) OR
-		(m.task_id IS NULL AND m.room_id=?||m.project_id AND m.recipient=m.room_id AND ` + groupMemberSender + `))
+		(m.task_id IS NULL AND m.room_id=?||m.project_id AND m.recipient=m.room_id AND (` + groupMemberSender + ` OR ` + groupNoticeSender + `)))
 		AND m.id IN (` + strings.Repeat("?,", len(seen)-1) + "?)"
 	return s.write(func(tx *sql.Tx) error {
 		var eligible int

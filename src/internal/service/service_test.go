@@ -613,9 +613,16 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 			return runtimeapi.Result{Text: assessment}, nil
 		}
 		if req.Kind == "scope_decision" {
-			if len(req.Context) != 3 || req.Context[0].Role != "operator" || req.Context[0].Text != prompt ||
-				req.Context[1].Role != "root" || req.Context[1].Text != create.Body ||
-				req.Context[2].Role != "po" || req.Context[2].Text != assessment {
+			contextWithoutNotice := make([]runtimeapi.Message, 0, len(req.Context))
+			for _, m := range req.Context {
+				if m.Sender == "service" && m.Role == "system" && m.GroupRecipient == "group:slate-smoke" && m.Text == "Root sent the project owner a request for scope assessment." {
+					continue
+				}
+				contextWithoutNotice = append(contextWithoutNotice, m)
+			}
+			if len(contextWithoutNotice) != 3 || contextWithoutNotice[0].Role != "operator" || contextWithoutNotice[0].Text != prompt ||
+				contextWithoutNotice[1].Role != "root" || contextWithoutNotice[1].Text != create.Body ||
+				contextWithoutNotice[2].Role != "po" || contextWithoutNotice[2].Text != assessment {
 				return runtimeapi.Result{}, fmt.Errorf("scope decision did not receive the original request, distinct draft and PO assessment")
 			}
 			return runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "delegate", Project: req.ProjectID, Title: create.Title, Body: finalBrief}}}, nil

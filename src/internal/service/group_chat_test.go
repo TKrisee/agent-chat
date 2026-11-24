@@ -140,10 +140,25 @@ func TestProjectGroupMessages(t *testing.T) {
 		job.Agent != po || job.Task != "" || job.Status != "completed" {
 		t.Fatalf("wrong group exchange or durable route: %+v %+v", newMessages, job)
 	}
-	if req := request(); req.Kind != groupMessageKind || req.AgentID != po || req.ProjectID != "atlas" || req.TaskID != "" ||
-		len(req.Context) != 2 || !containsShared(req, first, group) || !containsShared(req, broadcast, group) ||
-		!strings.Contains(req.Instructions, "shared project group conversation") {
-		t.Fatalf("group request did not isolate the shared conversation: %+v", req)
+	if req := request(); true {
+		ordinary := 0
+		for _, m := range req.Context {
+			if m.Sender == "service" && m.Role == "system" && m.GroupRecipient == group {
+				switch m.Text {
+				case "Root sent the project owner a request for scope assessment.", "Root sent the finalized assignment to the project owner.", "The project owner queued work for a worker.", "Worker run launched.", "The project owner completed the task and sent the report to Root.":
+					continue
+				default:
+					t.Fatalf("unexpected service group notice: %+v", m)
+				}
+			}
+			if (m.ID != first && m.ID != broadcast) || m.GroupRecipient != group {
+				t.Fatalf("unexpected group context: %+v", m)
+			}
+			ordinary++
+		}
+		if req.Kind != groupMessageKind || req.AgentID != po || req.ProjectID != "atlas" || req.TaskID != "" || ordinary != 2 || !containsShared(req, first, group) || !containsShared(req, broadcast, group) || !strings.Contains(req.Instructions, "shared project group conversation") {
+			t.Fatalf("group request did not isolate the shared conversation: %+v", req)
+		}
 	}
 
 	wrongParent := newID()

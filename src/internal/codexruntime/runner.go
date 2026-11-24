@@ -258,8 +258,10 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
-	if req.Role == "worker" {
-		b.WriteString("\nReturn only the requested text and workspace attachments; do not propose orchestration actions.\n")
+	if req.Role == "worker" && req.Kind == "work" {
+		b.WriteString("\nReturn the requested text, workspace attachments, and optional post_group actions for project coordination; do not propose orchestration actions.\n")
+	} else if req.Role == "worker" {
+		b.WriteString("\nReturn only the requested text and workspace attachments; do not propose actions.\n")
 	} else {
 		b.WriteString("\nReturn the requested structured response. Actions and attachments are proposals for the Agent Chat service to validate; never claim an external action completed without evidence.\n")
 	}
@@ -417,6 +419,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		return zero, fmt.Errorf("%w: process containment failed: %v", ErrUnknown, err)
 	}
 	defer cleanup()
+	runtimeapi.NotifyStart(ctx)
 	waited := make(chan error, 1)
 	go func() { waited <- cmd.Wait() }()
 	select {

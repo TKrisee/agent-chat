@@ -133,7 +133,15 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		if hold {
 			return s.disposition(j.ID, "pending", "weekly usage guard", s.opts.Poll)
 		}
-		result, err := runner.Execute(ctx, j.Request)
+		runCtx := ctx
+		if j.Kind == "work" && j.Project != "" {
+			runCtx = runtimeapi.WithStartNotification(ctx, func() {
+				if err := s.workerStarted(j); err != nil {
+					log.Printf("record worker start: %v", err)
+				}
+			})
+		}
+		result, err := runner.Execute(runCtx, j.Request)
 		if err == nil {
 			return s.finish(j, result)
 		}
@@ -204,7 +212,18 @@ func (s *Service) disposition(id, status, diagnostic string, delay time.Duration
 			return err
 		}
 		_, err = tx.Exec("UPDATE tasks SET status='blocked' WHERE id=(SELECT task_id FROM jobs WHERE id=?) AND status!='completed'", id)
-		return err
+		if err != nil {
+			return err
+		}
+		var project sql.NullString
+		var task sql.NullString
+		if err = tx.QueryRow("SELECT project_id,task_id FROM jobs WHERE id=?", id).Scan(&project, &task); err != nil {
+			return err
+		}
+		if project.Valid && task.Valid {
+			return workflowNotice(tx, project.String, "blocked:"+id, "A task could not continue and needs attention.")
+		}
+		return nil
 	})
 }
 

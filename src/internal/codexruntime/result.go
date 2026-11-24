@@ -18,11 +18,10 @@ import (
 
 // The native CLI validates this response shape. jq independently validates and
 // extracts the resulting JSON; the Go adapter never parses JSON itself.
-const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","queue_worker","accept_result","report","request_approval"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","queue_worker","accept_result","report","request_approval","post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
-// Workers report text and files only; no orchestration action is exposed in
-// their native schema. Root and PO use the distinct schema above.
-const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","attachments"],"properties":{"text":{"type":"string"},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+// Workers may report group coordination without receiving orchestration actions.
+const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
 var errWorkerAction = errors.New("worker result contains orchestration actions")
 var errRoleAction = errors.New("result contains an action outside the recorded role")
@@ -35,7 +34,9 @@ func actionAllowed(role, action string) bool {
 	case "root":
 		return action == "create_project" || action == "delegate" || action == "stop_project" || action == "resume_project" || action == "request_approval"
 	case "po":
-		return action == "queue_worker" || action == "accept_result" || action == "report" || action == "request_approval"
+		return action == "queue_worker" || action == "accept_result" || action == "report" || action == "request_approval" || action == "post_group"
+	case "worker":
+		return action == "post_group"
 	default:
 		return false
 	}

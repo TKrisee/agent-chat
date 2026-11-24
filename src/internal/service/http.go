@@ -440,6 +440,12 @@ func (s *Service) setStop(w http.ResponseWriter, id string, stopped bool) {
 }
 
 func updateStop(tx *sql.Tx, id string, stopped bool) (int, error) {
+	var wasStopped bool
+	if err := tx.QueryRow("SELECT stopped FROM projects WHERE id=?", id).Scan(&wasStopped); errors.Is(err, sql.ErrNoRows) {
+		return 0, errAbsent
+	} else if err != nil {
+		return 0, err
+	}
 	res, err := tx.Exec("UPDATE projects SET stopped=? WHERE id=?", stopped, id)
 	if err != nil {
 		return 0, err
@@ -454,7 +460,15 @@ func updateStop(tx *sql.Tx, id string, stopped bool) (int, error) {
 	var unsettled int
 	err = tx.QueryRow("SELECT COUNT(*) FROM jobs WHERE project_id=? AND status IN ('submitted','running','uncertain')", id).
 		Scan(&unsettled)
-	return unsettled, err
+	if err != nil {
+		return 0, err
+	}
+	if stopped && !wasStopped {
+		if err = stopNotice(tx, id, unsettled); err != nil {
+			return 0, err
+		}
+	}
+	return unsettled, nil
 }
 
 func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
