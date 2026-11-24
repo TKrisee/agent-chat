@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/TKrisee/agent-chat/compare/v0.5.0...v0.5.1) (2026-11-24)
+
+
+### Bug Fixes
+
+* simplify settings navigation and move app updates ([34557b9](https://github.com/TKrisee/agent-chat/commit/34557b9c87b68bbff1830f9058467662bc248a68))
+
 ## [0.5.0](https://github.com/TKrisee/agent-chat/compare/v0.4.0...v0.5.0) (2026-11-24)
 
 
