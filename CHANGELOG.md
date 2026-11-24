@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/TKrisee/agent-chat/compare/v0.5.4...v0.6.0) (2026-11-24)
+
+
+### Features
+
+* simplify project activity and expose scope requests ([aedc419](https://github.com/TKrisee/agent-chat/commit/aedc4199598488601329dfa7097da6700c7a9cf3))
+
 ## [0.5.4](https://github.com/TKrisee/agent-chat/compare/v0.5.3...v0.5.4) (2026-11-24)
 
 
