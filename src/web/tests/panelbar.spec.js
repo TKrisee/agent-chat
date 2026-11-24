@@ -1,0 +1,35 @@
+import { test, expect } from './fixture.js';
+
+test('channel header retains panel controls on desktop and mobile', async ({ page, serviceURL }) => {
+  await page.goto(serviceURL);
+  const header = page.locator('.channel-header');
+  const left = header.locator('#rail-toggle');
+  const right = header.locator('#work-toggle');
+  await expect(header.getByRole('heading', { name: 'Root' })).toBeVisible();
+  await expect(page.getByText('Projects will appear here.')).toBeVisible();
+  await expect(left).toHaveAttribute('aria-expanded', 'true');
+  await expect(right).toHaveAttribute('aria-expanded', 'true');
+  await left.click();
+  await expect(left).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('#conversation-panel')).toHaveClass(/rail-collapsed/);
+  await expect(page.getByText('Projects will appear here.')).toBeHidden();
+  await right.click();
+  await expect(right).toHaveAttribute('aria-expanded', 'false');
+  await expect(page.locator('#work-panel')).toBeHidden();
+  await right.click();
+  await expect(page.locator('#work-panel')).toBeVisible();
+  await left.click();
+  await expect(left).toHaveAttribute('aria-expanded', 'true');
+  await expect(page.getByText('Projects will appear here.')).toBeVisible();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(left).toHaveAttribute('aria-expanded', 'false');
+  await left.click();
+  await expect(page.locator('#conversation-panel')).toBeVisible();
+  await expect(page.getByText('Projects will appear here.')).toBeVisible();
+  await left.click();
+  await expect(page.locator('#conversation-panel')).toBeHidden();
+  await right.click();
+  await expect(page.locator('#work-panel')).toBeHidden();
+  await right.click();
+  await expect(page.locator('#work-panel')).toBeVisible();
+});

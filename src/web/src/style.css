@@ -78,3 +78,10 @@
 .file-info strong { font-size:12px; }.file-info small { margin-top:3px; color:#6a7c70; font-size:10px; }
 .file-card button { position:absolute; top:3px; right:4px; border:0; border-radius:6px; background:transparent; color:#53675b; font-size:18px; }
 .compose-box textarea { resize:none; height:auto; max-height:min(240px, 35dvh); overflow-y:auto; }
+/* Panel controls remain in the channel header when panels are closed. */
+.channel-header .rail-toggle,.channel-header .work-toggle { display:grid; flex:none; align-self:center; place-items:center; width:36px; height:36px; margin:0; padding:6px; border:1px solid #dce4d8; border-radius:8px; background:#fff; color:#315d49; }
+.channel-header .work-toggle { margin-left:auto; }
+.channel-header .work-toggle[aria-expanded="false"] .toggle-chevron { transform:rotate(180deg); }
+.context.collapsed { display:none; }
+@media(max-width:760px) { .sidebar { top:52px; } .context:not(.collapsed) { top:52px; } }
+.sidebar.rail-collapsed:not(.open) .side-empty { display:none; }
