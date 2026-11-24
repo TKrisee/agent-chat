@@ -37,6 +37,11 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.fill(Array(50).fill('Long draft').join('\n'));
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? Infinity)).toBeLessThanOrEqual(240);
   await expect.poll(() => composer.evaluateAll(els => els.some(el => el.scrollHeight > el.clientHeight))).toBe(true);
+  await expect.poll(async () => {
+    const input = await composer.boundingBox();
+    const button = await add.boundingBox();
+    return input && button ? Math.abs(input.y - button.y) : Infinity;
+  }).toBeLessThan(4);
   await composer.fill('');
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
   const transfer = await page.evaluateHandle(() => {

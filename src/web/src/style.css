@@ -30,7 +30,7 @@
 /* Individual action feedback without changing control geometry. */
 @media(hover:hover){.message-actions button:hover,.attachment-download:hover{background:#dce8d8;color:#24493b}}
 .message-actions button:focus-visible,.attachment-download:focus-visible{background:#dce8d8;color:#24493b}
-.mention-toggle,.mention-selected button,.mention-options button{font:inherit;cursor:pointer}.mention-toggle{border:1px solid #dce4d8;border-radius:7px;background:#fff;color:#315d49;padding:5px 8px;font-size:11px;font-weight:700;white-space:nowrap}.mention-toggle:disabled,.mention-selected button:disabled{opacity:.6;cursor:default}.mention-selected{display:flex;flex-wrap:wrap;gap:5px;margin:0 0 8px}.mention-selected button{border:0;border-radius:7px;background:#e9f1e6;color:#315d49;padding:4px 7px;font-size:11px}.mention-options{display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;background:white;border:1px solid #dce4d8;border-radius:9px;padding:5px;margin:0 0 8px;box-shadow:0 5px 14px #263c2c12}.mention-options button{display:flex;align-items:center;justify-content:space-between;gap:10px;border:0;border-radius:6px;background:transparent;padding:7px;text-align:left;color:#314a39}.mention-options button:hover,.mention-options button:focus-visible{background:#edf4e9}.mention-options small{color:#819187;font-size:10px;overflow-wrap:anywhere}.mention-options span{padding:7px;color:#819187;font-size:12px}.mention-toggle:focus-visible,.mention-selected button:focus-visible{outline:2px solid #315d49;outline-offset:2px}@media(max-width:760px){.mention-toggle{padding:5px;font-size:10px}.mention-options{max-height:110px}}
+.mention-selected button,.mention-options button{font:inherit;cursor:pointer}.mention-selected button:disabled{opacity:.6;cursor:default}.mention-selected{display:flex;flex-wrap:wrap;gap:5px;margin:0 0 8px}.mention-selected button{border:0;border-radius:7px;background:#e9f1e6;color:#315d49;padding:4px 7px;font-size:11px}.mention-options{display:flex;flex-direction:column;gap:3px;max-height:150px;overflow:auto;background:white;border:1px solid #dce4d8;border-radius:9px;padding:5px;margin:0 0 8px;box-shadow:0 5px 14px #263c2c12}.mention-options button{display:flex;align-items:center;justify-content:space-between;gap:10px;border:0;border-radius:6px;background:transparent;padding:7px;text-align:left;color:#314a39}.mention-options button:hover,.mention-options button:focus-visible{background:#edf4e9}.mention-options small{color:#819187;font-size:10px;overflow-wrap:anywhere}.mention-options span{padding:7px;color:#819187;font-size:12px}.mention-selected button:focus-visible{outline:2px solid #315d49;outline-offset:2px}@media(max-width:760px){.mention-options{max-height:110px}}
 
 .composer { position:relative; }
 .compose-box { padding:12px 14px 10px; border-radius:16px; background:#fff; box-shadow:0 8px 28px #263b2d14; }
@@ -56,7 +56,7 @@
 .compose-box { padding:8px 10px; }
 .compose-entry { align-items:center; }
 .compose-box textarea { min-height:36px; padding:8px 0; }
-.attachment-control { position:relative; flex:none; }
+.attachment-control { position:relative; flex:none; align-self:flex-start; }
 .attachment-menu { position:absolute; z-index:10; left:0; bottom:calc(100% + 10px); min-width:180px; padding:5px; border:1px solid #dce4d8; border-radius:12px; background:#fff; box-shadow:0 12px 32px #263b2d26; }
 .attachment-menu[hidden] { display:none; }
 .attachment-menu button { width:100%; border:0; border-radius:8px; padding:10px 12px; text-align:left; background:transparent; color:#285a48; font-weight:700; }
@@ -100,3 +100,6 @@
  .context.collapsed { width:0; padding:0; border-width:0; }
 }
 @media(prefers-reduced-motion:reduce) { .sidebar,.sidebar.open,.context,.context.collapsed,.context-body { transition:none; } }
+.activity-dot.busy { animation:activity-pulse 1.4s ease-in-out infinite; }
+@keyframes activity-pulse { 50% { opacity:.35; } }
+@media(prefers-reduced-motion:reduce) { .activity-dot.busy { animation:none; } }

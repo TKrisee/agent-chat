@@ -33,11 +33,12 @@ export function renderProjectActivity(state:ActivityState, projectId:string, roo
   if (visited.has(agent.id)) return '';
   visited.add(agent.id);
   const current = jobs.filter(j=>j.agent_id===agent.id && active.has(j.status));
-  const working = current.some(j=>j.status==='running');
+  const working = agent.status!=='stopped' && current.some(j=>j.status==='running');
+  const status=agent.status==='stopped'?'Stopped':working?'Working':(current.some(j=>j.status==='uncertain') || tasks.some(t=>t.owner_id===agent.id && t.status==='blocked'))?'Needs attention':current.some(j=>j.status==='submitted')?'Starting':current.some(j=>j.status==='pending')?'Queued':'Idle';
   const work = current.map(j=>{const task=taskById.get(j.task_id); return `<li><span>${escape(j.status)}</span>${task ? ` · ${escape(short(task.title,100))}` : j.kind ? ` · ${escape(j.kind)}` : ''}</li>`;}).join('') + tasks.filter(t=>t.owner_id===agent.id && t.status==='blocked' && !current.some(j=>j.task_id===t.id)).map(t=>`<li><span>blocked</span> · ${escape(short(t.title,100))}</li>`).join('');
   const children = nodes.filter(a=>a.id!==agent.id && a.parent_id===agent.id && !visited.has(a.id));
   const recent = agent.parent_id && ids.has(agent.parent_id) && recentEdge(agent.parent_id,agent.id);
-  return `<li class="pa-branch${recent?' pa-recent':''}"><div class="pa-node${working?' pa-working':''}"><span class="pa-avatar" aria-hidden="true">${escape((agent.name || agent.role || '?').slice(0,1).toUpperCase())}</span><div><strong>${escape(agent.name || agent.id)}</strong><small>${escape(agent.role)}${agent.status ? ` · ${escape(agent.status)}` : ''}${working?' · Working':''}</small>${work?`<ul class="pa-work" aria-label="Current work">${work}</ul>`:''}</div></div>${children.length?`<ul class="pa-children">${children.map(child=>node(child,visited)).join('')}</ul>`:''}</li>`;
+  return `<li class="pa-branch${recent?' pa-recent':''}"><div class="pa-node${working?' pa-working':''}"><span class="pa-avatar" aria-hidden="true">${escape((agent.name || agent.role || '?').slice(0,1).toUpperCase())}</span><div><strong>${escape(agent.name || agent.id)}</strong><small>${escape(agent.role)} · <span class="activity-dot ${working?'busy':''}" aria-hidden="true"></span> ${escape(status)}</small>${work?`<ul class="pa-work" aria-label="Current work">${work}</ul>`:''}</div></div>${children.length?`<ul class="pa-children">${children.map(child=>node(child,visited)).join('')}</ul>`:''}</li>`;
  };
  const visited = new Set<string>();
  const roots = nodes.filter(a=>!a.parent_id || !ids.has(a.parent_id) || a.parent_id===a.id);
