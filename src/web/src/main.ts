@@ -15,13 +15,53 @@ const app = document.querySelector<HTMLDivElement>('#app')!;
 let state:State = {messages:[],projects:[],tasks:[],agents:[],jobs:[]};
 type UpdateInfo={available:boolean;current:string;version:string;state:string;error:string};
 let updateInfo:UpdateInfo|null=null;let updateBusy=false;let updateRestarting=false;
+let expectedUpdate:{version:string;started:number}|null=null;let updateUnconfirmed=false;let reloadTriggered=false;let updateDeferred=false;
+const updateWaitLimit=120000;
 async function updateRequest(action=''):Promise<void>{
- if(updateBusy)return;updateBusy=true;
- try{const r=await fetch('/api/update'+(action?'/'+action:''),{method:action?'POST':'GET',cache:'no-store'});if(r.status===404){updateInfo=null;return;}const available=r.headers.get('X-AgentChat-Update-Available')==='true';const status=r.headers.get('X-AgentChat-Update-State')||'idle';const detail=await r.text();if(!r.ok)throw new Error(detail||`Update request failed (${r.status}).`);updateInfo={available,current:r.headers.get('X-AgentChat-Update-Current')||'',version:r.headers.get('X-AgentChat-Update-Version')||'',state:status,error:status==='error'?detail:''};updateRestarting=status==='restarting';}
- catch(e){if(updateRestarting)updateInfo={available:true,current:'',version:'',state:'restarting',error:''};else if(updateInfo)updateInfo={...updateInfo,state:'error',error:e instanceof Error?e.message:'Update unavailable.'};}
- finally{updateBusy=false;renderUpdate();}
+ if(updateBusy || reloadTriggered || (updateUnconfirmed && !action))return;
+ if(action==='check')updateUnconfirmed=false;
+ if(action==='apply'){
+  const current=updateInfo?.current;const version=updateInfo?.version;
+  if(current && version && current!==version){expectedUpdate={version,started:Date.now()};updateRestarting=true;updateDeferred=false;}
+ }
+ updateBusy=true;
+ try {
+  const r=await fetch('/api/update'+(action?'/'+action:''),{method:action?'POST':'GET',cache:'no-store',signal:AbortSignal.timeout(8000)});
+  if(r.status===404 && !expectedUpdate){updateInfo=null;return;}
+  const detail=await r.text();
+  if(!r.ok){if(action==='apply'){expectedUpdate=null;updateRestarting=false;}throw new Error(detail||`Update request failed (${r.status}).`);}
+  const available=r.headers.get('X-AgentChat-Update-Available')==='true';const current=r.headers.get('X-AgentChat-Update-Current')||'';const status=r.headers.get('X-AgentChat-Update-State')||'idle';
+  if(!action && expectedUpdate && available && current===expectedUpdate.version && r.headers.get('X-AgentChat-Update-Committed')==='true'){
+   const health=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(8000)});
+   if(health.ok){
+    const verify=await fetch('/api/update',{cache:'no-store',signal:AbortSignal.timeout(8000)});
+    if(verify.ok && verify.headers.get('X-AgentChat-Update-Current')===expectedUpdate.version && verify.headers.get('X-AgentChat-Update-Committed')==='true'){
+     if(hasUnsentWork()){updateDeferred=true;updateInfo={available:true,current,version:expectedUpdate.version,state:'deferred',error:''};return;}
+     reloadTriggered=true;expectedUpdate=null;window.location.reload();return;
+    }
+   }
+  }
+  if(expireUpdate())return;
+  updateInfo={available,current,version:r.headers.get('X-AgentChat-Update-Version')||'',state:expectedUpdate?(updateDeferred?'deferred':'restarting'):status,error:status==='error'?detail:''};
+  updateRestarting=!!expectedUpdate || status==='restarting';
+ } catch(e) {
+  if(expireUpdate())return;
+  if(expectedUpdate || updateRestarting)updateInfo={available:true,current:updateInfo?.current||'',version:'',state:updateDeferred?'deferred':'restarting',error:''};
+  else if(updateInfo)updateInfo={...updateInfo,state:'error',error:e instanceof Error?e.message:'Update unavailable.'};
+ } finally {updateBusy=false;renderUpdate();}
 }
-function renderUpdate():void{const el=app.querySelector<HTMLElement>('#update-panel');if(!el)return;const u=updateInfo;if(!u?.available){el.hidden=true;return;}el.hidden=false;const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';el.innerHTML=`<strong>App updates</strong><small>${esc(u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;el.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',e=>{const action=(e.currentTarget as HTMLButtonElement).dataset.updateAction!;if(action==='apply')updateRestarting=true;void updateRequest(action);});}
+function hasUnsentWork():boolean {
+ if(sending || stopSending || settingsDirty || [...filesByChannel.values()].some(files=>files.length>0) || [...drafts.values()].some(text=>text.trim().length>0))return true;
+ try {for(let i=0;i<sessionStorage.length;i++){const key=sessionStorage.key(i);if(key && (key.startsWith('draft-text:') || key.startsWith('pending-id:') || key.startsWith('draft-reply:')) && sessionStorage.getItem(key)?.trim())return true;}}
+ catch{return true;}
+ return false;
+}
+function expireUpdate():boolean {
+ if(!expectedUpdate || Date.now()-expectedUpdate.started<updateWaitLimit || (updateDeferred && hasUnsentWork()))return false;
+ expectedUpdate=null;updateRestarting=false;updateDeferred=false;updateUnconfirmed=true;
+ updateInfo={available:true,current:updateInfo?.current||'',version:'',state:'error',error:'Update could not be confirmed. Check the running version.'};return true;
+}
+function renderUpdate():void{const el=app.querySelector<HTMLElement>('#update-panel');if(!el)return;const u=updateInfo;if(!u?.available){el.hidden=true;return;}el.hidden=false;const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';el.innerHTML=`<strong>App updates</strong><small>${esc(u.state==='deferred'?'Update ready. Finish or clear drafts to reload.':u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;el.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',e=>{const action=(e.currentTarget as HTMLButtonElement).dataset.updateAction!;void updateRequest(action);});}
 type WeeklyUsage={known:boolean;remaining:number|null;reset:number|null;observed:number|null;enabled:boolean;warn:number;reserve:number;paused:boolean};
 let weeklyUsage:WeeklyUsage|null=null;let weeklyError='';let settingsOpen=false;let guardEnabled=false;let guardWarn='40';let guardReserve='30';let settingsDirty=false;let savingGuard=false;
 function numberHeader(r:Response,key:string):number|null {const raw=r.headers.get(key);if(raw===null || raw.trim()==='')return null;const n=Number(raw);return Number.isFinite(n)?n:null;}
@@ -272,7 +312,7 @@ function render() {
   sessionStorage.setItem(replyKey(target),message.id);render();app.querySelector<HTMLTextAreaElement>('#message')?.focus();
  });
  app.querySelector<HTMLButtonElement>('#cancel-reply')?.addEventListener('click',()=>{sessionStorage.removeItem(replyKey(recipient));render();app.querySelector<HTMLTextAreaElement>('#message')?.focus();});
- app.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach(b=>b.onclick=async()=>{const m=msgs.find(x=>x.id===b.dataset.copy);if(!m)return;try{await navigator.clipboard.writeText(m.text);copyFeedback='Message copied.';}catch{copyFeedback='Could not copy message.';}const status=app.querySelector<HTMLElement>('.copy-feedback');if(status)status.textContent=copyFeedback;});
+ app.querySelectorAll<HTMLButtonElement>('[data-copy]').forEach(b=>b.onclick=async()=>{const m=msgs.find(x=>x.id===b.dataset.copy);if(!m)return;try{await navigator.clipboard.writeText(m.text);copyFeedback='';}catch{copyFeedback='Could not copy message.';}const status=app.querySelector<HTMLElement>('.copy-feedback');if(status)status.textContent=copyFeedback;});
  app.querySelector<HTMLButtonElement>('#retry')?.addEventListener('click',()=>void refresh());
  const addFiles=(incoming:FileList|File[])=>{if(pendingId(recipient)&&!missingPendingFiles(recipient))return;const files=[...draftFiles(recipient),...Array.from(incoming)];if(files.length>32 || files.some(f=>f.size>8*1024*1024) || files.reduce((n,f)=>n+f.size,0)>32*1024*1024){error='Choose up to 32 files, each at most 8 MiB and 32 MiB total.';render();return;}setDraftFiles(recipient,files);composeNotice='';error='';render();};
  const picker=app.querySelector<HTMLInputElement>('#file-input')!;

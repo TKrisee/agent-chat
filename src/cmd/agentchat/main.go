@@ -79,7 +79,16 @@ func run(ctx context.Context, stop context.CancelFunc, ready func()) error {
 		if err != nil || !info.IsDir() {
 			return fmt.Errorf("static directory unavailable")
 		}
-		ui = http.FileServer(http.Dir(*static))
+		files := http.FileServer(http.Dir(*static))
+		ui = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+				w.Header().Set("Cache-Control", "no-store")
+				r = r.Clone(r.Context())
+				r.Header.Del("If-Modified-Since")
+				r.Header.Del("If-None-Match")
+			}
+			files.ServeHTTP(w, r)
+		})
 	}
 	handler := s.Handler(ui)
 	update := &updater.Handler{Client: updater.Client{BaseURL: releaseBaseURL}, Root: os.Getenv("AGENTCHAT_MANAGED_ROOT"), Version: os.Getenv("AGENTCHAT_MANAGED_VERSION"), Stop: stop}

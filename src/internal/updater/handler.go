@@ -23,6 +23,7 @@ type Handler struct {
 	stage         string
 }
 type Status struct {
+	Committed bool   `json:"-"`
 	Available bool   `json:"available"`
 	Current   string `json:"current"`
 	Version   string `json:"version,omitempty"`
@@ -32,6 +33,11 @@ type Status struct {
 
 func (h *Handler) status() Status {
 	s := Status{Available: h.Root != "" && versionPattern.MatchString(h.Version), Current: h.Version, Version: h.release.Version, State: h.state, Error: h.message}
+	if s.Available {
+		active, err := os.ReadFile(filepath.Join(h.Root, "active-version"))
+		_, pendingErr := os.Stat(filepath.Join(h.Root, "update-request"))
+		s.Committed = err == nil && strings.TrimSpace(string(active)) == h.Version && os.IsNotExist(pendingErr)
+	}
 	if s.State == "" {
 		s.State = "idle"
 	}
@@ -163,6 +169,7 @@ func (h *Handler) download(rel Release) {
 
 func writeStatus(w http.ResponseWriter, s Status, code int) {
 	w.Header().Set("X-AgentChat-Update-Available", strconv.FormatBool(s.Available))
+	w.Header().Set("X-AgentChat-Update-Committed", strconv.FormatBool(s.Committed))
 	w.Header().Set("X-AgentChat-Update-Current", s.Current)
 	w.Header().Set("X-AgentChat-Update-Version", s.Version)
 	w.Header().Set("X-AgentChat-Update-State", s.State)

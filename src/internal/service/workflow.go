@@ -23,9 +23,10 @@ const groupChatGuide = "The operator explicitly mentioned you in the shared proj
 // instructions, and the runtime's permission and safety requirements.
 const workflowDefaults = `When applicable to the assigned work, follow these defaults:
 - Agree on the smallest useful acceptance criteria and prove the normal user workflow early when practical.
-- Investigate concrete blockers; retry only when inputs or evidence change, and keep repeated attempts bounded without preventing distinct recovery.
-- Stop repeating checks once the relevant workflow passes and required checks are complete.
-- Preserve working patches and receipts. Give each remaining blocker one owner and report its evidence and next step instead of discarding work or restarting it. Continue independent work.`
+- At the first genuine blocker, report the exact failed prerequisite or error, its impact, the responsible owner, and the next viable permitted alternative. Continue independent backlog work.
+- For the same blocked item, use meaningfully changed, permitted approaches across at most two further failed task turns. If both fail, stop only that item and escalate through your immediate parent (Root to the operator), with the attempts and decision or input needed. If no permitted alternative exists, escalate promptly instead of running empty turns.
+- Respect authorization boundaries, denials, stops, and uncertain-effect fences; never replay an effect without proof and authorization.
+- Stop repeating checks once the relevant workflow passes and required checks are complete. Preserve working patches and receipts rather than discarding or restarting them.`
 
 func agentGuide(role, kind string, shared bool) string {
 	guide := workerGuide

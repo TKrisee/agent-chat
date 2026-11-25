@@ -158,3 +158,32 @@ func httptestRequest(method, path string) *http.Request {
 	r, _ := http.NewRequest(method, "http://localhost"+path, nil)
 	return r
 }
+
+func TestCommittedStatusRequiresActiveVersionAndNoRequest(t *testing.T) {
+	root := t.TempDir()
+	h := &Handler{Root: root, Version: "2.0.0"}
+	check := func(want string) {
+		t.Helper()
+		w := &recorder{header: make(http.Header)}
+		h.ServeHTTP(w, httptestRequest(http.MethodGet, "/api/update"))
+		if got := w.header.Get("X-AgentChat-Update-Committed"); got != want {
+			t.Fatalf("committed = %q, want %q", got, want)
+		}
+	}
+	check("false")
+	if err := os.WriteFile(filepath.Join(root, "active-version"), []byte("1.0.0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	check("false")
+	if err := os.WriteFile(filepath.Join(root, "active-version"), []byte("2.0.0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "update-request"), []byte("2.0.0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	check("false")
+	if err := os.Remove(filepath.Join(root, "update-request")); err != nil {
+		t.Fatal(err)
+	}
+	check("true")
+}
