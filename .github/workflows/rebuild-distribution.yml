@@ -84,7 +84,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          id=$(gh api --paginate "repos/$REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0].id else error("unique draft required") end')
+          id=$(gh api --paginate "repos/$REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" '[.[][] | select(.tag_name == $tag or (.draft == true and (.tag_name | startswith("untagged-")) and .name == $tag))] | if length == 1 and .[0].draft == true then .[0].id else error("unique draft required") end')
           gh api --method PATCH "repos/$REPO/releases/$id" -f target_commitish="$SHA" >/dev/null
 
   package:
