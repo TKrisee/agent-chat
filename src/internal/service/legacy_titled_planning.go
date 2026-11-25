@@ -11,6 +11,7 @@ import (
 )
 
 const legacyTitledPlanningDiagnostic = "invalid runtime result: group post outside project scope"
+const legacyAssignmentLineageDiagnostic = "invalid runtime result: original PO assignment is unavailable"
 
 type legacyTitledPlan struct {
 	job        job
@@ -37,7 +38,7 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 	if err != nil {
 		return out, false, err
 	}
-	if out.job.Agent != po || (out.job.Kind != "assignment" && out.job.Kind != "po_followup") || status != "completed" || diagnostic != legacyTitledPlanningDiagnostic || len(payload) == 0 || len(payload) > 1<<20 {
+	if out.job.Agent != po || (out.job.Kind != "assignment" && out.job.Kind != "po_followup") || status != "completed" || (diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyAssignmentLineageDiagnostic) || len(payload) == 0 || len(payload) > 1<<20 {
 		return out, false, nil
 	}
 	out.job.Project = project
@@ -70,13 +71,37 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 		}
 		out.assignment = out.job.Source
 	} else {
-		out.assignment, err = poAssignmentSource(tx, out.job, po)
+		out.assignment, err = s.poAssignmentSource(tx, out.job, po)
 		if errors.Is(err, errWorkflow) {
 			return out, false, nil
 		}
 		if err != nil {
 			return out, false, err
 		}
+	}
+	if diagnostic == legacyAssignmentLineageDiagnostic {
+		if out.job.Kind != "po_followup" {
+			return out, false, nil
+		}
+		original, assignment, ok, err := s.recoveredTitledAssignment(tx, task, project, po)
+		if err != nil {
+			return out, false, err
+		}
+		if !ok || assignment != out.assignment {
+			return out, false, nil
+		}
+		f, err := readPOFollowup(tx, out.job.Source)
+		if err != nil {
+			return out, false, err
+		}
+		if f.trigger != original || f.assignment != assignment || f.note != out.job.Source || f.phase != "assigned" || f.ordinal != 1 {
+			return out, false, nil
+		}
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacySafePlanningInspector)
+		if !ok {
+			return out, false, nil
+		}
+		return out, inspector.IsLegacySafePlanning(context.Background(), payload, project), nil
 	}
 	inspector, ok := s.runtimeSetup().(runtimeapi.LegacyTitledPlanningInspector)
 	if !ok {
@@ -98,4 +123,45 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 		}
 	}
 	return out, proven, nil
+}
+
+// recoveredTitledAssignment recognizes only the exact rejected assignment and
+// the operator-authorized followup that pinned its source and private note.
+func (s *Service) recoveredTitledAssignment(tx *sql.Tx, task, project, po string) (jobID, assignment string, ok bool, err error) {
+	var payload []byte
+	err = tx.QueryRow(`SELECT a.id,a.source_id,a.result FROM jobs a JOIN messages m ON m.id=a.source_id WHERE a.task_id=? AND a.project_id=? AND a.agent_id=? AND a.kind='assignment' AND a.status='completed' AND a.diagnostic=? AND m.task_id=a.task_id AND m.project_id=a.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0`, task, project, po, legacyTitledPlanningDiagnostic, root, po, directRoom(root, po)).Scan(&jobID, &assignment, &payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	var count int
+	err = tx.QueryRow(`SELECT count(*) FROM po_followups f JOIN jobs j ON j.source_id=f.source_id AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND j.kind='po_followup' JOIN messages n ON n.id=f.note_id AND n.id=f.source_id AND n.task_id=j.task_id AND n.project_id=j.project_id AND n.sender=? AND n.recipient=? AND n.role='operator' AND n.room_id=? WHERE f.trigger_id=? AND f.assignment_id=? AND f.phase='assigned' AND f.ordinal=1`, task, project, po, operator, po, directRoom(operator, po), jobID, assignment).Scan(&count)
+	if err != nil {
+		return "", "", false, err
+	}
+	if count != 1 {
+		return "", "", false, nil
+	}
+	inspector, valid := s.runtimeSetup().(runtimeapi.LegacyTitledPlanningInspector)
+	if !valid || len(payload) == 0 || len(payload) > 1<<20 {
+		return "", "", false, nil
+	}
+	key := fmt.Sprintf("titled:%s:%x", jobID, sha256.Sum256(payload))
+	s.reviewProofMu.Lock()
+	proven := s.reviewProof[key]
+	s.reviewProofMu.Unlock()
+	if !proven {
+		proven = inspector.IsLegacyTitledPlanning(context.Background(), payload, project)
+		if proven {
+			s.reviewProofMu.Lock()
+			if s.reviewProof == nil {
+				s.reviewProof = make(map[string]bool)
+			}
+			s.reviewProof[key] = true
+			s.reviewProofMu.Unlock()
+		}
+	}
+	return jobID, assignment, proven, nil
 }

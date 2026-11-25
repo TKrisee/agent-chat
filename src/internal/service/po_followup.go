@@ -18,7 +18,7 @@ func readPOFollowup(tx *sql.Tx, source string) (f poFollowup, err error) {
 	err = tx.QueryRow(`SELECT trigger_id,phase,assignment_id,COALESCE(note_id,''),COALESCE(review_id,''),ordinal FROM po_followups WHERE source_id=?`, source).Scan(&f.trigger, &f.phase, &f.assignment, &f.note, &f.review, &f.ordinal)
 	return
 }
-func poAssignmentSource(tx *sql.Tx, j job, po string) (string, error) {
+func (s *Service) poAssignmentSource(tx *sql.Tx, j job, po string) (string, error) {
 	var id string
 	var count int
 	assignmentTask := j.Task
@@ -31,6 +31,15 @@ func poAssignmentSource(tx *sql.Tx, j job, po string) (string, error) {
 	err := tx.QueryRow(`SELECT count(*),COALESCE(min(m.id),'') FROM jobs a JOIN messages m ON m.id=a.source_id WHERE a.task_id=? AND a.project_id=? AND a.agent_id=? AND a.kind='assignment' AND (a.status='completed' OR a.id=?) AND COALESCE(a.diagnostic,'')='' AND m.task_id=a.task_id AND m.project_id=a.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0`, assignmentTask, j.Project, po, j.ID, root, po, directRoom(root, po)).Scan(&count, &id)
 	if err != nil {
 		return "", err
+	}
+	if count == 0 {
+		_, recovered, ok, err := s.recoveredTitledAssignment(tx, assignmentTask, j.Project, po)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return recovered, nil
+		}
 	}
 	if count != 1 {
 		return "", fmt.Errorf("%w: original PO assignment is unavailable", errWorkflow)
@@ -90,7 +99,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		}
 		f.phase = phase
 	} else {
-		f.assignment, err = poAssignmentSource(tx, j, a.ID)
+		f.assignment, err = s.poAssignmentSource(tx, j, a.ID)
 		if err != nil {
 			return err
 		}
@@ -155,7 +164,7 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 		return err
 	}
 	if explicit {
-		assignment, err := poAssignmentSource(tx, j, a.ID)
+		assignment, err := s.poAssignmentSource(tx, j, a.ID)
 		if err != nil {
 			return err
 		}

@@ -164,6 +164,9 @@ type LegacyReviewConflictInspector interface {
 type LegacyTitledPlanningInspector interface {
 	IsLegacyTitledPlanning(context.Context, []byte, string) bool
 }
+type LegacySafePlanningInspector interface {
+	IsLegacySafePlanning(context.Context, []byte, string) bool
+}
 type LegacyStructuredHoldInspector interface {
 	IsLegacyStructuredHold(context.Context, []byte) bool
 }

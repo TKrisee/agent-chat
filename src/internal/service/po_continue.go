@@ -107,7 +107,7 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					return err
 				}
-				return s.enqueue(tx, a, planning.job.Project, planning.job.Task, id, "po_followup", "Continue the same assignment using the pinned original brief and operator instruction. The prior titled project post was rejected before its actions were applied; plan the next safe steps without assuming they committed or replaying effects. Preserve all stops and scope constraints.")
+				return s.enqueue(tx, a, planning.job.Project, planning.job.Task, id, "po_followup", "Continue the same assignment using the pinned original brief and operator instruction. The prior planning proposal was rejected before its actions were applied; plan the next safe steps without assuming they committed or replaying effects. Preserve all stops and scope constraints.")
 			}
 			a, err := getAgent(tx, legacy.job.Agent)
 			if err != nil {

@@ -114,11 +114,8 @@ func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	if parentStatus != "assigned" || stopped != 0 || open != 0 || busy != 0 {
 		return nil
 	}
-	var trigger, assignment string
-	err = tx.QueryRow(`SELECT j.id,j.source_id FROM jobs j WHERE j.task_id=? AND j.agent_id=? AND j.kind='assignment' AND j.status='completed' AND COALESCE(j.diagnostic,'')='' ORDER BY j.rowid DESC LIMIT 1`, parent, poID).Scan(&trigger, &assignment)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: parent assignment unavailable", errWorkflow)
-	}
+	var trigger string
+	assignment, err := s.poAssignmentSource(tx, job{Task: parent, Project: j.Project}, poID)
 	if err != nil {
 		return err
 	}
@@ -168,7 +165,7 @@ func (s *Service) followWorkPlanning(tx *sql.Tx, j job, po agent) error {
 	if busy != 0 {
 		return nil
 	}
-	assignment, err := poAssignmentSource(tx, j, po.ID)
+	assignment, err := s.poAssignmentSource(tx, j, po.ID)
 	if err != nil {
 		return err
 	}

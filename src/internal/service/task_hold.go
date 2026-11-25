@@ -67,7 +67,7 @@ func (s *Service) activeTaskHold(tx *sql.Tx, task string) (h activeHold, ok bool
 		return h, false, err
 	}
 	j.Source = source
-	h.assignment, err = poAssignmentSource(tx, j, h.po)
+	h.assignment, err = s.poAssignmentSource(tx, j, h.po)
 	if errors.Is(err, errWorkflow) {
 		return h, false, nil
 	}

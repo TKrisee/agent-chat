@@ -3,6 +3,7 @@ package codexruntime
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os/exec"
 	"time"
@@ -40,6 +41,14 @@ func (r *Runner) IsLegacyStructuredHold(ctx context.Context, payload []byte) boo
 // IsLegacyTitledPlanning accepts only the historical harmless title error and
 // planning proposals; the caller must independently verify task provenance.
 func (r *Runner) IsLegacyTitledPlanning(ctx context.Context, payload []byte, project string) bool {
+	return r.isLegacyPlanning(ctx, payload, project, true)
+}
+
+func (r *Runner) IsLegacySafePlanning(ctx context.Context, payload []byte, project string) bool {
+	return r.isLegacyPlanning(ctx, payload, project, false)
+}
+
+func (r *Runner) isLegacyPlanning(ctx context.Context, payload []byte, project string, titled bool) bool {
 	if len(payload) == 0 || len(payload) > 1<<20 || project == "" {
 		return false
 	}
@@ -59,8 +68,8 @@ all(.actions[];
   elif .type == "create_worker" then (.project == "" or .project == $project) and (.title | nonblank and (test("\\s") | not)) and .body == "" and .recipient == ""
   elif .type == "queue_work_item" then (.project == "" or .project == $project) and (.title | nonblank) and (.body | nonblank) and (.recipient | nonblank)
   else false end) and
-any(.actions[]; .type == "post_group" and (.title | nonblank))`
-	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, filter)
+($titled == false or any(.actions[]; .type == "post_group" and (.title | nonblank)))`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, "--argjson", "titled", fmt.Sprint(titled), filter)
 	cmd.Stdin = bytes.NewReader(payload)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard

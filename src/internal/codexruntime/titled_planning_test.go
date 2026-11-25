@@ -28,4 +28,12 @@ func TestLegacyTitledPlanning(t *testing.T) {
 			}
 		})
 	}
+	untitled := strings.Replace(valid, `"Starting"`, `""`, 1)
+	if !r.IsLegacySafePlanning(context.Background(), []byte(untitled), "alpha") {
+		t.Fatal("safe untitled planning result rejected")
+	}
+	unsafe := strings.Replace(untitled, `"queue_work_item"`, `"stop_project"`, 1)
+	if r.IsLegacySafePlanning(context.Background(), []byte(unsafe), "alpha") {
+		t.Fatal("unsafe planning action accepted")
+	}
 }

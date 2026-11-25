@@ -111,7 +111,7 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	if err = tx.QueryRow(`SELECT count(*) FROM po_followups WHERE trigger_id=?`, out.job.ID).Scan(&previous); err != nil || previous != 0 {
 		return
 	}
-	out.assignment, e = poAssignmentSource(tx, out.job, po)
+	out.assignment, e = s.poAssignmentSource(tx, out.job, po)
 	if errors.Is(e, errWorkflow) {
 		return out, false, nil
 	}
