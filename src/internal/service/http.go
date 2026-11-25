@@ -55,6 +55,7 @@ type Task struct {
 	Status               string `json:"status"`
 	Owner                string `json:"owner_id"`
 	RetryHandoffEligible bool   `json:"retry_handoff_eligible"`
+	ContinuePOEligible   bool   `json:"continue_po_eligible"`
 }
 
 type Agent struct {
@@ -226,6 +227,12 @@ func (s *Service) state() (State, error) {
 					return err
 				}
 			}
+			if view.Tasks[i].Status == "assigned" {
+				_, _, _, view.Tasks[i].ContinuePOEligible, err = poContinuation(tx, view.Tasks[i].ID)
+				if err != nil {
+					return err
+				}
+			}
 		}
 		view.Agents, err = querySlice(tx, `SELECT a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,
 			CASE WHEN p.stopped=1 THEN 'stopped' WHEN EXISTS(SELECT 1 FROM jobs j
@@ -278,6 +285,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 		respond(w, http.StatusOK, view)
 	})
 	mux.HandleFunc("POST /api/tasks/{id}/retry-handoff", s.retryHandoff)
+	mux.HandleFunc("POST /api/tasks/{id}/continue-po", s.continuePO)
 	mux.HandleFunc("POST /api/messages", s.postMessage)
 	mux.HandleFunc("POST /api/messages/upload", s.postMessageUpload)
 	mux.HandleFunc("POST /api/messages/read", s.postOperatorRead)

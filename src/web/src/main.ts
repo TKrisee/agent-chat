@@ -7,7 +7,7 @@ import {renderMessageMarkdown} from './message-markdown';
 type Attachment = {id:string; name:string; media_type:string; url:string};
 type Message = {id:string; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]};
 type Project = {id:string; name:string; status:string; po_id:string; goal_objective?:string; goal_status?:string};
-type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean};
+type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean};
 type Job = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string};
 type Agent = {id:string; name:string; role:string; project_id:string; status:string; model:string; parent_id?:string};
 type State = {messages:Message[]; projects:Project[]; tasks:Task[]; agents:Agent[]; jobs:Job[]};
@@ -51,7 +51,7 @@ async function updateRequest(action=''):Promise<void>{
  } finally {updateBusy=false;renderUpdate();}
 }
 function hasUnsentWork():boolean {
- if(sending || stopSending || settingsDirty || [...filesByChannel.values()].some(files=>files.length>0) || [...drafts.values()].some(text=>text.trim().length>0))return true;
+ if(sending || stopSending || settingsDirty || poPending.size>0 || [...poNotes.values()].some(note=>note.trim()) || [...filesByChannel.values()].some(files=>files.length>0) || [...drafts.values()].some(text=>text.trim().length>0))return true;
  try {for(let i=0;i<sessionStorage.length;i++){const key=sessionStorage.key(i);if(key && (key.startsWith('draft-text:') || key.startsWith('pending-id:') || key.startsWith('draft-reply:')) && sessionStorage.getItem(key)?.trim())return true;}}
  catch{return true;}
  return false;
@@ -277,10 +277,35 @@ function agentActivity(target:string): {label:string; detail?:string; guidance?:
 }
 const handoffPending = new Set<string>();
 const handoffFeedback = new Map<string,{kind:'queued'|'conflict'|'error'; text:string}>();
+const poNotes = new Map<string,string>();
+const poRequestIds = new Map<string,{id:string;note:string}>();
+const poOpen = new Set<string>();
+const poPending = new Set<string>();
+const poFeedback = new Map<string,{kind:'queued'|'conflict'|'error';text:string}>();
+function poMarkup(task:Task):string {
+ const id=esc(task.id), projectId=esc(task.project_id), feedback=poFeedback.get(task.id);
+ const blocked=poPending.has(task.id)||feedback?.kind==='queued'||feedback?.kind==='conflict';
+ const control=task.continue_po_eligible?(poOpen.has(task.id)?`<form class="pa-continue" data-continue-po="${id}" data-project-id="${projectId}"><label>Next instruction<textarea name="note" required ${poPending.has(task.id)?'disabled':''}>${esc(poNotes.get(task.id)||'')}</textarea></label><button type="submit" ${blocked?'disabled':''}>Queue continuation</button> <button type="button" data-cancel-po="${id}" ${poPending.has(task.id)?'disabled':''}>Cancel</button></form>`:`<button type="button" class="pa-handoff" data-open-po="${id}" ${blocked?'disabled':''}>Continue with PO</button>`):'';
+ return control+(feedback?`<p class="pa-handoff-status" role="${feedback.kind==='error'?'alert':'status'}">${esc(feedback.text)}</p>`:'');
+}
+async function continuePO(id:string, projectId:string):Promise<void> {
+ const note=poNotes.get(id)||'';const task=state.tasks.find(t=>t.id===id && t.project_id===projectId);
+ if(project()?.id!==projectId || !task?.continue_po_eligible || poPending.has(id) || ['queued','conflict'].includes(poFeedback.get(id)?.kind||''))return;
+ if(!note.trim() || new TextEncoder().encode(note).length>4096){poFeedback.set(id,{kind:'error',text:'Enter an instruction of up to 4 KiB.'});refreshActivity();return;}
+ let request=poRequestIds.get(id);if(request && request.note!==note){poFeedback.set(id,{kind:'error',text:'This request may already be queued. Check its status before changing the instruction.'});refreshActivity();return;}if(!request){request={id:crypto.randomUUID(),note};poRequestIds.set(id,request);}
+ poPending.add(id);poFeedback.delete(id);refreshActivity();
+ try {const response=await fetch(`/api/tasks/${encodeURIComponent(id)}/continue-po`,{method:'POST',body:new URLSearchParams({id:request.id,note})});
+  if(response.status===202){poFeedback.set(id,{kind:'queued',text:'PO continuation queued.'});poNotes.delete(id);poOpen.delete(id);}
+  else if(response.status===409)poFeedback.set(id,{kind:'conflict',text:'PO continuation is unavailable. Check its current status.'});
+  else if(response.status===400)poFeedback.set(id,{kind:'error',text:'The instruction was rejected. Check its length and try again.'});
+  else poFeedback.set(id,{kind:'error',text:`Could not confirm the continuation request (HTTP ${response.status}). Check its status before trying again.`});
+ }catch{poFeedback.set(id,{kind:'error',text:'Could not confirm the continuation request. Check its status before trying again.'});}
+ finally{poPending.delete(id);if(project()?.id===projectId)refreshActivity();await refresh();}
+}
 function handoffMarkup(task:Task):string {
  const feedback=handoffFeedback.get(task.id);
  const button=task.retry_handoff_eligible?`<button type="button" class="pa-handoff" data-retry-handoff="${esc(task.id)}" data-project-id="${esc(task.project_id)}" ${handoffPending.has(task.id)||feedback?.kind==='queued'||feedback?.kind==='conflict'?'disabled':''}>Retry handoff</button>`:'';
- return button+(feedback?`<p class="pa-handoff-status" role="${feedback.kind==='error'?'alert':'status'}">${esc(feedback.text)}</p>`:'');
+ return button+(feedback?`<p class="pa-handoff-status" role="${feedback.kind==='error'?'alert':'status'}">${esc(feedback.text)}</p>`:'')+poMarkup(task);
 }
 async function retryHandoff(id:string, projectId:string):Promise<void> {
  const task=state.tasks.find(t=>t.id===id && t.project_id===projectId);
@@ -299,6 +324,9 @@ function activityMarkup(projectId:string):string {
  return lastActivityMarkup;
 }
 function bindPanelDetails():void {
+ app.querySelectorAll<HTMLButtonElement>('[data-open-po]').forEach(button=>{button.onclick=()=>{poOpen.add(button.dataset.openPo!);refreshActivity();app.querySelector<HTMLTextAreaElement>('[data-continue-po] textarea')?.focus();};});
+ app.querySelectorAll<HTMLButtonElement>('[data-cancel-po]').forEach(button=>{button.onclick=()=>{const id=button.dataset.cancelPo!;poOpen.delete(id);poNotes.delete(id);poRequestIds.delete(id);poFeedback.delete(id);refreshActivity();};});
+ app.querySelectorAll<HTMLFormElement>('[data-continue-po]').forEach(form=>{const id=form.dataset.continuePo!;form.querySelector<HTMLTextAreaElement>('textarea')!.oninput=e=>poNotes.set(id,(e.target as HTMLTextAreaElement).value);form.onsubmit=e=>{e.preventDefault();void continuePO(id,form.dataset.projectId!);};});
  app.querySelectorAll<HTMLButtonElement>('[data-retry-handoff]').forEach(button=>{button.onclick=()=>void retryHandoff(button.dataset.retryHandoff!,button.dataset.projectId!);});
  app.querySelectorAll<HTMLDetailsElement>('details[data-diagnostic]').forEach(details=>{const key=details.dataset.diagnostic!;details.ontoggle=()=>{if(details.open)openDetails.add(key);else openDetails.delete(key);};});
 }

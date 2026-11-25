@@ -3,7 +3,7 @@ export type ActivityProject = {id:string; name:string; po_id:string; goal_object
 export type ActivityAgent = {id:string; name:string; role:string; project_id:string; status:string; parent_id?:string};
 export type ActivityJob = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; source_id?:string; kind?:string};
 export type ActivityMessage = {id:string; room_id:string; sender:string; recipient:string; text:string; at:string; project_id?:string};
-export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean};
+export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean};
 export type ActivityState = {projects:ActivityProject[]; agents:ActivityAgent[]; jobs:ActivityJob[]; messages:ActivityMessage[]; tasks:ActivityTask[]};
 const escape = (value:unknown) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 const short = (value:string, limit:number) => Array.from(value).slice(0,limit).join('') + (Array.from(value).length > limit ? '…' : '');

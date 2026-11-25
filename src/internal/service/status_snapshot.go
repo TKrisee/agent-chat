@@ -105,7 +105,11 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 			}
 		}
 		for _, t := range tasks {
-			fmt.Fprintf(&out, "  task=%s status=%s owner=%s\n", strconv.Quote(t.id), strconv.Quote(t.status), strconv.Quote(t.owner))
+			_, _, _, continuation, err := poContinuation(tx, t.id)
+			if err != nil {
+				return "", err
+			}
+			fmt.Fprintf(&out, "  task=%s status=%s owner=%s po_continuation_available=%t\n", strconv.Quote(t.id), strconv.Quote(t.status), strconv.Quote(t.owner), continuation)
 		}
 		// Reserve room independently for latest rejected job so many active jobs cannot displace it.
 		jobs, err := querySlice(tx, `SELECT id,COALESCE(task_id,''),agent_id,kind,status,COALESCE(diagnostic,'') FROM jobs WHERE project_id=? ORDER BY CASE WHEN status IN ('pending','submitted','running','uncertain') THEN 0 WHEN diagnostic IS NOT NULL AND diagnostic<>'' THEN 1 ELSE 2 END,rowid DESC LIMIT 7`, scanSnapshotJob, p.id)

@@ -12,7 +12,7 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
-const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
+const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can use project Work → Continue with PO to continue the existing assignment without a new scope round. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
 const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment, promptly hand off actionable work and acceptance criteria with queue_worker, or return one concrete blocking reason. Avoid substantial implementation work in the handoff turn, and never redispatch a prior uncertain effect without verified authorization. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
@@ -93,7 +93,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	if parent != "" {
 		guide += "\nThe operator replied to message " + parent + ". Its exact text and attachments are included in the context."
 	}
-	history, err := s.runtimeContext(tx, a, project, task, parent, kind)
+	history, err := s.runtimeContext(tx, a, project, task, parent, kind, source)
 	if err != nil {
 		return err
 	}
@@ -109,7 +109,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	return err
 }
 
-func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kind string) ([]runtimeapi.Message, error) {
+func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kind string, source ...string) ([]runtimeapi.Message, error) {
 	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient,recipient,room_id"
 	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
 		WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL
@@ -163,6 +163,22 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 			query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id=?`
 			args = append(args, assessment)
 		}
+	}
+	if kind == "po_continue" {
+		p, po, assignment, eligible, err := poContinuation(tx, task)
+		if err != nil {
+			return nil, err
+		}
+		if !eligible || p != project || po != a.ID || len(source) != 1 {
+			return nil, fmt.Errorf("%w: PO continuation scope changed", errConflict)
+		}
+		var note string
+		err = tx.QueryRow(`SELECT id FROM messages WHERE id=? AND task_id=? AND project_id=? AND sender=? AND recipient=? AND role='operator' AND room_id=?`, source[0], task, project, operator, po, directRoom(operator, po)).Scan(&note)
+		if err != nil {
+			return nil, err
+		}
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?)`
+		args = append(args, assignment, note)
 	}
 	if parent != "" {
 		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END,recipient,room_id

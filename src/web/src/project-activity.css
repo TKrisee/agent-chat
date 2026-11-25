@@ -16,3 +16,7 @@
 
 .pa-handoff { margin-top:6px; }
 .pa-handoff-status { font-size:11px; line-height:1.4; margin:6px 0 0; overflow-wrap:anywhere; }
+
+.pa-continue { margin-top:6px; }
+.pa-continue label, .pa-continue textarea { display:block; width:100%; }
+.pa-continue textarea { min-height:4em; margin:4px 0; }

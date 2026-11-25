@@ -179,7 +179,7 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 					log.Printf("record worker start: %v", err)
 				}
 			})
-		} else if j.Kind == "assignment" && j.Project != "" && j.Request.Role == "po" {
+		} else if (j.Kind == "assignment" || j.Kind == "po_continue") && j.Project != "" && j.Request.Role == "po" {
 			runCtx = runtimeapi.WithStartNotification(runCtx, func() {
 				if err := s.ownerAssignmentStarted(j); err != nil {
 					log.Printf("record project owner start: %v", err)
