@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/TKrisee/agent-chat/compare/v0.13.2...v0.14.0) (2026-11-25)
+
+
+### Features
+
+* let project owners build teams and deliver work across rounds ([8375fd8](https://github.com/TKrisee/agent-chat/commit/8375fd8ec4fd67549731510191ed87bf53b4bfbf))
+
 ## [0.13.2](https://github.com/TKrisee/agent-chat/compare/v0.13.1...v0.13.2) (2026-11-25)
 
 
