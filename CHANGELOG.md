@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/TKrisee/agent-chat/compare/v0.8.0...v0.8.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* safely repair rejected Root handoffs ([7a03b14](https://github.com/TKrisee/agent-chat/commit/7a03b1423ecbadcaca3643b9703b031b9e26785e))
+
 ## [0.8.0](https://github.com/TKrisee/agent-chat/compare/v0.7.0...v0.8.0) (2026-11-25)
 
 
