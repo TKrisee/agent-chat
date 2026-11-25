@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.1](https://github.com/TKrisee/agent-chat/compare/v0.15.0...v0.15.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* constrain native actions to each agent job ([2935b63](https://github.com/TKrisee/agent-chat/commit/2935b634eea9a197c0438911f9af8635c1507c50))
+
 ## [0.15.0](https://github.com/TKrisee/agent-chat/compare/v0.14.5...v0.15.0) (2026-11-25)
 
 
