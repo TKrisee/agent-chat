@@ -7,7 +7,7 @@ import {renderMessageMarkdown} from './message-markdown';
 type Attachment = {id:string; name:string; media_type:string; url:string};
 type Message = {id:string; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]};
 type Project = {id:string; name:string; status:string; po_id:string; goal_objective?:string; goal_status?:string};
-type Task = {id:string; project_id:string; title:string; status:string; owner_id:string};
+type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean};
 type Job = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string};
 type Agent = {id:string; name:string; role:string; project_id:string; status:string; model:string; parent_id?:string};
 type State = {messages:Message[]; projects:Project[]; tasks:Task[]; agents:Agent[]; jobs:Job[]};
@@ -270,17 +270,37 @@ function agentActivity(target:string): {label:string; detail?:string; guidance?:
  if(last?.status==='completed' && last.diagnostic?.trim()) {const detail=last.diagnostic.trim();const historical=last.id==='c22b9643-a9f5-441f-8fcf-fde5ebdcd903' && detail==='invalid runtime result: a new project requires an unused ID and service-owned PO';const guidance=historical?'The project was not created. Send the request again as a new message.':detail.startsWith('invalid runtime result:')?'The result was not applied. Ask Root to review what happened.':'Ask Root to review what happened before trying again.';return {label:'Failed',detail,guidance,key:last.id,busy:false};}
  return {label:'Idle',busy:false};
 }
+const handoffPending = new Set<string>();
+const handoffFeedback = new Map<string,{kind:'queued'|'conflict'|'error'; text:string}>();
+function handoffMarkup(task:Task):string {
+ const feedback=handoffFeedback.get(task.id);
+ const button=task.retry_handoff_eligible?`<button type="button" class="pa-handoff" data-retry-handoff="${esc(task.id)}" data-project-id="${esc(task.project_id)}" ${handoffPending.has(task.id)||feedback?.kind==='queued'||feedback?.kind==='conflict'?'disabled':''}>Retry handoff</button>`:'';
+ return button+(feedback?`<p class="pa-handoff-status" role="${feedback.kind==='error'?'alert':'status'}">${esc(feedback.text)}</p>`:'');
+}
+async function retryHandoff(id:string, projectId:string):Promise<void> {
+ const task=state.tasks.find(t=>t.id===id && t.project_id===projectId);
+ if(project()?.id!==projectId || !task?.retry_handoff_eligible || handoffPending.has(id) || ['queued','conflict'].includes(handoffFeedback.get(id)?.kind || ''))return;
+ handoffPending.add(id);handoffFeedback.delete(id);refreshActivity();
+ try {
+  const response=await fetch(`/api/tasks/${encodeURIComponent(id)}/retry-handoff`,{method:'POST'});
+  if(response.status===202)handoffFeedback.set(id,{kind:'queued',text:'Handoff correction queued for Root. Delivery is not yet confirmed.'});
+  else if(response.status===409)handoffFeedback.set(id,{kind:'conflict',text:'Handoff retry is unavailable. Check its current status.'});
+  else handoffFeedback.set(id,{kind:'error',text:`Could not confirm the retry request (HTTP ${response.status}). Check its status before trying again.`});
+ } catch {handoffFeedback.set(id,{kind:'error',text:'Could not confirm the retry request. Check its status before trying again.'});}
+ finally {handoffPending.delete(id);if(project()?.id===projectId)refreshActivity();await refresh();}
+}
 function activityMarkup(projectId:string):string {
- lastActivityMarkup=renderProjectActivity(state,projectId,roomFor(recipient),openDetails,id=>{const agent=state.agents.find(a=>a.id===id);return agent?memberActivity(agent):{label:'Status unavailable',active:false};},taskDiagnostics);
+ lastActivityMarkup=renderProjectActivity(state,projectId,roomFor(recipient),openDetails,id=>{const agent=state.agents.find(a=>a.id===id);return agent?memberActivity(agent):{label:'Status unavailable',active:false};},taskDiagnostics,handoffMarkup);
  return lastActivityMarkup;
 }
 function bindPanelDetails():void {
+ app.querySelectorAll<HTMLButtonElement>('[data-retry-handoff]').forEach(button=>{button.onclick=()=>void retryHandoff(button.dataset.retryHandoff!,button.dataset.projectId!);});
  app.querySelectorAll<HTMLDetailsElement>('details[data-diagnostic]').forEach(details=>{const key=details.dataset.diagnostic!;details.ontoggle=()=>{if(details.open)openDetails.add(key);else openDetails.delete(key);};});
 }
 function refreshActivity():void {
  const p=project();const current=app.querySelector<HTMLElement>('.project-activity');
  if(!p || !current)return;
- const next=renderProjectActivity(state,p.id,roomFor(recipient),openDetails,id=>{const agent=state.agents.find(a=>a.id===id);return agent?memberActivity(agent):{label:'Status unavailable',active:false};},taskDiagnostics);
+ const next=renderProjectActivity(state,p.id,roomFor(recipient),openDetails,id=>{const agent=state.agents.find(a=>a.id===id);return agent?memberActivity(agent):{label:'Status unavailable',active:false};},taskDiagnostics,handoffMarkup);
  if(next!==lastActivityMarkup){current.outerHTML=next;lastActivityMarkup=next;bindPanelDetails();}
 }
 const panelToggleIcon = `<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M15 4v16"></path><path class="toggle-chevron" d="m9 9 3 3-3 3"></path></svg>`;

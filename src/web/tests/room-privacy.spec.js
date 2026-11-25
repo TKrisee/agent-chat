@@ -105,8 +105,12 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
 
 test('project panel shows current work once and preserves earlier uncertainty', async ({page, serviceURL}) => {
   // Fixed state models an older uncertain attempt and a newer submitted attempt.
-  const state = `{"projects":[{"id":"sample","name":"Sample","status":"running","po_id":"11111111-1111-4111-8111-111111111111","goal_objective":"Deliver the full goal","goal_status":"active"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"},{"id":"11111111-1111-4111-8111-111111111111","name":"Sample-PO","role":"po","project_id":"sample","status":"busy","model":"test"}],"tasks":[{"id":"22222222-2222-4222-8222-222222222222","project_id":"sample","title":"Deliver launch","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111"}],"jobs":[{"id":"33333333-3333-4333-8333-333333333333","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"uncertain","diagnostic":"Earlier run outcome unknown"},{"id":"44444444-4444-4444-8444-444444444444","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"submitted"}],"messages":[]}`;
+  const state = `{"projects":[{"id":"sample","name":"Sample","status":"running","po_id":"11111111-1111-4111-8111-111111111111","goal_objective":"Deliver the full goal","goal_status":"active"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"},{"id":"11111111-1111-4111-8111-111111111111","name":"Sample-PO","role":"po","project_id":"sample","status":"busy","model":"test"}],"tasks":[{"id":"22222222-2222-4222-8222-222222222222","project_id":"sample","title":"Deliver launch","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111"},{"id":"55555555-5555-4555-8555-555555555555","project_id":"sample","title":"Finalize handoff","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111","retry_handoff_eligible":true}],"jobs":[{"id":"33333333-3333-4333-8333-333333333333","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"uncertain","diagnostic":"Earlier run outcome unknown"},{"id":"44444444-4444-4444-8444-444444444444","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"submitted"}],"messages":[]}`;
   await page.route('**/api/state', route=>route.fulfill({status:200,contentType:'application/json',body:state}));
+  let releaseRetry;
+  const heldRetry=new Promise(resolve=>{releaseRetry=resolve;});
+  let retries=0;
+  await page.route('**/api/tasks/55555555-5555-4555-8555-555555555555/retry-handoff', async route=>{retries++;await heldRetry;await route.fulfill({status:202,body:'Handoff correction queued.'});});
   await page.goto(serviceURL);
   await page.locator('[data-project="sample"]').click();
   const panel=page.getByLabel('Sample activity');
@@ -121,4 +125,13 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   await expect(panel.locator('.pa-work li').filter({hasText:'Deliver launch'})).toContainText('Starting');
   await panel.getByText('Details',{exact:true}).click();
   await expect(panel.getByText('Earlier run outcome unknown')).toBeVisible();
+  const eligible=panel.locator('.pa-work li').filter({hasText:'Finalize handoff'});
+  const retry=eligible.getByRole('button',{name:'Retry handoff'});
+  await expect(panel.locator('.pa-work li').filter({hasText:'Deliver launch'}).getByRole('button',{name:'Retry handoff'})).toHaveCount(0);
+  await retry.click();
+  await expect(retry).toBeDisabled();
+  expect(retries).toBe(1);
+  releaseRetry();
+  await expect(eligible.getByRole('status')).toContainText('Handoff correction queued for Root');
+  await expect(retry).toBeDisabled();
 });

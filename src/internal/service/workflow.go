@@ -12,7 +12,7 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
-const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
+const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
 const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment, promptly hand off actionable work and acceptance criteria with queue_worker, or return one concrete blocking reason. Avoid substantial implementation work in the handoff turn, and never redispatch a prior uncertain effect without verified authorization. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
@@ -151,6 +151,18 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages m
 			WHERE m.id=(SELECT message_id FROM task_origins WHERE task_id=?)`
 		args = append(args, task)
+		var po string
+		if err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", project).Scan(&po); err != nil {
+			return nil, err
+		}
+		assessment, err := scopeAssessmentID(tx, task, project, po)
+		if err != nil {
+			return nil, err
+		}
+		if assessment != "" {
+			query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id=?`
+			args = append(args, assessment)
+		}
 	}
 	if parent != "" {
 		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END,recipient,room_id
@@ -242,6 +254,20 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 			}
 		}
 		if invalid != nil {
+			var fieldErr *scopeFieldError
+			if j.Kind == "scope_decision" && errors.As(invalid, &fieldErr) && len(files) == 0 && len(uploads) == 0 {
+				eligible, err := handoffEligible(tx, j.Task, "assigned", j.ID, false)
+				if err != nil {
+					return err
+				}
+				if eligible {
+					if err := s.queueScopeCorrection(tx, j.Task, j.Project, fieldErr.Error()); err != nil {
+						return err
+					}
+					_, err := tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, invalid.Error(), j.ID)
+					return err
+				}
+			}
 			if j.Task != "" {
 				if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 					return err
@@ -631,6 +657,13 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 	if err := tx.QueryRow("SELECT po_id FROM projects WHERE id=?", j.Project).Scan(&poID); err != nil {
 		return err
 	}
+	var valid int
+	if err := tx.QueryRow(`SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id JOIN agents po ON po.id=p.po_id AND po.project_id=p.id AND po.role='po' WHERE t.id=? AND p.id=? AND p.stopped=0 AND t.status='assigned' AND t.owner_id=p.po_id`, j.Task, j.Project).Scan(&valid); err != nil {
+		return err
+	}
+	if valid != 1 || a.ID != root {
+		return fmt.Errorf("%w: task owner or status changed", errWorkflow)
+	}
 	if len(result.Actions) == 0 && strings.TrimSpace(result.Text) != "" {
 		if err := moveTask(tx, j, "assigned", "blocked", poID, poID); err != nil {
 			return err
@@ -645,10 +678,20 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 		return fmt.Errorf("%w: Root must finalize the assignment once or explain the blocker", errWorkflow)
 	}
 	action := result.Actions[0]
-	if action.Type != "delegate" || action.Project != j.Project || action.Recipient != "" ||
-		strings.TrimSpace(action.Title) == "" || len(action.Title) > 250 ||
-		strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
-		return fmt.Errorf("%w: final assignment requires the same project, a title and a body", errWorkflow)
+	if action.Type != "delegate" {
+		return fmt.Errorf("%w: final assignment action must be delegate", errWorkflow)
+	}
+	if action.Project != j.Project {
+		return &scopeFieldError{"project must equal the current project ID"}
+	}
+	if action.Recipient != "" && action.Recipient != poID {
+		return &scopeFieldError{"recipient must be empty or the appointed PO ID"}
+	}
+	if strings.TrimSpace(action.Title) == "" || len(action.Title) > 250 {
+		return &scopeFieldError{"title must be nonempty and at most 250 bytes"}
+	}
+	if strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
+		return &scopeFieldError{"body must be nonempty and at most 65536 bytes"}
 	}
 	po, err := getAgent(tx, poID)
 	if err != nil {

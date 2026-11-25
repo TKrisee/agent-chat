@@ -49,11 +49,12 @@ type Project struct {
 }
 
 type Task struct {
-	ID      string `json:"id"`
-	Project string `json:"project_id"`
-	Title   string `json:"title"`
-	Status  string `json:"status"`
-	Owner   string `json:"owner_id"`
+	ID                   string `json:"id"`
+	Project              string `json:"project_id"`
+	Title                string `json:"title"`
+	Status               string `json:"status"`
+	Owner                string `json:"owner_id"`
+	RetryHandoffEligible bool   `json:"retry_handoff_eligible"`
 }
 
 type Agent struct {
@@ -218,6 +219,14 @@ func (s *Service) state() (State, error) {
 		if err != nil {
 			return err
 		}
+		for i := range view.Tasks {
+			if view.Tasks[i].Status == "blocked" {
+				view.Tasks[i].RetryHandoffEligible, err = handoffEligible(tx, view.Tasks[i].ID, "blocked", "", true)
+				if err != nil {
+					return err
+				}
+			}
+		}
 		view.Agents, err = querySlice(tx, `SELECT a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,
 			CASE WHEN p.stopped=1 THEN 'stopped' WHEN EXISTS(SELECT 1 FROM jobs j
 			WHERE j.agent_id=a.id AND j.status IN ('submitted','running')) THEN 'busy' ELSE 'idle' END,
@@ -267,6 +276,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 		}
 		respond(w, http.StatusOK, view)
 	})
+	mux.HandleFunc("POST /api/tasks/{id}/retry-handoff", s.retryHandoff)
 	mux.HandleFunc("POST /api/messages", s.postMessage)
 	mux.HandleFunc("POST /api/messages/upload", s.postMessageUpload)
 	mux.HandleFunc("POST /api/messages/read", s.postOperatorRead)
