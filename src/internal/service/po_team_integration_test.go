@@ -53,19 +53,41 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	if err := s.complete(assignment, runtimeapi.Result{Actions: actions}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	first, err := s.claim(nil)
-	if err != nil || first == nil || first.Kind != "work" {
-		t.Fatalf("first work %+v: %v", first, err)
+	initial, err := s.claim(nil)
+	if err != nil || initial == nil {
+		t.Fatalf("initial claim %+v: %v", initial, err)
 	}
-	planning := followupClaim(t, s)
+	other, err := s.claim(map[string]bool{initial.Agent: true})
+	if err != nil || other == nil {
+		t.Fatalf("second claim %+v: %v", other, err)
+	}
+	first, planningJob := initial, other
+	if initial.Kind == "po_followup" {
+		first, planningJob = other, initial
+	}
+	if first.Kind != "work" || planningJob.Kind != "po_followup" {
+		t.Fatalf("expected work and planning, got %s and %s", first.Kind, planningJob.Kind)
+	}
+	planning := *planningJob
 	if err := s.complete(planning, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Title: "map", Body: "Inspect the approved map.", Recipient: "World"}}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	second, err := s.claim(nil)
-	if err != nil || second == nil || second.Kind != "work" {
-		t.Fatalf("second work %+v: %v", second, err)
+	next, err := s.claim(map[string]bool{first.Agent: true})
+	if err != nil || next == nil {
+		t.Fatalf("next claim %+v: %v", next, err)
 	}
-	wait := followupClaim(t, s)
+	last, err := s.claim(map[string]bool{first.Agent: true, next.Agent: true})
+	if err != nil || last == nil {
+		t.Fatalf("last claim %+v: %v", last, err)
+	}
+	second, waitJob := next, last
+	if next.Kind == "po_followup" {
+		second, waitJob = last, next
+	}
+	if second.Kind != "work" || waitJob.Kind != "po_followup" {
+		t.Fatalf("expected second work and wait, got %s and %s", second.Kind, waitJob.Kind)
+	}
+	wait := *waitJob
 	if err := s.complete(wait, runtimeapi.Result{Text: "Waiting for both results."}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -85,11 +107,15 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	if err := s.db.QueryRow("SELECT id,model FROM agents WHERE project_id='alpha' AND name='Character-Art'").Scan(&artID, &model); err != nil || model != s.opts.WorkerModel {
 		t.Fatalf("worker model %q: %v", model, err)
 	}
-	for _, w := range workers {
+	for i, w := range workers {
 		if err := s.complete(w, runtimeapi.Result{Text: "Evidence gathered."}, nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
-		r, err := s.claim(nil)
+		active := map[string]bool{}
+		if i == 0 {
+			active[workers[1].Agent] = true
+		}
+		r, err := s.claim(active)
 		if err != nil || r == nil || r.Kind != "review" || r.Task != w.Task {
 			t.Fatalf("review %+v: %v", r, err)
 		}
@@ -112,11 +138,22 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	if err := s.complete(follow, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Title: "art followup", Body: "Check one remaining approved source.", Recipient: "Character-Art"}}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	third, err := s.claim(nil)
-	if err != nil || third == nil || third.Kind != "work" || third.Agent != artID {
-		t.Fatalf("follow-on worker %+v: %v", third, err)
+	next, err = s.claim(nil)
+	if err != nil || next == nil {
+		t.Fatalf("follow-on claim %+v: %v", next, err)
 	}
-	wait = followupClaim(t, s)
+	last, err = s.claim(map[string]bool{next.Agent: true})
+	if err != nil || last == nil {
+		t.Fatalf("follow-on second claim %+v: %v", last, err)
+	}
+	third, waitJob := next, last
+	if next.Kind == "po_followup" {
+		third, waitJob = last, next
+	}
+	if third.Kind != "work" || third.Agent != artID || waitJob.Kind != "po_followup" {
+		t.Fatalf("follow-on worker %+v, planning %+v", third, waitJob)
+	}
+	wait = *waitJob
 	if err := s.complete(wait, runtimeapi.Result{Text: "Waiting for the follow-on result."}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
