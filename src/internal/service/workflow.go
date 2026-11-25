@@ -13,7 +13,7 @@ import (
 )
 
 const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can use project Work → Continue with PO to continue the existing assignment without a new scope round. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
-const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment, promptly hand off actionable work and acceptance criteria with queue_worker, or return one concrete blocking reason. Avoid substantial implementation work in the handoff turn, and never redispatch a prior uncertain effect without verified authorization. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
+const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment or task follow-up, promptly hand off actionable work and acceptance criteria with queue_worker when authorized. For a genuine blocker, deliberate hold, or an instruction that forbids dispatch, emit hold_task with the exact reason in body; for a required external decision use request_approval. A text or group update alone does not hold the task. Respect read-only, stop, production and prior uncertain-effect constraints. Avoid substantial implementation work in the handoff turn, and never redispatch a prior uncertain effect without verified authorization. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
 const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
@@ -179,6 +179,39 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		}
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?)`
 		args = append(args, assignment, note)
+	}
+	if kind == "po_followup" {
+		if len(source) != 1 {
+			return nil, fmt.Errorf("%w: follow-up source unavailable", errWorkflow)
+		}
+		f, err := readPOFollowup(tx, source[0])
+		if err != nil {
+			return nil, err
+		}
+		var valid int
+		err = tx.QueryRow(`SELECT count(*) FROM jobs j JOIN messages m ON m.id=? WHERE j.id=? AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND m.task_id=j.task_id AND m.project_id=j.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=?`, f.assignment, f.trigger, task, project, a.ID, root, a.ID, directRoom(root, a.ID)).Scan(&valid)
+		if err != nil {
+			return nil, err
+		}
+		if valid != 1 {
+			return nil, fmt.Errorf("%w: follow-up assignment unavailable", errWorkflow)
+		}
+		if f.note != "" {
+			err = tx.QueryRow(`SELECT count(*) FROM messages WHERE id=? AND task_id=? AND project_id=? AND sender=? AND recipient=? AND role='operator' AND room_id=?`, f.note, task, project, operator, a.ID, directRoom(operator, a.ID)).Scan(&valid)
+			if err != nil {
+				return nil, err
+			}
+			if valid != 1 {
+				return nil, fmt.Errorf("%w: follow-up operator instruction unavailable", errWorkflow)
+			}
+		}
+		if f.review != "" {
+			if _, err := activeReviewWorker(tx, job{Task: task, Project: project, Kind: "review", Source: f.review}, a.ID); err != nil {
+				return nil, err
+			}
+		}
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
+		args = append(args, f.assignment, f.note, f.review)
 	}
 	if parent != "" {
 		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END,recipient,room_id
@@ -358,6 +391,17 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	if a.Role == "po" && j.Kind != "operator_message" && !strings.HasPrefix(j.Kind, "approval_") {
 		recipient = root
 	}
+	if a.Role == "po" {
+		if j.Kind == "po_continue" || j.Kind == "po_followup" {
+			recipient = operator
+		}
+		for _, action := range result.Actions {
+			if action.Type == "hold_task" {
+				recipient = operator
+				break
+			}
+		}
+	}
 	if a.Role == "root" && j.Kind == "project_report" {
 		if err := relayProjectReport(tx, a, j, result.Text, files); err != nil {
 			return err
@@ -375,7 +419,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			return err
 		}
 	}
-	return nil
+	return s.poFollowThrough(tx, j, a, result)
 }
 
 func groupMessageResult(tx *sql.Tx, a agent, j job, result runtimeapi.Result, files []attachmentData) error {
@@ -533,6 +577,8 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		return fmt.Errorf("%w: action %q outside role or task scope", errWorkflow, action.Type)
 	}
 	switch action.Type {
+	case "hold_task":
+		return s.poHoldAction(tx, j, a, action)
 	case "queue_worker":
 		return s.queueWorker(tx, j, a, action)
 	case "accept_result":
@@ -572,7 +618,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 }
 
 func activeReviewWorker(tx *sql.Tx, j job, po string) (string, error) {
-	if j.Kind != "review" && j.Kind != "approval_approved" {
+	if j.Kind != "review" && j.Kind != "approval_approved" && j.Kind != "po_followup" {
 		return "", fmt.Errorf("%w: accept_result requires the active review", errWorkflow)
 	}
 	var message, worker string
@@ -588,8 +634,16 @@ func activeReviewWorker(tx *sql.Tx, j job, po string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if j.Kind == "review" {
-		if j.Source != message {
+	if j.Kind == "review" || j.Kind == "po_followup" {
+		source := j.Source
+		if j.Kind == "po_followup" {
+			f, err := readPOFollowup(tx, j.Source)
+			if err != nil {
+				return "", err
+			}
+			source = f.review
+		}
+		if source != message {
 			return "", fmt.Errorf("%w: review source differs from the current worker result", errWorkflow)
 		}
 	} else {

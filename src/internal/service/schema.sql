@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,next_at);
 
+CREATE TABLE IF NOT EXISTS po_followups (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id),
+ trigger_id TEXT NOT NULL REFERENCES jobs(id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 1 AND 2),
+ phase TEXT NOT NULL CHECK(phase IN ('assigned','review','accepted')),
+ assignment_id TEXT NOT NULL REFERENCES messages(id), note_id TEXT REFERENCES messages(id), review_id TEXT REFERENCES messages(id),
+ UNIQUE(trigger_id,phase,ordinal)
+);
+
 CREATE TABLE IF NOT EXISTS project_goals (
  project_id TEXT PRIMARY KEY REFERENCES projects(id),
  objective TEXT NOT NULL,
