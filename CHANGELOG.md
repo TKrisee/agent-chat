@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/TKrisee/agent-chat/compare/v0.15.2...v0.16.0) (2026-11-25)
+
+
+### Features
+
+* reuse project workspaces and clean accepted job scratch ([3ac465c](https://github.com/TKrisee/agent-chat/commit/3ac465c9da47f6746c4ae7b763d7f81f33bccde8))
+
 ## [0.15.2](https://github.com/TKrisee/agent-chat/compare/v0.15.1...v0.15.2) (2026-11-25)
 
 
