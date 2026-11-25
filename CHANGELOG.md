@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/TKrisee/agent-chat/compare/v0.9.1...v0.10.0) (2026-11-25)
+
+
+### Features
+
+* continue an existing assignment with its project owner ([c7158ac](https://github.com/TKrisee/agent-chat/commit/c7158ac07414ab8f0c421ac92d87645ac0fdef5f))
+
 ## [0.9.1](https://github.com/TKrisee/agent-chat/compare/v0.9.0...v0.9.1) (2026-11-25)
 
 
