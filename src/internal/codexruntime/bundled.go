@@ -38,7 +38,12 @@ type bundleSpec struct {
 }
 
 func lockedBundle(platform string) (*bundleSpec, error) {
-	lines := strings.Split(strings.TrimSuffix(codexLock, "\n"), "\n")
+	return parseLockedBundle(codexLock, platform)
+}
+
+func parseLockedBundle(lock, platform string) (*bundleSpec, error) {
+	lock = strings.ReplaceAll(lock, "\r\n", "\n")
+	lines := strings.Split(strings.TrimSuffix(lock, "\n"), "\n")
 	if len(lines) != 4 {
 		return nil, errors.New("invalid Codex version lock")
 	}
