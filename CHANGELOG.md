@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.11.0](https://github.com/TKrisee/agent-chat/compare/v0.10.0...v0.11.0) (2026-11-25)
+
+
+### Features
+
+* advance PO work automatically after progress updates ([d1f1978](https://github.com/TKrisee/agent-chat/commit/d1f19789d09d90072bb0823437fb31975cab8512))
+* run project controls from slash commands ([21b04fd](https://github.com/TKrisee/agent-chat/commit/21b04fdea38cc9eb77d123935de2c2c9e191830f))
+
 ## [0.10.0](https://github.com/TKrisee/agent-chat/compare/v0.9.1...v0.10.0) (2026-11-25)
 
 
