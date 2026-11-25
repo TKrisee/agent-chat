@@ -149,3 +149,8 @@
 @media (prefers-reduced-motion:reduce) { .command-receipt { transition:none; } }
 
 .message.operator-mention { background:#fff6dc; border-left:3px solid #cb8b28; border-radius:8px; padding:8px 10px; }
+
+.group-unread-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px min(4%,38px);background:#e7efe7;color:#294b3e;font-size:12px;font-weight:600}
+.group-unread-banner button{border:0;background:transparent;color:#315c49;font-size:12px;font-weight:700;text-decoration:underline;text-underline-offset:2px}
+.unread-divider{display:flex;align-items:center;gap:10px;margin:18px 0 8px;color:#657d6a;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.unread-divider:before,.unread-divider:after{content:"";height:1px;flex:1;background:#bdcdbd}

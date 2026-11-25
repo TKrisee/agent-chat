@@ -14,11 +14,21 @@ export class ReadReceipts {
   private scheduled = false;
   private scrollTimer: number | undefined;
   private refreshAfterScroll = false;
+  private markingRoom = false;
+  private readonly scrolledVisible = new Set<string>();
+  private userScrollUntil = 0;
   constructor(private readonly options: Options) {
     window.addEventListener('focus', () => { this.attempted.clear(); this.schedule(); });
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) { this.attempted.clear(); this.schedule(); }
     });
+    const userScroll = (event: Event) => {
+      const viewport = document.querySelector<HTMLElement>('#chat-scroll');
+      if (event.isTrusted && viewport && event.target instanceof Node && viewport.contains(event.target)) this.userScrollUntil = Date.now() + 600;
+    };
+    document.addEventListener('wheel', userScroll, {capture:true,passive:true});
+    document.addEventListener('touchmove', userScroll, {capture:true,passive:true});
+    document.addEventListener('keydown', event => { if (['ArrowUp','ArrowDown','PageUp','PageDown','Home','End',' '].includes(event.key)) userScroll(event); }, true);
     document.addEventListener('scroll', () => this.onScroll(), {capture:true,passive:true});
     document.addEventListener('close', () => this.schedule(), true);
     window.addEventListener('resize', () => this.schedule());
@@ -27,6 +37,7 @@ export class ReadReceipts {
   }
   private onScroll() {
     if (!this.options.recipient().startsWith('group:')) { this.schedule(); return; }
+    if (Date.now() <= this.userScrollUntil) this.collectScrolledVisible();
     const target = this.options.recipient();
     window.clearTimeout(this.scrollTimer);
     this.scrollTimer = window.setTimeout(() => {
@@ -36,7 +47,26 @@ export class ReadReceipts {
       this.schedule();
     }, 180);
   }
-  contextChanged() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.refreshAfterScroll = false; this.attempted.clear(); this.schedule(); }
+  contextChanged() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.refreshAfterScroll = false; this.scrolledVisible.clear(); this.userScrollUntil = 0; this.attempted.clear(); this.schedule(); }
+  async markCurrentRoomRead() {
+    const target = this.options.recipient();
+    if (!target.startsWith('group:') || this.options.obstructed() || this.markingRoom) return;
+    this.markingRoom = true;
+    const ids = this.options.messages().filter(m => this.options.eligible(m) && !m.operator_read_at && !this.inFlight.has(m.id)).map(m => m.id);
+    try {
+      for (let i = 0; i < ids.length && target === this.options.recipient(); i += 128) {
+        const batch = ids.slice(i, i + 128);
+        batch.forEach(id => this.inFlight.add(id));
+        try { if (!(await this.send(batch)).ok) break; }
+        catch { break; }
+        finally { batch.forEach(id => this.inFlight.delete(id)); }
+      }
+      if (target === this.options.recipient()) await this.options.refresh();
+    } finally { this.markingRoom = false; }
+  }
+  private send(ids: string[]) {
+    return fetch('/api/messages/read', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_ids:ids})});
+  }
   schedule() {
     if (this.scheduled || this.scrollTimer !== undefined) return;
     this.scheduled = true;
@@ -54,8 +84,18 @@ export class ReadReceipts {
     const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
     return !!hit && (element === hit || element.contains(hit));
   }
+  private collectScrolledVisible() {
+    if (document.hidden || !document.hasFocus() || this.options.obstructed()) return;
+    const viewport = document.querySelector<HTMLElement>('#chat-scroll');
+    if (!viewport) return;
+    const unread = new Set(this.options.messages().filter(m => this.options.eligible(m) && !m.operator_read_at).map(m => m.id));
+    viewport.querySelectorAll<HTMLElement>('[data-message-id]').forEach(el => {
+      const id = el.dataset.messageId;
+      if (id && unread.has(id) && this.visible(el, viewport)) this.scrolledVisible.add(id);
+    });
+  }
   private async observe() {
-    if (this.scrollTimer !== undefined || document.hidden || !document.hasFocus() || this.options.obstructed()) return;
+    if (this.markingRoom || this.scrollTimer !== undefined || document.hidden || !document.hasFocus() || this.options.obstructed()) return;
     const viewport = document.querySelector<HTMLElement>('#chat-scroll');
     if (!viewport) return;
     const target = this.options.recipient();
@@ -65,14 +105,14 @@ export class ReadReceipts {
     const ids: string[] = [];
     for (const msg of messages) {
       const element = displayed.get(msg.id);
-      if (!element || !this.visible(element, viewport)) { this.attempted.delete(msg.id); continue; }
+      if (!this.scrolledVisible.has(msg.id) && (!element || !this.visible(element, viewport))) { this.attempted.delete(msg.id); continue; }
       if (!this.attempted.has(msg.id) && !this.inFlight.has(msg.id)) ids.push(msg.id);
     }
     ids.splice(128);
     if (!ids.length || document.hidden || !document.hasFocus() || this.options.obstructed() || target !== this.options.recipient()) return;
-    ids.forEach(id => { this.attempted.add(id); this.inFlight.add(id); });
+    ids.forEach(id => { this.scrolledVisible.delete(id); this.attempted.add(id); this.inFlight.add(id); });
     try {
-      const response = await fetch('/api/messages/read', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_ids:ids})});
+      const response = await this.send(ids);
       if (response.status === 204 && target === this.options.recipient()) {
         if (this.scrollTimer !== undefined) this.refreshAfterScroll = true;
         else await this.options.refresh();

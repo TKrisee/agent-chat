@@ -125,3 +125,30 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.press('Enter');
   await expect(page.getByRole('article').filter({ hasText: 'Retry this upload' }).getByText('retry.txt')).toBeVisible();
 });
+
+test('image gallery stays within one message and downloads the selected image', async ({page, serviceURL}) => {
+  const state = `{"projects":[],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"}],"tasks":[],"jobs":[],"messages":[{"id":"gallery-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Gallery","at":"2026-01-01T00:00:00Z","attachments":[{"id":"image-one","name":"one.png","media_type":"image/png"},{"id":"image-two","name":"two.png","media_type":"image/png"},{"id":"image-three","name":"three.png","media_type":"image/png"}]},{"id":"other-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Other","at":"2026-01-01T00:00:01Z","attachments":[{"id":"other-image","name":"other.png","media_type":"image/png"}]}]}`;
+  await page.route('**/api/state', route => route.fulfill({status:200,contentType:'application/json',body:state}));
+  await page.route('**/api/attachments/*/preview', route => route.fulfill({status:200,contentType:'image/png',body:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')}));
+  await page.goto(serviceURL);
+  await page.locator('[data-attachment-preview="image-two"]').click();
+  const dialog=page.locator('dialog.attachment-preview');
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole('heading',{name:'two.png'})).toBeVisible();
+  await expect(dialog.getByRole('link',{name:'Download'})).toHaveAttribute('href','/api/attachments/image-two?download=1');
+  await expect(dialog.getByRole('button',{name:'Show two.png'})).toHaveAttribute('aria-pressed','true');
+  await expect(dialog.getByRole('button',{name:'Show other.png'})).toHaveCount(0);
+  await dialog.getByRole('button',{name:'Next image'}).click();
+  await expect(dialog.getByRole('heading',{name:'three.png'})).toBeVisible();
+  await expect(dialog.getByRole('link',{name:'Download'})).toHaveAttribute('href','/api/attachments/image-three?download=1');
+  await dialog.press('ArrowLeft');
+  await expect(dialog.getByRole('heading',{name:'two.png'})).toBeVisible();
+  await dialog.getByRole('button',{name:'Show one.png'}).click();
+  await expect(dialog.getByRole('heading',{name:'one.png'})).toBeVisible();
+  await dialog.getByRole('button',{name:'Next image'}).click();
+  await dialog.getByRole('button',{name:'Previous image'}).click();
+  await expect(dialog.getByRole('heading',{name:'one.png'})).toBeVisible();
+  await dialog.press('Escape');
+  await expect(dialog).toBeHidden();
+  await expect(page.locator('[data-attachment-preview="image-two"]')).toBeFocused();
+});
