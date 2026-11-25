@@ -109,6 +109,12 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if t.status == "blocked" {
+				_, continuation, err = s.legacyReviewRecovery(tx, t.id)
+				if err != nil {
+					return "", err
+				}
+			}
 			fmt.Fprintf(&out, "  task=%s status=%s owner=%s po_continuation_available=%t\n", strconv.Quote(t.id), strconv.Quote(t.status), strconv.Quote(t.owner), continuation)
 		}
 		// Reserve room independently for latest rejected job so many active jobs cannot displace it.

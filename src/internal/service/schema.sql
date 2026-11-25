@@ -63,6 +63,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,next_at);
 
+CREATE TABLE IF NOT EXISTS project_workspace_roots (
+ project_id TEXT PRIMARY KEY REFERENCES projects(id), path TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS project_workspace_jobs (
+ job_id TEXT PRIMARY KEY, path TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0 CHECK(created IN (0,1))
+);
+
 CREATE TABLE IF NOT EXISTS po_followups (
  source_id TEXT PRIMARY KEY REFERENCES messages(id),
  trigger_id TEXT NOT NULL REFERENCES jobs(id), ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 1 AND 2),

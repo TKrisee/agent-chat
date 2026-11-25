@@ -49,6 +49,8 @@ type Options struct {
 type Service struct {
 	setupMu         sync.RWMutex
 	setup           runtimeapi.CodexSetup
+	reviewProofMu   sync.Mutex
+	reviewProof     map[string]bool
 	startMu         sync.Mutex
 	runningJobs     int
 	activeMu        sync.Mutex

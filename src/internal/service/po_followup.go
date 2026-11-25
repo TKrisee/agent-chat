@@ -30,7 +30,7 @@ func poAssignmentSource(tx *sql.Tx, j job, po string) (string, error) {
 	}
 	return id, nil
 }
-func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.Result) error {
+func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.Result, correction ...string) error {
 	if a.Role != "po" || j.Task == "" || (j.Kind != "assignment" && j.Kind != "po_continue" && j.Kind != "review" && j.Kind != "po_followup") {
 		return nil
 	}
@@ -105,7 +105,10 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,?,?,?,?,?)`, id, f.trigger, f.ordinal, f.phase, f.assignment, nullIfEmpty(f.note), nullIfEmpty(f.review)); err != nil {
 		return err
 	}
-	instruction := "Make the next safe decision for this same task using the pinned original assignment and any operator instruction. Preserve scope, explicit holds, read-only and production restrictions; do not repeat prior effects or assume authorization. If a genuine blocker or deliberate hold prevents progress, use hold_task with its exact reason."
+	instruction := "Make the next safe decision for this same task using the pinned original assignment and task-scoped operator instructions. When instructions differ, follow the latest one within existing safety and authorization boundaries. Preserve scope, explicit holds, read-only and production restrictions; do not repeat prior effects or assume authorization. If a genuine blocker or deliberate hold prevents progress, use hold_task with its exact reason."
+	if len(correction) > 0 {
+		instruction += " The prior proposal was rejected before applying it: " + correction[0] + " Choose either hold_task alone (optionally with a group post), or an appropriate review action; do not combine them."
+	}
 	switch phase {
 	case "assigned":
 		instruction += " If authorized and actionable, use queue_worker; otherwise use hold_task or request_approval."

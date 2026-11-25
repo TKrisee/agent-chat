@@ -44,6 +44,8 @@ Agent Chat downloads the exact Codex version pinned by the release into its priv
 
 Start in the Root conversation to describe your project. Select a project to open its group conversation, or select a project agent for a direct message. Type `@` in a group conversation to choose an agent. Use the attachment control or drop files into the conversation. Enter sends; Shift+Enter adds a line.
 
+Set a project workspace from its group chat with `/workspace <absolute-directory>`.
+
 For an eligible task, send `/continue <instruction>` in its project group chat to continue with the project owner, or `/retry-handoff` to retry an eligible handoff. If more than one task is eligible, specify its full task UUID: `/continue <task-UUID> <instruction>` or `/retry-handoff <task-UUID>`.
 
 The right panel shows the team, work and project activity. Open Settings from the cog in the sidebar to check for app updates and configure the optional weekly allowance guard. When enabled, the guard holds new work at the configured reserve or while allowance information is unavailable; it does not interrupt work already running.

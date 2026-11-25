@@ -58,7 +58,7 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 		e := tx.QueryRow(`SELECT sender,COALESCE(task_id,''),text FROM messages WHERE id=?`, id).Scan(&sender, &priorTask, &priorText)
 		if e == nil {
 			var linked int
-			if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE source_id=? AND task_id=? AND kind='po_continue'`, id, priorTask).Scan(&linked); err != nil {
+			if err := tx.QueryRow(`SELECT count(*) FROM jobs j WHERE j.source_id=? AND j.task_id=? AND (j.kind='po_continue' OR (j.kind='po_followup' AND EXISTS (SELECT 1 FROM po_followups f WHERE f.source_id=j.source_id AND f.note_id=j.source_id)))`, id, priorTask).Scan(&linked); err != nil {
 				return err
 			}
 			if sender == operator && priorTask == r.PathValue("id") && priorText == note && linked == 1 {
@@ -74,7 +74,35 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if !eligible {
-			return fmt.Errorf("%w: PO continuation unavailable", errConflict)
+			legacy, ok, err := s.legacyReviewRecovery(tx, r.PathValue("id"))
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("%w: PO continuation unavailable", errConflict)
+			}
+			a, err := getAgent(tx, legacy.job.Agent)
+			if err != nil {
+				return err
+			}
+			if err := addMessage(tx, id, operator, a.ID, "operator", note, legacy.job.Project, legacy.job.Task); err != nil {
+				return err
+			}
+			res, err := tx.Exec(`UPDATE tasks SET status='review' WHERE id=? AND status='blocked' AND project_id=? AND owner_id=?`, legacy.job.Task, legacy.job.Project, a.ID)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			if n != 1 {
+				return errConflict
+			}
+			if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,1,'review',?,?,?)`, id, legacy.job.ID, legacy.assignment, id, legacy.job.Source); err != nil {
+				return err
+			}
+			return s.enqueue(tx, a, legacy.job.Project, legacy.job.Task, id, "po_followup", "The operator explicitly asks you to continue the same review. The prior proposal was rejected: hold_task cannot be combined with accept_result, report, queue_worker, or request_approval. Read the pinned original assignment, worker receipt, and task-scoped operator instructions; when instructions differ, follow the latest one within existing safety and authorization boundaries. Choose either a hold or a valid review action; do not replay or assume completion of prior work.")
 		}
 		a, err := getAgent(tx, po)
 		if err != nil {

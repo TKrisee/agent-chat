@@ -46,6 +46,7 @@ type Project struct {
 	UnsettledEffects int    `json:"unsettled_effects"`
 	GoalObjective    string `json:"goal_objective,omitempty"`
 	GoalStatus       string `json:"goal_status,omitempty"`
+	WorkspaceRoot    string `json:"workspace_root"`
 }
 
 type Task struct {
@@ -194,12 +195,12 @@ func (s *Service) state() (State, error) {
 				view.Messages[i].Attachments = refs
 			}
 		}
-		view.Projects, err = querySlice(tx, `SELECT p.id,p.name,p.po_id,p.stopped,COALESCE(g.objective,''),COALESCE(g.status,''),(SELECT COUNT(*) FROM jobs j
+		view.Projects, err = querySlice(tx, `SELECT p.id,p.name,p.po_id,p.stopped,COALESCE(g.objective,''),COALESCE(g.status,''),COALESCE((SELECT path FROM project_workspace_roots w WHERE w.project_id=p.id),''),(SELECT COUNT(*) FROM jobs j
 			WHERE j.project_id=p.id AND j.status IN ('submitted','running','uncertain'))
 			FROM projects p LEFT JOIN project_goals g ON g.project_id=p.id ORDER BY p.id`, func(rows *sql.Rows) (Project, error) {
 			var p Project
 			var stopped bool
-			err := rows.Scan(&p.ID, &p.Name, &p.PO, &stopped, &p.GoalObjective, &p.GoalStatus, &p.UnsettledEffects)
+			err := rows.Scan(&p.ID, &p.Name, &p.PO, &stopped, &p.GoalObjective, &p.GoalStatus, &p.WorkspaceRoot, &p.UnsettledEffects)
 			p.Status = "running"
 			if stopped {
 				p.Status = "stopped"
@@ -223,6 +224,10 @@ func (s *Service) state() (State, error) {
 		for i := range view.Tasks {
 			if view.Tasks[i].Status == "blocked" {
 				view.Tasks[i].RetryHandoffEligible, err = handoffEligible(tx, view.Tasks[i].ID, "blocked", "", true)
+				if err != nil {
+					return err
+				}
+				_, view.Tasks[i].ContinuePOEligible, err = s.legacyReviewRecovery(tx, view.Tasks[i].ID)
 				if err != nil {
 					return err
 				}
@@ -286,6 +291,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	})
 	mux.HandleFunc("POST /api/tasks/{id}/retry-handoff", s.retryHandoff)
 	mux.HandleFunc("POST /api/tasks/{id}/continue-po", s.continuePO)
+	mux.HandleFunc("POST /api/projects/{id}/workspace", s.setProjectWorkspace)
 	mux.HandleFunc("POST /api/messages", s.postMessage)
 	mux.HandleFunc("POST /api/messages/upload", s.postMessageUpload)
 	mux.HandleFunc("POST /api/messages/read", s.postOperatorRead)

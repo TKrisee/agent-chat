@@ -223,8 +223,18 @@ func attachmentPreviewType(stored string, content []byte) string {
 }
 
 func (s *Service) materialize(req runtimeapi.Request) error {
-	if err := os.MkdirAll(req.Workspace, 0700); err != nil {
-		return err
+	managed := false
+	if req.Kind == "work" && req.ProjectID != "" {
+		var err error
+		managed, err = s.prepareWorkWorkspace(req.ProjectID, req.ID, req.Workspace)
+		if err != nil {
+			return err
+		}
+	}
+	if !managed {
+		if err := os.MkdirAll(req.Workspace, 0700); err != nil {
+			return err
+		}
 	}
 	for _, msg := range req.Context {
 		for _, ref := range msg.Attachments {

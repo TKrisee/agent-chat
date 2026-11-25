@@ -115,6 +115,8 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   const heldPO=new Promise(resolve=>{releasePO=resolve;});
   let continuations=0, submittedNote='';
   await page.route('**/api/tasks/22222222-2222-4222-8222-222222222222/continue-po', async route=>{continuations++;submittedNote=route.request().postData()||'';await heldPO;await route.fulfill({status:202,body:'PO continuation queued.'});});
+  let workspacePath='';
+  await page.route('**/api/projects/sample/workspace', route=>{workspacePath=new URLSearchParams(route.request().postData()||'').get('path')||'';return route.fulfill({status:workspacePath==='relative'?400:200,body:''});});
   await page.goto(serviceURL);
   await page.locator('[data-project="sample"]').click();
   const panel=page.getByLabel('Sample activity');
@@ -149,4 +151,16 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   await expect.poll(()=>retries).toBe(1);
   releaseRetry();
   await expect(page.getByRole('status').filter({hasText:'Handoff correction queued'})).toBeVisible();
+  await composer.fill('/work');
+  await expect(page.getByRole('listbox',{name:'Slash commands'}).getByRole('option')).toContainText('/workspace');
+  await composer.press('Tab');
+  await expect(composer).toHaveValue('/workspace ');
+  await composer.fill('/workspace relative');
+  await composer.press('Enter');
+  await expect(page.getByRole('status').filter({hasText:'Enter an absolute path'})).toBeVisible();
+  await expect(composer).toHaveValue('/workspace relative');
+  await composer.fill('/workspace /tmp/My Project');
+  await composer.press('Enter');
+  await expect.poll(()=>workspacePath).toBe('/tmp/My Project');
+  await expect(page.getByRole('status').filter({hasText:'Project workspace updated.'})).toBeVisible();
 });
