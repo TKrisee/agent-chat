@@ -215,7 +215,7 @@ jobs:
         with:
           ref: ${{ needs.guard.outputs.sha }}
           fetch-depth: 0
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: agentchat-*
           path: artifacts
