@@ -1119,7 +1119,7 @@ func moveTask(tx *sql.Tx, j job, from, to, oldOwner, newOwner string) error {
 
 // postGroupAction records an authored project-room message without dispatching new work.
 func postGroupAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
-	if (a.Role != "po" && a.Role != "worker") || j.Project == "" || a.Project != j.Project || action.Project != j.Project || action.Recipient != "" || strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
+	if (a.Role != "po" && a.Role != "worker") || j.Project == "" || a.Project != j.Project || action.Project != j.Project || (action.Recipient != "" && action.Recipient != groupPrefix+j.Project) || strings.TrimSpace(action.Body) == "" || len(action.Body) > 64*1024 {
 		return fmt.Errorf("%w: group post outside project scope", errWorkflow)
 	}
 	var valid int

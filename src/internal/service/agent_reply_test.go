@@ -81,3 +81,37 @@ func TestAddressedGroupResponseRepliesToExactSource(t *testing.T) {
 		})
 	}
 }
+
+func TestGroupPostRecipientScope(t *testing.T) {
+	for _, role := range []string{"po", "worker"} {
+		for _, tc := range []struct {
+			name, recipient, project string
+			want                     bool
+		}{
+			{"implicit", "", "alpha", true}, {"exact room", "group:alpha", "alpha", true},
+			{"other room", "group:other", "alpha", false}, {"private recipient", "operator", "alpha", false}, {"wrong project", "group:alpha", "other", false},
+		} {
+			t.Run(role+"/"+tc.name, func(t *testing.T) {
+				s, task, po, worker := continuationFixture(t)
+				defer s.Close()
+				id := po
+				if role == "worker" {
+					id = worker
+				}
+				err := s.write(func(tx *sql.Tx) error {
+					return postGroupAction(tx, agent{ID: id, Role: role, Project: "alpha"}, job{Project: "alpha", Task: task}, runtimeapi.Action{Type: "post_group", Project: tc.project, Recipient: tc.recipient, Body: "Scoped update"})
+				})
+				if (err == nil) != tc.want {
+					t.Fatalf("recipient=%q project=%q err=%v", tc.recipient, tc.project, err)
+				}
+				var count int
+				if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE text='Scoped update' AND room_id='group:alpha'`).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if (count == 1) != tc.want {
+					t.Fatalf("stored posts=%d", count)
+				}
+			})
+		}
+	}
+}
