@@ -268,6 +268,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	mux.HandleFunc("GET /api/workflow-notices/{id}/scope-request", s.scopeRequest)
 	mux.HandleFunc("GET /api/codex-setup", s.codexSetupStatus)
 	mux.HandleFunc("POST /api/codex-setup/retry", s.codexSetupRetry)
+	mux.HandleFunc("POST /api/codex-setup/source", s.codexSetupSource)
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		view, err := s.state()
 		if err != nil {

@@ -29,10 +29,17 @@ func (s *Service) pollUsage(ctx context.Context, runner runtimeapi.Runner) {
 	tick := time.NewTicker(30 * time.Second)
 	defer tick.Stop()
 	for {
+		s.usageMu.RLock()
+		generation := s.usageGeneration
+		s.usageMu.RUnlock()
 		readCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		v, err := reader.ReadWeeklyUsage(readCtx)
 		cancel()
 		s.usageMu.Lock()
+		if generation != s.usageGeneration {
+			s.usageMu.Unlock()
+			continue
+		}
 		if err == nil && v.Remaining >= 0 && v.Remaining <= 100 {
 			s.usage = weeklySample{value: v, observed: time.Now(), known: true}
 		} else {

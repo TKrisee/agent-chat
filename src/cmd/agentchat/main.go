@@ -120,7 +120,9 @@ func run(ctx context.Context, stop context.CancelFunc, ready func()) error {
 	default:
 		return fmt.Errorf("unknown runtime %q", *mode)
 	}
-	s.ConfigureRuntime(ctx, runner)
+	if err := s.ConfigureRuntime(ctx, runner); err != nil {
+		return err
+	}
 	var ui http.Handler
 	if *static != "" {
 		info, err := os.Stat(*static)

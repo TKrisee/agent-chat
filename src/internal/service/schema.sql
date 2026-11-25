@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS usage_settings (
  id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
  warn INTEGER NOT NULL CHECK(warn BETWEEN 0 AND 100), reserve INTEGER NOT NULL CHECK(reserve BETWEEN 0 AND warn)
 );
+CREATE TABLE IF NOT EXISTS codex_source_settings (
+ id INTEGER PRIMARY KEY CHECK(id=1), source TEXT NOT NULL CHECK(source IN ('managed','override'))
+);
 INSERT OR IGNORE INTO usage_settings VALUES (1,0,40,30);
 
 CREATE TABLE IF NOT EXISTS workflow_notices (

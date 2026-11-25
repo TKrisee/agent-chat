@@ -25,7 +25,9 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 	default:
 		return fmt.Errorf("%w: runner already active", errConflict)
 	}
-	s.ConfigureRuntime(ctx, runner)
+	if err := s.ConfigureRuntime(ctx, runner); err != nil {
+		return err
+	}
 	go s.pollUsage(ctx, runner)
 	tick := time.NewTicker(s.opts.Poll)
 	defer tick.Stop()
@@ -42,7 +44,12 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 	}()
 	for {
 		for ctx.Err() == nil && len(active) < s.opts.Concurrency {
-			j, err := s.claim(active)
+			s.startMu.Lock()
+			j, err := s.claimLocked(active)
+			if err == nil && j != nil {
+				s.runningJobs++
+			}
+			s.startMu.Unlock()
 			if err != nil {
 				return err
 			}
@@ -55,7 +62,14 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 			if j.Status == "pending" {
 				runCtx, release = s.registerRun(ctx, *j)
 			}
-			go func() { err := s.runJob(runCtx, runner, *j); release(); done <- attempt{j.Agent, err} }()
+			go func() {
+				err := s.runJob(runCtx, runner, *j)
+				release()
+				s.startMu.Lock()
+				s.runningJobs--
+				s.startMu.Unlock()
+				done <- attempt{j.Agent, err}
+			}()
 		}
 		select {
 		case <-ctx.Done():
@@ -72,6 +86,11 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 }
 
 func (s *Service) claim(active map[string]bool) (*job, error) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	return s.claimLocked(active)
+}
+func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 	if !s.runtimeReady() {
 		return nil, nil
 	}

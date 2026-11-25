@@ -20,7 +20,7 @@ func (r *Runner) StartSetup(ctx context.Context) {
 		return
 	}
 	r.setupCtx = ctx
-	if r.cfg.CodexPath != "" || r.setupState.State == "error" {
+	if r.setupState.Source != "managed" || r.setupState.State == "error" {
 		r.setupMu.Unlock()
 		return
 	}
@@ -28,6 +28,13 @@ func (r *Runner) StartSetup(ctx context.Context) {
 	r.beginSetup()
 }
 func (r *Runner) beginSetup() {
+	r.setupMu.RLock()
+	generation := r.setupGeneration
+	if r.setupState.Source != "managed" {
+		r.setupMu.RUnlock()
+		return
+	}
+	r.setupMu.RUnlock()
 	go func() {
 		r.setupMu.RLock()
 		ctx := r.setupCtx
@@ -40,6 +47,9 @@ func (r *Runner) beginSetup() {
 		path, version, err := resolveManaged(ctx, r.cfg.StateDir, "")
 		r.setupMu.Lock()
 		defer r.setupMu.Unlock()
+		if r.setupGeneration != generation || r.setupState.Source != "managed" {
+			return
+		}
 		if err != nil {
 			r.setupState.State = "error"
 			r.setupState.Message = setupError(err)
@@ -50,6 +60,48 @@ func (r *Runner) beginSetup() {
 		r.setupState.Message = ""
 		r.setupState.State = "ready"
 	}()
+}
+
+// SelectSource never changes an already-running process. A generation prevents
+// a prior managed download from overwriting a later selection.
+func (r *Runner) SelectSource(source string) {
+	r.setupMu.Lock()
+	if r.setupState.Source == source {
+		r.setupMu.Unlock()
+		return
+	}
+	r.setupGeneration++
+	r.setupState.Source = source
+	r.setupState.Version = ""
+	r.setupState.Message = ""
+	r.setupPath = ""
+	if source == "override" {
+		if r.cfg.CodexPath == "" {
+			r.setupState.State = "error"
+			r.setupState.Message = "Configured Codex executable is unavailable."
+		} else if _, err := exec.LookPath(r.cfg.CodexPath); err != nil {
+			r.setupState.State = "error"
+			r.setupState.Message = "Configured Codex executable is unavailable."
+		} else {
+			r.setupState.State = "ready"
+			r.setupPath = r.cfg.CodexPath
+		}
+		r.setupMu.Unlock()
+		return
+	}
+	if !r.setupState.CanSelectManaged {
+		r.setupState.State = "error"
+		r.setupState.Message = "This platform has no managed Codex package."
+		r.setupMu.Unlock()
+		return
+	}
+	r.setupState.State = "downloading"
+	r.setupState.Version = r.setupState.ManagedVersion
+	started := r.setupCtx != nil
+	r.setupMu.Unlock()
+	if started {
+		r.beginSetup()
+	}
 }
 func setupError(err error) string {
 	s := err.Error()
@@ -77,7 +129,7 @@ func (r *Runner) RetrySetup() bool {
 		r.setupMu.Unlock()
 		return false
 	}
-	if r.cfg.CodexPath != "" {
+	if r.setupState.Source == "override" {
 		if _, err := exec.LookPath(r.cfg.CodexPath); err != nil {
 			r.setupMu.Unlock()
 			return false

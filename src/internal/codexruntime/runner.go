@@ -45,6 +45,7 @@ type Runner struct {
 	setupState         runtimeapi.CodexSetupStatus
 	setupCtx           context.Context
 	setupPath          string
+	setupGeneration    uint64
 }
 
 var _ runtimeapi.Runner = (*Runner)(nil)
@@ -100,7 +101,9 @@ func New(cfg Config) (*Runner, error) {
 	spec, e := lockedBundle(runtime.GOOS + "-" + runtime.GOARCH)
 	if e == nil {
 		r.setupState.ManagedVersion = spec.version
+		r.setupState.CanSelectManaged = true
 	}
+	r.setupState.CanSelectOverride = cfg.CodexPath != ""
 	if cfg.CodexPath == "" {
 		if e != nil {
 			r.setupState.State = "error"

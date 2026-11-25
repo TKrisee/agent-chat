@@ -147,7 +147,11 @@ func StartThroughGate(ctx context.Context, start func() error) error {
 }
 
 // CodexSetupStatus reports installation readiness, never authentication state.
-type CodexSetupStatus struct{ State, Source, Version, ManagedVersion, Message string }
+type CodexSetupStatus struct {
+	State, Source, Version, ManagedVersion, Message string
+	CanSelectManaged, CanSelectOverride             bool
+}
+type CodexSourceSelector interface{ SelectSource(string) }
 type CodexSetup interface {
 	StartSetup(context.Context)
 	SetupStatus() CodexSetupStatus
