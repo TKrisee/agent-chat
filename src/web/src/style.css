@@ -147,3 +147,5 @@
 .command-receipt { opacity:1; transition:opacity 250ms ease; }
 .command-receipt.fading { opacity:0; }
 @media (prefers-reduced-motion:reduce) { .command-receipt { transition:none; } }
+
+.message.operator-mention { background:#fff6dc; border-left:3px solid #cb8b28; border-radius:8px; padding:8px 10px; }

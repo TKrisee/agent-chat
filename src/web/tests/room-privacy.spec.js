@@ -105,7 +105,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
 
 test('project panel shows current work once and preserves earlier uncertainty', async ({page, serviceURL}) => {
   // Fixed state models an older uncertain attempt and a newer submitted attempt.
-  const state = `{"projects":[{"id":"sample","name":"Sample","status":"running","po_id":"11111111-1111-4111-8111-111111111111","goal_objective":"Deliver the full goal","goal_status":"active"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"},{"id":"11111111-1111-4111-8111-111111111111","name":"Sample-PO","role":"po","project_id":"sample","status":"busy","model":"test"}],"tasks":[{"id":"22222222-2222-4222-8222-222222222222","project_id":"sample","title":"Deliver launch","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111","continue_po_eligible":true},{"id":"55555555-5555-4555-8555-555555555555","project_id":"sample","title":"Finalize handoff","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111","retry_handoff_eligible":true}],"jobs":[{"id":"33333333-3333-4333-8333-333333333333","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"uncertain","diagnostic":"Earlier run outcome unknown"},{"id":"44444444-4444-4444-8444-444444444444","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"submitted"}],"messages":[]}`;
+  const state = `{"projects":[{"id":"sample","name":"Sample","status":"running","po_id":"11111111-1111-4111-8111-111111111111","goal_objective":"Deliver the full goal","goal_status":"active"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"},{"id":"11111111-1111-4111-8111-111111111111","name":"Sample-PO","role":"po","project_id":"sample","status":"busy","model":"test"}],"tasks":[{"id":"22222222-2222-4222-8222-222222222222","project_id":"sample","title":"Deliver launch","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111","continue_po_eligible":true},{"id":"55555555-5555-4555-8555-555555555555","project_id":"sample","title":"Finalize handoff","status":"blocked","owner_id":"11111111-1111-4111-8111-111111111111","retry_handoff_eligible":true}],"jobs":[{"id":"33333333-3333-4333-8333-333333333333","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"uncertain","diagnostic":"Earlier run outcome unknown"},{"id":"44444444-4444-4444-8444-444444444444","agent_id":"11111111-1111-4111-8111-111111111111","project_id":"sample","task_id":"22222222-2222-4222-8222-222222222222","status":"submitted"}],"messages":[{"id":"m1","room_id":"group:sample","sender":"11111111-1111-4111-8111-111111111111","recipient":"operator","role":"po","text":"@operator please review","at":"2026-01-01T00:00:00Z"},{"id":"m2","room_id":"group:sample","sender":"11111111-1111-4111-8111-111111111111","recipient":"operator","role":"po","text":"Ordinary update and email@example.com","at":"2026-01-01T00:00:01Z"},{"id":"m3","room_id":"group:sample","sender":"11111111-1111-4111-8111-111111111111","recipient":"operator","role":"po","text":"Quoted > not a ping: \`@operator\`","at":"2026-01-01T00:00:02Z"},{"id":"m4","room_id":"group:sample","sender":"operator","recipient":"operator","role":"operator","text":"@operator own message","at":"2026-01-01T00:00:03Z"},{"id":"m5","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"@operator direct message","at":"2026-01-01T00:00:04Z"},{"id":"m6","room_id":"group:sample","sender":"11111111-1111-4111-8111-111111111111","recipient":"operator","role":"po","text":"Reply to you","reply_to":"m4","at":"2026-01-01T00:00:05Z"},{"id":"m7","room_id":"group:sample","sender":"11111111-1111-4111-8111-111111111111","recipient":"operator","role":"po","text":"Reply to teammate","reply_to":"m2","at":"2026-01-01T00:00:06Z"}]}`;
   await page.route('**/api/state', route=>route.fulfill({status:200,contentType:'application/json',body:state}));
   let releaseRetry;
   const heldRetry=new Promise(resolve=>{releaseRetry=resolve;});
@@ -120,6 +120,13 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   await page.goto(serviceURL);
   await page.locator('[data-project="sample"]').click();
   const panel=page.getByLabel('Sample activity');
+  await expect(page.locator('[data-message-id="m1"]')).toHaveClass(/operator-mention/);
+  await expect(page.locator('[data-message-id="m2"]')).not.toHaveClass(/operator-mention/);
+  await expect(page.locator('[data-message-id="m3"]')).not.toHaveClass(/operator-mention/);
+  await expect(page.locator('[data-message-id="m4"]')).not.toHaveClass(/operator-mention/);
+  await expect(page.locator('[data-message-id="m6"]')).toHaveClass(/operator-mention/);
+  await expect(page.locator('[data-message-id="m7"]')).not.toHaveClass(/operator-mention/);
+
   await expect(panel.getByRole('heading',{name:'Team'})).toBeVisible();
   await expect(panel.locator('.pa-team li').filter({hasText:'Sample-PO'})).toContainText('Starting');
   await expect(page.getByText('PROJECT LEAD',{exact:true})).toHaveCount(0);
@@ -165,4 +172,6 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   const workspaceReceipt=page.getByRole('status').filter({hasText:'Project workspace updated.'});
   await expect(workspaceReceipt).toBeVisible();
   await expect(workspaceReceipt).toHaveCount(0,{timeout:8000});
+  await page.getByRole('button',{name:/Root conversation/}).click();
+  await expect(page.locator('[data-message-id="m5"]')).not.toHaveClass(/operator-mention/);
 });

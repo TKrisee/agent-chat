@@ -108,3 +108,22 @@ export function renderMessageMarkdown(container: HTMLElement, source: string): v
   container.replaceChildren();
   appendTokens(container, markdown.parse(source, {}));
 }
+
+/** Match an operator address in message prose, excluding quoted and code content. */
+export function mentionsOperator(source: string): boolean {
+  let quotedBlock=0;
+  for (const token of markdown.parse(source, {})) {
+    if (token.type==='blockquote_open') { quotedBlock++; continue; }
+    if (token.type==='blockquote_close') { quotedBlock--; continue; }
+    if (quotedBlock || token.type!=='inline') continue;
+    let link=0;
+    for (const child of token.children || []) {
+      if (child.type==='link_open') { link++; continue; }
+      if (child.type==='link_close') { link--; continue; }
+      if (link || child.type!=='text') continue;
+      const prose=child.content.replace(/"[^"\n]*"|“[^”\n]*”/g, '');
+      if (/(?:^|[^\w@])@operator(?![\w@-]|\.[a-z0-9])/i.test(prose)) return true;
+    }
+  }
+  return false;
+}
