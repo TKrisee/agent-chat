@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.0](https://github.com/TKrisee/agent-chat/compare/v0.12.1...v0.13.0) (2026-11-25)
+
+
+### Features
+
+* give Root durable decisions and same-task hold resolution ([71dc9dc](https://github.com/TKrisee/agent-chat/commit/71dc9dcdf61387248b55d9ed5eb8f1ed67179cfd))
+* highlight operator mentions and replies in project chat ([f0dad0e](https://github.com/TKrisee/agent-chat/commit/f0dad0ef00e93fe265f6e2efb64ed33251bd134d))
+
 ## [0.12.1](https://github.com/TKrisee/agent-chat/compare/v0.12.0...v0.12.1) (2026-11-25)
 
 
