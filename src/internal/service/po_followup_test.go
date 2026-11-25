@@ -65,12 +65,9 @@ func TestPOFollowThroughAssignmentAndBound(t *testing.T) {
 		if err != nil || escalation == nil || escalation.Kind != "task_blocked" {
 			t.Fatalf("escalation %+v %v", escalation, err)
 		}
-		if strings.Contains(escalation.Request.Instructions, "Review only; do not deploy.") {
-			t.Fatal("private note leaked to Root instructions")
-		}
 		for _, m := range escalation.Request.Context {
 			if strings.Contains(m.Text, "Review only; do not deploy.") {
-				t.Fatal("private note leaked to Root context")
+				t.Fatal("private continuation content reached Root")
 			}
 		}
 	})

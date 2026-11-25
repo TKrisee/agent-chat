@@ -51,7 +51,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		return nil
 	}
 	for _, action := range result.Actions {
-		if action.Type != "post_group" && action.Type != "accept_result" && action.Type != "create_worker" {
+		if action.Type != "post_group" && action.Type != "accept_result" && action.Type != "create_worker" && action.Type != "report_progress" {
 			return nil
 		}
 	}
@@ -125,7 +125,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		}
 	}
 	if f.ordinal >= 2 {
-		return s.escalatePOHold(tx, j, a, phase, "The project owner did not choose a next task action after two follow-up turns. The task needs a decision; no further work was dispatched by the service.", false)
+		return s.escalatePOHold(tx, j, a, phase, "The project owner did not choose a next task action after two follow-up turns. The task needs a decision; no further work was dispatched by the service.", false, false)
 	}
 	f.ordinal++
 	id := newID()
@@ -149,18 +149,26 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	}
 	return s.enqueue(tx, a, j.Project, j.Task, id, "po_followup", instruction)
 }
-func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason string, explicit bool) error {
+func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason string, explicit, rootOwned bool) error {
 	if err := moveTask(tx, j, phase, "blocked", a.ID, a.ID); err != nil {
 		return err
 	}
 	if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 		return err
 	}
-	if err := addMessage(tx, newID(), "service", operator, "system", reason, j.Project, j.Task); err != nil {
+	protected, err := poHasPrivateOperatorInput(tx, j, a)
+	if err != nil {
 		return err
 	}
+	rootReason := reason
+	if protected && !rootOwned {
+		if err := addMessage(tx, newID(), "service", operator, "system", reason, j.Project, j.Task); err != nil {
+			return err
+		}
+		rootReason = "A task is blocked and needs a decision. The operator has the private details; do not infer or disclose them."
+	}
 	source := newID()
-	if err := addMessage(tx, source, a.ID, root, a.Role, "This task is blocked and needs operator attention. The operator has the detailed reason.", j.Project, j.Task); err != nil {
+	if err := addMessage(tx, source, a.ID, root, a.Role, rootReason, j.Project, j.Task); err != nil {
 		return err
 	}
 	if explicit {
@@ -188,17 +196,37 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 			return err
 		}
 	}
+	if rootOwned && explicit {
+		var used int
+		if err := tx.QueryRow(`SELECT count(*) FROM root_hold_decisions WHERE task_id=?`, j.Task).Scan(&used); err != nil {
+			return err
+		}
+		if used == 0 {
+			if _, err := tx.Exec(`INSERT INTO root_owned_holds(job_id) VALUES(?)`, j.ID); err != nil {
+				return err
+			}
+		} else {
+			rootOwned = false
+		}
+	}
 	manager, err := getAgent(tx, root)
 	if err != nil {
 		return err
 	}
-	return s.enqueue(tx, manager, j.Project, j.Task, source, "task_blocked", "The project owner stopped this task pending a decision. The operator has the detailed reason. Report the recorded blocked state without inventing a reason; do not create a new task or assignment.")
+	instruction := "The project owner recorded a blocker. Determine whether an operator decision is actually required; if so, state the exact question and any supplied options, risks and recommendation. Do not invent missing choices or create a new task or assignment."
+	if protected && !rootOwned {
+		instruction = "The project owner recorded a task blocker with operator-private details. The operator has the exact details. Ask only whether an operator decision is needed; do not infer, reconstruct, or disclose private content."
+	}
+	if rootOwned {
+		instruction = "The project owner explicitly requests a Root-owned decision. If within existing scope and all stops and safeguards, use resolve_hold with this exact task and project and your decision as body; work resumes only through the appointed PO. Otherwise ask the operator a specific question with any supplied options and risks. Do not invent authorization."
+	}
+	return s.enqueue(tx, manager, j.Project, j.Task, source, "task_blocked", instruction)
 }
 func (s *Service) poHoldAction(tx *sql.Tx, j job, a agent, action runtimeapi.Action) error {
 	if j.Kind != "assignment" && j.Kind != "po_continue" && j.Kind != "review" && j.Kind != "po_followup" {
 		return fmt.Errorf("%w: hold requires an active task decision", errWorkflow)
 	}
-	if action.Project != "" && action.Project != j.Project || action.Recipient != "" || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
+	if action.Project != "" && action.Project != j.Project || (action.Recipient != "" && action.Recipient != root) || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
 		return fmt.Errorf("%w: task hold requires a reason and the current project", errWorkflow)
 	}
 	var phase, owner string
@@ -213,5 +241,5 @@ func (s *Service) poHoldAction(tx *sql.Tx, j job, a agent, action runtimeapi.Act
 	if owner != a.ID || stopped != 0 || (phase != "assigned" && phase != "review" && phase != "accepted") {
 		return fmt.Errorf("%w: task hold scope changed", errWorkflow)
 	}
-	return s.escalatePOHold(tx, j, a, phase, action.Body, true)
+	return s.escalatePOHold(tx, j, a, phase, action.Body, true, action.Recipient == root)
 }

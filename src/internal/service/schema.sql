@@ -115,3 +115,16 @@ CREATE INDEX IF NOT EXISTS po_work_items_parent ON po_work_items(parent_task_id)
 CREATE TABLE IF NOT EXISTS po_planning_wakes (
  source_id TEXT PRIMARY KEY REFERENCES messages(id)
 );
+
+CREATE TABLE IF NOT EXISTS po_progress_notes (
+ message_id TEXT PRIMARY KEY REFERENCES messages(id)
+);
+
+CREATE TABLE IF NOT EXISTS root_owned_holds (
+ job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id)
+);
+CREATE TABLE IF NOT EXISTS root_hold_decisions (
+ task_id TEXT PRIMARY KEY REFERENCES tasks(id),
+ hold_job_id TEXT NOT NULL REFERENCES task_holds(job_id),
+ note_id TEXT NOT NULL REFERENCES messages(id)
+);

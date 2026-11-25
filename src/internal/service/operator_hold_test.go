@@ -66,6 +66,7 @@ func TestOperatorHoldResolution(t *testing.T) {
 		s, task, _, _ := heldTaskFixture(t)
 		defer s.Close()
 		installReviewInspector(t, s)
+		makeLegacyHoldLayout(t, s, task)
 		if _, err := s.db.Exec("DELETE FROM task_holds WHERE task_id=?", task); err != nil {
 			t.Fatal(err)
 		}

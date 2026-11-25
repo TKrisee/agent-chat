@@ -50,7 +50,7 @@ func (s *Service) operatorResolveHold(w http.ResponseWriter, r *http.Request) {
 		if !allowed {
 			return errConflict
 		}
-		return s.applyHoldResolution(tx, h, note, id)
+		return s.applyHoldResolution(tx, h, note, id, "")
 	})
 	w.Header().Set("Cache-Control", "no-store")
 	if err != nil {

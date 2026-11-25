@@ -18,7 +18,7 @@ import (
 
 // The native CLI validates this response shape. jq independently validates and
 // extracts the resulting JSON; the Go adapter never parses JSON itself.
-const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","task","reply_to"],"properties":{"reply_to":{"type":"string"},"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","request_approval","post_group","hold_task","resolve_hold","create_worker","queue_work_item"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"task":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","task","reply_to"],"properties":{"reply_to":{"type":"string"},"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","report_progress","request_approval","post_group","hold_task","resolve_hold","create_worker","queue_work_item"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"task":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
 // Workers may report group coordination without receiving orchestration actions.
 const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","reply_to"],"properties":{"reply_to":{"type":"string"},"type":{"type":"string","enum":["post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
@@ -34,7 +34,7 @@ func actionAllowed(role, action string) bool {
 	case "root":
 		return action == "create_project" || action == "delegate" || action == "stop_project" || action == "resume_project" || action == "resolve_hold" || action == "set_project_goal" || action == "set_project_goal_status" || action == "request_approval"
 	case "po":
-		return action == "queue_worker" || action == "create_worker" || action == "queue_work_item" || action == "accept_result" || action == "report" || action == "request_approval" || action == "post_group" || action == "hold_task"
+		return action == "queue_worker" || action == "create_worker" || action == "queue_work_item" || action == "accept_result" || action == "report" || action == "report_progress" || action == "request_approval" || action == "post_group" || action == "hold_task"
 	case "worker":
 		return action == "post_group"
 	default:
@@ -185,6 +185,15 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				return result, errRoleAction
 			}
 			if values[6] != "" && values[0] != "post_group" {
+				return result, errRoleAction
+			}
+			if values[0] == "report_progress" && (req.TaskID == "" || req.Kind == "scope_review" || req.Kind == "operator_message" || req.Kind == "project_message" || (values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
+				return result, errRoleAction
+			}
+			if values[0] == "hold_task" && ((values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
+				return result, errRoleAction
+			}
+			if values[0] == "resolve_hold" && req.Kind == "task_blocked" && (req.TaskID == "" || values[5] != req.TaskID || values[1] != req.ProjectID || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "") {
 				return result, errRoleAction
 			}
 			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6]})

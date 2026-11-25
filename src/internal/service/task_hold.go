@@ -121,12 +121,15 @@ func (s *Service) activeTaskHold(tx *sql.Tx, task string) (h activeHold, ok bool
 	return h, true, nil
 }
 func (s *Service) holdCanResolve(tx *sql.Tx, h activeHold) (bool, error) {
+	return s.holdCanResolveExcluding(tx, h, "", true)
+}
+func (s *Service) holdCanResolveExcluding(tx *sql.Tx, h activeHold, excludeJob string, requireRootMessage bool) (bool, error) {
 	var valid, other, approvals int
-	err := tx.QueryRow(`SELECT (SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id JOIN agents a ON a.id=p.po_id AND a.project_id=p.id AND a.role='po' WHERE t.id=? AND p.id=? AND p.po_id=? AND p.stopped=0 AND t.status='blocked' AND t.owner_id=p.po_id), (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain')), (SELECT count(*) FROM approvals WHERE task_id=?)`, h.task, h.project, h.po, h.task, h.task).Scan(&valid, &other, &approvals)
+	err := tx.QueryRow(`SELECT (SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id JOIN agents a ON a.id=p.po_id AND a.project_id=p.id AND a.role='po' WHERE t.id=? AND p.id=? AND p.po_id=? AND p.stopped=0 AND t.status='blocked' AND t.owner_id=p.po_id), (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain')), (SELECT count(*) FROM approvals WHERE task_id=?)`, h.task, h.project, h.po, h.task, excludeJob, h.task).Scan(&valid, &other, &approvals)
 	if err != nil {
 		return false, err
 	}
-	if valid != 1 || other != 0 || approvals != 0 || h.rootMessage == "" {
+	if valid != 1 || other != 0 || approvals != 0 || (requireRootMessage && h.rootMessage == "") {
 		return false, nil
 	}
 	if h.review != "" {
@@ -161,6 +164,9 @@ func (s *Service) holdCanResolve(tx *sql.Tx, h activeHold) (bool, error) {
 	return true, nil
 }
 func (s *Service) resolveHold(tx *sql.Tx, j job, action runtimeapi.Action) error {
+	if j.Kind == "task_blocked" && j.Agent == root {
+		return s.resolveRootOwnedHold(tx, j, action)
+	}
 	if j.Kind != "operator_message" || j.Agent != root || action.Task == "" || action.Project == "" || action.Recipient != "" || action.Title != "" {
 		return fmt.Errorf("%w: resolve_hold requires an exact task and project", errWorkflow)
 	}
@@ -211,11 +217,11 @@ func (s *Service) resolveHold(tx *sql.Tx, j job, action runtimeapi.Action) error
 			return fmt.Errorf("%w: specify the exact held task", errWorkflow)
 		}
 	}
-	return s.applyHoldResolution(tx, h, text, newID())
+	return s.applyHoldResolution(tx, h, text, newID(), "")
 }
 
 // applyHoldResolution executes the shared held-task transition after authorization.
-func (s *Service) applyHoldResolution(tx *sql.Tx, h activeHold, text, note string) error {
+func (s *Service) applyHoldResolution(tx *sql.Tx, h activeHold, text, note, rootJob string) error {
 	var err error
 	if h.legacy {
 		_, err = tx.Exec(`INSERT INTO task_holds(job_id,task_id,project_id,po_id,phase,assignment_id,note_id,review_id,root_source_id,root_message_id,status) VALUES(?,?,?,?,?,?,?,?,?,?,'active')`, h.job, h.task, h.project, h.po, h.phase, h.assignment, nullIfEmpty(h.note), nullIfEmpty(h.review), h.rootSource, h.rootMessage)
@@ -239,17 +245,31 @@ func (s *Service) applyHoldResolution(tx *sql.Tx, h activeHold, text, note strin
 	if err != nil || n != 1 {
 		return fmt.Errorf("%w: held task changed", errWorkflow)
 	}
-	if err := addMessage(tx, note, operator, h.po, "operator", text, h.project, h.task); err != nil {
+	sender, role, noteID := operator, "operator", note
+	if rootJob != "" {
+		sender, role, noteID = root, "root", ""
+	}
+	if err := addMessage(tx, note, sender, h.po, role, text, h.project, h.task); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,1,?,?,?,?)`, note, h.job, h.phase, h.assignment, note, nullIfEmpty(h.review)); err != nil {
+	if rootJob != "" {
+		if _, err = tx.Exec(`INSERT INTO root_hold_decisions(task_id,hold_job_id,note_id) VALUES(?,?,?)`, h.task, h.job, note); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,1,?,?,?,?)`, note, h.job, h.phase, h.assignment, nullIfEmpty(noteID), nullIfEmpty(h.review)); err != nil {
 		return err
 	}
 	a, err := getAgent(tx, h.po)
 	if err != nil {
 		return err
 	}
-	return s.enqueue(tx, a, h.project, h.task, note, "po_followup", "The operator has explicitly responded to the held task. Read the pinned original assignment, any current worker receipt and the new operator instruction. Respect all earlier task-scoped safety constraints, stops and authorization boundaries. Continue only this held phase; do not replay earlier effects or create a new task.")
+	instruction := "The operator has explicitly responded to the held task. Read the pinned original assignment, any current worker receipt and the new operator instruction. Respect all earlier task-scoped safety constraints, stops and authorization boundaries. Continue only this held phase; do not replay earlier effects or create a new task."
+	if rootJob != "" {
+		instruction = "Root has made an explicit within-scope decision on this held task. Read the pinned original assignment, any current worker receipt and Root's task-linked decision. Respect all earlier safety constraints, production stops and authorization boundaries. Continue only this held phase; do not replay earlier effects or create a new task."
+	}
+	instruction += fmt.Sprintf(" The hold on task %s has already been resolved; the current task phase is %s and its owning PO is %s. You are the PO: do not emit resolve_hold, which is Root-only. Make the next permitted decision or delegate approved scoped work through normal actions, preserving the recorded receipt and all constraints.", h.task, h.phase, h.po)
+	return s.enqueue(tx, a, h.project, h.task, note, "po_followup", instruction)
 }
 
 // Outstanding hold references are bounded; ambiguity fails closed.
@@ -298,4 +318,34 @@ func clearHoldAuthorization(text, task string) bool {
 		return true
 	}
 	return false
+}
+
+// resolveRootOwnedHold handles one explicit Root-owned escalation without
+// converting a legacy/operator-owned hold into Root authority.
+func (s *Service) resolveRootOwnedHold(tx *sql.Tx, j job, action runtimeapi.Action) error {
+	if action.Task == "" || action.Task != j.Task || action.Project == "" || action.Project != j.Project || action.Recipient != "" || action.Title != "" || action.ReplyTo != "" || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
+		return fmt.Errorf("%w: Root decision requires the exact held task and project", errWorkflow)
+	}
+	h, found, err := s.activeTaskHold(tx, action.Task)
+	if err != nil {
+		return err
+	}
+	if !found || h.project != j.Project || h.rootSource != j.Source || h.legacy {
+		return fmt.Errorf("%w: Root-owned hold unavailable", errWorkflow)
+	}
+	var marked, used int
+	if err = tx.QueryRow(`SELECT (SELECT count(*) FROM root_owned_holds WHERE job_id=?),(SELECT count(*) FROM root_hold_decisions WHERE task_id=?)`, h.job, h.task).Scan(&marked, &used); err != nil {
+		return err
+	}
+	if marked != 1 || used != 0 {
+		return fmt.Errorf("%w: Root-owned hold unavailable or already resolved", errWorkflow)
+	}
+	allowed, err := s.holdCanResolveExcluding(tx, h, j.ID, false)
+	if err != nil {
+		return err
+	}
+	if !allowed {
+		return fmt.Errorf("%w: held task is not safe to resume", errWorkflow)
+	}
+	return s.applyHoldResolution(tx, h, strings.TrimSpace(action.Body), newID(), j.ID)
 }

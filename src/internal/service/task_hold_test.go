@@ -9,6 +9,39 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
+// Prior releases wrote an operator-facing service reason between the notice
+// and PO-to-Root escalation; reconstruct that authentic legacy ordering.
+func makeLegacyHoldLayout(t *testing.T, s *Service, task string) {
+	t.Helper()
+	err := s.write(func(tx *sql.Tx) error {
+		var notice int64
+		if err := tx.QueryRow(`SELECT m.seq FROM task_holds h JOIN workflow_notices n ON n.event_key='blocked:'||h.job_id JOIN messages m ON m.id=n.message_id WHERE h.task_id=?`, task).Scan(&notice); err != nil {
+			return err
+		}
+		var rootSeq int64
+		if err := tx.QueryRow(`SELECT m.seq FROM task_holds h JOIN messages m ON m.id=h.root_source_id WHERE h.task_id=?`, task).Scan(&rootSeq); err != nil {
+			return err
+		}
+		if rootSeq == notice+2 {
+			return nil
+		}
+		if rootSeq != notice+1 {
+			t.Fatalf("unexpected hold layout notice=%d root=%d", notice, rootSeq)
+		}
+		if _, err := tx.Exec("UPDATE messages SET seq=seq+1000000 WHERE seq>?", notice); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE messages SET seq=seq-999999 WHERE seq>?", notice+1000000); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO messages(seq,id,sender,recipient,role,text,at,task_id,project_id,room_id) VALUES(?,?,'service','operator','system','Legacy hold reason',?,?, 'alpha',?)`, notice+1, newID(), now(), task, directRoom("service", operator))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func heldTaskFixture(t *testing.T) (*Service, string, string, string) {
 	t.Helper()
 	s, task, po, _ := continuationFixture(t)
@@ -35,6 +68,11 @@ func heldTaskFixture(t *testing.T) (*Service, string, string, string) {
 	rootJob, err := s.claim(nil)
 	if err != nil || rootJob == nil || rootJob.Kind != "task_blocked" {
 		t.Fatalf("Root escalation %+v %v", rootJob, err)
+	}
+	for _, m := range rootJob.Request.Context {
+		if m.Text == "A private decision is needed." || m.Text == "Private operator-to-PO context." {
+			t.Fatal("private continuation content reached Root")
+		}
 	}
 	if err := s.complete(*rootJob, runtimeapi.Result{Text: "May I continue this held task?"}, nil, nil, nil); err != nil {
 		t.Fatal(err)
@@ -84,7 +122,7 @@ func TestRootHoldResolutionFreshContextAndPrivacy(t *testing.T) {
 		if m.ID == id {
 			sourcePinned = true
 		}
-		if m.Text == "Private operator-to-PO context." || m.Text == "A private decision is needed." {
+		if m.Text == "Private operator-to-PO context." {
 			t.Fatal("private PO context leaked to Root")
 		}
 	}
@@ -152,6 +190,7 @@ func TestLegacyStructuredHoldRecovery(t *testing.T) {
 	s, task, _, _ := heldTaskFixture(t)
 	defer s.Close()
 	installReviewInspector(t, s)
+	makeLegacyHoldLayout(t, s, task)
 	if _, err := s.db.Exec("DELETE FROM task_holds WHERE task_id=?", task); err != nil {
 		t.Fatal(err)
 	}
@@ -264,6 +303,7 @@ func TestLegacyReviewHoldPreservesWorkerAndPriorNote(t *testing.T) {
 	if err := s.complete(*rootJob, runtimeapi.Result{Text: "May I proceed with this task?"}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
+	makeLegacyHoldLayout(t, s, review.Task)
 	if _, err := s.db.Exec("DELETE FROM task_holds WHERE task_id=?", review.Task); err != nil {
 		t.Fatal(err)
 	}

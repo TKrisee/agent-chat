@@ -13,7 +13,7 @@ import (
 )
 
 const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can send /continue <instruction> in that project’s group chat to continue the existing assignment without a new scope round; if several tasks are eligible, use /continue <full-task-UUID> <instruction>. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. When an active hold is shown and the operator clearly authorizes continuing that exact task, emit only resolve_hold with the exact task and project IDs, body copied exactly from the current operator message, and empty title and recipient. Use the linked Root escalation as context; if task or authorization is ambiguous, ask which task instead. The action resumes a PO decision, never directly dispatches work. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
-const poGuide = "You are the project owner. On scope_review assess the original request and context for Root; do not dispatch. After the finalized assignment, plan the full authorized scope, create a requirement-specific team using create_worker, and delegate distinct work items to registered same-project workers with queue_work_item. Specify each worker by exact name or ID, with a clear title and brief. You coordinate and review; do not perform leaf implementation yourself. The parent task stays open through multiple rounds. Review each child worker receipt with accept_result then report on that child; the service returns child outcomes for your next parent turn. Continue independent work after a blocker without repeating uncertain effects. Only report the parent to Root once every required work item is completed and the full scope is delivered. Preserve production stops, read-only restrictions, explicit holds and authorization boundaries. For a genuine blocker use hold_task with the exact reason, or request_approval only when operator approval is actually required. Existing queue_worker remains available for legacy tasks. Use post_group for ordinary shared updates; never publish private handoff content."
+const poGuide = "You are the project owner. On scope_review assess the original request and context for Root; do not dispatch. After the finalized assignment, plan the full authorized scope, create a requirement-specific team using create_worker, and delegate distinct work items to registered same-project workers with queue_work_item. Specify each worker by exact name or ID, with a clear title and brief. You coordinate and review; do not perform leaf implementation yourself. The parent task stays open through multiple rounds. Review each child worker receipt with accept_result then report on that child; the service returns child outcomes for your next parent turn. Continue independent work after a blocker without repeating uncertain effects. Only report the parent to Root once every required work item is completed and the full scope is delivered. Preserve production stops, read-only restrictions, explicit holds and authorization boundaries. For a genuine blocker use hold_task with the exact reason, or request_approval only when operator approval is actually required. Existing queue_worker remains available for legacy tasks. Use post_group for team working chatter and coordination; do not mention the operator for routine progress. Direct questions or decisions needing operator input through the existing hold or approval workflow, and send the final report to Root. Reply privately when the operator directly messages you. Never publish private handoff content."
 
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
@@ -34,6 +34,7 @@ func agentGuide(role, kind string, shared bool) string {
 	switch role {
 	case "root":
 		guide = rootGuide
+		guide += "\nFor project reports and escalations, filter and summarize the facts for the operator; forward concrete questions or choices that require the operator's decision. Do not relay routine team chatter or private PO conversations."
 		guide += "\nOnly when the operator explicitly asks to set a PO goal, emit set_project_goal with the exact existing project ID, objective in body, and empty title and recipient. To change an existing goal only on explicit operator instruction, emit set_project_goal_status with the project ID and body exactly active, paused, or complete. These actions do not dispatch work."
 	case "po":
 		guide = poGuide
@@ -58,6 +59,9 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		return fmt.Errorf("%w: Codex setup is not ready", errConflict)
 	}
 	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
+	if a.Role == "po" && kind != "operator_message" && kind != groupMessageKind {
+		guide += "\nUse explicit task-scoped Root escalation or report_progress to share task decisions and progress. You may quote task-sourced private wording when it is needed for a decision, or summarize it; omit unrelated material. Ordinary operator direct messages remain private unless intentionally shared for the task."
+	}
 	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind {
 		var objective string
 		err := tx.QueryRow(`SELECT g.objective FROM project_goals g JOIN projects p ON p.id=g.project_id WHERE g.project_id=? AND p.po_id=? AND g.status='active'`, project, a.ID).Scan(&objective)
@@ -91,6 +95,9 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		if len(outcomes) > 0 {
 			guide += "\nRecorded child work items:\n" + strings.Join(outcomes, "\n")
 		}
+	}
+	if a.Role == "root" {
+		guide += "\nRoot-bound task updates and escalations may contain private operator-to-PO material intentionally shared for a decision. Before any operator-facing response, include only the information needed for that response; do not relay unrelated private conversation."
 	}
 	if a.Role == "root" && (kind == "operator_message" || kind == "approval_approved") {
 		projects, err := querySlice(tx, "SELECT id FROM projects ORDER BY id", func(rows *sql.Rows) (string, error) {
@@ -172,6 +179,12 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		}
 	}
 	query = "SELECT * FROM (" + query + ")"
+	if a.ID == root && kind == "operator_message" && project == "" {
+		// PO progress is private to Root; preserve project/task identity in the runtime view.
+		query += ` UNION SELECT * FROM (SELECT id,sender,role,('[Project '||project_id||'; task '||task_id||'] '||text) AS text,seq,'' AS group_recipient,recipient,room_id FROM messages WHERE id IN (SELECT message_id FROM po_progress_notes) AND recipient=? AND role='po' AND room_id='dm:'||CASE WHEN sender<recipient THEN sender||':'||recipient ELSE recipient||':'||sender END ORDER BY seq DESC LIMIT 24)`
+		args = append(args, root)
+	}
+
 	if kind == groupMessageKind {
 		query += " UNION SELECT * FROM (" + notice + ")"
 		args = append(args, project, groupRecipient)
@@ -296,6 +309,8 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		// Carry authenticated parent-task decisions into a child review without widening rooms.
 		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages WHERE id IN (SELECT f.note_id FROM po_followups f JOIN jobs j ON j.source_id=f.source_id JOIN po_work_items i ON i.parent_task_id=j.task_id WHERE i.child_task_id=? AND j.project_id=? AND j.agent_id=? AND f.note_id IS NOT NULL) AND sender=? AND recipient=? AND role='operator' AND room_id=? ORDER BY seq DESC LIMIT 12)`
 		args = append(args, task, project, a.ID, operator, a.ID, directRoom(operator, a.ID))
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (SELECT note_id FROM root_hold_decisions WHERE task_id=?) AND sender=? AND recipient=? AND role='root' AND room_id=?`
+		args = append(args, task, root, a.ID, directRoom(root, a.ID))
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
 		args = append(args, f.assignment, f.note, f.review)
 	}
@@ -311,8 +326,13 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 	}
 	args = append(args, a.ID, a.ID, groupRecipient, groupAllowed)
 	if kind == "operator_message" {
-		query += " AND room_id=?"
-		args = append(args, directRoom(a.ID, operator))
+		if a.ID == root && project == "" {
+			query += " AND (room_id=? OR (id IN (SELECT message_id FROM po_progress_notes) AND recipient=?))"
+			args = append(args, directRoom(a.ID, operator), root)
+		} else {
+			query += " AND room_id=?"
+			args = append(args, directRoom(a.ID, operator))
+		}
 	} else if kind == groupMessageKind {
 		query += " AND room_id=?"
 		args = append(args, groupRecipient)
@@ -540,31 +560,42 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	}
 
 	recipient := operator
-	if a.Role == "po" && j.Kind != "operator_message" && !strings.HasPrefix(j.Kind, "approval_") {
+	if a.Role == "po" && j.Kind != "operator_message" {
 		recipient = root
-	}
-	if a.Role == "po" {
-		if j.Kind == "po_continue" || j.Kind == "po_followup" {
-			recipient = operator
-		}
-		for _, action := range result.Actions {
-			if action.Type == "hold_task" {
-				recipient = operator
-				break
-			}
-		}
 	}
 	if a.Role == "root" && j.Kind == "project_report" {
 		if err := relayProjectReport(tx, a, j, result.Text, files); err != nil {
 			return err
 		}
+	} else if a.ID == root && j.Kind == "task_blocked" && len(result.Actions) == 1 && result.Actions[0].Type == "resolve_hold" {
+		// A successful Root-owned decision is delivered to the PO by the action, not the operator.
+
 	} else if strings.TrimSpace(result.Text) != "" || len(files) > 0 {
-		id, err := outputMessage(tx, a, recipient, j, result.Text, files)
+		text, outputFiles := result.Text, files
+		if a.Role == "po" && j.Kind != "operator_message" && recipient == root {
+			protected, err := poHasPrivateOperatorInput(tx, j, a)
+			if err != nil {
+				return err
+			}
+			if protected {
+				if _, err := outputMessage(tx, a, a.ID, j, result.Text, files); err != nil {
+					return err
+				}
+				text = "A task turn completed; details remain private to the operator and project owner."
+				outputFiles = nil
+			}
+		}
+		id, err := outputMessage(tx, a, recipient, j, text, outputFiles)
 		if err != nil {
 			return err
 		}
 		if a.ID == root && j.Kind == "task_blocked" {
 			if _, err := tx.Exec(`UPDATE task_holds SET root_message_id=? WHERE root_source_id=? AND status='active'`, id, j.Source); err != nil {
+				return err
+			}
+		}
+		if a.Role == "po" && j.Kind != "operator_message" && recipient == root {
+			if _, err := tx.Exec(`INSERT INTO po_progress_notes(message_id) VALUES(?)`, id); err != nil {
 				return err
 			}
 		}
@@ -779,6 +810,9 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			newID(), nullIfEmpty(j.Project), nullIfEmpty(j.Task), a.ID, action.Title, action.Body)
 		return err
 	}
+	if a.Role == "root" && j.Kind == "task_blocked" && action.Type == "resolve_hold" {
+		return s.resolveHold(tx, j, action)
+	}
 	if a.Role == "root" && (j.Kind == "operator_message" || j.Kind == "approval_approved") {
 		switch action.Type {
 		case "resolve_hold":
@@ -807,6 +841,8 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	switch action.Type {
 	case "hold_task":
 		return s.poHoldAction(tx, j, a, action)
+	case "report_progress":
+		return s.reportPOProgress(tx, j, a, action)
 	case "queue_worker":
 		return s.queueWorker(tx, j, a, action)
 	case "create_worker":

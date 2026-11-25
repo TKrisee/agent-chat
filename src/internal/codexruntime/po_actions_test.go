@@ -68,3 +68,60 @@ func TestGroupReplyContract(t *testing.T) {
 		t.Fatal("reply guidance absent")
 	}
 }
+
+func TestPOProgressContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, role, kind, recipient string
+		want                        bool
+	}{
+		{"task progress", "po", "assignment", "root", true},
+		{"scope assessment", "po", "scope_review", "root", false},
+		{"direct chat", "po", "operator_message", "root", false},
+		{"group chat", "po", "project_message", "root", false},
+		{"worker", "worker", "work", "root", false},
+		{"other recipient", "po", "assignment", "operator", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, req, _ := setup(t)
+			req.Role, req.Kind = tc.role, tc.kind
+			t.Setenv("FAKE_RESULT", `{"text":"","actions":[{"type":"report_progress","project":"project","title":"","body":"Coordination is underway.","recipient":"`+tc.recipient+`","task":"","reply_to":""}],"attachments":[]}`)
+			result, err := r.Execute(context.Background(), req)
+			if (err == nil) != tc.want {
+				t.Fatalf("result=%+v error=%v", result, err)
+			}
+			if tc.want {
+				cmd := exec.Command(r.cfg.JQPath, "-e", `.properties.actions.items.properties.type.enum | index("report_progress") != null`, filepath.Join(r.dir(req.ID), "schema.json"))
+				if err := cmd.Run(); err != nil {
+					t.Fatal("missing progress schema action")
+				}
+				if !strings.Contains(prompt(req), "report_progress") {
+					t.Fatal("missing progress guidance")
+				}
+			}
+		})
+	}
+}
+
+func TestRootOwnedHoldContract(t *testing.T) {
+	for _, tc := range []struct {
+		name, role, kind, action, project, task, recipient string
+		want                                               bool
+	}{
+		{"root owned hold", "po", "assignment", "hold_task", "project", "", "root", true},
+		{"operator owned hold", "po", "assignment", "hold_task", "project", "", "", true},
+		{"invalid hold recipient", "po", "assignment", "hold_task", "project", "", "other", false},
+		{"root decision", "root", "task_blocked", "resolve_hold", "project", "task", "", true},
+		{"different task", "root", "task_blocked", "resolve_hold", "project", "other", "", false},
+		{"different project", "root", "task_blocked", "resolve_hold", "other", "task", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, req, _ := setup(t)
+			req.Role, req.Kind = tc.role, tc.kind
+			t.Setenv("FAKE_RESULT", `{"text":"","actions":[{"type":"`+tc.action+`","project":"`+tc.project+`","title":"","body":"Scoped decision","recipient":"`+tc.recipient+`","task":"`+tc.task+`","reply_to":""}],"attachments":[]}`)
+			_, err := r.Execute(context.Background(), req)
+			if (err == nil) != tc.want {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+}

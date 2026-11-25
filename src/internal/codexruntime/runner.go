@@ -315,10 +315,21 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
+	if req.Role == "root" {
+		b.WriteString("\nWhen receiving project reports or escalations, summarize relevant facts for the operator and forward actual questions or choices needing their decision; do not relay routine team chatter or private PO conversations.\n")
+		if req.Kind == "task_blocked" {
+			b.WriteString("For a blocked-task escalation, distinguish operational decisions explicitly assigned to Root from decisions actually requiring the operator. For an active hold explicitly marked Root-owned, use resolve_hold with its exact project and task and your scoped decision in body, within the authorized scope and respecting stops, exhausted retry limits and approval boundaries. Do not assume legacy or operator-owned holds allow autonomous resolution. For an operator-owned decision, lead with the specific recorded question in plain language, followed by any supplied options, tradeoffs, recommendation and independent constraints. Never invent a decision or infer private PO details. If no actual question was supplied, say clarification from the PO is needed; do not claim it was requested.\n")
+		}
+	}
+	if req.Role == "po" && req.Kind != "operator_message" {
+		b.WriteString("\nSend routine project progress privately to Root using report_progress: set body to the update, project to empty or this project, recipient to empty or root, and title, task and reply_to empty. Do not send generic status or recaps to the operator or group. Use the project group for worker coordination and focused collaboration; answer a directly addressed operator question once in that room. Route actual operator decisions through the existing hold or approval workflow, and send the completed parent report to Root.\n")
+		b.WriteString("For hold_task, set recipient to root only when the needed scoped decision is delegated to Root; leave recipient empty for an operator-owned decision. Never use a Root-owned hold to bypass stops, retry limits or approval requirements.\n")
+	}
 	if req.Role == "po" || req.Role == "worker" {
 		b.WriteString("\nFor a post_group reply, set reply_to to the exact message id of the prior message in this project group shown in the live context. Leave reply_to empty for standalone posts and every other action. Archived or external references belong in the message body as citations; do not use their identifiers as reply_to.\n")
 	}
 	if req.Role == "po" && req.TaskID != "" && req.Kind != "scope_review" {
+		b.WriteString("\nYou are the PO, not Root: never emit resolve_hold. If a continuation says a hold is already resolved, follow its recorded decision and use only PO actions for the current task.\n")
 		b.WriteString("\nPlan the whole authorized scope and coordinate workers; workers implement leaf items and you review their results. Provision the needed team and delegate distinct work items over multiple turns. Review each child result, and report the parent outcome only after all required items are confirmed. Continue independent authorized work when an item is blocked; after two further failed permitted approaches on the same blocked item, stop that item and escalate its exact blocker. Never repeat an uncertain effect. For create_worker use title as the exact agent name with no whitespace; leave project, body, recipient and task empty, or use the exact current project in project. For queue_work_item use a scoped title and body, the exact same-project worker ID or name in recipient, and an empty task; project may be empty or the exact current project. The service validates every proposal.\n")
 	}
 	if req.Role == "worker" && req.Kind == "work" {
