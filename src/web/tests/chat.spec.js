@@ -50,6 +50,9 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await expect(page.getByRole('article').filter({hasText:'Earlier conversation'}).first()).toBeVisible();
   const scroll = page.locator('#chat-scroll');
   await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.clientHeight)).toBeGreaterThan(300);
+  // The first message can render before its send acknowledgement and final scroll.
+  await expect(page.locator('#composer')).toHaveAttribute('aria-busy', 'false');
+  await expect.poll(() => scroll.evaluate(el => el.scrollHeight-el.clientHeight-el.scrollTop)).toBeLessThan(3);
   await scroll.evaluate(el => {el.scrollTop=0;});
   await expect.poll(() => scroll.evaluate(el => el.scrollTop)).toBe(0);
   const transfer = await page.evaluateHandle(() => {
