@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/TKrisee/agent-chat/compare/v0.12.0...v0.12.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* fade successful chat command confirmations ([0971549](https://github.com/TKrisee/agent-chat/commit/09715492e8829c24c1711319e7a666841ce8d7ba))
+
 ## [0.12.0](https://github.com/TKrisee/agent-chat/compare/v0.11.0...v0.12.0) (2026-11-25)
 
 
