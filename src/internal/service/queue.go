@@ -102,12 +102,23 @@ func (s *Service) claim(active map[string]bool) (*job, error) {
 		if err := json.Unmarshal(candidate.request, &candidate.Request); err != nil {
 			return fmt.Errorf("decode durable job %s: %w", candidate.ID, err)
 		}
+		if candidate.Status == "pending" && candidate.Request.Role == "root" && candidate.Kind == "operator_message" && !strings.HasPrefix(candidate.Request.Instructions, "App-owned status snapshot v1 at ") {
+			snapshot, err := s.statusSnapshot(tx)
+			if err != nil {
+				return err
+			}
+			candidate.Request.Instructions = snapshot + "\n" + candidate.Request.Instructions
+			candidate.request, err = json.Marshal(candidate.Request)
+			if err != nil {
+				return err
+			}
+		}
 		next := candidate.Status
 		if next == "pending" {
 			next = "submitted"
 		}
-		if _, err := tx.Exec("UPDATE jobs SET status=?,next_at=? WHERE id=?",
-			next, now()+s.opts.Poll.Milliseconds(), candidate.ID); err != nil {
+		if _, err := tx.Exec("UPDATE jobs SET status=?,next_at=?,request=? WHERE id=?",
+			next, now()+s.opts.Poll.Milliseconds(), candidate.request, candidate.ID); err != nil {
 			return err
 		}
 		selected = &candidate.job
