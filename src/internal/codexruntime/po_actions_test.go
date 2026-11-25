@@ -46,6 +46,9 @@ func TestPOMultiWorkerActionContract(t *testing.T) {
 	if strings.Contains(prompt(req), "For create_worker") {
 		t.Fatal("scope assessment was given dispatch guidance")
 	}
+	if !strings.Contains(prompt(req), "app delivers it to Root") || strings.Contains(prompt(req), "using report_progress") {
+		t.Fatal("scope assessment must use the text assessment route")
+	}
 	req.Kind, req.TaskID = "operator_message", ""
 	if strings.Contains(prompt(req), "For create_worker") {
 		t.Fatal("private chat was given task dispatch guidance")

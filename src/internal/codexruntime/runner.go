@@ -321,7 +321,10 @@ func prompt(req runtimeapi.Request) string {
 			b.WriteString("For a blocked-task escalation, distinguish operational decisions explicitly assigned to Root from decisions actually requiring the operator. For an active hold explicitly marked Root-owned, use resolve_hold with its exact project and task and your scoped decision in body, within the authorized scope and respecting stops, exhausted retry limits and approval boundaries. Do not assume legacy or operator-owned holds allow autonomous resolution. For an operator-owned decision, lead with the specific recorded question in plain language, followed by any supplied options, tradeoffs, recommendation and independent constraints. Never invent a decision or infer private PO details. If no actual question was supplied, say clarification from the PO is needed; do not claim it was requested.\n")
 		}
 	}
-	if req.Role == "po" && req.Kind != "operator_message" {
+	if req.Role == "po" && req.Kind == "scope_review" {
+		b.WriteString("\nReturn the scope assessment in text; the app delivers it to Root. Do not use report_progress or dispatch actions during scope review.\n")
+	}
+	if req.Role == "po" && req.Kind != "operator_message" && req.Kind != "scope_review" && req.Kind != "project_message" && req.Kind != "approval_denied" {
 		b.WriteString("\nSend routine project progress privately to Root using report_progress: set body to the update, project to empty or this project, recipient to empty or root, and title, task and reply_to empty. Do not send generic status or recaps to the operator or group. Use the project group for worker coordination and focused collaboration; answer a directly addressed operator question once in that room. Route actual operator decisions through the existing hold or approval workflow, and send the completed parent report to Root.\n")
 		b.WriteString("For hold_task, set recipient to root only when the needed scoped decision is delegated to Root; leave recipient empty for an operator-owned decision. Never use a Root-owned hold to bypass stops, retry limits or approval requirements.\n")
 	}
@@ -398,10 +401,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		if err = syncFile(filepath.Join(dir, "intent"), []byte(fingerprint(req))); err != nil {
 			return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
 		}
-		schema := outputSchema
-		if req.Role == "worker" {
-			schema = workerOutputSchema
-		}
+		schema := newJobSchema(req)
 		if err = syncFile(filepath.Join(dir, "schema.json"), []byte(schema)); err != nil {
 			return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
 		}

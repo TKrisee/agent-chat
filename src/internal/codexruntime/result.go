@@ -29,17 +29,55 @@ var errResultShape = errors.New("native output is not a valid structured result"
 var errResultAttachment = errors.New("native output references an invalid workspace attachment")
 var errValidationUnavailable = errors.New("native output validator was unavailable")
 
+// actionTypes is the single role allowlist used for new schemas and decoding.
+var actionTypes = map[string][]string{
+	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold"},
+	"po":     {"queue_worker", "create_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
+	"worker": {"post_group"},
+}
+
 func actionAllowed(role, action string) bool {
-	switch role {
-	case "root":
-		return action == "create_project" || action == "delegate" || action == "stop_project" || action == "resume_project" || action == "resolve_hold" || action == "set_project_goal" || action == "set_project_goal_status" || action == "request_approval"
-	case "po":
-		return action == "queue_worker" || action == "create_worker" || action == "queue_work_item" || action == "accept_result" || action == "report" || action == "report_progress" || action == "request_approval" || action == "post_group" || action == "hold_task"
-	case "worker":
-		return action == "post_group"
-	default:
-		return false
+	for _, allowed := range actionTypes[role] {
+		if allowed == action {
+			return true
+		}
 	}
+	return false
+}
+
+func newJobSchema(req runtimeapi.Request) string {
+	schema, oldEnum := outputSchema, `"enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","report_progress","request_approval","post_group","hold_task","resolve_hold","create_worker","queue_work_item"]`
+	if req.Role == "worker" {
+		schema, oldEnum = workerOutputSchema, `"enum":["post_group"]`
+	}
+	allowed := make([]string, 0)
+	for _, action := range actionTypes[req.Role] {
+		ok := true
+		switch {
+		case req.Kind == "project_message" || req.Kind == "approval_denied":
+			ok = false
+		case req.Role == "worker" && req.Kind != "work":
+			ok = false
+		case req.Role == "po" && req.Kind == "operator_message":
+			ok = action == "request_approval"
+		case req.Role == "po" && req.Kind == "scope_review":
+			ok = action == "post_group"
+		case req.Role == "root" && req.Kind == "scope_decision":
+			ok = action == "delegate"
+		case req.Role == "root" && req.Kind == "task_blocked":
+			ok = action == "resolve_hold" || action == "request_approval"
+		case req.Role == "root" && req.Kind != "operator_message" && req.Kind != "approval_approved":
+			ok = action == "request_approval"
+		}
+		if ok {
+			allowed = append(allowed, `"`+action+`"`)
+		}
+	}
+	if len(allowed) == 0 {
+		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":0,"items":`, 1)
+		return schema
+	}
+	return strings.Replace(schema, oldEnum, `"enum":[`+strings.Join(allowed, ",")+`]`, 1)
 }
 
 const extractFilter = `
