@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/TKrisee/agent-chat/compare/v0.14.1...v0.14.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* preserve recovered PO assignment lineage through worker dispatch ([1b2f5c4](https://github.com/TKrisee/agent-chat/commit/1b2f5c44f4770e89c67bbcc7d728b7a85a50bfe9))
+
 ## [0.14.1](https://github.com/TKrisee/agent-chat/compare/v0.14.0...v0.14.1) (2026-11-25)
 
 
