@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.3](https://github.com/TKrisee/agent-chat/compare/v0.14.2...v0.14.3) (2026-11-25)
+
+
+### Bug Fixes
+
+* queue follow-on work without blocking busy workers or other lanes ([abbac02](https://github.com/TKrisee/agent-chat/commit/abbac0249ea97eba458374c3e6bd810824444e27))
+
 ## [0.14.2](https://github.com/TKrisee/agent-chat/compare/v0.14.1...v0.14.2) (2026-11-25)
 
 
