@@ -1,8 +1,10 @@
 """Exercise durable recovery with isolated coordination and a fake native runtime."""
 import copy
 import contextlib
+import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest import mock
@@ -13,7 +15,7 @@ from agent_chat.bridge_client import RemoteBridgeState
 from agent_chat.capacity_recovery import CAPACITY_MESSAGE, CONTINUATION, REMOTE_COMPACT_STREAM_PREFIX, capacity_error
 from agent_chat.core import Coordinator, CoordError
 from agent_chat.rpc import RpcError, TransportError
-from agent_chat.root_owner import OWNER_FIELDS
+from agent_chat.root_owner import OWNER_FIELDS, RootOwnerMonitor
 from test_remote_web import RemoteWebFixture
 
 
@@ -635,6 +637,29 @@ class CapacityRecoveryTests(unittest.TestCase):
         self.rpc.fail()
         with mock.patch.dict('os.environ', {'AGENT_CHAT_CAPACITY_RECOVERY': '0'}): self.tick()
         self.assertEqual(self.count('thread/queue/add'), 0)
+
+    def test_supported_resume_argv_does_not_alternate_to_recovery_blocked(self):
+        pid = 4321
+        start = 'Mon Oct 12 09:13:14 2026'
+        def utility(argv, **kwargs):
+            if argv[0] == 'pgrep':
+                return SimpleNamespace(returncode=0, stdout=str(pid))
+            column = argv[-1]
+            if column == 'uid=,lstart=':
+                return SimpleNamespace(returncode=0, stdout=str(os.getuid()) + ' ' + start)
+            if column == 'comm=':
+                return SimpleNamespace(returncode=0, stdout='/usr/local/bin/codex')
+            return SimpleNamespace(returncode=0, stdout=(
+                '/usr/local/bin/codex resume --remote ws://127.0.0.1:4500 ' + self.thread))
+
+        self.bridge.capacity_worker.owner_monitor = RootOwnerMonitor('ws://127.0.0.1:4500', utility)
+        for _ in range(3):
+            self.tick()
+            blocked = self.coord.db.execute(
+                "SELECT 1 FROM bridge_observations WHERE thread_id=? AND state='recovery_blocked' LIMIT 1",
+                (self.thread,)).fetchone()
+            self.assertIsNone(blocked)
+        self.assertGreaterEqual(sum(method == 'thread/read' for method, _ in self.rpc.calls), 3)
 
 
 class RemoteCapacityRecoveryTests(RemoteWebFixture):

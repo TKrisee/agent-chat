@@ -7,6 +7,7 @@ from email.parser import BytesParser
 from email.policy import default as email_policy
 import fcntl
 import http.server
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ import time
 import tempfile
 from urllib.parse import parse_qs, quote, urlsplit
 
-from agent_chat.core import CoordError, Coordinator, agent_labels, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE
+from agent_chat.core import CoordError, CurrentnessNoEffect, Coordinator, agent_labels, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE, MAX_ATTACHMENT_TOTAL_SIZE, decision_projection
 from .remote import MAX_COORD_REQUEST_BYTES
 from .projects import Projects
 from .bridge_state import runtime_snapshot
@@ -104,7 +105,8 @@ def service_notice_ids(db, ids):
         f'SELECT message_id FROM root_project_notices WHERE message_id IN ({marks})', list(ids))}
 
 
-def message_rows(rows, agents, db, project_operator=None):
+def message_rows(rows, agents, db, project_operator=None, receipt_operator=None,
+                 include_agent_delivery_receipts=False):
     operators = {row['session_id'] for row in db.execute('SELECT session_id FROM operator_identities')}
     items = [dict(row, sender_role='human_operator' if row['sender_session'] in operators else 'agent',
                   recipient_role='human_operator' if row['recipient_session'] in operators else 'agent', sender_agent=agents.get(row['sender_session']),
@@ -122,6 +124,38 @@ def message_rows(rows, agents, db, project_operator=None):
     for item in items:
         item['service_notice'] = item['id'] in notices
         item['instruction_origin'] = 'authenticated_operator_ui' if item['id'] in origins else 'agent_message'
+    if receipt_operator in operators and all(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() for name in ('project_evidence_events','project_evidence_requests','project_artifact_decisions')):
+        for row in db.execute(f'''SELECT e.id,e.work_id,e.request_id,e.message_id,e.after_id,e.after_sha256,a.name AS artifact_name,d.outcome
+            FROM project_evidence_events e JOIN project_evidence_requests r ON r.work_id=e.work_id AND r.request_id=e.request_id
+            JOIN attachments a ON a.id=e.after_id AND a.message_id=e.message_id
+            LEFT JOIN project_artifact_decisions d ON d.delivery_id=e.id
+            WHERE e.kind='delivery' AND r.customer_session=? AND e.message_id IN ({marks})''', [receipt_operator, *by_message]):
+            if by_message[row['message_id']]['recipient_session'] == receipt_operator:
+                by_message[row['message_id']].setdefault('artifact_decisions', []).append(dict(row))
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_decision_requests'").fetchone():
+        project_meta = db.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+        current_project = project_meta['value'] if project_meta else 'default'
+        for row in db.execute(f'SELECT message_id,recipient_session,project_id FROM operator_decision_requests WHERE message_id IN ({marks})', list(by_message)):
+            try:
+                by_message[row['message_id']]['decision'] = decision_projection(db, row['message_id'])
+            except CoordError:
+                # Invalid stored annotation never hides an unresolved decision.
+                by_message[row['message_id']]['decision'] = {'status': 'pending', 'ancestry_limited': True,
+                    'answer_outcome': None, 'reply_message_id': None, 'answer_history': []}
+            if (receipt_operator in operators and row['recipient_session'] == receipt_operator
+                    and row['project_id'] == current_project
+                    and by_message[row['message_id']]['recipient_session'] == receipt_operator):
+                decision = by_message[row['message_id']]['decision']
+                by_message[row['message_id']]['retained_child_diagnostic'] = {
+                    'author_classification': decision.get('answer_outcome') or 'unknown',
+                    'provenance': decision.get('answer_origin') or 'unknown',
+                    'verified_consent': 'unknown',
+                    'expiration': 'unknown',
+                    'capability': 'retained-child-review-event',
+                    'eligibility': 'unavailable',
+                    'reason': 'This integration has no supported lookup for a retained parent-owned child review event.',
+                    'review_outcome': 'unknown',
+                }
     if attachment_table(db):
         for row in db.execute(f'SELECT id,message_id,name,mime,size FROM attachments WHERE message_id IN ({marks}) ORDER BY rowid', list(by_message)):
             by_message[row['message_id']]['attachments'].append({
@@ -170,6 +204,37 @@ def message_rows(rows, agents, db, project_operator=None):
         item['operator_ack'] = ({'id': incoming['id'], 'recipient_session': project_operator,
                                  'acked_at': incoming['acked_at']}
                                 if incoming else None)
+    # Project existing delivery evidence only onto rows already visible to this
+    # caller. Agent acknowledgements are meaningful only for agent recipients.
+    outgoing = [item for item in items if not item['service_notice']
+                and item['recipient_role'] == 'agent'
+                and item['recipient_session'] != item['sender_session']
+                and (include_agent_delivery_receipts or item['sender_session'] == receipt_operator)]
+    for item in outgoing:
+        attention = False
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='message_attention'").fetchone():
+            attention = bool(db.execute('SELECT 1 FROM message_attention WHERE message_id=?', (item['id'],)).fetchone())
+        job = None
+        if all(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+               for table in ('bridge_deliveries', 'bridge_jobs')):
+            row = db.execute('''SELECT j.status,j.updated_at
+                FROM bridge_deliveries d JOIN bridge_jobs j ON j.id=d.job_id
+                WHERE d.message_id=?''', (item['id'],)).fetchone()
+            if row:
+                job = dict(row)
+        replies = []
+        if reply_table(db):
+            replies = [dict(row) for row in db.execute('''SELECT m.id,m.created_at FROM message_replies r
+                JOIN messages m ON m.id=r.message_id
+                WHERE r.reply_to=? AND m.sender_session=? AND m.recipient_session=?
+                ORDER BY m.seq''', (item['id'], item['recipient_session'], item['sender_session']))]
+        item['delivery_receipt'] = {
+            'saved_at': item['created_at'],
+            'wake_requested': attention,
+            'native_job': job,
+            'agent_ack_at': item['acked_at'],
+            'linked_replies': replies,
+        }
     return items
 
 
@@ -190,7 +255,7 @@ def snapshot(db_path, limit=UI_MESSAGE_LIMIT, usage_store=None, session_models=N
         total = db.execute(f'SELECT COUNT(*) FROM messages m WHERE {condition}', args).fetchone()[0]
         rows = db.execute(f'SELECT {MESSAGE_COLUMNS} FROM messages m WHERE {condition} ORDER BY seq DESC LIMIT ?',
                           (*args, limit)).fetchall()
-        messages = message_rows(list(reversed(rows)), agents, db, operator)
+        messages = message_rows(list(reversed(rows)), agents, db, operator, operator)
         resources = []
         columns = 'name,owner_session,reservation_id,deadline,stale,reason'
         resource_page = None
@@ -323,7 +388,7 @@ def page(db_path, before=None, limit=UI_MESSAGE_LIMIT, after=None, operator=None
             messages = rows[:limit]
         else:
             messages = list(reversed(rows[:limit]))
-        return dict(messages=message_rows(messages, agents, db, operator if project_feed else None), has_more=len(rows) > limit)
+        return dict(messages=message_rows(messages, agents, db, operator if project_feed else None, operator), has_more=len(rows) > limit)
 
 
 def operator_session(db_path):
@@ -365,11 +430,19 @@ class WebServer(http.server.ThreadingHTTPServer):
                  trusted_proxies=(), inbox_diagnostics=None, logging_config=None):
         self.db_path = str(Path(db_path).expanduser().resolve())
         self.web_root = Path(web_root).resolve()
+        self.http_admission = threading.Condition()
+        self.http_active = set()
+        self.http_drain_epoch = None
+        self.http_sealed = False
+        self.http_instance = secrets.token_hex(16)
         self.stop_event = threading.Event()
         self.csrf_token = secrets.token_urlsafe(32)
         self.api_token = api_token
         self.inbox_diagnostics = None
         self.logging = configure(logging_config or LoggingConfig())
+        # Required approval outcomes use the existing private rotating event sink,
+        # independently of optional diagnostic logging. Pending authority is never saved.
+        self.approval_logging = configure(LoggingConfig(level='INFO', path=self.db_path + '.approvals.jsonl'))
         self.log = self.logging.logger('agent_chat.web')
         self.server_log = self.logging.logger('agent_chat.server')
         self.coordinator_log = self.logging.logger('agent_chat.coordinator')
@@ -392,6 +465,10 @@ class WebServer(http.server.ThreadingHTTPServer):
         self.project_lock = threading.RLock()
         super().__init__(address, handler)
         try:
+            # A reverse proxy can erase forwarding headers; do not infer a
+            # direct client when this listener has any proxy/public setup.
+            self.direct_local_auth = (ipaddress.ip_address(self.socket.getsockname()[0]).is_loopback
+                                      and not self.public_url and not self.trusted_proxies)
             self.request_origins = RequestOrigins(address[0], self.server_port, self.public_url, self.trusted_proxies)
             self.sender_session = operator_session(self.db_path)
             if api_token:
@@ -400,6 +477,8 @@ class WebServer(http.server.ThreadingHTTPServer):
             self.measurements = MeasurementStore(self.db_path, sessions_root=sessions_root, usage_store=self.usage,
                                                  pause_callback=self.pause_measured_agents)
             if self.bridge_manager:
+                self.bridge_manager.approvals.operator = self.sender_session
+                self.bridge_manager.approvals.audit = self.approval_logging.logger('agent_chat.web').event
                 self.bridge_manager.roots = self.roots
                 self.bridge_manager.measurements = self.measurements
             self.session_models = SessionModels(self.measurements.sessions_root)
@@ -407,6 +486,45 @@ class WebServer(http.server.ThreadingHTTPServer):
         except BaseException:
             self.server_close()
             raise
+
+    def http_begin(self):
+        ticket = object()
+        with self.http_admission:
+            self.http_active.add(ticket)
+        return ticket
+
+    def http_end(self, ticket):
+        with self.http_admission:
+            self.http_active.discard(ticket)
+            self.http_admission.notify_all()
+
+    def http_admit(self):
+        with self.http_admission:
+            return self.http_drain_epoch is None
+
+    def http_maintenance(self, action, epoch=None):
+        with self.http_admission:
+            if action == 'start':
+                if self.http_drain_epoch is None:
+                    self.http_drain_epoch = secrets.token_hex(16)
+            elif action in ('seal', 'resume'):
+                if not epoch or epoch != self.http_drain_epoch:
+                    raise ValueError('maintenance epoch differs')
+                if action == 'resume':
+                    if self.http_sealed:
+                        raise ValueError('sealed server requires selected restart; cannot resume')
+                    self.http_drain_epoch = None
+                elif self.http_sealed:
+                    raise ValueError('maintenance epoch already sealed; no repeat restart authorization')
+                elif self.http_active:
+                    raise ValueError('active HTTP handlers remain; cannot seal')
+                else:
+                    self.http_sealed = True
+            elif action != 'status':
+                raise ValueError('unsupported maintenance action')
+            return dict(instance=self.http_instance, pid=os.getpid(), epoch=self.http_drain_epoch,
+                        active=len(self.http_active), sealed=self.http_sealed,
+                        state='sealed' if self.http_sealed else ('draining' if self.http_drain_epoch else 'open'))
 
     @property
     def origin(self):
@@ -421,7 +539,8 @@ class WebServer(http.server.ThreadingHTTPServer):
 
     def listed_projects(self):
         active = self.measurements.active_projects()
-        return [dict(project, measurement_running=project['id'] in active)
+        return [dict(project, measurement_running=project['id'] in active,
+                     activity=self.projects.activity_summary(project['id']))
                 for project in self.projects.list()]
 
     def measurement_models(self, result):
@@ -449,6 +568,8 @@ class WebServer(http.server.ThreadingHTTPServer):
                     manager = BridgeManager(path, usage_store=self.usage)
                     manager.measurements, manager.project_id = self.measurements, item['id']
                     manager.roots = self.roots
+                    manager.approvals.operator = sender
+                    manager.approvals.audit = self.approval_logging.logger('agent_chat.web').event
                 self.project_contexts[item['id']] = (path, sender, manager)
             return self.project_contexts[item['id']]
 
@@ -463,6 +584,7 @@ class WebServer(http.server.ThreadingHTTPServer):
             if manager: manager.close()
         if self.bridge_manager:
             self.bridge_manager.close()
+        self.approval_logging.close()
         super().server_close()
 
     def shutdown(self):
@@ -473,6 +595,50 @@ class WebServer(http.server.ThreadingHTTPServer):
 class Handler(http.server.BaseHTTPRequestHandler):
     server: WebServer
     protocol_version = 'HTTP/1.1'
+
+    def handle_one_request(self):
+        # Count header/body reads, dispatch, streaming and response flush. Idle
+        # keepalive/slow headers conservatively count until timeout or close.
+        self._http_ticket = self.server.http_begin()
+        try:
+            return super().handle_one_request()
+        finally:
+            try:
+                self.wfile.flush()
+            finally:
+                self.server.http_end(self._http_ticket)
+
+    def parse_request(self):
+        if not super().parse_request():
+            return False
+        self._maintenance = self.command == 'POST' and self.path == '/api/server-maintenance'
+        if self._maintenance:
+            local = ipaddress.ip_address(self.client_address[0]).is_loopback
+            forwarded = any(self.headers.get(name) for name in
+                            ('Forwarded', 'X-Forwarded-Host', 'X-Forwarded-Proto', 'X-Forwarded-For'))
+            if not local or forwarded or not self.trusted():
+                self.close_connection = True
+                self.json(403, {'error': 'direct server-local maintenance required'})
+                return False
+            if not self.server.api_token:
+                self.close_connection = True
+                self.json(403, {'error': 'configured bearer token required for maintenance'})
+                return False
+            if not self.authenticate(bearer_only=True):
+                return False
+            # Only authenticated control requests are exempt from the ledger;
+            # no coordinator/project/body work has been admitted here.
+            self.server.http_end(self._http_ticket)
+            return True
+        if not self.server.http_admit():
+            self.close_connection = True
+            if not self.trusted():
+                self.json(403, {'error': 'Untrusted host or origin'})
+            elif self.authenticate(bearer_only=self.path.split('?')[0] in
+                                   ('/api/coord', '/api/bridge/rpc', '/api/projects/rpc', '/api/usage/rpc', '/api/root/rpc')):
+                self.json(503, {'error': 'server draining; no work admitted; reconcile prior uncertain operations'})
+            return False
+        return True
 
     def setup(self):
         super().setup()
@@ -508,6 +674,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return self.server.request_origins.trusted(self.headers, self.client_address[0])
 
     def authenticate(self, bearer_only=False):
+        path = urlsplit(self.path).path
+        # Maintenance retains its explicit bearer-only contract. Direct CLI
+        # clients may omit Origin; browser fetch metadata must not be cross-site.
+        if (self.server.direct_local_auth and path != '/api/server-maintenance' and not self.headers.get('Authorization')
+                and self.server.request_origins.direct_local(
+                    self.headers, self.client_address[0], require_origin=False)):
+            return True
         if authorized(self.headers.get('Authorization', ''), self.server.api_token, bearer_only):
             return True
         raw = b'{"error":"Authentication required"}'
@@ -528,6 +701,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return bool(self.server.api_token and self.headers.get('Authorization', '').startswith('Basic ')
                     and authorized(self.headers.get('Authorization', ''), self.server.api_token))
 
+    def credentialed_channel(self):
+        return bool(self.server.api_token and authorized(
+            self.headers.get('Authorization', ''), self.server.api_token))
+
     def operator_ack_rows(self, message_id=None, root_view=False):
         with reader(self.db_path) as db:
             if not db.execute('SELECT 1 FROM operator_identities WHERE session_id=?', (self.sender_session,)).fetchone():
@@ -537,6 +714,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not root or root['home_project'] != self.project['id']:
                     raise CoordError('current Root conversation is unavailable')
                 condition = '(m.sender_session=? AND m.recipient_session=?)'
+                if batch_table(db):
+                    condition += ' AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)'
                 arguments = [root['home_session'], self.sender_session]
             else:
                 condition, arguments = project_message_filter(db, self.sender_session)
@@ -588,13 +767,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             raise ValueError('Expected a JSON object')
         return value
 
-    def respond(self, code, raw, mime, *, download_name=None, extra_headers=None):
+    def respond(self, code, raw, mime, *, download_name=None, extra_headers=None,
+                stream=None, stream_size=None):
         trace = self._inbox_trace
         if trace: trace.mark('response', 'start')
         try:
             self.send_response(code)
             self.send_header('Content-Type', mime)
-            self.send_header('Content-Length', str(len(raw)))
+            self.send_header('Content-Length', str(len(raw) if stream is None else stream_size))
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy', "default-src 'none'; sandbox" if download_name is not None else CSP)
@@ -606,8 +786,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             try:
-                self.wfile.write(raw)
-            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                if stream is None:
+                    self.wfile.write(raw)
+                else:
+                    written = 0
+                    for part in stream:
+                        written += len(part)
+                        if written > stream_size:
+                            raise CoordError('stored attachment exceeds declared size')
+                        self.wfile.write(part)
+                    if written != stream_size:
+                        raise CoordError('stored attachment is incomplete')
+            except (BrokenPipeError, ConnectionResetError, TimeoutError, CoordError, sqlite3.Error):
                 if trace: trace.mark('response', 'end', 'error')
                 self._finish_request(error=TimeoutError())
             else:
@@ -618,7 +808,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._finish_request(error=RuntimeError())
             raise
 
-    def respond_video(self, content, mime):
+    def respond_media(self, content, mime):
         headers = {'Accept-Ranges': 'bytes'}
         ranges = self.headers.get_all('Range', [])
         if not ranges:
@@ -689,13 +879,48 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 ((sender_session=? AND recipient_session=?) OR (sender_session=? AND recipient_session=?))
                 AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=m.id)''',
                 (self.sender_session,root_id,root_id,self.sender_session)).fetchone()[0]
+            pending_decisions = []
+            pending_decision_count = 0
+            if (root_id and db.execute("SELECT 1 FROM operator_identities WHERE session_id=?",
+                                       (self.sender_session,)).fetchone()
+                    and db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_decision_requests'").fetchone()):
+                project_meta = db.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+                home_project_id = project_meta['value'] if project_meta else 'default'
+                rows = db.execute('''SELECT r.message_id,r.created_at FROM operator_decision_requests r
+                    JOIN messages m ON m.id=r.message_id AND m.sender_session=r.author_session
+                      AND m.recipient_session=r.recipient_session
+                    WHERE r.author_session=? AND r.recipient_session=? AND r.project_id=?
+                      AND NOT EXISTS (SELECT 1 FROM message_batches b WHERE b.message_id=r.message_id)
+                    ORDER BY r.created_at,r.message_id''', (root_id,self.sender_session,home_project_id)).fetchall()
+                has_dismissals = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_decision_dismissals'").fetchone()
+                for row in rows:
+                    if has_dismissals and db.execute('SELECT 1 FROM operator_decision_dismissals WHERE message_id=?', (row['message_id'],)).fetchone():
+                        continue
+                    try:
+                        decision = decision_projection(db, row['message_id'])
+                    except CoordError:
+                        decision = {'status': 'pending', 'answer_outcome': None, 'ancestry_limited': True}
+                    if decision['status'] == 'answer_recorded':
+                        continue
+                    pending_decision_count += 1
+                    pending_decisions.append({'message_id': row['message_id'], 'requested_at': row['created_at'],
+                        'reply_received': decision['status'] == 'reply_received',
+                        'clarification_recorded': decision['answer_outcome'] == 'clarification',
+                        'ancestry_limited': decision['ancestry_limited']})
+                pending_decisions = pending_decisions[-100:]
             for session in sessions:
                 if session['id'] == root_id:
                     session.update(thread_id=root['thread_id'],is_root_orchestrator=True,is_orchestrator=True)
+        from .project_activity import read_objectives
+        overview = self.server.roots.status()
+        for project in overview.get('projects', []):
+            project['objectives'] = read_objectives(self.server.projects.db_path(project['project_id']), project['project_id'])
         return dict(messages=messages['messages'],history_truncated=messages['has_more'],total_messages=total,
+            pending_decisions=pending_decisions,
+            pending_decision_count=pending_decision_count,
             sessions=sessions,resources=[],session_resets=[],server_time=time.time(),
             usage=self.server.usage.status(),bridge=bridge,project=self.project,
-            projects=self.server.listed_projects(),root_orchestrator=self.root_summary(),root_overview=self.server.roots.status())
+            projects=self.server.listed_projects(),root_orchestrator=self.root_summary(),root_overview=overview)
 
     def root_page(self, before=None, limit=UI_MESSAGE_LIMIT, after=None, to_me=False):
         root = self.server.roots.config()
@@ -749,6 +974,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticate():
             return
         try:
+            if url.path == '/api/approvals':
+                if not self.operator_browser_channel():
+                    self.json(403, {'error': 'authenticated operator browser channel required'}); return
+                self.select_existing_operator_context()
+                if not self.bridge_manager: raise CoordError('approval dispatcher unavailable')
+                self.json(200, {'requests': self.bridge_manager.approvals.public(self.sender_session)})
+                return
             root_view = url.path.startswith('/api/root/') and url.path != '/api/root/rpc'
             ack_plan = url.path in ('/api/messages/ack-plan','/api/root/messages/ack-plan')
             if ack_plan:
@@ -758,6 +990,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             root = self.select_root_home() if root_view and not ack_plan else None
             if url.path.startswith('/api/') and url.path != '/api/usage' and not root_view and not ack_plan and not url.path.startswith(('/api/communications', '/api/attachment-gallery')):
                 self.select_project()
+            if url.path == '/api/root/goal-status':
+                if not self.operator_browser_channel():
+                    self.json(403, {'error': 'authenticated operator browser channel required'}); return
+                if not root:
+                    self.json(200, {'status': 'unavailable', 'reason': 'root_unavailable'}); return
+                with reader(self.db_path) as db:
+                    if not db.execute('SELECT 1 FROM operator_identities WHERE session_id=?', (self.sender_session,)).fetchone():
+                        self.json(403, {'error': 'operator enrollment unavailable'}); return
+                params = parse_qs(url.query, keep_blank_values=True)
+                if set(params) != {'project'} or len(params['project']) != 1 or not params['project'][0]:
+                    raise ValueError('one project ID is required')
+                from .goal_local_provider import read_project_goal
+                self.json(200, read_project_goal(self.server.projects, params['project'][0])); return
             if url.path in ('/api/attachment-gallery', '/api/root/attachment-gallery'):
                 from .attachment_gallery import AttachmentGallery
                 params = parse_qs(url.query, keep_blank_values=True)
@@ -791,8 +1036,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.json(200,view.page(limit=int(raw_limit),**values))
             elif url.path == '/api/projects':
                 self.json(200, {'projects': self.server.listed_projects(), 'project': self.project})
+            elif url.path == '/api/projects/active':
+                self.json(200, {'projects': self.server.projects.active_projects()})
             elif url.path == '/api/root':
                 self.json(200, self.server.roots.status())
+            elif url.path == '/api/root/fresh-status':
+                if not self.operator_browser_channel():
+                    self.json(403, {'error': 'authenticated operator browser channel required'}); return
+                params = parse_qs(url.query, keep_blank_values=True)
+                if set(params) != {'request_id'} or len(params['request_id']) != 1 or not params['request_id'][0]:
+                    raise ValueError('one fresh-start request ID is required')
+                if not root:
+                    raise CoordError('canonical Root is not enrolled')
+                from .root_restart import RootRestart
+                with self.server.root_lock:
+                    result = RootRestart(self.server.roots).authorize_status(
+                        root['home_project'], root['home_session'], root['host_id'], params['request_id'][0])
+                self.json(200, result)
             elif url.path == '/api/usage':
                 self.json(200, self.server.usage.status())
             elif url.path == '/api/measurements':
@@ -856,7 +1116,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                             ((self.sender_session,root['home_session']),(root['home_session'],self.sender_session))
                             or db.execute('SELECT 1 FROM message_batches WHERE message_id=?',(message_id,)).fetchone()):
                         row = None
-                    item = message_rows([row], agents, db, None if root_view else self.sender_session)[0] if row else None
+                    item = message_rows([row], agents, db, None if root_view else self.sender_session,
+                                        self.sender_session)[0] if row else None
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                 else:
@@ -880,15 +1141,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         else:
                             from .communication_view import CommunicationView
                             condition, args, _ = CommunicationView.private_filter(db)
-                        item = db.execute('SELECT a.name,a.mime,a.content FROM attachments a JOIN messages m ON m.id=a.message_id '
+                        item = db.execute('SELECT a.id,a.name,a.mime,a.size,a.content,a.message_id,m.sender_session FROM attachments a JOIN messages m ON m.id=a.message_id '
                                           'WHERE a.id=? AND (' + condition + ')', (attachment_id, *args)).fetchone()
                     else:
-                        item = db.execute('SELECT name,mime,content FROM attachments WHERE id=?', (attachment_id,)).fetchone()
+                        item = db.execute('SELECT a.id,a.name,a.mime,a.size,a.content,a.message_id,m.sender_session '
+                                          'FROM attachments a LEFT JOIN messages m ON m.id=a.message_id WHERE a.id=?', (attachment_id,)).fetchone()
+                    if item is not None:
+                        from .attachment_transfer import CHUNK, published, read_chunk
+                        if published(db, attachment_id):
+                            first = read_chunk(db, item, 0)
+                            def stream_parts():
+                                yield first['content']
+                                for offset in range(CHUNK, first['size'], CHUNK):
+                                    yield read_chunk(db, item, offset)['content']
+                            self.respond(200, b'', item['mime'], download_name=item['name'],
+                                         stream=stream_parts(), stream_size=first['size'])
+                            return
                 if item is None:
                     self.json(404, {'error': 'Not found'})
                     return
-                if item['mime'].startswith('video/'):
-                    self.respond_video(item['content'], item['mime'])
+                if item['mime'].startswith(('video/', 'audio/')):
+                    self.respond_media(item['content'], item['mime'])
                 else:
                     self.respond(200, item['content'], item['mime'],
                                  download_name=None if item['mime'] in {'image/png', 'image/jpeg', 'image/gif', 'image/webp'} else item['name'])
@@ -912,6 +1185,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.json(400, {'error': str(error)})
 
     def do_POST(self):
+        if self._maintenance:
+            self.close_connection = True
+            try:
+                data = self.read_json(1024)
+                action = data.get('action')
+                keys = {'action', 'epoch'} if action in ('seal', 'resume') else {'action'}
+                if set(data) != keys:
+                    raise ValueError('invalid maintenance fields')
+                self.json(200, self.server.http_maintenance(action, data.get('epoch')))
+            except (ValueError, OSError) as error:
+                self.json(400, {'error': str(error)})
+            return
         self._request_started = True
         self._event('request_start')
         handler_wall, handler_monotonic = time.time(), time.monotonic()
@@ -927,12 +1212,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         timeline = []
         if path == '/api/coord' and self.server.inbox_diagnostics:
             timeline.append(('handler', 'start', 'ok', handler_wall, handler_monotonic))
-        if path in ('/api/messages/ack','/api/root/messages/ack') and not self.operator_browser_channel():
+        if path in ('/api/messages/ack','/api/root/messages/ack','/api/approvals/decision','/api/artifact-acceptance') and not self.operator_browser_channel():
             self.json(403, {'error': 'authenticated operator browser channel required'}); return
         try:
             if path not in ('/api/usage', '/api/usage/rpc', '/api/coord'):
                 if timeline: timeline.append(('project', 'start', 'ok', time.time(), time.monotonic()))
-                if path in ('/api/messages/ack','/api/root/messages/ack'): self.select_existing_operator_context(path.startswith('/api/root/'))
+                if path in ('/api/messages/ack','/api/root/messages/ack','/api/approvals/decision','/api/artifact-acceptance'): self.select_existing_operator_context(path.startswith('/api/root/'))
                 else: self.select_project(metadata_only=path == '/api/root/rpc')
                 if timeline: timeline.append(('project', 'end', 'ok', time.time(), time.monotonic()))
         except (CoordError, ValueError, sqlite3.Error, OSError) as error:
@@ -950,7 +1235,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if path == '/api/coord':
                     if timeline: timeline.append(('project', 'start', 'ok', time.time(), time.monotonic()))
                     attachment_read = data.get('op') == 'attachment-download'
-                    self.select_project(metadata_only=attachment_read)
+                    first_ack_read = data.get('op') in ('first-ack-lookup', 'source-trace')
+                    self.select_project(metadata_only=(attachment_read or first_ack_read))
+                    if attachment_read or first_ack_read:
+                        # Project selection above read the registry. Derive its
+                        # deterministic database path from that selected ID and
+                        # the configured root, without reopening the registry
+                        # through Projects.get() (which could recreate an
+                        # unlinked registry during this read).
+                        project_id = self.project['id']
+                        projects = self.server.projects
+                        if project_id == 'default':
+                            target_path = projects.database
+                        else:
+                            target_path = (projects.database.parent /
+                                           (projects.database.name + '.projects') /
+                                           project_id / 'state.sqlite3')
+                        self.db_path = str(target_path)
                     if (attachment_read and isinstance(data.get('params'), dict)
                             and data['params'].get('source_project') == self.project['id']):
                         # Preserve the existing direct-home coordinator path.
@@ -972,9 +1273,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if path == '/api/root/rpc':
                     self.json(200, self.shared_bearer_root_action(data))
                     return
+                if (path == '/api/bridge/rpc' and data.get('op') == 'reset'
+                        and not authorized(self.headers.get('Authorization', ''), self.server.api_token, True)):
+                    self.json(403, {'error': 'configured bearer token required for dispatcher recovery'})
+                    return
                 if path == '/api/coord':
-                    from .remote_service import dispatch, managed_operator_attachment
+                    if not self.credentialed_channel() and isinstance(data.get('session'), str):
+                        with reader(self.db_path) as db:
+                            if (db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='operator_identities'").fetchone()
+                                    and db.execute('SELECT 1 FROM operator_identities WHERE session_id=?', (data['session'],)).fetchone()):
+                                self.json(403, {'error': 'operator identity requires authentication'})
+                                return
+                    from .remote_service import dispatch, managed_operator_attachment, sender_owned_first_ack_lookup, source_trace_read
                     self.server.coordinator_log.event('operation_start', correlation_id=self._log_id)
+                    if data.get('op') == 'source-trace':
+                        result = source_trace_read(self.db_path, data, canonical_project=self.project['id'])
+                        self.server.coordinator_log.event('operation_complete', correlation_id=self._log_id)
+                        self._event('operation_complete')
+                        self.json(200, self.scoped(result))
+                        return
+                    if data.get('op') == 'first-ack-lookup':
+                        result = sender_owned_first_ack_lookup(
+                            self.db_path, data, canonical_project=self.project['id'])
+                        self.server.coordinator_log.event('operation_complete', correlation_id=self._log_id)
+                        self._event('operation_complete')
+                        self.json(200, self.scoped(result))
+                        return
                     if attachment_read and (not isinstance(data.get('params'), dict)
                                             or data['params'].get('source_project') != self.project['id']):
                         result = managed_operator_attachment(data, self.project['id'], self.server.roots)
@@ -1007,11 +1331,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._event('operation_failed', error=error)
                 self._finish_request(error=error)
                 if trace: trace.mark('dispatch', 'end', 'error')
-                self.json(400, {'error': str(error)})
+                response = {'error': str(error)}
+                if isinstance(error, CurrentnessNoEffect):
+                    response['recovery'] = error.recovery
+                self.json(400, response)
             finally:
                 self._inbox_trace = None
             return
-        if path not in ('/api/messages', '/api/messages/ack', '/api/root/messages/ack', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch', '/api/root/workspaces', '/api/root/provision', '/api/root/fresh-start', '/api/usage', '/api/measurements'):
+        if path not in ('/api/approvals/decision', '/api/artifact-acceptance', '/api/messages', '/api/messages/ack', '/api/root/messages/ack', '/api/sessions/remove', '/api/sessions/reset', '/api/projects', '/api/projects/rename', '/api/projects/workspaces', '/api/projects/workspaces-batch', '/api/root/workspaces', '/api/root/provision', '/api/root/fresh-start', '/api/usage', '/api/measurements'):
             self._finish_request(rejected=True)
             self.json(404, {'error': 'Not found'})
             return
@@ -1019,6 +1346,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not csrf.isascii() or not secrets.compare_digest(csrf, self.server.csrf_token):
             self._finish_request(rejected=True)
             self.json(403, {'error': 'Messaging connection expired. Reconnect and try again.'})
+            return
+        if path == '/api/artifact-acceptance':
+            try:
+                if self.headers.get('Content-Type', '').split(';', 1)[0].strip().lower() == 'application/x-www-form-urlencoded':
+                    if len(self.headers.get_all('Content-Length', [])) != 1 or self.headers.get_all('Transfer-Encoding', []): raise CoordError('one content length required')
+                    size = int(self.headers.get('Content-Length', '0'))
+                    if not 1 <= size <= 4096: raise CoordError('invalid artifact action size')
+                    fields = parse_qs(self.rfile.read(size).decode('utf-8'), keep_blank_values=True, strict_parsing=True)
+                    if any(len(values) != 1 for values in fields.values()): raise CoordError('duplicate artifact action fields')
+                    data = {key: values[0] for key, values in fields.items()}
+                else:
+                    data = self.read_json(4096)
+                if not isinstance(data, dict) or set(data) != {'work_id','request_id','delivery_id','outcome'}:
+                    raise CoordError('exact task, request, delivery and explicit outcome required')
+                from .activity_evidence import operator_decide
+                coord = Coordinator(self.db_path, self.sender_session)
+                try: result = operator_decide(coord, self.project['id'], data['work_id'], data['request_id'], data['delivery_id'], data['outcome'])
+                finally: coord.close()
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError, sqlite3.Error) as error:
+                self.json(400, {'error': str(error)})
+            finally:
+                self._finish_request()
+            return
+        if path == '/api/approvals/decision':
+            try:
+                data = self.read_json(4096)
+                if not isinstance(data, dict) or set(data) != {'handle','decision'}:
+                    raise CoordError('exact approval handle and decision required')
+                if not self.bridge_manager: raise CoordError('approval dispatcher unavailable')
+                result = self.bridge_manager.approvals.decide(self.sender_session, data['handle'], data['decision'])
+                self.json(200, result)
+            except (CoordError, ValueError, TypeError) as error:
+                self.json(400, {'error': str(error)})
+            finally:
+                self._finish_request()
             return
         if path in ('/api/messages/ack', '/api/root/messages/ack'):
             try:
@@ -1062,6 +1425,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(400, {'error': str(error)})
             return
         if path == '/api/root/fresh-start':
+            if not self.credentialed_channel():
+                self.json(403, {'error': 'authenticated operator browser channel required'}); return
             try:
                 data=self.read_json(512 * 1024)
                 if not isinstance(data,dict) or set(data)!={'expected_thread','prompt','request_id','confirm'}:
@@ -1076,6 +1441,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(400,{'error':str(error)})
             return
         if path in ('/api/root/workspaces', '/api/root/provision'):
+            if not self.credentialed_channel():
+                self.json(403, {'error': 'authenticated operator browser channel required'}); return
             try:
                 data = self.read_json(512 * 1024)
                 result = self.browser_root_action(data, 'reconfigure-workspaces' if path == '/api/root/workspaces' else 'provision')
@@ -1094,6 +1461,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(400, {'error': str(error)})
             return
         if path == '/api/sessions/reset':
+            if not self.credentialed_channel():
+                self.json(403, {'error': 'authenticated operator browser channel required'}); return
             try:
                 data = self.read_json()
                 if not isinstance(data, dict):
@@ -1120,6 +1489,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.json(400, {'error': str(error)})
             return
         if path == '/api/sessions/remove':
+            if not self.credentialed_channel():
+                self.json(403, {'error': 'authenticated operator browser channel required'}); return
             try:
                 data = self.read_json()
                 if set(data) != {'id'} or not isinstance(data['id'], str) or not data['id']:
@@ -1175,7 +1546,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 upload_paths = self.write_uploads(directory, attachments or [])
                 coord = Coordinator(self.db_path, self.sender_session)
                 try:
-                    coord._operator_message_origin = True
+                    coord._operator_message_origin = self.operator_browser_channel()
                     sent = (coord.send_group_prepared(recipient, body.strip(), coord._prepare_attachments(upload_paths), reply_to)
                             if is_many else coord.send(recipient, body.strip(), attachments=upload_paths, reply_to=reply_to))
                 finally:
@@ -1239,8 +1610,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def write_uploads(directory, uploads):
         if len(uploads) > MAX_ATTACHMENTS:
             raise CoordError(f'at most {MAX_ATTACHMENTS} attachments are allowed')
-        if any(len(content) > MAX_ATTACHMENT_SIZE for _, content in uploads):
-            raise CoordError('attachment exceeds 10 MiB')
+        if sum(len(content) for _, content in uploads) > MAX_ATTACHMENT_TOTAL_SIZE:
+            raise CoordError('attachments exceed 500 MiB total raw size')
+        for name, content in uploads:
+            limit = Coordinator.attachment_size_limit(name)
+            if len(content) > limit:
+                if limit > MAX_ATTACHMENT_SIZE:
+                    raise CoordError('GLB v2 and binary FBX 7400 model attachments may not exceed 64 MiB')
+                raise CoordError('attachment exceeds 10 MiB')
         paths = []
         for index, (name, content) in enumerate(uploads):
             child = Path(directory) / str(index)
@@ -1256,6 +1633,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.move_history(data)
         if op == 'list' and set(data) == {'op'}:
             return {'projects': self.server.listed_projects()}
+        if op == 'active' and set(data) == {'op'}:
+            return {'projects': self.server.projects.active_projects()}
         if op == 'create' and {'op', 'name'} <= set(data) <= {'op', 'name', 'workspace', 'workspaces', 'instructions'}:
             item = self.server.projects.create(data['name'], data.get('workspace'), data.get('instructions'), workspaces=data.get('workspaces'))
             self.server.project_context(item['id'])
@@ -1463,7 +1842,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         prior = None
         try:
-            while not self.server.stop_event.is_set():
+            while not self.server.stop_event.is_set() and self.server.http_admit():
                 comparable = dict(data)
                 comparable.pop('server_time')
                 if comparable != prior:
@@ -1474,6 +1853,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.wfile.write(payload.encode())
                 self.wfile.flush()
                 self.server.stop_event.wait(1)
+                if not self.server.http_admit():
+                    break
                 data = self.scoped(self.project_snapshot())
         except (OSError, sqlite3.Error, RuntimeError):
             pass

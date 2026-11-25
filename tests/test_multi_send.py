@@ -65,7 +65,7 @@ class MultiSendTests(unittest.TestCase):
         sent = self.many([self.alpha, self.beta], 'page boundary')
         coord = Coordinator(self.db, self.alpha)
         try:
-            row = coord.db.execute('SELECT id,sender_session,body,created_at,acked_at,seq FROM messages WHERE id=?', (sent[0]['id'],)).fetchone()
+            row = coord.db.execute('SELECT * FROM messages WHERE id=?', (sent[0]['id'],)).fetchone()
             item = coord._message_dicts(coord.db, [row])[0]
         finally: coord.close()
         self.assertEqual({delivery['id'] for delivery in item['deliveries']}, {sent[0]['id'], sent[1]['id']})

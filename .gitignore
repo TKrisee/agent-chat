@@ -32,3 +32,4 @@ node_modules/
 /.root-local-control-adapter-*/
 /.vm-provider-source-*/
 /.vm-whole-guest-protocol-*/
+/.finite-batch-*/

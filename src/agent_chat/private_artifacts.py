@@ -1,5 +1,6 @@
 """Private reservation capabilities and factual, prospective process evidence."""
 import hashlib
+import errno
 import json
 import os
 from pathlib import Path
@@ -123,16 +124,25 @@ class ProcessEvidence:
     def __init__(self, path, **identity):
         parent, name = _parent(path)
         self.fd = None
+        stage = 'exclusive create'
         try:
             self.fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
                               0o600, dir_fd=parent)
+            stage = 'owner mode'
             os.fchmod(self.fd, 0o600)
+            stage = 'directory sync'
             os.fsync(parent)
-        except OSError:
+        except OSError as error:
             if self.fd is not None:
                 os.close(self.fd)
                 self.fd = None
-            raise CoordError('process evidence creation failed') from None
+            category = {errno.EEXIST: 'destination exists', errno.EACCES: 'access denied',
+                        errno.EPERM: 'operation denied', errno.ENOENT: 'destination unavailable',
+                        errno.ENOSPC: 'storage full', errno.EROFS: 'read-only filesystem',
+                        errno.EINVAL: 'unsupported operation', errno.EIO: 'I/O failure'}.get(
+                            error.errno, 'OS failure')
+            raise CoordError(f'process evidence creation failed ({stage}: {category}); '
+                             'preserve evidence and reservation; admission/closure is not inferred') from None
         finally:
             os.close(parent)
         self.identity = identity

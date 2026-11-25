@@ -191,6 +191,44 @@ class Projects:
         if item['id'] == 'default': return self.database
         return self.database.parent / (self.database.name + '.projects') / item['id'] / 'state.sqlite3'
 
+    def activity_summary(self, project):
+        """Read only aggregate work metadata for authenticated project listings.
+
+        Missing work tables mean no work has been adopted. Read/schema failures
+        propagate: an unreadable project must never be presented as inactive.
+        This does not expose goal/task bodies or grant cross-project actor rights.
+        """
+        database = self.db_path(project)
+        with contextlib.closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            identity = db.execute("SELECT value FROM meta WHERE key='project_id'").fetchone()
+            if (identity[0] if identity else 'default') != project:
+                raise CoordError('activity database project identity mismatch')
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_work'").fetchone():
+                return dict(active=False, unfinished=0, blocked=0)
+            unfinished, blocked = db.execute("""
+                SELECT COUNT(*), COALESCE(SUM(state='blocked'),0) FROM project_work
+                WHERE project_id=? AND state IN ('queued','in_progress','blocked')
+            """, (project,)).fetchone()
+            return dict(active=bool(unfinished), unfinished=unfinished, blocked=blocked)
+
+    def active_projects(self):
+        """Metadata selection for an already-authenticated global listing."""
+        result = []
+        for project in self.list():
+            summary = self.activity_summary(project['id'])
+            if summary['active']:
+                result.append(dict(project, activity=summary))
+        return result
+
+    def activity(self, project, coord):
+        """Bind durable work to this registry's project and caller Coordinator.
+
+        Remote adapters must supply the server-selected project and the
+        authenticated host/session Coordinator, never an activity-body actor.
+        """
+        from .project_activity import ProjectActivity
+        return ProjectActivity(self, project, coord)
+
     def create(self, name, workspace=None, instructions=None, *, workspaces=None):
         with self.root_lock:
             return self._create(name, workspace, instructions, workspaces)

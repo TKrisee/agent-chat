@@ -93,6 +93,8 @@ class AttachmentGalleryTests(RemoteWebFixture):
         self.assertEqual(status, 200, raw); self.jq(raw, '.attachments==[]')
         self.assertEqual(self.request('GET', '/api/gallery-attachments/attachment_unlinked')[0], 404)
         self.assertEqual(self.request('GET', '/api/attachments/attachment_unlinked')[1], b'draft')
+        self.assertEqual(self.request('GET', '/api/attachments/attachment_unlinked', auth=None)[0], 401)
+        self.assertEqual(self.request('GET', '/api/attachments/attachment_unlinked?project=' + self.second)[0], 404)
 
     def test_auth_query_validation_and_partial_project_failure(self):
         self.assertEqual(self.request('GET', '/api/attachment-gallery', auth=None)[0], 401)

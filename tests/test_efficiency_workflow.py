@@ -1,5 +1,4 @@
 """Real HTTP/CLI workflows; JSON assertions use jq rather than another parser."""
-import json
 import os
 from pathlib import Path
 import subprocess
@@ -85,17 +84,29 @@ class EfficiencyWorkflowTests(RemoteWebFixture):
         finally:
             coord.close()
         old_message = self.call('send', session='b', to='a', body='Verify readiness')
-        old_calls = [('inbox', {}), ('status', {}),
-                     ('send', {'to': 'b', 'body': 'Ready', 'reply_to': old_message['id']}),
+        old_calls = [('inbox', {}), ('status', {}), ('message', {'id': old_message['id']}),
+                     ('send', {'to': 'b', 'body': 'Ready', 'reply_to': old_message['id'], 'ack_reply': True}),
                      ('acknowledge', {'id': old_message['id']})]
-        old_results = [self.call(op, **params) for op, params in old_calls]
+        old_snapshot = [self.command('--session', 'a', 'inbox'), self.command('--session', 'a', 'status')]
+        self.assertEqual(self.call('message', id=old_message['id'])['message']['body'], 'Verify readiness')
+        old_reply = self.call(old_calls[3][0], **old_calls[3][1])
+        self.assertTrue(old_reply['acknowledged_reply'])
+        self.call(old_calls[4][0], **old_calls[4][1])
         fresh = self.call('send', session='b', to='a', body='Verify readiness again')
         new_calls = [('context', {}), ('send', {'to': 'b', 'body': 'Ready',
                      'reply_to': fresh['id'], 'ack_reply': True})]
-        new_results = [self.call(op, **params) for op, params in new_calls]
+        new_snapshot = self.command('--session', 'a', 'context')
+        self.assert_json(new_snapshot, '.messages | length == 1 and .[0].body == "Verify readiness again" and .[0].body_truncated == false')
+        new_reply = self.call(new_calls[1][0], **new_calls[1][1])
+        self.assertTrue(new_reply['acknowledged_reply'])
+        for source, reply in ((old_message['id'], old_reply['id']), (fresh['id'], new_reply['id'])):
+            lookup = self.command('--session', 'a', 'first-ack-lookup', source, '--expected-recipient', 'b')
+            checked = subprocess.run(['jq', '-e', '--arg', 'reply', reply,
+                '.status == "recorded" and .reply_id == $reply'], input=lookup, text=True, capture_output=True)
+            self.assertEqual(checked.returncode, 0, checked.stderr or checked.stdout)
         self.assertLessEqual(len(new_calls), len(old_calls) / 2)
-        old_bytes = sum(len(json.dumps(r).encode()) for r in old_results[:2])
-        new_bytes = len(json.dumps(new_results[0]).encode())
+        old_bytes = sum(len(raw.encode()) for raw in old_snapshot)
+        new_bytes = len(new_snapshot.encode())
         self.assertLessEqual(new_bytes, old_bytes * .3)
         self.assertEqual(self.call('inbox')['messages'], [])
         print(f'efficiency fixture: coordination steps {len(old_calls)} -> {len(new_calls)}; '

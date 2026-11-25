@@ -58,16 +58,24 @@ class RootOwnerMonitor:
         if process['uid'] != os.getuid() or process['program'] != 'codex':
             return False
         argv = process['argv']
-        # Require one unambiguous explicit resume target, rather than --last,
-        # cwd, a process nickname or a thread UUID embedded in prompt text.
-        resumes = [index for index, word in enumerate(argv[1:], 1) if word == 'resume']
-        if len(resumes) != 1 or resumes[0] + 1 >= len(argv) or argv[resumes[0] + 1] != target['thread_id']:
+        # Accept only exact no-prompt layouts supported by the installed CLI;
+        # do not find a UUID anywhere in otherwise arbitrary argv.
+        if not argv or Path(argv[0]).name != 'codex':
             return False
-        endpoints = []
-        for index, word in enumerate(argv[1:], 1):
-            if word == '--remote' and index + 1 < len(argv): endpoints.append(argv[index + 1])
-            elif word.startswith('--remote='): endpoints.append(word[len('--remote='):])
-        return len(endpoints) == 1 and endpoint_identity(endpoints[0]) == self.endpoint
+        endpoint = thread_id = None
+        if len(argv) == 5 and argv[1] == 'resume' and argv[2] == '--remote':
+            endpoint, thread_id = argv[3], argv[4]
+        elif len(argv) == 5 and argv[1] == '--remote' and argv[3] == 'resume':
+            endpoint, thread_id = argv[2], argv[4]
+        elif len(argv) == 5 and argv[1] == 'resume' and argv[3] == '--remote':
+            thread_id, endpoint = argv[2], argv[4]
+        elif len(argv) == 4 and argv[1] == 'resume' and argv[2].startswith('--remote='):
+            endpoint, thread_id = argv[2][len('--remote='):], argv[3]
+        elif len(argv) == 4 and argv[1].startswith('--remote=') and argv[2] == 'resume':
+            endpoint, thread_id = argv[1][len('--remote='):], argv[3]
+        elif len(argv) == 4 and argv[1] == 'resume' and argv[3].startswith('--remote='):
+            thread_id, endpoint = argv[2], argv[3][len('--remote='):]
+        return thread_id == target['thread_id'] and endpoint_identity(endpoint) == self.endpoint
 
     def proof(self, process, target):
         fields = (str(process['pid']), process['start'], str(process['uid']), self.endpoint,

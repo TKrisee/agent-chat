@@ -212,6 +212,102 @@ class RemoteRunTests(RemoteWebFixture):
                        reservation_id=self.claim['reservation_id'], token=self.claim['token'],
                        server=self.url, project='default'))
 
+    def test_evidence_collision_fails_before_admission_without_child(self):
+        evidence = Path(self.tmp.name) / 'existing-evidence'
+        evidence.write_text('retain original facts')
+        evidence.chmod(0o600)
+        marker = Path(self.tmp.name) / 'must-not-launch'
+        with self.assertRaisesRegex(CoordError, 'exclusive create: destination exists'):
+            self.invoke('run', '--process-evidence-file', str(evidence), 'shared', '--',
+                        sys.executable, '-c', 'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(evidence.read_text(), 'retain original facts')
+
+    def test_finite_child_retains_real_evidence_and_run_closure(self):
+        evidence = Path(self.tmp.name) / 'new-evidence'
+        result, output = self.invoke('run', '--process-evidence-file', str(evidence), 'shared', '--',
+                                     sys.executable, '-c', 'pass')
+        self.assertEqual(result, 0)
+        runs = self.runs()
+        self.assertEqual(len(runs), 1)
+        self.assertIsNotNone(runs[0]['closed_at'])
+        self.assert_group_dead(runs[0]['local_pid'])
+        self.assertEqual(self.lifecycle_query(evidence.read_text(),
+            'any(.[]; .event == "guard_call_succeeded" and .operation == "begin-guard" and .run_id == $run) and '
+            'any(.[]; .event == "guard_call_succeeded" and .operation == "close-guard" and .run_id == $run)',
+            '--arg', 'run', runs[0]['run_id']), 'true')
+        self.assertEqual(self.lifecycle_query(output, '.[0].exit_code == 0 and (.[0].run_id | startswith("remote_run_"))'), 'true')
+
+    def test_max_seconds_is_local_restore_only_rejection(self):
+        evidence = Path(self.tmp.name) / 'must-not-create'
+        marker = Path(self.tmp.name) / 'must-not-launch'
+        calls = []
+        def reject_if_http(client, path, payload, **kwargs):
+            calls.append(payload)
+            raise AssertionError('ordinary max-seconds must fail before HTTP')
+        with mock.patch.object(HttpClient, 'call', reject_if_http), self.assertRaisesRegex(
+                CoordError, '--max-seconds requires --restore'):
+            self.invoke('run', '--max-seconds', '5', '--process-evidence-file', str(evidence),
+                        'shared', '--', sys.executable, '-c',
+                        'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
+        self.assertEqual(calls, [])
+        self.assertFalse(evidence.exists())
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.runs(), [])
+
+    def test_begin_failure_retains_requested_tuple_without_invented_run(self):
+        evidence = Path(self.tmp.name) / 'failed-admission'
+        original = HttpClient.call
+        def fail(client, path, payload, **kwargs):
+            if payload['op'] == 'begin-guard':
+                raise RemoteCoordError('synthetic admission unavailable')
+            return original(client, path, payload, **kwargs)
+        with mock.patch.object(HttpClient, 'call', fail), self.assertRaises(RemoteCoordError):
+            self.invoke('run', '--process-evidence-file', str(evidence), 'shared', '--', sys.executable, '-c', 'pass')
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(self.lifecycle_query(evidence.read_text(),
+            'map(select(.event == "guard_call_failed")) | length == 1 and '
+            '.[0].resource == "shared" and .[0].reservation_id == $rid and .[0].run_id == null',
+            '--arg', 'rid', self.claim['reservation_id']), 'true')
+
+    def test_ambiguous_begin_preserves_accepted_guard_without_launch(self):
+        evidence = Path(self.tmp.name) / 'ambiguous-evidence'
+        original = HttpClient.call
+        def ambiguous(client, path, payload, **kwargs):
+            response = original(client, path, payload, **kwargs)
+            if payload['op'] == 'begin-guard':
+                raise RemoteCoordError('synthetic lost response after acceptance')
+            return response
+        with mock.patch.object(HttpClient, 'call', ambiguous), self.assertRaises(RemoteCoordError):
+            self.invoke('run', '--process-evidence-file', str(evidence), 'shared', '--', sys.executable, '-c', 'pass')
+        runs = self.runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]['local_pid'], 0)
+        self.assertIsNone(runs[0]['closed_at'])
+        self.assertEqual(self.lifecycle_query(evidence.read_text(),
+            'any(.[]; .event == "guard_call_failed" and .run_id == null) and '
+            'all(.[]; .event != "guard_close_succeeded")'), 'true')
+
+    def test_journal_failure_after_begin_preserves_open_guard_without_launch(self):
+        from agent_chat.private_artifacts import ProcessEvidence
+        original = ProcessEvidence.record
+        captured = []
+        def fail(evidence, event, **facts):
+            captured.append(evidence)
+            if event == 'guard_call_succeeded' and facts.get('operation') == 'begin-guard':
+                with mock.patch('agent_chat.private_artifacts.os.write', side_effect=OSError('synthetic storage failure')):
+                    return original(evidence,event,**facts)
+            return original(evidence,event,**facts)
+        with mock.patch.object(ProcessEvidence, 'record', fail), self.assertRaisesRegex(CoordError, 'retention failed'):
+            self.invoke('run', 'shared', '--', sys.executable, '-c', 'pass')
+        runs = self.runs()
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]['local_pid'], 0)
+        self.assertIsNone(runs[0]['closed_at'])
+        self.assertIsNone(captured[0].fd)
+        self.assertTrue(captured[0].failed)
+
     def capability_args(self, args):
         args = list(args)
         head = args[:args.index('--')] if '--' in args else args
@@ -222,15 +318,47 @@ class RemoteRunTests(RemoteWebFixture):
                 args[run_index + 1:run_index + 1] = ['--reservation-id', self.claim['reservation_id']]
         return args
 
-    def batch_manifest(self):
-        other = self.call('request', resource='second', minutes=5)
-        items = [dict(resource=resource, session_id='a', host_id='mac',
-                      reservation_id=claim['reservation_id'], token=claim['token'])
-                 for resource, claim in (('shared', self.claim), ('second', other))]
-        path = Path(self.tmp.name) / 'batch-private.json'
-        path.write_text(json.dumps(items))
-        path.chmod(0o600)
-        return path
+    def batch_manifest(self, count=64):
+        claims = [('shared', self.claim)] + [
+            ('batch-' + str(index), self.call('request', resource='batch-' + str(index), minutes=5))
+            for index in range(1, count)]
+        rows = ''.join('\t'.join((resource, 'a', 'mac', claim['reservation_id'], claim['token'])) + '\n'
+                       for resource, claim in claims)
+        argv = ['/opt/homebrew/Cellar/jq/1.7/bin/jq', '-Rn',
+                '[inputs | split("\\t") | {resource:.[0],session_id:.[1],host_id:.[2],reservation_id:.[3],token:.[4]}]']
+        wall, mono = time.time(), time.monotonic()
+        W = float(os.environ.get('AGENT_CHAT_NEUTRAL_WORK_MS', str((wall+10)*1000)))/1000
+        C = float(os.environ.get('AGENT_CHAT_NEUTRAL_CLEANUP_MS', str((wall+20)*1000)))/1000
+        def remaining(end): return max(0, min(end-time.time(), end-wall-(time.monotonic()-mono)))
+        self.assertGreater(remaining(W), 0, 'manifest work cutoff')
+        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print('MANIFEST_JQ_START pid=' + str(child.pid), flush=True)
+        try:
+            output, errors = child.communicate(rows.encode(), timeout=min(5,remaining(W)))
+            self.assertEqual(child.returncode, 0, 'manifest jq failed')
+            fd = os.open(Path(self.tmp.name) / 'batch-private.json',
+                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(output); stream.flush(); os.fsync(stream.fileno())
+        finally:
+            if child.poll() is None and remaining(C)>0:
+                child.terminate()
+                try: child.wait(timeout=min(1,remaining(C)))
+                except subprocess.TimeoutExpired:
+                    if child.poll() is None and remaining(C)>0: child.kill()
+                    child.wait(timeout=remaining(C))
+            for stream in (child.stdin, child.stdout, child.stderr): stream.close()
+            print('MANIFEST_JQ_WAIT pid=' + str(child.pid) + ' code=' + str(child.returncode) +
+                  ' pipes_closed=' + str(all(stream.closed for stream in (child.stdin,child.stdout,child.stderr))), flush=True)
+        return Path(self.tmp.name) / 'batch-private.json'
+
+    def invoke_batch64(self, *args):
+        try:
+            return self.invoke(*args)
+        except (CoordError, RemoteCoordError) as error:
+            if str(error) in ('invalid batch manifest', 'invalid batch admission'):
+                self.fail('single64 cohort rejected before selected lifecycle: ' + str(error))
+            raise
 
     def test_batch_one_launcher_all_attached_and_closed(self):
         manifest = self.batch_manifest()
@@ -238,17 +366,28 @@ class RemoteRunTests(RemoteWebFixture):
         def capture(client, path, payload):
             calls.append(payload['op'])
             return original(client, path, payload)
-        with mock.patch.object(HttpClient, 'call', capture):
-            result, output = self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--',
-                                         sys.executable, '-c', 'pass')
+        original_write, releases = os.write, []
+        def release_after_all(fd, data):
+            if data == b'G':
+                rows = self.runs()
+                self.assertEqual(calls.count('attach-guard-pid'), 64)
+                self.assertEqual(len(rows), 64)
+                self.assertTrue(all(row['local_pid'] > 0 for row in rows))
+                releases.append(len(rows))
+            return original_write(fd, data)
+        with mock.patch.object(HttpClient, 'call', capture), mock.patch.object(os, 'write', release_after_all):
+            result, output = self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--',
+                                         sys.executable, '-c', 'import time; time.sleep(1.2)')
+        self.assertEqual(releases, [64])
+        self.assertGreaterEqual(calls.count('guard-pulse'), 64)
         self.assertEqual(result, 0)
         runs = self.runs()
-        self.assertEqual(len(runs), 2)
+        self.assertEqual(len(runs), 64)
         self.assertEqual(len({run['local_pid'] for run in runs}), 1)
         self.assertTrue(all(run['closed_at'] is not None for run in runs))
         self.assertEqual(calls.count('begin-guard-batch'), 1)
-        self.assertEqual(calls.count('attach-guard-pid'), 2)
-        self.assertEqual(calls.count('close-guard'), 2)
+        self.assertEqual(calls.count('attach-guard-pid'), 64)
+        self.assertEqual(calls.count('close-guard'), 64)
         self.assertEqual(self.lifecycle_query(output,
             '.[0].restored == false and .[0].released == false and .[0].processes_closed == true'),
             'true')
@@ -262,14 +401,14 @@ class RemoteRunTests(RemoteWebFixture):
             nonlocal count
             if payload['op'] == 'attach-guard-pid':
                 count += 1
-                if count == 2: raise RemoteCoordError('second attach unresolved')
+                if count == 64: raise RemoteCoordError('final attach unresolved')
             return original(client, path, payload)
         with mock.patch.object(HttpClient, 'call', fail_second), self.assertRaises(RemoteCoordError):
-            self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
+            self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
                         'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
         self.assertFalse(marker.exists())
         runs = self.runs()
-        self.assertEqual(sorted(run['local_pid'] == 0 for run in runs), [False, True])
+        self.assertEqual(sorted(run['local_pid'] == 0 for run in runs), [False] * 63 + [True])
         self.assertTrue(all(run['closed_at'] is None for run in runs))
         self.assert_group_dead(next(run['local_pid'] for run in runs if run['local_pid']))
 
@@ -277,6 +416,10 @@ class RemoteRunTests(RemoteWebFixture):
         manifest = self.batch_manifest()
         marker = Path(self.tmp.name) / 'must-not-run'
         original, count, calls = HttpClient.call, 0, []
+        original_write, releases = os.write, []
+        def capture_release(fd, data):
+            if data == b'G': releases.append(data)
+            return original_write(fd, data)
         def invalid_second(client, path, payload):
             nonlocal count
             calls.append(payload['op'])
@@ -285,16 +428,24 @@ class RemoteRunTests(RemoteWebFixture):
                 count += 1
                 if count == 2: result = dict(result, run_id='another-run')
             return result
-        with mock.patch.object(HttpClient, 'call', invalid_second), self.assertRaisesRegex(CoordError, 'attach response unresolved'):
-            self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
+        with mock.patch.object(HttpClient, 'call', invalid_second), mock.patch.object(os, 'write', capture_release), self.assertRaisesRegex(CoordError, 'attach response unresolved'):
+            self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
                         'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
         self.assertFalse(marker.exists())
         runs = self.runs()
-        self.assertEqual(len(runs), 2)
-        self.assertEqual(len({run['local_pid'] for run in runs}), 1)
-        self.assertTrue(all(run['local_pid'] > 0 and run['closed_at'] is None for run in runs))
-        self.assertNotIn('close-guard', calls)
-        self.assert_group_dead(runs[0]['local_pid'])
+        self.assertEqual(len(runs), 64)
+        rows = {row['resource']: row for row in runs}
+        self.assertEqual(set(rows), {'shared'} | {'batch-' + str(index) for index in range(1, 64)})
+        attached = {resource: row for resource, row in rows.items() if row['local_pid'] > 0}
+        self.assertEqual(set(attached), {'shared', 'batch-1'})
+        self.assertEqual(len({row['local_pid'] for row in attached.values()}), 1)
+        self.assertTrue(all(rows[resource]['local_pid'] == 0 for resource in set(rows) - set(attached)))
+        self.assertTrue(all(row['closed_at'] is None for row in runs))
+        self.assertEqual(calls.count('begin-guard-batch'), 1)
+        self.assertEqual(calls.count('attach-guard-pid'), 2)
+        self.assertEqual(calls.count('close-guard'), 0)
+        self.assertEqual(releases, [])
+        self.assert_group_dead(rows['shared']['local_pid'])
 
     def test_batch_launcher_failure_retains_pid_zero_admissions(self):
         manifest = self.batch_manifest()
@@ -304,8 +455,8 @@ class RemoteRunTests(RemoteWebFixture):
             raise OSError('launcher failed')
         with mock.patch('agent_chat.cli.subprocess.Popen', side_effect=fail_launcher):
             with self.assertRaises(OSError):
-                self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c', 'pass')
-        self.assertEqual(len(self.runs()), 2)
+                self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c', 'pass')
+        self.assertEqual(len(self.runs()), 64)
         self.assertTrue(all(run['local_pid'] == 0 and run['closed_at'] is None for run in self.runs()))
 
     def test_batch_partial_close_does_not_claim_all_closed(self):
@@ -315,13 +466,35 @@ class RemoteRunTests(RemoteWebFixture):
             nonlocal count
             if payload['op'] == 'close-guard':
                 count += 1
-                if count == 2: raise RemoteCoordError('second close unresolved')
+                if count == 64: raise RemoteCoordError('final close unresolved')
             return original(client, path, payload)
         with mock.patch.object(HttpClient, 'call', fail_second_close), self.assertRaises(RemoteCoordError):
-            self.invoke('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c', 'pass')
+            self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c', 'pass')
         runs = self.runs()
         self.assertEqual(sum(run['closed_at'] is None for run in runs), 1)
         self.assert_group_dead(runs[0]['local_pid'])
+
+    def test_batch_lost_final_attach_response_keeps_gate_closed(self):
+        manifest = self.batch_manifest()
+        marker = Path(self.tmp.name) / 'must-not-run'
+        original, count, calls = HttpClient.call, 0, []
+        def lost_response(client, path, payload):
+            nonlocal count
+            calls.append(payload['op'])
+            result = original(client, path, payload)
+            if payload['op'] == 'attach-guard-pid':
+                count += 1
+                if count == 64: raise RemoteCoordError('final attach response lost after commit')
+            return result
+        with mock.patch.object(HttpClient, 'call', lost_response), self.assertRaises(RemoteCoordError):
+            self.invoke_batch64('run', '--batch-manifest', str(manifest), 'batch', '--', sys.executable, '-c',
+                               'from pathlib import Path; Path(' + repr(str(marker)) + ').touch()')
+        self.assertFalse(marker.exists())
+        rows = self.runs()
+        self.assertEqual(len(rows), 64)
+        self.assertTrue(all(row['local_pid'] > 0 and row['closed_at'] is None for row in rows))
+        self.assertNotIn('close-guard', calls)
+        self.assert_group_dead(rows[0]['local_pid'])
 
     def invoke(self, *args):
         output = io.StringIO()
@@ -424,7 +597,7 @@ class RemoteRunTests(RemoteWebFixture):
         output = self.guard_status()
         self.query_guard_status(output,
             '.resource == "shared" and .reservation_id == $reservation and (.runs | length) == 3'
-            ' and (.runs | map(keys) | all(. == ["closed_at", "local_pid", "run_id", "started_at"]))'
+            ' and (.runs | map(keys) | all(. == ["close_evidence_sha256", "closed_at", "local_pid", "run_id", "started_at"]))'
             ' and (.runs | any(.closed_at != null))'
             ' and (.runs | any(.run_id == $unattached and .local_pid == 0 and .closed_at == null))',
             '--arg', 'reservation', self.claim['reservation_id'], '--arg', 'unattached', unattached['run_id'])
@@ -1072,3 +1245,158 @@ class RemoteRunTests(RemoteWebFixture):
             with self.assertRaisesRegex(CoordError,'remote'):
                 c.recover('shared',self.receipt([]))
         finally: c.close()
+
+class ExistingGuardFinalizerTests(RemoteWebFixture):
+    """Real CLI/server/store, real ended cohort journal; no production cleanup."""
+    def setUp(self):
+        super().setUp()
+        self.call('register',agent='finalizer-fixture')
+        self.private=Path(self.tmp.name)/'private-finalizer';self.private.mkdir(mode=0o700)
+        self.env={k:v for k,v in os.environ.items() if not k.startswith('AGENT_CHAT_')}
+        self.env.update(AGENT_CHAT_SERVER=self.url,AGENT_CHAT_API_TOKEN=TOKEN,AGENT_CHAT_SESSION='a',AGENT_CHAT_HOST_ID='mac',AGENT_CHAT_STATE_DIR=str(self.private))
+        self.manifest=self.private/'manifest.json';self.journal=self.private/'original.jsonl'
+        self.original_call=HttpClient.call
+
+    def invoke(self,*args):
+        with mock.patch.dict(os.environ,self.env,clear=True),contextlib.redirect_stdout(io.StringIO()):
+            return cli.main(list(args))
+
+    def jqfile(self,path,expression,*,source=None):
+        data=source.read_bytes() if source else b''
+        result=subprocess.run(['jq', '-c' if source else '-Rn', expression],input=data,capture_output=True,check=True)
+        path.write_bytes(result.stdout);path.chmod(0o600)
+
+    def cohort(self,count=3):
+        self.claims=[self.call('request',resource='file:synthetic-finalizer/'+str(i),minutes=5) for i in range(count)]
+        raw=''.join('\t'.join((c['resource'],'a','mac',c['reservation_id'],c['token']))+'\n' for c in self.claims).encode()
+        result=subprocess.run(['jq','-Rn','[inputs|split("\t")|{resource:.[0],session_id:.[1],host_id:.[2],reservation_id:.[3],token:.[4]}]'],input=raw,capture_output=True,check=True)
+        self.manifest.write_bytes(result.stdout);self.manifest.chmod(0o600)
+        def interrupted(client,path,payload,**kwargs):
+            if payload.get('op')=='close-guard':raise RemoteCoordError('synthetic interruption before original close')
+            return self.original_call(client,path,payload,**kwargs)
+        with mock.patch.object(HttpClient,'call',interrupted),self.assertRaises(RemoteCoordError):
+            self.invoke('run','--batch-manifest',str(self.manifest),'--process-evidence-file',str(self.journal),'batch','--',sys.executable,'-c','pass')
+        self.assertEqual(len(self.open_runs()),count)
+
+    def open_runs(self):
+        rows=[]
+        for claim in self.claims:
+            context=self.call('guard-context',resource=claim['resource'])
+            rows.extend(row for row in context['runs'] if row['closed_at'] is None)
+        return rows
+
+    def finalize(self,name='result',manifest=None,journal=None):
+        return self.invoke('guard-finalize','--batch-manifest',str(manifest or self.manifest),
+                           '--process-evidence-file',str(journal or self.journal),'--result-file',str(self.private/(name+'.jsonl')))
+
+    def test_exact60_real_ended_cohort_and_no_blind_repeat(self):
+        self.cohort(60)
+        calls=[]
+        def observed(client,path,payload,**kwargs):
+            if payload.get('op')=='close-guard':calls.append(payload['params']['run_id'])
+            return self.original_call(client,path,payload,**kwargs)
+        with mock.patch.object(HttpClient,'call',observed):
+            self.assertEqual(self.finalize(),0);self.assertEqual(self.open_runs(),[])
+            self.assertEqual(self.finalize('reconciled'),0)
+        self.assertEqual(len(calls),60)
+        self.assertEqual(len(set(calls)),60)
+
+    def test_wrong_owner_host_resource_rid_and_token_preflight_has_no_effect(self):
+        self.cohort()
+        for i,expression in enumerate(('.[0].session_id="foreign"','.[0].host_id="elsewhere"','.[0].resource="file:elsewhere"','.[0].reservation_id="different"','.[2].token="wrong-secret"')):
+            wrong=self.private/('wrong'+str(i)+'.json');self.jqfile(wrong,expression,source=self.manifest)
+            with self.assertRaises(CoordError):self.finalize('bad'+str(i),manifest=wrong)
+            self.assertEqual(len(self.open_runs()),3)
+
+    def test_missing_or_mismatched_journal_and_live_pid_refuse(self):
+        self.cohort()
+        for i,expression in enumerate(('select(.event!="group_absent")','.host_id="wrong"','if .event=="admitted" then .observed_at=1 else . end','if .event=="admitted" then .reservations[0].run_id="wrong-run" else . end','if .event=="launcher_created" then .child_pid=1 else . end','if .sequence==0 then .observed_at=now else . end')):
+            wrong=self.private/('journal'+str(i)+'.jsonl');self.jqfile(wrong,expression,source=self.journal)
+            with self.assertRaises(CoordError):self.finalize('badjournal'+str(i),journal=wrong)
+            self.assertEqual(len(self.open_runs()),3)
+        with mock.patch('agent_chat.cli.receipt_pid_alive',return_value=True),self.assertRaisesRegex(CoordError,'live|ambiguous'):
+            self.finalize('live-pid')
+        with mock.patch.object(Coordinator,'_alive',return_value=True),self.assertRaisesRegex(CoordError,'live|ambiguous'):
+            self.finalize('live-group')
+        with self.assertRaises(OSError):self.finalize('missing',journal=self.private/'absent')
+        self.assertEqual(len(self.open_runs()),3)
+
+    def test_lost_after_commit_reconciles_exact_hash_without_resend(self):
+        self.cohort();calls=[]
+        def lost(client,path,payload,**kwargs):
+            result=self.original_call(client,path,payload,**kwargs)
+            if payload.get('op')=='close-guard':
+                calls.append(payload['params']['run_id']);raise RemoteCoordError('synthetic lost response after commit')
+            return result
+        with mock.patch.object(HttpClient,'call',lost):self.assertEqual(self.finalize(),0)
+        self.assertEqual(len(calls),3);self.assertEqual(self.open_runs(),[])
+
+    def test_partial_unknown_stops_and_later_exact_resume_skips_success(self):
+        self.cohort();calls=[]
+        def partial(client,path,payload,**kwargs):
+            if payload.get('op')=='close-guard':
+                calls.append(payload['params']['run_id'])
+                if len(calls)==2:raise RemoteCoordError('synthetic missing effect/response')
+            return self.original_call(client,path,payload,**kwargs)
+        with mock.patch.object(HttpClient,'call',partial),self.assertRaisesRegex(CoordError,'UNKNOWN'):
+            self.finalize()
+        self.assertEqual(len(calls),2);self.assertEqual(len(self.open_runs()),2)
+        self.assertTrue((self.private/'result.jsonl').exists())
+        self.assertEqual(self.finalize('resume'),0);self.assertEqual(self.open_runs(),[])
+
+    def test_different_hash_refuses_and_server_preserves_first_closure(self):
+        self.cohort();self.finalize()
+        altered=self.private/'altered.jsonl';self.jqfile(altered,'.+{fixture_note:"different bytes"}',source=self.journal)
+        with self.assertRaisesRegex(CoordError,'evidence differs'):self.finalize('different',journal=altered)
+        row=self.call('guard-context',resource=self.claims[0]['resource'])['runs'][0]
+        with self.assertRaises(RemoteCoordError):
+            self.call('close-guard',run_id=row['run_id'],token=self.claims[0]['token'],evidence_sha256='a'*64)
+        self.assertEqual(self.call('guard-context',resource=self.claims[0]['resource'])['runs'][0]['close_evidence_sha256'],row['close_evidence_sha256'])
+        self.assertTrue(self.call('close-guard',run_id=row['run_id'],token=self.claims[0]['token'],evidence_sha256=row['close_evidence_sha256'])['closed'])
+
+    def test_live_cleanup_is_not_stale_restore_and_does_not_close_old_runs(self):
+        self.cohort()
+        with self.assertRaisesRegex(CoordError,'stale'):
+            self.invoke('run','--restore','--max-seconds','5','--batch-manifest',str(self.manifest),'batch','--',sys.executable,'-c','pass')
+        cleanup=self.private/'cleanup.jsonl'
+        self.assertEqual(self.invoke('run','--batch-manifest',str(self.manifest),'--process-evidence-file',str(cleanup),'batch','--',sys.executable,'-c','pass'),0)
+        self.assertEqual(len(self.open_runs()),3)
+        self.assertEqual(self.finalize(),0)
+
+    def test_stale_finalization_then_stale_cleanup(self):
+        self.cohort();future=time.time()+400
+        with mock.patch('agent_chat.core._now',return_value=future):
+            with self.assertRaises(CoordError):
+                self.invoke('run','--batch-manifest',str(self.manifest),'batch','--',sys.executable,'-c','pass')
+            with self.assertRaisesRegex(CoordError,'existing guarded runs'):
+                self.invoke('run','--restore','--max-seconds','5','--batch-manifest',str(self.manifest),'batch','--',sys.executable,'-c','pass')
+            self.assertEqual(self.finalize(),0)
+            self.assertEqual(self.invoke('run','--restore','--max-seconds','5','--batch-manifest',str(self.manifest),'--process-evidence-file',str(self.private/'stale-cleanup.jsonl'),'batch','--',sys.executable,'-c','pass'),0)
+
+    def test_reused_pid_and_missing_hash_projection_refuse_before_closure(self):
+        self.cohort()
+        with mock.patch('agent_chat.cli.receipt_pid_alive',return_value=False),mock.patch.object(Coordinator,'_alive',side_effect=lambda pid,group=False:not group),self.assertRaisesRegex(CoordError,'live|ambiguous'):
+            self.finalize('reused')
+        def old_projection(client,path,payload,**kwargs):
+            result=self.original_call(client,path,payload,**kwargs)
+            if payload.get('op')=='guard-context':
+                for row in result['runs']:row.pop('close_evidence_sha256',None)
+            return result
+        with mock.patch.object(HttpClient,'call',old_projection),self.assertRaisesRegex(CoordError,'projection unavailable'):
+            self.finalize('old-server')
+        self.assertEqual(len(self.open_runs()),3)
+
+    def test_server_atomic_old_rid_rejects_new_own_capability(self):
+        self.cohort(1);self.finalize()
+        old=self.call('guard-context',resource=self.claims[0]['resource'])['runs'][0]
+        fields=subprocess.run(['jq','-rs','[(map(select(.event=="launcher_created"))[0].child_pid),(map(select(.event=="group_absent"))[-1].observed_at)]|@tsv',str(self.journal)],capture_output=True,text=True,check=True).stdout.strip().split('\t')
+        import hashlib
+        digest=hashlib.sha256(self.journal.read_bytes()).hexdigest();receipt=self.private/'return.json'
+        args=['jq','-n','--arg','resource',self.claims[0]['resource'],'--arg','rid',self.claims[0]['reservation_id'],'--arg','evidence',str(self.journal),'--arg','sha',digest,'--argjson','pid',fields[0],'--argjson','group_at',fields[1],'--argjson','at',str(time.time()),'{version:2,resource:$resource,reservation_id:$rid,restored:true,processes_closed:true,closed_at:$at,evidence:$evidence,pids:[$pid],process_closures:[{pid:$pid,closed_at:$group_at,evidence:$evidence,evidence_sha256:$sha}]}']
+        receipt.write_bytes(subprocess.run(args,capture_output=True,check=True).stdout);receipt.chmod(0o600)
+        self.assertEqual(self.invoke('release',self.claims[0]['resource'],'--token',self.claims[0]['token'],'--receipt',str(receipt)),0)
+        current=self.call('request',resource=self.claims[0]['resource'],minutes=5)
+        self.assertNotEqual(current['reservation_id'],self.claims[0]['reservation_id'])
+        with self.assertRaisesRegex(RemoteCoordError,'reservation has changed'):
+            self.call('close-guard',run_id=old['run_id'],token=current['token'],evidence_sha256=old['close_evidence_sha256'])
+        self.assertEqual(self.call('guard-context',resource=current['resource'])['reservation_id'],current['reservation_id'])

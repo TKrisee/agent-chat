@@ -1,6 +1,6 @@
 """Service-free policy maintenance latency/proof regressions; no real waits."""
 import copy
-import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,18 +9,26 @@ from unittest import mock
 from agent_chat import communication
 from agent_chat.bridge import Bridge
 from agent_chat.policy_store import PolicyStore
+from agent_chat.core import CoordError
 from agent_chat.rpc import RpcError
 from agent_chat.root_restart import RootRestartWorker
 
 
+def full_policy_payload():
+    metadata=subprocess.run(['jq','-nc','--arg','version',communication.policy_version(),
+                             '{policy_version:$version}'],text=True,capture_output=True,check=True).stdout.strip()
+    return communication.STANDING_POLICY+' '+communication.BOOT_AUTHORIZATION+'\n'+metadata
+
+
 class PolicyState:
-    def __init__(self,path):
+    def __init__(self,path,project='project'):
+        self.project=project
         self.store=PolicyStore(path);self.messages=[];self.delivered=set();self.work={};self.observations=[]
 
-    def policy_pending(self): return self.store.pending('host')
-    def policy_receipt(self,offer,turn): return self.store.receipt('host',offer['thread'],offer['client_id'],offer['version'],turn)
-    def policy_consumed(self,thread): return self.store.consumed('host',thread)
-    def policy_offer(self,kind,client,thread,payload): return self.store.offer('host','project',kind,client,thread,payload)
+    def policy_pending(self): return self.store.pending('host',project=self.project)
+    def policy_receipt(self,offer,turn): return self.store.receipt('host',offer['thread'],offer['client_id'],offer['version'],turn,project=self.project)
+    def policy_consumed(self,thread): return self.store.consumed('host',thread,project=self.project)
+    def policy_offer(self,kind,client,thread,payload): return self.store.offer('host',self.project,kind,client,thread,payload)
     def jobs(self): return [dict(job) for job in self.work.values() if job['status'] not in ('dispatched','cancelled')]
     def pending(self): return [m for m in self.messages if m['id'] not in self.delivered]
     def resolve(self,session): return dict(thread_id=session,route=[dict(session_id=session,agent_path=None)])
@@ -74,12 +82,38 @@ class PolicyRpc:
 class PolicyObservationTests(unittest.TestCase):
     def setUp(self):
         temporary=tempfile.TemporaryDirectory(prefix='policy-observation-');self.addCleanup(temporary.cleanup)
-        self.state=PolicyState(Path(temporary.name)/'policy.sqlite3');self.rpc=PolicyRpc();self.bridge=Bridge(self.state,self.rpc)
+        from agent_chat.core import Coordinator
+        self.state=PolicyState(Path(temporary.name)/'policy.sqlite3')
+        self.state.coord=Coordinator(Path(temporary.name)/'coordinator.sqlite3');self.addCleanup(self.state.coord.close)
+        self.rpc=PolicyRpc();self.bridge=Bridge(self.state,self.rpc)
         self.bridge._policy_clock=lambda:self.rpc.now
 
     def offer(self,thread,client='offered'):
-        payload=communication.STANDING_POLICY+'\n'+json.dumps(dict(policy_version=communication.policy_version()))
-        self.state.policy_offer('wake',client,thread,payload)
+        return self.state.policy_offer('wake',client,thread,full_policy_payload())
+
+    def test_incomplete_authorization_and_foreign_project_remain_cold(self):
+        full=full_policy_payload();version=communication.policy_version()
+        auth=communication.BOOT_AUTHORIZATION
+        self.assertIn('An assigned goal',auth)
+        for client,payload in (
+                ('missing',full.replace(auth,'')),
+                ('altered',full.replace(auth,auth.replace('An assigned goal','An altered goal',1))),
+                ('truncated',full.replace(auth,auth[:-1]))):
+            with self.subTest(client=client):
+                self.assertFalse(self.state.policy_offer('wake',client,'negative',payload)['offered'])
+                with self.assertRaises(CoordError):
+                    self.state.store.receipt('host','negative',client,version,'synthetic-turn',project=self.state.project)
+        self.assertEqual(self.state.policy_pending(),[])
+        self.assertFalse(self.state.policy_consumed('negative'))
+        self.assertTrue(self.offer('own','own-client')['offered'])
+        with self.assertRaises(CoordError):
+            self.state.store.receipt('host','own','own-client',version,'synthetic-turn',project='foreign-project')
+        with self.assertRaises(CoordError):
+            self.state.store.receipt('host','own','own-client',version,'synthetic-turn')
+        self.assertFalse(self.state.policy_consumed('own'))
+        self.assertEqual(self.state.store.pending('host',project='foreign-project'),[])
+        with self.state.store.connection() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM native_policy_verified_receipts').fetchone()[0],0)
 
     def turns(self,count):
         return [dict(id='turn-'+str(i),status='completed',items=[]) for i in range(count)]

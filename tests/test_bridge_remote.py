@@ -1,3 +1,4 @@
+import contextlib
 import json
 import hashlib
 from pathlib import Path
@@ -52,7 +53,9 @@ class RemoteBridgeTests(RemoteWebFixture):
         self.assertIn('owner/request IDs, relationships, acceptance versus completion/consumption', instructions)
         self.assertIn('evidence, failures, blockers, dependencies and next actions', instructions)
         self.assertNotIn('child', instructions)
-        self.assertLessEqual(len(instructions.split()),90)
+        from agent_chat.communication import BOOT_AUTHORIZATION
+        self.assertIn(BOOT_AUTHORIZATION, instructions)
+        self.assertLessEqual(len(payload.encode('utf-8')), 12288)
         record=next(item for item in json.loads(metadata)['messages'] if item['id']==message)
         self.assertEqual(record['sender_role'],'human_operator')
         self.assertEqual(record['recipient_role'],'agent')
@@ -92,12 +95,15 @@ class RemoteBridgeTests(RemoteWebFixture):
         self.bridge.tick()
         self.assertEqual([m for m, _ in self.rpc.calls].count('thread/queue/start'), 1)
 
-    def test_unread_peer_reply_wakes_but_acknowledged_and_self_messages_do_not(self):
+    def test_unread_peer_reply_wakes_but_consumed_and_self_messages_do_not(self):
         self.call('register', session='b', agent='beta')
         question = self.call('send', to='b', body='Can you check this?')['id']
-        reply = self.call('send', session='b', to='a', body='Done.', reply_to=question)['id']
+        self.call('message', session='b', id=question)
+        reply = self.call('send', session='b', to='a', body='Done.', reply_to=question, ack_reply=True)['id']
         acknowledged = self.call('send', session='b', to='a', body='Already handled.')['id']
         self.call('acknowledge', id=acknowledged)
+        self.assertIn(acknowledged, [m['id'] for m in self.state.pending()])
+        self.assertIsNotNone(self.call('message', id=acknowledged)['message']['acked_at'])
         self.call('deregister', session='b')
         own_message = self.call('send', to='a', body='Do not wake myself.')['id']
 
@@ -252,6 +258,33 @@ class RemoteBridgeTests(RemoteWebFixture):
         recovered = self.call('bridge-retry', job_id=job['id'], confirm_not_started=True)
         self.assertEqual(recovered['status'], 'prepared')
         self.assertEqual(other.pending(), [])
+
+
+
+    def test_epoch_rpc_uses_existing_host_auth_and_keeps_lost_response_uncertain(self):
+        params={'threadId':self.tid,'clientUserMessageId':'epoch-fixture','input':[]}
+        self.bridge.rpc.request('thread/queue/add',params)
+        with contextlib.closing(Coordinator(self.db)) as c:
+            rows=c.db.execute('SELECT settled_at,outcome FROM execution_epoch_handoffs').fetchall()
+            self.assertEqual(len(rows),1);self.assertIsNotNone(rows[0]['settled_at'])
+            self.assertEqual(rows[0]['outcome'],'submitted')
+        self.rpc.drop_add=True
+        with self.assertRaises(TransportError): self.bridge.rpc.request('thread/queue/add',params)
+        with contextlib.closing(Coordinator(self.db)) as c:
+            self.assertEqual(c.db.execute('SELECT count(*) FROM execution_epoch_handoffs WHERE settled_at IS NULL').fetchone()[0],1)
+        other,foreign=self.second_host()
+        before=len(self.rpc.calls)
+        with self.assertRaises(RemoteCoordError): self.bridge.rpc.request('thread/queue/add',dict(params,threadId=foreign))
+        self.assertEqual(len(self.rpc.calls),before)
+        with contextlib.closing(Coordinator(self.db)) as c:
+            unresolved=c.db.execute('SELECT id FROM execution_epoch_handoffs WHERE settled_at IS NULL').fetchone()['id']
+        self.state.call('release')
+        replacement=RemoteBridgeState(self.client,self.url,{'owner':'new-fixture-dispatcher','secret':'n'*40,'host_id':'mac'})
+        replacement.call('acquire')
+        try:
+            with self.assertRaisesRegex(RemoteCoordError,'dispatcher owner'):
+                replacement.call('execution-epoch-settle',id=unresolved,outcome='submitted')
+        finally: replacement.call('release')
 
 
 class DispatcherMigrationTests(unittest.TestCase):

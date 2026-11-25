@@ -39,6 +39,9 @@ class OwnershipDispositionTests(unittest.TestCase):
                                             root, os.getuid(), '127.0.0.1', 8765)
         self.patch = patch('agent_chat.service._installed_server_config', return_value=self.config)
         self.patch.start(); self._write_config()
+        alias_patch = patch('agent_chat.ownership_disposition._installed_server_config', return_value=self.config)
+        alias_patch.start()
+        self.addCleanup(alias_patch.stop)
         self.coord = Coordinator(self.master)
         # Keep the fixture compatible with producers that already create the
         # provenance column, without promoting existing legacy reads to proof.
@@ -1084,6 +1087,15 @@ class LegacyGuardDispositionTests(unittest.TestCase):
             ('session_resets', 'target_session TEXT,status TEXT', ('old', 'uncertain')),
             ('root_team_reset_targets', 'session_id TEXT,thread_id TEXT', ('old', 'thread-old')),
             ('root_team_stops', 'active INTEGER', (1,))):
+            if table == 'root_team_stops' and self.coord.db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                self.coord.db.execute('INSERT INTO root_team_stops(id,root_session,active,created_at,resumed_at) VALUES(?,?,?,?,?)',
+                    ('private-test-stop','root',1,time.time(),None))
+                try:
+                    self._refuses_unchanged()
+                finally:
+                    self.coord.db.execute("DELETE FROM root_team_stops WHERE id='private-test-stop'")
+                continue
             self.coord.db.execute(f'CREATE TABLE {table} ({columns})')
             self.coord.db.execute(f'INSERT INTO {table} VALUES({",".join("?" for _ in values)})', values)
             self._refuses_unchanged()

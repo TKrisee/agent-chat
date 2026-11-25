@@ -4,6 +4,8 @@ import copy
 import io
 import json
 import os
+import plistlib
+import shlex
 import subprocess
 import time
 import uuid
@@ -11,7 +13,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from agent_chat import cli
+from agent_chat import cli, root_local, service
 from agent_chat.bridge import Bridge
 from agent_chat.bridge_state import BridgeState
 from agent_chat.bridge_client import RemoteBridgeState
@@ -855,10 +857,30 @@ class OrdinaryTurnRpc(ModelRpc):
         self.inputs = []
         self.failure = None
         self.race = False
+        self.provider_turn = None
+        self.provider_direct = True
+        self.provider_history_reads = 0
+        self.provider_after_history = None
+        self.provider_changed_turn = False
         self.settings.update(runtimeWorkspaceRoots=['/neutral/a', '/neutral/b', '/neutral/c'],
                              opaque={'ordered': [3, None, {'future': True}]}, summary=None, personality='neutral')
 
     def request(self, method, params):
+        if method == 'thread/read' and self.provider_turn is not None:
+            result = super().request(method, params)
+            result['thread']['id'] = self.old
+            result['thread']['canAcceptDirectInput'] = self.provider_direct
+            if self.provider_history_reads and self.provider_after_history:
+                result['thread']['status']['type'] = self.provider_after_history
+            return result
+        if method == 'thread/turns/list' and self.provider_turn is not None:
+            self.calls.append((method, copy.deepcopy(params)))
+            self.provider_history_reads += 1
+            turn = copy.deepcopy(self.provider_turn)
+            if self.provider_changed_turn and self.provider_history_reads > 1:
+                turn['id'] = 'newer-provider-turn'
+            turn['items'] = copy.deepcopy(self.history[self.old])
+            return {'data': [turn], 'nextCursor': None}
         if method == 'thread/turns/list':
             self.calls.append((method, copy.deepcopy(params)))
             return {'data': [{'id': 'neutral-history', 'status': 'completed',
@@ -905,6 +927,128 @@ class OrdinaryModelInputTests(RemoteWebFixture):
 
     status = AgentModelTests.status
     advance = AgentModelTests.advance
+
+    def provider_failure(self):
+        self.rpc.status[self.target_thread]='systemError'
+        self.rpc.provider_turn=dict(id='exact-failed-provider-turn',status='failed',
+            error=dict(codexErrorInfo='serverOverloaded',message='Selected model is at capacity. Please try a different model.'))
+
+    def test_explicit_ordinary_selection_admits_existing_inputs_after_terminal_provider_failure(self):
+        self.provider_failure()
+        request=self.change(model='gpt-6-sol')
+        original=copy.deepcopy(self.rpc.settings)
+        first=self.call('send',session='b',to='worker',body='first real queued instruction')['id']
+        second=self.call('send',session='b',to='worker',body='second real queued instruction')['id']
+        self.bridge.tick(observe_policies=False)
+        self.assertEqual(len(self.rpc.inputs),1)
+        params=self.rpc.inputs[0]
+        self.assertEqual(set(params),{'threadId','clientUserMessageId','input','model','effort'})
+        self.assertEqual((params['threadId'],params['model'],params['effort']),(self.target_thread,'gpt-6-sol','high'))
+        self.assertLess(params['input'][0]['text'].index(first),params['input'][0]['text'].index(second))
+        status=self.status()['requests'][0]
+        self.assertEqual(status['id'],request['id']);self.assertEqual(status['native_input_job_id'],params['clientUserMessageId'])
+        self.assertEqual(status['native_input_state'],'accepted');self.assertFalse(status['observed_defaults_verified'])
+        for key,value in original.items():
+            if key not in ('model','reasoningEffort'):self.assertEqual(self.rpc.settings[key],value,key)
+        self.assertFalse(any(method in ('thread/resume','thread/unsubscribe','thread/settings/update','thread/start') for method,_ in self.rpc.calls))
+        self.bridge.tick(observe_policies=False);self.assertEqual(len(self.rpc.inputs),1)
+
+    def test_provider_failure_without_explicit_selection_remains_inbox_only(self):
+        self.provider_failure();self.call('send',session='b',to='worker',body='no implicit model or capacity retry')
+        self.bridge.tick(observe_policies=False)
+        self.assertEqual(self.rpc.inputs,[]);self.assertEqual(self.state.jobs(),[])
+        self.assertFalse(any(method=='turn/start' for method,_ in self.rpc.calls))
+
+    def test_provider_failure_gate_refuses_busy_queue_noninput_unloaded_and_inconsistent_samples(self):
+        self.provider_failure();self.change();self.call('send',session='b',to='worker',body='retain original input')
+        for scenario in ('active','unloaded','queue','noninput','latestactive','changedstate','changedturn'):
+            with self.subTest(scenario=scenario):
+                self.provider_failure();self.rpc.provider_direct=True;self.rpc.provider_history_reads=0
+                self.rpc.provider_after_history=None;self.rpc.provider_changed_turn=False;self.rpc.queues[self.target_thread]=[]
+                if scenario=='active':self.rpc.status[self.target_thread]='active'
+                if scenario=='unloaded':self.rpc.status[self.target_thread]='notLoaded'
+                if scenario=='queue':self.rpc.queues[self.target_thread]=[dict(id='external-queue',clientUserMessageId='foreign')]
+                if scenario=='noninput':self.rpc.provider_direct=False
+                if scenario=='latestactive':self.rpc.provider_turn['status']='inProgress'
+                if scenario=='changedstate':self.rpc.provider_after_history='active'
+                if scenario=='changedturn':self.rpc.provider_changed_turn=True
+                self.bridge.tick(observe_policies=False)
+                self.assertEqual(self.rpc.inputs,[])
+                self.assertIsNone(self.status()['requests'][0]['native_input_job_id'])
+
+    def test_terminal_provider_gate_excludes_arbitrary_auth_rate_billing_safety_and_malformed_errors(self):
+        self.provider_failure();self.change();self.call('send',session='b',to='worker',body='no unsafe error fallback')
+        errors=[dict(codexErrorInfo='other',message='arbitrary failure'),
+                dict(codexErrorInfo='unauthorized',message='bad authentication'),
+                dict(codexErrorInfo='rateLimitExceeded',message='rate limit'),
+                dict(codexErrorInfo='serverOverloaded',message='billing account unavailable'),
+                dict(codexErrorInfo='serverOverloaded',message='approval or safety required'),
+                dict(codexErrorInfo={'unknownFuture':{}},message='Selected model is at capacity. Please try a different model.'),
+                dict(codexErrorInfo='serverOverloaded',message=None),None]
+        for error in errors:
+            with self.subTest(error=error):
+                self.provider_failure();self.rpc.provider_turn['error']=error
+                self.bridge.tick(observe_policies=False);self.assertEqual(self.rpc.inputs,[])
+                self.assertIsNone(self.status()['requests'][0]['native_input_job_id'])
+
+    def test_terminal_provider_open_guard_refuses_without_closure_or_model_effect(self):
+        self.provider_failure();self.change()
+        hold=self.call('request',resource='terminal-guard',minutes=5)
+        guard=self.call('begin-guard',resource=hold['resource'],token=hold['token'],pid=0)
+        self.call('send',session='b',to='worker',body='preserve guarded work')
+        with self.assertRaises(CoordError):self.bridge.tick(observe_policies=False)
+        self.assertEqual(self.rpc.inputs,[])
+        self.assertEqual(self.status()['ownership']['open_guards'][0]['run_id'],guard['run_id'])
+        self.assertFalse(self.status()['requests'][0]['observed_defaults_verified'])
+
+    def test_terminal_provider_lost_response_remains_original_uncertain_without_replay(self):
+        self.provider_failure();request=self.change();self.call('send',session='b',to='worker',body='original unknown outcome')
+        self.rpc.failure='before'
+        with self.assertRaises(TransportError):self.bridge.tick(observe_policies=False)
+        prior=self.status()['requests'][0]
+        self.assertEqual(prior['status'],'uncertain');self.assertEqual(prior['id'],request['id'])
+        self.rpc.failure=None;self.bridge.tick(observe_policies=False)
+        current=self.status()['requests'][0]
+        self.assertEqual((current['id'],current['native_input_job_id'],current['status']),
+                         (prior['id'],prior['native_input_job_id'],'uncertain'))
+        self.assertEqual(sum(method=='turn/start' for method,_ in self.rpc.calls),1)
+        self.assertFalse(current['observed_defaults_verified'])
+
+    def test_neutral_store_without_optional_role_registry_has_no_task_admission(self):
+        from agent_chat.root_lifecycle import task_admission
+        message=self.call('send',session='b',to='worker',body='neutral no role bypass')['id']
+        with contextlib.closing(Coordinator(self.db,'a')) as coord:
+            self.assertIsNone(coord.db.execute("SELECT 1 FROM sqlite_master WHERE name='project_orchestrators'").fetchone())
+            self.assertIsNotNone(coord.db.execute("SELECT 1 FROM sqlite_master WHERE name='root_team_stop_task_admissions'").fetchone())
+            self.assertIsNone(task_admission(coord.db,message))
+        self.change();self.bridge.tick(observe_policies=False)
+        self.assertEqual(len(self.rpc.inputs),1)
+
+    def test_provider_input_preserves_unknown_permissions_nulls_and_ordered_roots(self):
+        self.provider_failure()
+        self.rpc.settings.update(activePermissionProfile=None,sandbox=None,approvalsReviewer=None,
+            runtimeWorkspaceRoots=['/neutral/Z','/neutral/A/../A','/neutral/B ','/neutral/D'],
+            opaque={'future':[None,{'permission':None}]})
+        original=copy.deepcopy(self.rpc.settings)
+        self.change();self.call('send',session='b',to='worker',body='preserve unknown policy')
+        self.bridge.tick(observe_policies=False)
+        self.assertEqual(len(self.rpc.inputs),1)
+        for key,value in original.items():
+            if key not in ('model','reasoningEffort'):self.assertEqual(self.rpc.settings[key],value,key)
+        self.assertEqual(set(self.rpc.inputs[0]),{'threadId','clientUserMessageId','input','model','effort'})
+
+    def test_provider_gate_rechecks_native_queue_after_original_job_preparation(self):
+        self.provider_failure();self.change();self.call('send',session='b',to='worker',body='do not race known queue')
+        original=self.state.prepare
+        def prepare(*args,**kwargs):
+            job=original(*args,**kwargs)
+            self.rpc.queues[self.target_thread]=[dict(id='new-external-queue',clientUserMessageId='external')]
+            return job
+        self.state.prepare=prepare
+        self.bridge.tick(observe_policies=False)
+        self.assertEqual(self.rpc.inputs,[])
+        self.assertIsNotNone(self.status()['requests'][0]['native_input_job_id'])
+        self.assertEqual(self.state.jobs()[0]['status'],'prepared')
 
     def test_ordinary_request_keeps_admission_and_waits_for_genuine_input(self):
         self.rpc.status[self.target_thread] = 'active'
@@ -1138,7 +1282,37 @@ class ScopedModelRpc(_root_tests.ScopedRpc):
 
 
 class RootModelRoutingTests(RemoteWebFixture):
-    root = _root_tests.RootOrchestratorTests.root
+    def root(self, op, session='a', host='mac', **params):
+        # Owner-local administration is distinct from the shared HTTP bearer.
+        return root_local.execute(op, params, master_db=self.db,
+                                  service_plist=self.local_plist, home_project='default',
+                                  session=session, host_id=host)
+
+    def owner_local_provider(self):
+        # Same installed-provider fixture as RootLocalTests, with real UID/file
+        # checks. Registration, binding and observation come from the bridge.
+        base = Path(self.tmp.name).resolve()
+        self.db = self.db.resolve()
+        self.local_plist = base / 'server.plist'
+        wrapper = base / 'wrapper'
+        executable = base / 'server-bin'
+        executable.write_text('')
+        config = service.InstalledServerConfig(self.local_plist, wrapper, executable,
+            self.db, base, os.getuid(), '127.0.0.1', self.server.server_port)
+        wrapper.write_text('exec ' + shlex.join([str(executable), '--db', str(self.db),
+            '--host', '127.0.0.1', '--port', str(self.server.server_port)]) + '\n')
+        self.local_plist.write_bytes(plistlib.dumps({
+            'Label': service.LABEL + '.server',
+            'AssociatedBundleIdentifiers': [service.LABEL + '.server'],
+            'WorkingDirectory': str(base), 'RunAtLoad': True, 'KeepAlive': True,
+            'ThrottleInterval': 10, 'ProgramArguments': [str(wrapper)],
+            'EnvironmentVariables': {}}))
+        for target in ('agent_chat.service._installed_server_config',
+                       'agent_chat.root_local._installed_server_config'):
+            patcher = mock.patch(target, return_value=config)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     project = _root_tests.RootOrchestratorTests.project
     routed = _root_tests.RootOrchestratorTests.routed
     configure = _root_tests.RootOrchestratorTests.configure
@@ -1161,6 +1335,10 @@ class RootModelRoutingTests(RemoteWebFixture):
         self.call('agent-status', refresh=True, expected_thread=self.thread_id,
                   request_id=str(uuid.uuid4()))
         self.bridge.tick()
+        self.owner_local_provider()
+        with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+            self.client.call('/api/root/rpc', dict(op='enroll', session='a', host_id='mac',
+                params=dict(expected_thread=self.thread_id, confirm=True)))
         self.root('enroll', expected_thread=self.thread_id, confirm=True)
 
     def test_root_cli_routes_only_designated_orchestrator_without_changing_root(self):
@@ -1177,8 +1355,15 @@ class RootModelRoutingTests(RemoteWebFixture):
                 '--to', 'orchestrator', '--expected-thread', target, '--model', TARGET,
                 '--reasoning-effort', 'high', '--request-id', request, '--allow-cold-resume', '--confirm']
         with mock.patch.dict(os.environ, dict(AGENT_CHAT_API_TOKEN=TOKEN), clear=True), mock.patch('agent_chat.remote.client_host_id', return_value='mac'):
+            with self.assertRaisesRegex(RemoteCoordError, 'shared bearer permits only exact root status readbacks'):
+                cli.main(args)
+            # Documented local `in` returns selectors, not a privileged nested
+            # command. Run the ordinary CLI using those exact own selectors.
+            route = self.root('in', project=project)
+            routed_args = ['--server', self.url, '--session', route['session'],
+                           '--project', route['project'], *args[7:]]
             with contextlib.redirect_stdout(io.StringIO()):
-                self.assertEqual(cli.main(args), 0)
+                self.assertEqual(cli.main(routed_args), 0)
         bridge.tick()
         status = self.routed(project, 'agent-status', to='orchestrator')
         self.assertEqual(status['thread_id'], target)

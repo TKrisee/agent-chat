@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["tomli>=2; python_version < '3.11'"]
 
 [project.scripts]
 agent-chat-server = "agent_chat.server:main"
@@ -21,4 +21,7 @@ agent-chat-root-guidance = "agent_chat.root_guidance:main"
 agent-chat-project-guidance = "agent_chat.project_guidance:main"
 
 [tool.setuptools.package-data]
-agent_chat = ["web/*.html", "web/*.css", "web/*.js", "templates/*.md"]
+# native-image-proof is the pinned macOS arm64, linker-ad-hoc-signed helper.
+# Rebuild on the supported host: xcrun clang src/agent_chat/native-image-proof.c
+#   -framework Security -framework CoreFoundation -o src/agent_chat/native-image-proof
+agent_chat = ["web/*.html", "web/*.css", "web/*.js", "templates/*.md", "native-image-proof", "native-image-proof.c"]

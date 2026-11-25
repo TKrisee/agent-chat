@@ -204,6 +204,26 @@ class RootRpcSharedBearerTests(RemoteWebFixture):
                        '.id == "' + request_id + '" and .instruction_origin == "authenticated_operator_ui" '
                        'and (has("prompt") | not) and (has("settings_digest") | not)')
 
+    def test_dashboard_fresh_status_requires_operator_channel_and_exact_request_query(self):
+        request_id = str(uuid.uuid4())
+        accepted, raw, _ = self.request('POST', '/api/root/fresh-start', {
+            'expected_thread': self.thread_id, 'prompt': 'Read the retained checkpoint.',
+            'request_id': request_id, 'confirm': True,
+        }, auth='basic', headers={'X-Agent-Chat-CSRF': self.server.csrf_token})
+        self.assertEqual(accepted, 200, raw)
+        status, raw, _ = self.request('GET', '/api/root/fresh-status?request_id=' + request_id, auth='basic')
+        self.assertEqual(status, 200, raw)
+        self.assert_jq(raw, '.id == "' + request_id + '" and (has("prompt") | not) and (has("settings_digest") | not)')
+        self.assertNotIn(b'Read the retained checkpoint.', raw)
+        denied, raw, _ = self.request('GET', '/api/root/fresh-status?request_id=' + request_id, auth='none')
+        self.assertEqual(403, denied, raw)
+        denied, raw, _ = self.request('GET', '/api/root/fresh-status?request_id=' + request_id, auth='bearer')
+        self.assertEqual(403, denied, raw)
+        invalid, raw, _ = self.request('GET', '/api/root/fresh-status?request_id=' + request_id + '&project=default', auth='basic')
+        self.assertEqual(400, invalid, raw)
+        missing, raw, _ = self.request('GET', '/api/root/fresh-status?request_id=' + str(uuid.uuid4()), auth='basic')
+        self.assertEqual(400, missing, raw)
+
     def test_readiness_explicit_projection_is_nonmutating_and_minimal(self):
         import hashlib
         from agent_chat.root_orchestrator import RootOrchestrator

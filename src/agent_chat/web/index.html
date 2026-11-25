@@ -23,6 +23,7 @@
       <!-- agent-chat:all-communication-menu -->
       <button class="room-button" id="open-attachments" type="button"><span class="room-icon" aria-hidden="true">▧</span><span>Attachments</span></button>
       <div class="section-label project-nav-heading"><span>PROJECTS</span><div><button class="quiet-button" id="rename-project" type="button" aria-label="Rename project" title="Rename project">✎</button><button class="quiet-button" id="new-project" type="button" aria-label="New project" title="New project">+</button></div></div>
+      <label class="project-activity-filter" for="project-activity-filter"><input id="project-activity-filter" type="checkbox"> Projects with tracked work only</label>
       <nav id="project-list" class="project-nav-list" aria-label="Projects"></nav>
       <button class="room-button selected" id="all-conversations" aria-pressed="true">
         <span class="room-icon" aria-hidden="true">#</span><span>All conversations</span><span class="count" id="all-count">0</span>
@@ -53,11 +54,23 @@
       <div class="conversation-header">
         <h1 id="conversation-title">All conversations</h1>
         <div class="conversation-actions" aria-label="Conversation controls">
+          <button class="quiet-button" id="action-review-button" type="button" disabled aria-haspopup="dialog" aria-controls="action-review-dialog">Action review <span id="action-review-count" aria-live="polite"></span></button>
           <div class="conversation-utilities" role="group" aria-label="Setup and usage controls">
             <button class="quiet-button setup-button" id="setup-guide" type="button" aria-haspopup="dialog">Setup guide</button>
             <button class="quiet-button usage-button" id="usage-button" type="button" aria-haspopup="dialog"><span id="usage-label">Weekly guard off</span></button>
             <button class="quiet-button measurement-button" id="measurement-button" type="button" aria-haspopup="dialog"><span class="measurement-indicator" id="measurement-indicator" aria-hidden="true" hidden></span>Measure usage</button>
           </div>
+          <button class="quiet-button" id="root-ack-all" type="button" hidden disabled aria-describedby="root-ack-status">Ack all</button>
+          <span id="root-ack-status" class="sr-only" role="status" hidden></span>
+          <details class="decision-notifications" id="decision-notifications" hidden>
+            <summary aria-label="Operator decisions"><span>Decisions</span><span class="decision-count" id="decision-count">0</span></summary>
+            <div class="decision-menu" aria-label="Pending operator decisions">
+              <p class="decision-list-summary" id="decision-list-summary"></p>
+              <p class="decision-status" id="decision-status" role="status" aria-live="polite">In-app decision list is available.</p>
+              <ul id="decision-list"></ul>
+              <button class="quiet-button" id="decision-notification-opt-in" type="button">Enable desktop alerts</button>
+            </div>
+          </details>
           <button class="quiet-button pause-button" id="pause-button" aria-pressed="false"><span id="pause-icon" aria-hidden="true">Ⅱ</span> <span id="pause-label">Pause feed</span></button>
         </div>
       </div>
@@ -86,13 +99,13 @@
           <button class="cancel-reply" id="cancel-reply" type="button" aria-label="Cancel reply">×</button>
         </div>
         <div class="composer-images" id="composer-images" role="list" aria-label="File attachments" hidden></div>
-        <input id="image-input" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.mp4,.m4v,.mov,.webm,.pdf,.txt,.md,.markdown,.json,.xml,.csv,.tsv,.log,.yaml,.yml,.toml" multiple hidden>
+        <input id="image-input" type="file" accept=".png,.jpg,.jpeg,.gif,.webp,.wav,.mp4,.m4v,.mov,.webm,.glb,.fbx,.eml,.pdf,.cs,.meta,.patch,.csproj,.txt,.md,.markdown,.json,.xml,.csv,.tsv,.log,.yaml,.yml,.toml" multiple hidden>
         <label class="sr-only" for="message-input">Your message</label>
         <div class="mention-list" id="mention-list" role="listbox" aria-label="Agent mentions" hidden></div>
         <div class="composer-input-row">
           <textarea id="message-input" placeholder="Message all agents, @tag recipients, or drop files…" rows="2" maxlength="60000" required disabled role="combobox" aria-autocomplete="list" aria-controls="mention-list" aria-expanded="false"></textarea>
           <div class="composer-actions" role="group" aria-label="Message actions">
-            <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach files" title="Attach up to 50 supported files, 10 MiB each" disabled>＋ Attach</button>
+            <button class="quiet-button attach-button" id="attach-button" type="button" aria-label="Attach files" title="Attach up to 50 supported files; binary GLB v2 and FBX 7400 models up to 64 MiB, other files up to 10 MiB each; 500 MiB total before metadata" disabled>＋ Attach</button>
             <button class="send-button" id="send-button" type="submit" disabled>Send <span aria-hidden="true">↗</span></button>
           </div>
         </div>
@@ -253,11 +266,18 @@
   <dialog id="attachment-gallery" aria-labelledby="gallery-title">
     <header class="usage-dialog-heading"><h2 id="gallery-title">Attachments</h2><button id="close-gallery" class="quiet-button usage-close" type="button" aria-label="Close attachment gallery" autofocus>×</button></header>
     <p id="gallery-scope">Files sent in project rooms. Private Root attachments stay in Root.</p>
-    <div class="gallery-controls"><label id="gallery-project-label">Project <select id="gallery-project"><option value="">All projects</option></select></label><label>File name <input id="gallery-search" type="search" placeholder="Search files" maxlength="256"></label><button id="gallery-refresh" class="quiet-button" type="button">Refresh</button></div>
+    <div class="gallery-controls"><label id="gallery-project-label">Project <select id="gallery-project"><option value="">All projects</option></select></label><label>File name <input id="gallery-search" type="search" placeholder="Search files" maxlength="256"></label><label>File type <select id="gallery-type"><option value="all">All types</option><option value="image">Images</option><option value="video">Videos</option><option value="audio">Audio</option><option value="model">3D models</option><option value="document">Documents</option><option value="other">Other</option><option value="unknown">Unknown / missing</option></select></label><button id="gallery-refresh" class="quiet-button" type="button">Refresh</button></div>
     <p id="gallery-status" role="status" aria-live="polite"></p>
     <div id="gallery-grid" class="gallery-grid" aria-label="Sent attachments"></div>
     <button id="gallery-more" class="quiet-button" type="button" hidden>Load more</button>
   </dialog>
   <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
+  <dialog id="action-review-dialog" aria-labelledby="action-review-title" aria-describedby="action-review-status">
+    <div class="action-review-heading"><h2 id="action-review-title">Action review</h2><button class="quiet-button" id="action-review-close" type="button" aria-label="Close action review">Close</button></div>
+    <p id="action-review-status" role="status">Loading current project requests…</p>
+    <p id="action-review-empty">No current action requests in this project.</p>
+    <div id="action-review-list"></div>
+    <button class="quiet-button" id="action-review-refresh" type="button">Refresh requests</button>
+  </dialog>
 </body>
 </html>

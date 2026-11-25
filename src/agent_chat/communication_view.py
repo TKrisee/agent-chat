@@ -4,6 +4,7 @@ import contextlib
 import json
 import math
 import sqlite3
+import time
 from pathlib import Path
 from urllib.parse import quote
 from .core import CoordError, agent_labels
@@ -46,7 +47,8 @@ class CommunicationView:
     def serialize(db,rows,project,project_operator=None,full=False):
         # Reuse the existing read-only public serializer; no inbox/message reads.
         from .web import message_rows
-        result=message_rows(rows,agent_labels(db),db,project_operator)
+        result=message_rows(rows,agent_labels(db),db,project_operator,
+                            include_agent_delivery_receipts=True)
         for item in result:
             item.update(project_id=project['id'],project_name=project['name'])
             item['history_cursor']=cursor(CommunicationView.key(item))
@@ -100,7 +102,7 @@ class CommunicationView:
                 errors.append(dict(project_id=item['id'],project_name=item['name'],error=str(error)))
         merged.sort(key=self.key,reverse=after is None);more=len(merged)>limit;page=merged[:limit]
         messages=page if after is not None else list(reversed(page))
-        return dict(messages=messages,has_more=more,
+        return dict(messages=messages,has_more=more,observed_at=time.time(),
                     next_cursor=cursor(self.key(page[-1])) if more and page else None,
                     oldest_cursor=cursor(self.key(messages[0])) if messages else None,
                     newest_cursor=cursor(self.key(messages[-1])) if messages else None,
@@ -116,4 +118,5 @@ class CommunicationView:
             rows=db.execute('SELECT m.seq,m.id,m.sender_session,m.recipient_session,m.body,m.created_at,m.acked_at FROM messages m WHERE m.id=? AND ('+condition+')',
                             (message_id,*args)).fetchall()
             if not rows: raise CoordError('message not found in selected project')
-            return dict(message=self.serialize(db,rows,known[project],project_operator,full=True)[0],read_only=True)
+            return dict(message=self.serialize(db,rows,known[project],project_operator,full=True)[0],
+                        observed_at=time.time(),read_only=True)

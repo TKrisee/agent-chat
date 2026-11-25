@@ -1,4 +1,5 @@
 import hashlib
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -44,6 +45,8 @@ class HistoryMoveTests(unittest.TestCase):
         parent = self.send('source-operator','old-agent','α\nuser question')
         self.source.session = 'old-agent'
         self.source.message(parent['id'])
+        read_before = dict(self.source.db.execute('SELECT * FROM message_reads WHERE message_id=?', (parent['id'],)).fetchone())
+        self.assertEqual(read_before['provenance'], 'recipient_full_message')
         attachments = [('same.txt','text/plain',b'first\n'),('same.txt','text/plain',b'\x00second\xff')]
         reply = self.send('old-agent','source-operator','answer\nβ',attachments=attachments,
                           reply_to=parent['id'],ack_reply=True)
@@ -54,6 +57,8 @@ class HistoryMoveTests(unittest.TestCase):
         old_destination = self.records(self.destination)
         result = self.execute()
         self.assertEqual((result['count'],result['attachments'],result['replies']),(2,2,1))
+        moved_read = dict(self.destination.db.execute('SELECT * FROM message_reads WHERE message_id=?', (parent['id'],)).fetchone())
+        self.assertEqual(moved_read, {**read_before, 'reader_session': 'new-agent'})
         self.assertEqual(self.records(self.source),[before])
         self.assertEqual(self.records(self.destination)[:1],old_destination)
         self.assertEqual(self.destination.db.execute('SELECT acked_at FROM messages WHERE id=?',(reply['id'],)).fetchone()[0],None)
@@ -69,6 +74,76 @@ class HistoryMoveTests(unittest.TestCase):
         self.assertEqual(list(self.source.db.execute('PRAGMA foreign_key_check')),[])
         self.assertEqual(list(self.destination.db.execute('PRAGMA foreign_key_check')),[])
         self.assertEqual(self.move.execute(self.request,result['count'],result['digest']),result)
+
+    def test_context_full_read_provenance_and_time_are_preserved(self):
+        message = self.send('source-operator', 'old-agent', 'Context-read source')
+        self.source.session = 'old-agent'
+        self.source.context(message_ids=[message['id']])
+        before = dict(self.source.db.execute('SELECT * FROM message_reads WHERE message_id=?', (message['id'],)).fetchone())
+        self.assertEqual(before['provenance'], 'recipient_context_full')
+        self.execute()
+        after = dict(self.destination.db.execute('SELECT * FROM message_reads WHERE message_id=?', (message['id'],)).fetchone())
+        self.assertEqual(after, {**before, 'reader_session': 'new-agent'})
+        self.assertIsNone(self.destination.db.execute('SELECT acked_at FROM messages WHERE id=?', (message['id'],)).fetchone()[0])
+
+    def legacy_read(self, *, migrated):
+        message = self.send('source-operator', 'old-agent', 'Synthetic old-format read marker')
+        # Explicit old-schema fixture, not an authenticated recipient-read receipt.
+        self.source.db.execute('DROP TABLE message_reads')
+        self.source.db.execute('CREATE TABLE message_reads (message_id TEXT PRIMARY KEY, reader_session TEXT NOT NULL, read_at REAL NOT NULL)')
+        self.source.db.execute('INSERT INTO message_reads VALUES(?,?,?)', (message['id'], 'old-agent', 123.0))
+        if migrated:
+            self.source._migrate_message_reads()
+        return message['id']
+
+    def assert_unknown_moved(self, message_id):
+        self.execute()
+        row = dict(self.destination.db.execute('SELECT * FROM message_reads WHERE message_id=?', (message_id,)).fetchone())
+        self.assertEqual(row, dict(message_id=message_id, reader_session='new-agent', read_at=123.0, provenance='legacy_unknown'))
+        self.assertFalse(self.destination.db.execute("SELECT 1 FROM message_reads WHERE message_id=? AND provenance IN ('recipient_full_message','recipient_context_full')", (message_id,)).fetchone())
+        self.assertIsNone(self.destination.db.execute('SELECT acked_at FROM messages WHERE id=?', (message_id,)).fetchone()[0])
+
+    def test_pre_provenance_source_marker_moves_as_explicit_unknown(self):
+        message_id = self.legacy_read(migrated=False)
+        self.assert_unknown_moved(message_id)
+        self.assertNotIn('provenance', {row['name'] for row in self.source.db.execute('PRAGMA table_info(message_reads)')})
+
+    def test_migrated_legacy_unknown_is_not_promoted(self):
+        message_id = self.legacy_read(migrated=True)
+        self.assertEqual(self.source.db.execute('SELECT provenance FROM message_reads WHERE message_id=?', (message_id,)).fetchone()[0], 'legacy_unknown')
+        self.assert_unknown_moved(message_id)
+
+    def test_provenance_only_change_invalidates_preview_without_copy(self):
+        message = self.send('source-operator', 'old-agent', 'Read provenance is part of the selected history')
+        self.source.session = 'old-agent'
+        self.source.message(message['id'])
+        preview = self.move.preview(self.request)
+        self.source.db.execute("UPDATE message_reads SET provenance='legacy_unknown' WHERE message_id=?", (message['id'],))
+        with self.assertRaisesRegex(CoordError, 'selection changed'):
+            self.move.execute(self.request, preview['count'], preview['digest'])
+        self.assertEqual(self.records(self.destination), [])
+        self.assertEqual(len(self.records(self.source)), 1)
+
+    def test_read_import_failure_rolls_back_destination_and_retains_source(self):
+        message = self.send('source-operator', 'old-agent', 'Read before private transfer')
+        self.source.session = 'old-agent'
+        self.source.message(message['id'])
+        self.destination.send('new-agent', 'Unrelated destination history')
+        before_source, before_destination = self.records(self.source), self.records(self.destination)
+        preview = self.move.preview(self.request)
+        self.destination.db.execute("CREATE TRIGGER fail_read_import AFTER INSERT ON message_reads BEGIN SELECT RAISE(ABORT,'injected after-read import failure'); END")
+        with self.assertRaisesRegex(sqlite3.IntegrityError, 'injected after-read import failure'):
+            self.move.execute(self.request, preview['count'], preview['digest'])
+        self.assertEqual(self.records(self.source), before_source)
+        self.assertEqual(self.records(self.destination), before_destination)
+        self.assertFalse(self.destination.db.execute('SELECT 1 FROM bridge_jobs WHERE id=?', ('history_move_' + self.request,)).fetchone())
+        if self.destination.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='history_moves'").fetchone():
+            self.assertFalse(self.destination.db.execute('SELECT 1 FROM history_moves WHERE request_id=?', (self.request,)).fetchone())
+        self.destination.db.execute('DROP TRIGGER fail_read_import')
+        result = self.move.execute(self.request, preview['count'], preview['digest'])
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(self.records(self.source), [])
+        self.assertEqual(len(self.records(self.destination)), len(before_destination) + 1)
 
     def test_group_delivery_moves_without_its_other_recipient(self):
         self.source.session = 'source-operator'

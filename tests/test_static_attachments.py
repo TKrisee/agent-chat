@@ -1,13 +1,17 @@
 """Static attachment-type coverage without HTTP or JSON parsing."""
 from __future__ import annotations
+from unittest import mock
 
 import base64
 import sqlite3
+import struct
 import tempfile
 import unittest
 from pathlib import Path
 
-from agent_chat.core import CoordError, Coordinator
+from agent_chat.core import CoordError, Coordinator, MAX_ATTACHMENTS, MAX_ATTACHMENT_SIZE, MAX_MODEL_ATTACHMENT_SIZE
+from agent_chat.remote import MAX_COORD_REQUEST_BYTES
+from agent_chat.web import MAX_MULTIPART_BYTES
 from agent_chat.remote_service import dispatch
 
 
@@ -30,6 +34,11 @@ FILES = {
     'config.yml': (b'key: value\n', 'application/yaml'),
     'config.toml': (b'key = "value"\n', 'application/toml'),
 }
+
+GLB = b'glTF' + struct.pack('<II', 2, 48) + struct.pack('<II', 4, 0x4E4F534A) + b'xxxx' + struct.pack('<II', 4, 0x004E4942) + b'BIN!' + struct.pack('<II', 4, 0x12345678) + b'EXT!'
+FBX = b'Kaydara FBX Binary  \x00\x1a\x00' + struct.pack('<I', 7400) + b'node'
+FILES.update({'model.glb': (GLB, 'model/gltf-binary'), 'model.fbx': (FBX, 'application/octet-stream'),
+              'empty.txt': (b'', 'text/plain')})
 
 
 class StaticAttachmentTests(unittest.TestCase):
@@ -90,6 +99,51 @@ class StaticAttachmentTests(unittest.TestCase):
                 stored = db.execute('SELECT name,mime,size,content FROM attachments ORDER BY rowid').fetchall()
             self.assertEqual(stored, [(name, mime, len(content), content) for name, mime, content in expected])
 
+    def test_only_supported_model_files_receive_the_20_mib_per_file_limit(self):
+        self.register_local()
+        self.remote('register', 'alpha', agent='alpha')
+        self.remote('register', 'beta', agent='beta')
+        size = MAX_ATTACHMENT_SIZE + 4
+        chunk_size = size - 20
+        large_glb = b'glTF' + struct.pack('<II', 2, size) + struct.pack('<II', chunk_size, 0x4E4F534A) + b' ' * chunk_size
+        large_fbx = FBX[:27] + b'F' * (size - 27)
+        expected = [('large.glb', 'model/gltf-binary', large_glb),
+                    ('large.fbx', 'application/octet-stream', large_fbx)]
+
+        paths = []
+        for name, _, content in expected:
+            path = self.root / name
+            path.write_bytes(content)
+            paths.append(path)
+        coord = self.local('alpha')
+        try:
+            local = coord.send('beta', 'large models', paths)['attachments']
+        finally:
+            coord.close()
+        remote = self.remote('send', 'alpha', to='beta', body='large models', attachments=[
+            {'name': name, 'content_base64': base64.b64encode(content).decode('ascii')}
+            for name, _, content in expected])['attachments']
+        self.assertEqual([(item['mime'], item['size']) for item in local],
+                         [(mime, len(content)) for _, mime, content in expected])
+        self.assertEqual([(item['mime'], item['size']) for item in remote],
+                         [(mime, len(content)) for _, mime, content in expected])
+        for db_path in (self.local_db, self.remote_db):
+            with sqlite3.connect(db_path) as db:
+                stored = db.execute('SELECT name,mime,size,content FROM attachments ORDER BY rowid').fetchall()
+            self.assertEqual(stored, [(name, mime, len(content), content) for name, mime, content in expected])
+
+        with self.assertRaisesRegex(CoordError, '64 MiB'):
+            Coordinator._prepare_attachment('too-large.glb', b'glTF' + bytes(MAX_MODEL_ATTACHMENT_SIZE - 3))
+        with self.assertRaisesRegex(CoordError, '10 MiB'):
+            Coordinator._prepare_attachment('ordinary.txt', b'x' * (MAX_ATTACHMENT_SIZE + 1))
+
+    def test_existing_request_and_file_count_ceilings_are_unchanged(self):
+        self.assertEqual(MAX_ATTACHMENTS, 50)
+        self.assertEqual(MAX_ATTACHMENT_SIZE, 10 * 1024 * 1024)
+        self.assertEqual(MAX_MULTIPART_BYTES, MAX_ATTACHMENTS * MAX_ATTACHMENT_SIZE + 64 * 1024)
+        self.assertEqual(MAX_COORD_REQUEST_BYTES,
+                         MAX_ATTACHMENTS * (4 * ((MAX_ATTACHMENT_SIZE + 2) // 3)) + 1024 * 1024)
+
     def test_local_and_remote_normalize_names_identically(self):
         self.register_local()
         self.remote('register', 'alpha', agent='alpha')
@@ -122,9 +176,20 @@ class StaticAttachmentTests(unittest.TestCase):
             'fake.pdf': b'plain text',
             'empty.pdf': b'',
             'huge.pdf': b'%PDF-1.4\n' + b'x' * (10 * 1024 * 1024),
-            'empty.txt': b'',
             'control.log': b'hello\x1b[31mworld',
         }
+        invalid.update({
+            'bad-magic.glb': b'nope' + GLB[4:],
+            'wrong-version.glb': b'glTF' + struct.pack('<II', 1, len(GLB)) + GLB[12:],
+            'wrong-size.glb': GLB[:4] + struct.pack('<II', 2, len(GLB) - 4) + GLB[12:],
+            'truncated-chunk.glb': b'glTF' + struct.pack('<II', 2, 20) + struct.pack('<II', 4, 0x4E4F534A),
+            'wrong-first-chunk.glb': GLB[:12] + struct.pack('<II', 4, 0x004E4942) + b'BIN!' + GLB[24:],
+            'misplaced-bin.glb': GLB[:24] + struct.pack('<II', 4, 0x12345678) + b'EXT!' + struct.pack('<II', 4, 0x004E4942) + b'BIN!',
+            'misaligned-chunk.glb': b'glTF' + struct.pack('<II', 2, 25) + struct.pack('<II', 5, 0x4E4F534A) + b'xxxxx',
+            'wrong-version.fbx': FBX[:23] + struct.pack('<I', 7400 + 1) + FBX[27:],
+            'ascii.fbx': b'; FBX 7.4.0 project file\n',
+            'other-model.blend': b'BLENDER',
+        })
         for extension in ('exe', 'js', 'sh', 'ps1', 'html', 'svg', 'zip', 'pdf', 'docm', 'bin'):
             invalid['blocked.' + extension] = b'\x89PNG\r\n\x1a\npng'
         for name, content in invalid.items():
@@ -132,7 +197,7 @@ class StaticAttachmentTests(unittest.TestCase):
             path.write_bytes(content)
             coord = self.local('alpha')
             try:
-                with self.assertRaises(CoordError):
+                with self.assertRaises(CoordError, msg=name):
                     coord.send('beta', 'bad', [path])
             finally:
                 coord.close()
@@ -166,3 +231,33 @@ class StaticAttachmentTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ModelAggregateBoundaryTests(unittest.TestCase):
+    def test_explicit_raw_ceiling_rejects_before_reading_large_local_batch(self):
+        from agent_chat.core import MAX_ATTACHMENT_TOTAL_SIZE
+        self.assertEqual(MAX_ATTACHMENT_TOTAL_SIZE, 500 * 1024 * 1024)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'synthetic.glb'
+            with path.open('wb') as stream: stream.truncate(64 * 1024 * 1024)
+            coord = Coordinator(Path(directory) / 'state.sqlite3', 'fixture')
+            try:
+                with mock.patch('agent_chat.core.os.open', side_effect=AssertionError('must reject before opening contents')):
+                    with self.assertRaisesRegex(CoordError, '500 MiB total'):
+                        coord._prepare_attachments([path] * 8)
+            finally: coord.close()
+
+    def test_exact_model_cap_and_ordinary_cap_remain_format_specific(self):
+        maximum = 64 * 1024 * 1024
+        for extension in ('glb', 'fbx'):
+            if extension == 'glb':
+                data = b'glTF' + struct.pack('<II', 2, maximum) + struct.pack('<II', maximum-20, 0x4E4F534A) + b'{}' + b' '*(maximum-22)
+            else:
+                data = b'Kaydara FBX Binary  \x00\x1a\x00' + struct.pack('<I', 7400) + bytes(maximum-27)
+            name, mime, actual = Coordinator._prepare_attachment('boundary.'+extension, data)
+            self.assertEqual(len(actual), maximum)
+            self.assertEqual(mime, 'model/gltf-binary' if extension=='glb' else 'application/octet-stream')
+            with self.assertRaisesRegex(CoordError, '64 MiB'):
+                Coordinator._prepare_attachment('boundary.'+extension, data+b'x')
+        with self.assertRaisesRegex(CoordError, '10 MiB'):
+            Coordinator._prepare_attachment('ordinary.txt', b'x'*(10*1024*1024+1))

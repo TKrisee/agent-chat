@@ -38,6 +38,37 @@ class OwnerMonitorTests(unittest.TestCase):
                 self.records[42] = dict(original, **update)
                 self.assertEqual(self.monitor.observe(self.target)['state'], 'unknown')
 
+    def test_resume_subcommand_accepts_remote_option_after_thread(self):
+        for args in (
+            '/tmp/codex resume root-thread --remote ws://127.0.0.1:4500',
+            '/tmp/codex resume root-thread --remote=ws://127.0.0.1:4500',
+        ):
+            with self.subTest(args=args):
+                self.records[42]['args'] = args
+                self.assertEqual(self.monitor.observe(self.target)['state'], 'open')
+
+    def test_resume_subcommand_accepts_remote_option_before_thread(self):
+        for args in (
+            '/tmp/codex resume --remote ws://127.0.0.1:4500 root-thread',
+            '/tmp/codex resume --remote=ws://127.0.0.1:4500 root-thread',
+        ):
+            with self.subTest(args=args):
+                self.records[42]['args'] = args
+                self.assertEqual(self.monitor.observe(self.target)['state'], 'open')
+
+    def test_resume_parser_rejects_ambiguous_or_camouflaged_arguments(self):
+        original = self.records[42].copy()
+        for args in (
+            '/tmp/codex resume root-thread --remote ws://127.0.0.1:4600',
+            '/tmp/codex resume root-thread --remote=ws://127.0.0.1:4500 extra',
+            '/tmp/codex resume root-thread --remote ws://127.0.0.1:4500 --remote ws://127.0.0.1:4500',
+            '/tmp/codex resume other-thread --remote ws://127.0.0.1:4500 --prompt root-thread',
+            '/tmp/codex resume --unknown root-thread --remote ws://127.0.0.1:4500',
+        ):
+            with self.subTest(args=args):
+                self.records[42] = dict(original, args=args)
+                self.assertEqual(self.monitor.observe(self.target)['state'], 'unknown')
+
     def test_ambiguous_discovery_does_not_transfer_previously_bound_owner(self):
         bound = self.monitor.observe(self.target)
         self.records[43] = self.records[42].copy()

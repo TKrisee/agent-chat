@@ -39,14 +39,49 @@ with tempfile.TemporaryDirectory(prefix='communications-browser-') as directory:
   c.session='alpha'
   long=c.send(server.sender_session,'## Preview ready\\n\\nThe conversation layout is ready for review.\\n\\n'+('Detailed review note. '*250)+'\\nFull final detail.')
   c.db.execute('INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)',('attachment_readonly_fixture',long['id'],'review-notes.txt','text/plain',12,b'review notes'))
+  if os.environ.get('GALLERY_FILTER_BOUNDARY_FIXTURE')=='1':
+   filter_message=c.send(server.sender_session,'Attachment filter page-boundary fixtures')
+   attachments=[]
+   for index in range(150):
+    matches=(102<=index<=148) or (94<=index<=101)
+    name='boundary-%03d.%s'%(index,'PDF' if matches else 'png')
+    mime='application/pdf' if matches else 'image/png'
+    attachments.append(('attachment_boundary_%03d'%index,filter_message['id'],name,mime,7,b'fixture'))
+   c.db.executemany('INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)',attachments)
+  if os.environ.get('GALLERY_FILTER_FIXTURE')=='1':
+   filter_message=c.send(server.sender_session,'Attachment filter fixtures')
+   attachments=[]
+   for index in range(120):
+    if index<20: name='later-image-%03d.PNG'%index;mime='image/png'
+    elif index==20: name='mystery-file';mime='application/octet-stream'
+    elif index==21: name='backup.ZIP';mime='application/zip'
+    elif index==22: name='mime-only';mime='image/webp'
+    else: name='batch-note-%03d.%s'%(index,'PDF' if index%2 else 'TXT');mime='application/pdf' if index%2 else 'text/plain'
+    attachments.append(('attachment_filter_%03d'%index,filter_message['id'],name,mime,7,b'fixture'))
+   c.db.executemany('INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)',attachments)
   if os.environ.get('GALLERY_SCROLL_FIXTURE')=='1':
    for index in range(75):c.db.execute('INSERT INTO attachments(id,message_id,name,mime,size,content) VALUES(?,?,?,?,?,?)',('attachment_scroll_%03d'%index,long['id'],'gallery-fixture-%03d.txt'%index,'text/plain',7,b'fixture'))
+ fixture_databases=[db,otherdb]
+ overlay_message=None
+ if os.environ.get('PROJECT_BADGE_FIXTURE')=='1':
+  server.projects.rename(other['id'],'Into The Rot')
+  with contextlib.closing(Coordinator(otherdb,'badge-recipient')) as c:c.register('gameplay-with-an-extraordinarily-long-unbroken-role-name-123456789')
+  with contextlib.closing(Coordinator(otherdb,'badge-sender')) as c:
+   c.register('orchestrator-with-an-extraordinarily-long-unbroken-role-name-123456789')
+   c.send('badge-recipient','PROJECT_BADGE_ROLE_HEADER '+('Long concept and gameplay report. '*180))
+   overlay_message=c.send('badge-recipient','DELIVERY_OVERLAY_LONG_HISTORY '+('Menu anchor report. '*30))
+  with contextlib.closing(Coordinator(otherdb,'badge-recipient')) as c:
+   for index in range(32):c.send('badge-sender','Delivery history detail '+str(index),reply_to=overlay_message['id'])
+  long_project=server.projects.create('IntoTheRotMultiplayerGameplayAndLevelDesignProductionCoordinationProject')
+  longdb=server.projects.db_path(long_project['id']);fixture_databases.append(longdb);operator_session(longdb)
+  with contextlib.closing(Coordinator(longdb,'gameplay')) as c:c.register('Gameplay')
+  with contextlib.closing(Coordinator(longdb,'orchestrator')) as c:c.register('Orchestrator');c.send('gameplay','PROJECT_BADGE_LONG_PROJECT '+('Long production report. '*180))
  original_ids={}
- for database in (db,otherdb):
+ for database in fixture_databases:
   with contextlib.closing(sqlite3.connect(database)) as conn:original_ids[database]={row[0] for row in conn.execute('SELECT id FROM messages')}
  def protected():
   rows=[]
-  for database in (db,otherdb):
+  for database in fixture_databases:
    with contextlib.closing(sqlite3.connect(database)) as conn:
     for query in ('SELECT id,acked_at FROM messages ORDER BY id','SELECT * FROM message_reads ORDER BY message_id,reader_session','SELECT id,inbox_read_seq FROM sessions ORDER BY id','SELECT * FROM resources ORDER BY name','SELECT * FROM guarded_runs ORDER BY run_id','SELECT * FROM resource_queue ORDER BY seq'):
      values=conn.execute(query).fetchall()
@@ -66,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix='communications-browser-') as directory:
  threading.Thread(target=commands,daemon=True).start()
  def stop(*unused):threading.Thread(target=server.shutdown,daemon=True).start()
  signal.signal(signal.SIGTERM,stop)
- print(json.dumps(dict(url='http://127.0.0.1:'+str(server.server_port),other=other['id'],long=long['id'],release=release['id'],protected=original)),flush=True)
+ print(json.dumps(dict(url='http://127.0.0.1:'+str(server.server_port),other=other['id'],long=long['id'],release=release['id'],overlay=overlay_message['id'] if overlay_message else None,protected=original)),flush=True)
  try:server.serve_forever(poll_interval=.05)
  finally:
   server.stop_event.set();server.server_close()
@@ -79,7 +114,7 @@ function bounded(promise, ms, label) {
 }
 async function run() {
   fs.mkdirSync(evidence,{recursive:true});
-  const fixture=spawn(process.env.PYTHON || 'python3',['-u','-c',fixtureCode],{cwd:root,env:{...process.env,PYTHONPATH:path.join(root,'src'),GALLERY_SCROLL_FIXTURE:process.argv.includes('--gallery-scroll-only')?'1':''},stdio:['pipe','pipe','inherit']});
+  const fixture=spawn(process.env.PYTHON || 'python3',['-u','-c',fixtureCode],{cwd:root,env:{...process.env,PYTHONPATH:path.join(root,'src'),GALLERY_SCROLL_FIXTURE:process.argv.includes('--gallery-scroll-only')||process.argv.includes('--gallery-position-only')?'1':'',GALLERY_FILTER_FIXTURE:process.argv.includes('--gallery-filter-only')?'1':'',GALLERY_FILTER_BOUNDARY_FIXTURE:process.argv.includes('--gallery-filter-boundary-only')?'1':'',PROJECT_BADGE_FIXTURE:process.argv.includes('--project-badge-only')?'1':''},stdio:['pipe','pipe','inherit']});
   const lines=createInterface({input:fixture.stdout});
   let server,browser,chrome,releaseOlder;
   let fixtureOutput='';fixture.stdout.on('data',data=>fixtureOutput+=data);
@@ -87,7 +122,7 @@ async function run() {
   try {
     const [line]=await bounded(Promise.race([once(lines,'line'),once(fixture,'exit').then(([code])=>{throw Error('fixture startup exited '+code);})]),15000,'fixture startup');
     const command=async value=>{const done=once(lines,'line');fixture.stdin.write(value+'\n');assert.equal((await bounded(done,20000,'fixture command'))[0],value+'_DONE');};
-    const url=jq(line,'.url'),other=jq(line,'.other'),long=jq(line,'.long'),release=jq(line,'.release');
+    const url=jq(line,'.url'),other=jq(line,'.other'),long=jq(line,'.long'),release=jq(line,'.release'),overlayMessage=jq(line,'.overlay // ""');
     server=await chromium.launchServer({headless:true,executablePath:process.env.AGENT_CHAT_CHROME_PATH,timeout:15000});
     chrome=server.process();console.log('OWNED_CHROME_PID='+chrome.pid);
     browser=await chromium.connect(server.wsEndpoint());
@@ -99,6 +134,102 @@ async function run() {
     page.on('pageerror',error=>errors.push(error.message));
     page.on('request',request=>{if(!['GET','HEAD','OPTIONS'].includes(request.method()))mutations.push(request.method()+' '+new URL(request.url()).pathname);else reads.push(new URL(request.url()));});
     await page.goto(url);await page.locator('#messages .message').first().waitFor();
+    if(process.argv.includes('--project-badge-only')) {
+      assert.equal(await page.locator('#messages .message-project-badge').count(),0,'Ordinary project context has no redundant badge');
+      assert.ok(await page.locator('#messages .copy-message').count()>0);assert.ok(await page.locator('#messages .reply-message').count()>0);
+      await page.locator('#all-communication-view').click();
+      const role=page.locator('#communication-messages .message').filter({hasText:'PROJECT_BADGE_ROLE_HEADER'}),longProject=page.locator('#communication-messages .message').filter({hasText:'PROJECT_BADGE_LONG_PROJECT'});
+      await role.first().waitFor();await longProject.first().waitFor();
+      async function checkHeader(card,expected){
+        const header=card.locator('.message-meta'),badge=header.locator('.message-project-badge');
+        if(before){assert.equal(await badge.count(),0);assert.equal(await card.locator('.message-bottom .communication-project-label').textContent(),expected);return;}
+        assert.equal(await badge.count(),0,'Project name is inline with sender, not a badge');
+        assert.ok(!(await header.locator('.sender-button').textContent()).includes(' ('+expected+')'),
+          'Project context is not attributed to the sender');
+        assert.equal(await card.locator('.message-bottom .communication-project-label').count(),0,'Project label moved out of footer');
+        assert.equal(await header.locator('.recipient').count(),1,'Recipient route remains visible');
+        assert.ok((await header.locator('.recipient').textContent()).endsWith(' ('+expected+')'),
+          'Project name follows the recipient in parentheses');
+        const result=await header.evaluate(element=>{const content=element.closest('.message-content').getBoundingClientRect();return{boxes:[...element.children].map(node=>{const box=node.getBoundingClientRect();return{left:box.left,right:box.right,top:box.top,bottom:box.bottom};}),left:content.left,right:content.right};});
+        for(const box of result.boxes)assert.ok(box.left>=result.left-1&&box.right<=result.right+1,'Header identity stays inside card');
+        for(let i=0;i<result.boxes.length;i++)for(let j=i+1;j<result.boxes.length;j++){const a=result.boxes[i],b=result.boxes[j];assert.ok(Math.min(a.right,b.right)-Math.max(a.left,b.left)<=1||Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top)<=1,'Header sender/recipient/project/time do not overlap');}
+      }
+      const longName='IntoTheRotMultiplayerGameplayAndLevelDesignProductionCoordinationProject';
+      await checkHeader(role,'Into The Rot');await checkHeader(longProject,longName);await role.scrollIntoViewIfNeeded();await page.screenshot({path:path.join(evidence,'project-badge-desktop.png'),animations:'disabled'});
+      async function checkDeliveryOverlay(card,width,height){
+        await page.setViewportSize({width,height});
+        await card.evaluate(element=>element.scrollIntoView({block:'center',inline:'nearest'}));
+        const details=card.locator('.delivery-timeline').first(),trigger=details.locator('summary'),panel=details.locator('.delivery-timeline-panel');
+        assert.equal(await details.count()>0,true,'Fixture message has its existing delivery-status menu');
+        await trigger.focus();
+        const before=await card.evaluate(element=>{const box=element.getBoundingClientRect(),next=element.nextElementSibling?.getBoundingClientRect();return{top:box.top,height:box.height,nextTop:next?.top};});
+        await page.keyboard.press('Enter');
+        await page.waitForFunction(element=>element.matches(':popover-open'),await panel.elementHandle());
+        const shown=await page.evaluate(({article,panel})=>{const card=article.getBoundingClientRect(),popup=panel.getBoundingClientRect(),next=article.nextElementSibling?.getBoundingClientRect();return{cardTop:card.top,cardHeight:card.height,nextTop:next?.top,popup:{top:popup.top,bottom:popup.bottom,left:popup.left,right:popup.right,height:popup.height,scrollHeight:panel.scrollHeight,clientHeight:panel.clientHeight,position:getComputedStyle(panel).position},viewport:{width:innerWidth,height:innerHeight},hit:document.elementFromPoint((popup.left+popup.right)/2,(popup.top+popup.bottom)/2)?.closest('.delivery-timeline-panel')===panel};},{article:await card.elementHandle(),panel:await panel.elementHandle()});
+        assert.equal(shown.cardTop,before.top,'Opening the menu does not move the bubble');
+        assert.equal(shown.cardHeight,before.height,'Opening the menu does not expand the bubble');
+        assert.equal(shown.nextTop,before.nextTop,'Opening the menu does not push following messages');
+        assert.equal(shown.popup.position,'fixed','Menu is positioned independently of bubble layout');
+        assert.ok(shown.popup.top>=0&&shown.popup.bottom<=shown.viewport.height,'Menu stays vertically in the viewport');
+        assert.ok(shown.popup.left>=0&&shown.popup.right<=shown.viewport.width,'Menu stays horizontally in the viewport');
+        assert.equal(shown.hit,true,'Top-layer menu receives hit testing above the bubble');
+        const triggerRect=await trigger.boundingBox();
+        if(triggerRect.y>=shown.popup.height+20)assert.ok(shown.popup.bottom<=triggerRect.y+1,'Menu floats above the trigger when there is room');
+        assert.ok(shown.popup.scrollHeight>shown.popup.clientHeight,'Long delivery history scrolls inside the menu');
+        const beforeCardTop=shown.cardTop;await page.mouse.move((shown.popup.left+shown.popup.right)/2,shown.popup.top+shown.popup.height/2);await page.mouse.wheel(0,180);await page.waitForFunction(element=>element.scrollTop>0,await panel.elementHandle());assert.equal(await card.evaluate(element=>element.getBoundingClientRect().top),beforeCardTop,'Scrolling the long panel does not move the bubble');
+        await page.screenshot({path:path.join(evidence,`delivery-menu-${width}x${height}.png`),animations:'disabled'});
+        await page.keyboard.press('Escape');await page.waitForFunction(element=>!element.open,await details.elementHandle());
+        assert.equal(await trigger.evaluate(element=>document.activeElement===element),true,'Escape returns focus to the existing trigger');
+        await trigger.click();await page.waitForFunction(element=>element.matches(':popover-open'),await panel.elementHandle());
+        await page.mouse.click(5,5);
+        await page.waitForFunction(element=>!element.open,await details.elementHandle());
+      }
+      const overlay=page.locator(`#communication-messages .message[data-message-id="${overlayMessage}"]`);await overlay.waitFor();
+      await checkDeliveryOverlay(overlay,1440,900);await checkDeliveryOverlay(overlay,390,320);
+      await page.setViewportSize({width:1440,height:900});await role.scrollIntoViewIfNeeded();
+      for(const width of [390,320]){await page.setViewportSize({width,height:844});await checkHeader(role,'Into The Rot');await checkHeader(longProject,longName);await longProject.scrollIntoViewIfNeeded();await page.screenshot({path:path.join(evidence,'project-badge-mobile-'+width+'.png'),animations:'disabled'});if(!before)assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);}
+      if(before){console.log('PROJECT_BADGE_BEFORE=CAPTURED footer labels');return;}
+      await role.locator('.copy-message').click();await role.locator('.copy-message').getByText('Copied!',{exact:true}).waitFor();assert.match(await page.evaluate(()=>navigator.clipboard.readText()),/PROJECT_BADGE_ROLE_HEADER/);
+      assert.equal(await page.locator('#communication-panel .message-ack').count(),0);assert.equal(await page.locator('#communication-panel .reply-message').count(),0);assert.equal(await page.locator('#composer').isVisible(),false);
+      let stripProjectResponse=true,completeStripProjectResponse;
+      const stripProjectResponseDone=new Promise(resolve=>{completeStripProjectResponse=resolve;});
+      await context.route('**/api/communications?**',async route=>{
+        if(!stripProjectResponse){await route.continue();return;}
+        stripProjectResponse=false;
+        try{const response=await route.fetch();const body=execFileSync('jq',['.messages |= map(del(.project_name))'],{input:await response.text(),encoding:'utf8'});await route.fulfill({response,body});}
+        finally{completeStripProjectResponse();}
+      });
+      await page.locator('#communication-text').fill('PROJECT_BADGE_ROLE_HEADER');await page.locator('#communication-filters').evaluate(form=>form.requestSubmit());
+      await page.waitForFunction(()=>document.querySelectorAll('#communication-messages .message').length===1&&document.querySelectorAll('#communication-messages .message-project-badge').length===0);
+      await stripProjectResponseDone;
+      assert.equal(await role.locator('.message-meta .sender-button').count(),1,'Missing project preserves message identity without invented label');
+      assert.equal(await role.locator('.message-meta .sender-button').textContent(),'orchestrator-with-an-extraordinarily-long-unbroken-role-name-123456789');
+      assert.equal(await role.locator('.message-meta .recipient').textContent(),'gameplay-with-an-extraordinarily-long-unbroken-role-name-123456789','Missing project metadata leaves the recipient identity intact');await context.unroute('**/api/communications?**');
+      assert.deepEqual(mutations,[]);assert.deepEqual(errors,[]);console.log('PROJECT_CONTEXT=PASS inline parenthetical project name long sender/project names desktop mobile missing metadata normal readonly copy');return;
+    }
+    if(process.argv.includes('--gallery-position-only')) {
+      for(const [mode,pathname] of [['ordinary','/'],['root','/root'],['aggregate','/communications']]){
+        await page.setViewportSize({width:2048,height:900});await page.goto(url+pathname);
+        if(mode==='root')await page.getByRole('heading',{name:'Root orchestrator',exact:true}).waitFor();
+        else await page.locator(mode==='aggregate'?'#communication-messages .message':'#messages .message').first().waitFor();
+        await page.locator('#open-attachments').click();await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+        const modal=page.locator('#attachment-gallery');
+        for(const width of [2048,1600,1440,1000,701,700,390]){
+          await page.setViewportSize({width,height:width<701?844:900});
+          await page.waitForFunction(viewport=>{const rect=document.querySelector('#attachment-gallery').getBoundingClientRect(),left=document.querySelector('.main').getBoundingClientRect().left,right=document.querySelector('.workspace').getBoundingClientRect().right;return Math.abs((rect.left+rect.right)/2-(viewport?innerWidth/2:(left+right)/2))<=1;},before);
+          const position=await modal.evaluate(element=>{const rect=element.getBoundingClientRect(),main=document.querySelector('.main').getBoundingClientRect(),workspace=document.querySelector('.workspace').getBoundingClientRect();return{left:rect.left,right:rect.right,center:(rect.left+rect.right)/2,contentLeft:main.left,contentRight:workspace.right,width:innerWidth};});
+          console.log('GALLERY_CENTER_'+mode+'_'+width+'='+[position.center,(position.contentLeft+position.contentRight)/2,position.left,position.right].join(','));
+          assert.ok(position.left>=0&&position.right<=position.width);
+          if(!before){assert.ok(position.left>=position.contentLeft+13);assert.ok(position.right<=position.contentRight-13);}
+          if(width===1440||width===390)await page.screenshot({path:path.join(evidence,'gallery-'+mode+'-'+width+'.png'),animations:'disabled'});
+        }
+        const beforeScroll=await modal.evaluate(element=>({dialog:element.scrollTop,header:element.querySelector('header').getBoundingClientRect().top,controls:element.querySelector('.gallery-controls').getBoundingClientRect().top,footer:document.querySelector('#gallery-more').getBoundingClientRect().top,body:document.documentElement.scrollTop}));
+        await page.locator('#gallery-grid').hover();await page.mouse.wheel(0,1400);await page.waitForFunction(()=>document.querySelector('#gallery-grid').scrollTop>0);
+        const afterScroll=await modal.evaluate(element=>({dialog:element.scrollTop,header:element.querySelector('header').getBoundingClientRect().top,controls:element.querySelector('.gallery-controls').getBoundingClientRect().top,footer:document.querySelector('#gallery-more').getBoundingClientRect().top,body:document.documentElement.scrollTop}));assert.deepEqual(afterScroll,beforeScroll,'Only list scrolls after content-relative positioning/resize');
+        await page.locator('#close-gallery').click();assert.equal(await modal.isVisible(),false,'Native closed modal stays hidden');
+      }
+      assert.deepEqual(errors,[]);assert.deepEqual(mutations,[]);console.log(before?'GALLERY_CENTER_BEFORE=CAPTURED':'GALLERY_CONTENT_CENTER=PASS ordinary root aggregate seven widths open resize mobile content gutter list scroll close readonly');return;
+    }
     if(process.argv.includes('--gallery-scroll-only')) {
       async function exerciseGallery(target,name){
         await target.locator('#open-attachments').click();await target.locator('#gallery-grid .gallery-card').first().waitFor();await target.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
@@ -126,6 +257,74 @@ async function run() {
       mobilePage.on('pageerror',error=>errors.push(error.message));mobilePage.on('request',request=>{if(!['GET','HEAD','OPTIONS'].includes(request.method()))mutations.push(request.method());});
       await mobilePage.goto(url);await mobilePage.locator('#messages .message').first().waitFor();await mobilePage.locator('#agents-toggle').click();await exerciseGallery(mobilePage,'mobile');
       assert.deepEqual(mutations,[]);assert.deepEqual(errors,[]);console.log(before?'GALLERY_SCROLL_BEFORE=REPRODUCED':'GALLERY_LIST_SCROLL=PASS desktop mobile fixed controls footer viewport close icon bytes readonly');return;
+    }
+    if(process.argv.includes('--gallery-filter-boundary-only')) {
+      await page.locator('#all-communication-view').click();await page.locator('#communication-messages .message').first().waitFor();
+      await page.locator('#open-attachments').click();
+      const type=page.locator('#gallery-type'),search=page.locator('#gallery-search'),grid=page.locator('#gallery-grid'),more=page.locator('#gallery-more');
+      const filteredNames=page.waitForResponse(response=>response.url().includes('q=boundary-'));
+      await search.fill('boundary-');await filteredNames;
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      await type.selectOption('document');
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      let names=await grid.locator('.gallery-file-name').allTextContents();
+      assert.equal(names.length,48,'filtered page stops at the 48-match page size across a mixed raw-page boundary');
+      assert.equal(new Set(names).size,48,'first filtered page contains no duplicates');
+      assert.equal(names.filter(name=>name.endsWith('.PDF')).length,48,'one overflow match is shown and the remaining raw-page matches are buffered');
+      assert.equal(await more.isVisible(),true,'buffered matches remain available even when the raw cursor has advanced');
+      await more.click();
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===55 && document.querySelector('#gallery-more').hidden);
+      names=await grid.locator('.gallery-file-name').allTextContents();
+      assert.equal(names.length,55,'Load more returns every match exactly once');
+      assert.equal(new Set(names).size,55,'overflow buffering does not duplicate results');
+      assert.equal(names.filter(name=>name.endsWith('.PDF')).length,55,'all 47+8 matching items are retained in order');
+      assert.equal(await more.isVisible(),false,'pagination ends when the filtered result set is exhausted');
+      assert.deepEqual(mutations,[]);assert.deepEqual(errors,[]);
+      console.log('GALLERY_FILTER_PAGE_BOUNDARY=PASS exactly 48 per filtered page buffered overflow no skip duplicate authorized read-only');return;
+    }
+    if(process.argv.includes('--gallery-filter-only')) {
+      await page.locator('#all-communication-view').click();await page.locator('#communication-messages .message').first().waitFor();
+      await page.locator('#open-attachments').click();
+      const type=page.locator('#gallery-type'),search=page.locator('#gallery-search'),grid=page.locator('#gallery-grid');
+      assert.match(await page.locator('label:has(#gallery-type)').innerText(),/^File type/,'selector remains visibly labelled');
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      assert.equal(await type.inputValue(),'all');
+      assert.equal(await grid.locator('.gallery-file-name').first().textContent(),'batch-note-119.PDF');
+      await type.focus();await type.press('i');
+      await page.waitForFunction(()=>document.querySelector('#gallery-type').value==='image');
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===21);
+      const imageNames=await grid.locator('.gallery-file-name').allTextContents();
+      assert.equal(imageNames.filter(name=>name.endsWith('.PNG')).length,20,'case-insensitive extension matches on later raw pages');
+      assert.ok(imageNames.includes('mime-only'),'extensionless known MIME is classified from metadata');
+      assert.equal(await page.locator('#gallery-more').isVisible(),false,'filter scans through the result set when matches fit one page');
+      await type.selectOption('unknown');await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===1);
+      assert.equal(await grid.locator('.gallery-file-name').textContent(),'mystery-file');
+      await type.selectOption('other');await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===1);
+      assert.equal(await grid.locator('.gallery-file-name').textContent(),'backup.ZIP');
+      await type.selectOption('document');await search.fill('batch-note-09');
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===10);
+      assert.ok((await grid.locator('.gallery-file-name').allTextContents()).every(name=>name.toLowerCase().includes('batch-note-09')),'type and filename search combine');
+      await search.fill('no-such-file');
+      await page.getByText('No attachments match documents and “no-such-file”.',{exact:true}).waitFor();
+      await page.locator('#gallery-project').selectOption({label:'Release planning'});
+      await type.selectOption('image');
+      await page.getByText('No attachments match images and “no-such-file”.',{exact:true}).waitFor();
+      assert.equal(await grid.locator('.gallery-file-name').count(),0,'project scope does not leak default-project matches');
+      await page.locator('#gallery-project').selectOption('');await search.fill('');await type.selectOption('all');
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      assert.equal(await page.locator('#gallery-more').isVisible(),true,'All resets to a valid first page');
+      await page.locator('#gallery-more').click();await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===96);
+      await type.selectOption('document');await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      assert.equal(await page.locator('#gallery-more').isVisible(),true);
+      await page.locator('#gallery-more').click();await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===96);
+      await page.locator('#gallery-more').click();await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===99);
+      assert.equal(await page.locator('#gallery-more').isVisible(),false,'Load more pages through all filtered matches');
+      await page.locator('#close-gallery').click();await page.locator('#open-attachments').click();
+      await page.waitForFunction(()=>document.querySelectorAll('#gallery-grid .gallery-card').length===48);
+      assert.equal(await type.inputValue(),'all','reopen restores default filter');
+      assert.equal(await search.inputValue(),'','reopen preserves existing search-reset convention');
+      assert.deepEqual(mutations,[]);assert.deepEqual(errors,[]);
+      console.log('GALLERY_FILETYPE_FILTER=PASS case-insensitive extension MIME fallback unknown other search paging reset scope keyboard reopen readonly');return;
     }
     if(process.argv.includes('--gallery-only')) {
       await page.locator('#all-communication-view').click();await page.locator('#communication-messages .message').first().waitFor();

@@ -96,6 +96,29 @@ class CompactionCounter:
         log.stamp, log.offset, log.thread_id, log.count = stamp, offset, thread_id, count
         return log
 
+    def cached_count(self, thread_id):
+        """Return verified unchanged cached evidence without waiting or scanning.
+
+        Compact rosters must remain available while another request reads a
+        rollout. Cold, changed, unavailable or busy evidence is unknown; an
+        explicit status read can obtain the current count through ``count``.
+        """
+        if not thread_id or not self._lock.acquire(blocking=False):
+            return None
+        try:
+            path = self._paths.get(thread_id)
+            log = self._logs.get(path)
+            if log is None or log.stamp is None or log.thread_id != thread_id:
+                return None
+            try:
+                stat = path.stat()
+            except OSError:
+                return None
+            stamp = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+            return log.count if stamp == log.stamp else None
+        finally:
+            self._lock.release()
+
     def count(self, thread_id):
         if not thread_id:
             return None

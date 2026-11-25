@@ -18,7 +18,8 @@ TABLES = {
     'message_replies': 'message_id,reply_to',
     'message_batches': 'message_id,batch_id',
     'message_attention': 'message_id',
-    'message_reads': 'message_id,reader_session,read_at',
+    'message_reads': 'message_id,reader_session,read_at,provenance',
+    'standalone_message_acknowledgements': 'message_id,recipient_session,acknowledged_at',
     'reply_ack_idempotency': 'sender_session,reply_to,fingerprint,message_id',
 }
 
@@ -30,6 +31,14 @@ def exists(db, table):
 def record(db, row):
     result = {'message': dict(row)}
     for table, columns in TABLES.items():
+        if table == 'standalone_message_acknowledgements' and not exists(db, table):
+            result[table] = []
+            continue
+        if table == 'message_reads' and 'provenance' not in {
+                column['name'] for column in db.execute('PRAGMA table_info(message_reads)')}:
+            # Old read markers could come from ACK bookkeeping, not a full read.
+            # Match the Coordinator migration without changing the source schema.
+            columns = "message_id,reader_session,read_at,'legacy_unknown' AS provenance"
         result[table] = [dict(item) for item in db.execute(
             f'SELECT {columns} FROM {table} WHERE message_id=? ORDER BY rowid', (row['id'],))]
     return result
@@ -40,6 +49,9 @@ def fingerprint(item):
         {**{k: v for k, v in attachment.items() if k != 'content'},
          'sha256': hashlib.sha256(attachment['content']).hexdigest()}
         for attachment in item['attachments']]}
+    # Preserve retained pre-provenance move journals when no evidence exists.
+    if not value.get('standalone_message_acknowledgements'):
+        value.pop('standalone_message_acknowledgements', None)
     return hashlib.sha256(Coordinator._canonical_bytes(value)).hexdigest()
 
 
@@ -61,6 +73,11 @@ def mapped(item, identities):
         if row['reader_session'] != item['message']['recipient_session']:
             raise CoordError('selected history has a foreign message reader')
         row['reader_session'] = identities[row['reader_session']]
+    for row in result['standalone_message_acknowledgements']:
+        if (row['recipient_session'] != item['message']['recipient_session']
+                or row['acknowledged_at'] != item['message']['acked_at']):
+            raise CoordError('selected history has inconsistent standalone acknowledgement metadata')
+        row['recipient_session'] = identities[row['recipient_session']]
     for row in result['reply_ack_idempotency']:
         if row['sender_session'] != item['message']['sender_session'] or row['fingerprint'] != reply_fingerprint(item):
             raise CoordError('selected history has inconsistent ACK-reply metadata')
@@ -272,6 +289,8 @@ class HistoryMove:
                 raise CoordError('source ACK-reply boundary changed after import')
         for row in present:
             for table in TABLES:
+                if table == 'standalone_message_acknowledgements' and not exists(source, table):
+                    continue
                 source.execute(f'DELETE FROM {table} WHERE message_id=?', (row['id'],))
             if exists(source,'bridge_deliveries'):
                 source.execute('DELETE FROM bridge_deliveries WHERE message_id=?', (row['id'],))

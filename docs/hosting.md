@@ -42,8 +42,8 @@ server {
     ssl_certificate /etc/letsencrypt/live/chat.example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/chat.example.com/privkey.pem;
 
-    # Covers the app's maximum 50 x 10 MiB attachment batch, including base64 RPCs.
-    # The application still enforces its own per-file and request limits.
+    # Covers the unchanged application request ceiling and base64 RPC overhead.
+    # GLB v2 and binary FBX 7400 files may be up to 64 MiB; other files remain 10 MiB.
     client_max_body_size 700m;
 
     location / {
@@ -161,3 +161,21 @@ written. Logging is `OFF` by default, bounded and rotated locally, and sink
 failures do not affect requests. A changed configuration takes effect only when
 the authorized operator explicitly starts or reloads the HTTP server; installing
 a service wrapper does not activate an existing server.
+
+
+Model attachment limits are 64 MiB per GLB v2/binary FBX 7400, 10 MiB for other
+formats, 50 files and 500 MiB raw total. Existing request/proxy/body bounds remain
+unchanged; raw total does not include multipart/JSON overhead. Only successful
+first-party attachment-download JSON permits up to 90,527,064 response bytes;
+general/error responses remain 60 MiB. A proxy may still impose a lower bound.
+Buffered transfer capacity and at-most-two-client synthetic 3 GiB memory evidence
+are distinct from arbitrary production concurrency or installed adoption.
+
+
+### Finalize an interrupted own guarded cohort
+
+`agent-chat-client guard-finalize --batch-manifest PRIVATE_TUPLES --process-evidence-file ORIGINAL_JOURNAL --result-file NEW_PRIVATE_RESULTS` closes only exact ended guards from one original prospective journal (1–64 resources). Use the original project/session and registered host; keep capabilities and all files owner-private. No actor/host override, new process or generic HTTP is provided. The entire cohort must match current original reservation IDs, run IDs, PID/start times, successful attachment, leader reap and later process-group absence. Missing/truncated journals, ambiguous/live PIDs and changed scope fail before closure.
+
+The result journal is exclusive-create and retains each confirmed, already-verified or read-reconciled closure and any partial/UNKNOWN result. Lost mutation responses are read-reconciled against the same run and immutable intended evidence hash; an OPEN result stops without retry. A later normally reviewed invocation uses the unchanged original journal and a new result file; already-closed matching hashes are never resent. Hash conflicts refuse. An older server without the owner-only closure-hash projection fails closed; source installation alone does not establish loaded runtime support.
+
+Finalization does not restore files, attest `restored=true`, create a receipt or release resources. Live ordinary cleanup runs can be admitted while older guards remain OPEN, but ordinary release requires every old guard closed and truthful restored/process-closure receipts. Stale-only `run --restore` must never be used for live roles and requires prior old-run finalization. Do not force status changes or borrow another owner's capability.

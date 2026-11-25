@@ -44,9 +44,10 @@ class RootDeliveryMetadataTests(unittest.TestCase):
                       thread=self.thread, turn='exact-native-turn')
         values.update(overrides)
         store = PolicyStore(self.projects.path)
-        payload = communication.STANDING_POLICY + '\n' + json.dumps(dict(policy_version=communication.policy_version()))
-        store.offer(values['host'], values['project'], values['kind'], values['client_id'], values['thread'], payload)
-        store.receipt(values['host'], values['thread'], values['client_id'], communication.policy_version(), values['turn'])
+        payload = communication.STANDING_POLICY + ' ' + communication.BOOT_AUTHORIZATION + '\n' + json.dumps(dict(policy_version=communication.policy_version()))
+        offered = store.offer(values['host'], values['project'], values['kind'], values['client_id'], values['thread'], payload)
+        self.assertTrue(offered['offered'])
+        store.receipt(values['host'], values['thread'], values['client_id'], communication.policy_version(), values['turn'], project=values['project'])
 
     def test_terminal_exact_message_mapping_without_content_or_writes(self):
         self.fixture()
