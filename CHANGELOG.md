@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/TKrisee/agent-chat/compare/v0.14.5...v0.15.0) (2026-11-25)
+
+
+### Features
+
+* add unread navigation and attachment galleries ([c8e6868](https://github.com/TKrisee/agent-chat/commit/c8e68683c8e334605d2d9b6bdd369c25f3a7709e))
+* route PO progress and escalations through Root ([98d8177](https://github.com/TKrisee/agent-chat/commit/98d8177e0b85e20d6c966088744acd215752f551))
+
 ## [0.14.5](https://github.com/TKrisee/agent-chat/compare/v0.14.4...v0.14.5) (2026-11-25)
 
 
