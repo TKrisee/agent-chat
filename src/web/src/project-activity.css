@@ -13,10 +13,3 @@
 .pa-work strong,.pa-work small { display:block; overflow-wrap:anywhere; }
 .pa-work strong { font-size:12px; }.pa-work small,.pa-exchanges small { color:#718477; font-size:10px; }
 .pa-exchanges p,.pa-empty { margin:4px 0; color:#718477; font-size:11px; line-height:1.45; white-space:pre-wrap; overflow-wrap:anywhere; }
-
-.pa-handoff { margin-top:6px; }
-.pa-handoff-status { font-size:11px; line-height:1.4; margin:6px 0 0; overflow-wrap:anywhere; }
-
-.pa-continue { margin-top:6px; }
-.pa-continue label, .pa-continue textarea { display:block; width:100%; }
-.pa-continue textarea { min-height:4em; margin:4px 0; }
