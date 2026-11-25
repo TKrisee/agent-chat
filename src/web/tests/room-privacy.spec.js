@@ -40,6 +40,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await group.press('Enter');
   await expect(page.locator('.chat').getByText('Shared tagged message', {exact:false})).toBeVisible();
   await expect(page.locator('.chat').getByText('PO replied in the project group:', {exact:false})).toBeVisible({timeout:20000});
+  await expect(page.locator('#composer')).toHaveAttribute('aria-busy','false');
   await lead.click();
   const direct = page.locator('#message');
   await expect(dispatchNotice).toHaveCount(0);
@@ -47,9 +48,19 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toHaveCount(0);
   await expect(page.getByText('Shared tagged message', {exact:false})).toHaveCount(0);
   await expect(page.getByText('PO replied in the project group:', {exact:false})).toHaveCount(0);
+  let releaseDirect;
+  let directCommitted, directFinished;
+  const directReady = new Promise(resolve => { directCommitted = resolve; });
+  const directDone = new Promise(resolve => { directFinished = resolve; });
+  await page.route('**/api/messages/upload', async route => {
+    const response = await route.fetch();
+    directCommitted();
+    await new Promise(resolve => { releaseDirect = resolve; });
+    try { await route.fulfill({response}); } finally { directFinished(); }
+  });
   await direct.fill('Private direct message');
   await direct.press('Enter');
-  await expect(page.locator('.chat').getByText('Private direct message', {exact:true})).toBeVisible();
+  await directReady;
   await project.click();
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
   await expect(page.getByText('Private direct message', {exact:true})).toHaveCount(0);
@@ -60,12 +71,34 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(page.getByText('Project missing was not found.', {exact:false})).toBeVisible();
   await expect(rootComposer).toHaveValue('/stop missing');
   await rootComposer.fill('/stop atlas');
+  let releaseStop, stopStarted, stopFinished, stopCount=0;
+  const stopReady=new Promise(resolve=>{stopStarted=resolve;});
+  const stopDone=new Promise(resolve=>{stopFinished=resolve;});
+  await page.route('**/api/projects/atlas/stop', async route=>{
+    stopCount++;
+    const response=await route.fetch();
+    stopStarted();
+    await new Promise(resolve=>{releaseStop=resolve;});
+    try { await route.fulfill({response}); } finally { stopFinished(); }
+  });
   const stopResponse=page.waitForResponse(r=>r.url().endsWith('/api/projects/atlas/stop') && r.request().method()==='POST');
   await rootComposer.press('Enter');
+  await stopReady;
+  await rootComposer.press('Enter');
+  expect(stopCount).toBe(1);
+  releaseStop();
   expect((await stopResponse).status()).toBe(200);
+  await stopDone;
+  await page.unroute('**/api/projects/atlas/stop');
   await expect(page.getByText(/Stop requested for atlas\. \d+ jobs? remain(?:s)? submitted, running or uncertain\./)).toBeVisible();
   await expect(project.locator('small')).toHaveText(/^(stopped|stopping)$/);
   await expect(rootComposer).toHaveValue('');
+  releaseDirect();
+  await directDone;
+  await page.unroute('**/api/messages/upload');
+  await project.click();
+  await lead.click();
+  await expect(page.locator('.chat').getByText('Private direct message', {exact:true})).toBeVisible();
 });
 
 test('project panel shows current work once and preserves earlier uncertainty', async ({page, serviceURL}) => {
