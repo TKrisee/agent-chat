@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -37,12 +38,23 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 		err   error
 	}
 	done := make(chan attempt, s.opts.Concurrency)
+	cleaning := make(chan struct{}, 1)
 	defer func() {
 		for range len(active) {
 			<-done
 		}
 	}()
 	for {
+		select {
+		case cleaning <- struct{}{}:
+			go func() {
+				defer func() { <-cleaning }()
+				if err := s.cleanupOneScratch(); err != nil {
+					log.Printf("scratch cleanup deferred: %v", err)
+				}
+			}()
+		default:
+		}
 		for ctx.Err() == nil && len(active) < s.opts.Concurrency {
 			s.startMu.Lock()
 			j, err := s.claimLocked(active)
@@ -177,6 +189,25 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		}
 		if stopped {
 			return s.disposition(j.ID, "pending", "", 0)
+		}
+		if j.Kind == "work" {
+			j.Request.Scratch = ""
+			if err := s.prepareScratch(j.ID); err != nil {
+				log.Printf("optional scratch unavailable for work job: %v", err)
+			} else {
+				var created int
+				err := s.db.QueryRow("SELECT created FROM job_scratch WHERE job_id=? AND cleaned=0", j.ID).Scan(&created)
+				if err == nil && created == 1 {
+					j.Request.Scratch = filepath.Join(s.dir, "scratch", j.ID)
+				}
+			}
+			body, err := json.Marshal(j.Request)
+			if err != nil {
+				return s.disposition(j.ID, "pending", "prepare request failed", s.opts.Poll)
+			}
+			if _, err = s.db.Exec("UPDATE jobs SET request=? WHERE id=? AND status='submitted'", body, j.ID); err != nil {
+				return err
+			}
 		}
 		if err := s.materialize(j.Request); err != nil {
 			return s.disposition(j.ID, "pending", "prepare request: "+err.Error(), s.opts.Poll)

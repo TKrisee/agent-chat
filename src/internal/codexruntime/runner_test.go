@@ -29,6 +29,11 @@ func TestMain(m *testing.M) {
 	if output == "" {
 		os.Exit(2)
 	}
+	if path := os.Getenv("FAKE_ARGS"); path != "" {
+		if err := os.WriteFile(path, []byte(strings.Join(os.Args[1:], "\n")), 0600); err != nil {
+			os.Exit(3)
+		}
+	}
 	input, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		os.Exit(3)
@@ -62,6 +67,37 @@ func TestMain(m *testing.M) {
 		os.Exit(3)
 	}
 	os.Exit(0)
+}
+
+func TestWorkerScratchIsWritableAndBoundToReceipt(t *testing.T) {
+	r, req, tmp := setup(t)
+	req.Role, req.Kind = "worker", "work"
+	req.Scratch = filepath.Join(tmp, "scratch")
+	if err := os.Mkdir(req.Scratch, 0700); err != nil {
+		t.Fatal(err)
+	}
+	argsPath := filepath.Join(tmp, "args")
+	t.Setenv("FAKE_ARGS", argsPath)
+	t.Setenv("FAKE_RESULT", `{"text":"done","actions":[],"attachments":[]}`)
+	withoutScratch := req
+	withoutScratch.Scratch = ""
+	if strings.Contains(prompt(withoutScratch), "App-owned disposable scratch for temporary work:") || !strings.Contains(prompt(req), "App-owned disposable scratch for temporary work: "+req.Scratch) || !strings.Contains(prompt(req), "only after the work is accepted and reported") {
+		t.Fatal("scratch prompt does not reflect the prepared path and cleanup boundary")
+	}
+	if fingerprint(req) == fingerprint(withoutScratch) {
+		t.Fatal("scratch missing from receipt identity")
+	}
+	if _, err := r.Execute(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil || !strings.Contains("\n"+string(args)+"\n", "\n--add-dir\n"+req.Scratch+"\n") {
+		t.Fatalf("scratch not passed as writable directory: %v", err)
+	}
+	req.Scratch = "relative"
+	if validate(req) == nil {
+		t.Fatal("relative scratch accepted")
+	}
 }
 
 func setup(t *testing.T) (*Runner, runtimeapi.Request, string) {

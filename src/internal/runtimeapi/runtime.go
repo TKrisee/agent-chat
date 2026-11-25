@@ -36,6 +36,7 @@ type Request struct {
 	TaskID       string    `json:"task_id"`
 	Kind         string    `json:"kind,omitempty"`
 	Workspace    string    `json:"workspace"`
+	Scratch      string    `json:"scratch,omitempty"`
 	Model        string    `json:"model"`
 	Effort       string    `json:"effort"`
 	Instructions string    `json:"instructions"`

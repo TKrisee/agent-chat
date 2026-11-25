@@ -145,6 +145,10 @@ func fingerprint(req runtimeapi.Request) string {
 		add("request-kind")
 		add(req.Kind)
 	}
+	if req.Scratch != "" {
+		add("scratch")
+		add(req.Scratch)
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -161,6 +165,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if !filepath.IsAbs(req.Workspace) {
 		return errors.New("workspace must be absolute")
+	}
+	if req.Scratch != "" && (!filepath.IsAbs(req.Scratch) || req.Role != "worker" || req.Kind != "work") {
+		return errors.New("scratch requires an absolute path for a worker work job")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")
@@ -315,6 +322,12 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
+	if (req.Role == "po" || req.Role == "worker") && req.ProjectID != "" && req.TaskID != "" && req.Kind != "operator_message" && req.Kind != "project_message" {
+		b.WriteString("\nWorkspace policy: An empty app-provided job directory is scratch, not an instruction to copy the project. For Git work, when authorized and permitted by the sandbox, reuse an existing isolated worktree or branch for the same owner, repository and work lane; keep concurrent work isolated. For small changes prefer an appropriately scoped checkout or sparse scope when practical. Do not recursively copy a full repository, generated dependencies or caches. For non-Git work, prefer the existing authorized workspace or a small local patch instead of a blanket copy. Preserve unmerged, dirty, uncertain and evidence-bearing work; do not reuse another owner's lane or overwrite unresolved work. Put deliverable artifacts and evidence in durable authorized project or app storage. Clean only scratch explicitly designated disposable; never delete source, workspaces, caches or evidence merely because a job ended.\n")
+		if req.Scratch != "" {
+			fmt.Fprintf(&b, "\nApp-owned disposable scratch for temporary work: %s. Keep deliverables and evidence in durable authorized storage; this scratch may be cleaned only after the work is accepted and reported.\n", req.Scratch)
+		}
+	}
 	if req.Role == "root" {
 		b.WriteString("\nWhen receiving project reports or escalations, summarize relevant facts for the operator and forward actual questions or choices needing their decision; do not relay routine team chatter or private PO conversations.\n")
 		if req.Kind == "task_blocked" {
@@ -440,6 +453,9 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		}
 	}
 	args := []string{"exec", "--ephemeral", "--color", "never", "--skip-git-repo-check", "--cd", req.Workspace, "--output-schema", filepath.Join(dir, "schema.json"), "--output-last-message", filepath.Join(dir, "result.json")}
+	if req.Scratch != "" {
+		args = append(args, "--add-dir", req.Scratch)
+	}
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
 	}

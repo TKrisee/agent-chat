@@ -69,6 +69,10 @@ CREATE TABLE IF NOT EXISTS project_workspace_roots (
 CREATE TABLE IF NOT EXISTS project_workspace_jobs (
  job_id TEXT PRIMARY KEY, path TEXT NOT NULL, created INTEGER NOT NULL DEFAULT 0 CHECK(created IN (0,1))
 );
+CREATE TABLE IF NOT EXISTS job_scratch (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id), created INTEGER NOT NULL DEFAULT 0,
+ cleaned INTEGER NOT NULL DEFAULT 0
+);
 
 CREATE TABLE IF NOT EXISTS po_followups (
  source_id TEXT PRIMARY KEY REFERENCES messages(id),

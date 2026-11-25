@@ -141,7 +141,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 			if _, err := tx.Exec("INSERT INTO project_workspace_jobs(job_id,path) VALUES(?,?)", id, workspace); err != nil {
 				return err
 			}
-			guide += "\nOperator-authorized fresh job workspace: " + workspace + ". Work within this directory; previous workspaces are not your workspace."
+			guide += "\nOperator-authorized fresh job workspace: " + workspace + ". This is the default isolated workspace, not a request to copy a repository. Reuse an existing worktree only when your PO explicitly assigns its exact authorized path for this same worker, repository and work lane, the sandbox permits it, and no concurrent owner or unresolved work would be disturbed. Preserve dirty, unmerged and uncertain work. All other job workspaces remain out of scope."
 		}
 	}
 	req := runtimeapi.Request{ID: id, AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
@@ -153,6 +153,9 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	}
 	_, err = tx.Exec("INSERT INTO jobs (id,agent_id,project_id,task_id,source_id,kind,status,request,next_at) VALUES (?,?,?,?,?,?,'pending',?,?)",
 		req.ID, a.ID, nullIfEmpty(project), nullIfEmpty(task), source, kind, body, now())
+	if err == nil && kind == "work" {
+		_, err = tx.Exec("INSERT INTO job_scratch(job_id) VALUES(?)", id)
+	}
 	return err
 }
 

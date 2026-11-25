@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"agentchat/src/internal/runtimeapi"
@@ -37,7 +39,11 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	if err := s.complete(*decision, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "delegate", Project: "alpha", Title: "Review approved sources", Body: "Review art and map sources, then report."}}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.db.Exec("INSERT INTO project_workspace_roots(project_id,path) VALUES('alpha',?)", t.TempDir()); err != nil {
+	workspaceRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("INSERT INTO project_workspace_roots(project_id,path) VALUES('alpha',?)", workspaceRoot); err != nil {
 		t.Fatal(err)
 	}
 	assignmentJob, err := s.claim(nil)
@@ -68,6 +74,26 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	if first.Kind != "work" || planningJob.Kind != "po_followup" {
 		t.Fatalf("expected work and planning, got %s and %s", first.Kind, planningJob.Kind)
 	}
+	if err := s.prepareScratch(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	scratch := filepath.Join(s.dir, "scratch", first.ID)
+	if err := os.WriteFile(filepath.Join(scratch, "temporary"), []byte("scratch"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	retained := filepath.Join(t.TempDir(), "retained")
+	if err := os.WriteFile(retained, []byte("evidence"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(retained, filepath.Join(scratch, "outside")); err != nil && !os.IsPermission(err) {
+		t.Fatal(err)
+	}
+	if err := s.cleanupOneScratch(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(scratch); err != nil {
+		t.Fatalf("scratch removed before work acceptance: %v", err)
+	}
 	planning := *planningJob
 	if err := s.complete(planning, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Title: "map", Body: "Inspect the approved map.", Recipient: "World"}}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
@@ -86,6 +112,13 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 	}
 	if second.Kind != "work" || waitJob.Kind != "po_followup" {
 		t.Fatalf("expected second work and wait, got %s and %s", second.Kind, waitJob.Kind)
+	}
+	collision := filepath.Join(s.dir, "scratch", second.ID)
+	if err := os.Mkdir(collision, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.prepareScratch(second.ID); err == nil {
+		t.Fatal("adopted unowned scratch")
 	}
 	wait := *waitJob
 	if err := s.complete(wait, runtimeapi.Result{Text: "Waiting for both results."}, nil, nil, nil); err != nil {
@@ -108,7 +141,27 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 		t.Fatalf("worker model %q: %v", model, err)
 	}
 	for i, w := range workers {
-		if err := s.complete(w, runtimeapi.Result{Text: "Evidence gathered."}, nil, nil, nil); err != nil {
+		if i == 1 {
+			called := false
+			runner := runnerFuncs{execute: func(_ context.Context, request runtimeapi.Request) (runtimeapi.Result, error) {
+				called = true
+				if request.Scratch != "" {
+					t.Errorf("collision exposed scratch %q", request.Scratch)
+				}
+				return runtimeapi.Result{Text: "Evidence gathered."}, nil
+			}}
+			if err := s.runJob(context.Background(), runner, w); err != nil {
+				t.Fatal(err)
+			}
+			if !called {
+				var diagnostic string
+				_ = s.db.QueryRow("SELECT COALESCE(diagnostic,'') FROM jobs WHERE id=?", w.ID).Scan(&diagnostic)
+				t.Fatalf("unowned collision prevented worker dispatch: %s", diagnostic)
+			}
+			if _, err := os.Stat(collision); err != nil {
+				t.Fatalf("collision removed: %v", err)
+			}
+		} else if err := s.complete(w, runtimeapi.Result{Text: "Evidence gathered."}, nil, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		active := map[string]bool{}
@@ -121,6 +174,27 @@ func TestPOTeamBacklogRoundTrip(t *testing.T) {
 		}
 		if err := s.complete(*r, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "accept_result", Project: "alpha"}, {Type: "report", Project: "alpha", Recipient: root, Body: "Reviewed evidence."}}}, nil, nil, nil); err != nil {
 			t.Fatal(err)
+		}
+		if i == 0 {
+			// An unrelated uncertain worker must not retain this accepted child's scratch.
+			if _, err := s.db.Exec("UPDATE jobs SET status='uncertain' WHERE id=?", workers[1].ID); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.cleanupOneScratch(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Stat(scratch); !os.IsNotExist(err) {
+				t.Fatalf("accepted scratch still present: %v", err)
+			}
+			if _, err := os.Stat(retained); err != nil {
+				t.Fatalf("scratch cleanup removed external evidence: %v", err)
+			}
+			if _, err := os.Stat(collision); err != nil {
+				t.Fatalf("unowned directory removed: %v", err)
+			}
+			if _, err := s.db.Exec("UPDATE jobs SET status='submitted' WHERE id=?", workers[1].ID); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	var completed int
