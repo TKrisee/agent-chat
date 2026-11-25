@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.2](https://github.com/TKrisee/agent-chat/compare/v0.13.1...v0.13.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* require task in the native structured action schema ([8de70a5](https://github.com/TKrisee/agent-chat/commit/8de70a56ee38e552f8d4e5a4d836322c0a8f9ae2))
+
 ## [0.13.1](https://github.com/TKrisee/agent-chat/compare/v0.13.0...v0.13.1) (2026-11-25)
 
 
