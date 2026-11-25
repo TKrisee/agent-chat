@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/TKrisee/agent-chat/compare/v0.6.2...v0.7.0) (2026-11-25)
+
+
+### Features
+
+* reload chat after committed app updates ([8355aaf](https://github.com/TKrisee/agent-chat/commit/8355aaf662e8af1367f7045e0fe6cd65b02aa35a))
+
 ## [0.6.2](https://github.com/TKrisee/agent-chat/compare/v0.6.1...v0.6.2) (2026-11-25)
 
 
