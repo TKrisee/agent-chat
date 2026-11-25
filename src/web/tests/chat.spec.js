@@ -1,4 +1,5 @@
 import { test, expect } from './fixture.js';
+import { randomUUID } from 'node:crypto';
 
 test('drop and send an attachment; preserve it for retry after a failed send', async ({ page, serviceURL }) => {
   await page.goto(serviceURL);
@@ -69,9 +70,19 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBe(initialHeight);
 
   await add.click();
+  const refreshWithMessage = async text => {
+    const response = await page.request.post(`${serviceURL}/api/messages/upload`, {multipart:{id:randomUUID(),recipient:'root',text}});
+    expect(response.status()).toBe(201);
+    await expect(page.getByRole('article').filter({hasText:text}).first()).toBeVisible({timeout:15000});
+  };
+  await refreshWithMessage('Background update with attachment menu open');
+  await expect(upload).toBeVisible();
+  await expect(upload).toBeFocused();
   const chooser = page.waitForEvent('filechooser');
   await upload.click();
-  await (await chooser).setFiles({ name: 'retry.txt', mimeType: 'text/plain', buffer: Buffer.from('retry') });
+  const selected = await chooser;
+  await refreshWithMessage('Background update with file chooser open');
+  await selected.setFiles({ name: 'retry.txt', mimeType: 'text/plain', buffer: Buffer.from('retry') });
   await expect(upload).toBeHidden();
   await composer.fill('Retry this upload');
   let releaseUpload;
