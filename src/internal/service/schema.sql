@@ -128,3 +128,16 @@ CREATE TABLE IF NOT EXISTS root_hold_decisions (
  hold_job_id TEXT NOT NULL REFERENCES task_holds(job_id),
  note_id TEXT NOT NULL REFERENCES messages(id)
 );
+
+-- Operator explicitly chose the already-recorded Root draft while retaining
+-- the uncertain scope-review receipt and its unknown effects.
+CREATE TABLE IF NOT EXISTS scope_draft_confirmations (
+ request_id TEXT PRIMARY KEY,
+ task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+ review_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+ draft_message_id TEXT NOT NULL REFERENCES messages(id),
+ assignment_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+ confirmed_by TEXT NOT NULL CHECK(confirmed_by='operator'),
+ effects_unknown_ack INTEGER NOT NULL CHECK(effects_unknown_ack=1),
+ created_at INTEGER NOT NULL
+);

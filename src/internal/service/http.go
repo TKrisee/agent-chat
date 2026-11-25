@@ -307,6 +307,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 		respond(w, http.StatusOK, view)
 	})
 	mux.HandleFunc("POST /api/tasks/{id}/retry-handoff", s.retryHandoff)
+	mux.HandleFunc("POST /api/tasks/{id}/confirm-scope-draft", s.confirmScopeDraft)
 	mux.HandleFunc("POST /api/tasks/{id}/continue-po", s.continuePO)
 	mux.HandleFunc("POST /api/tasks/{id}/resolve-hold", s.operatorResolveHold)
 	mux.HandleFunc("POST /api/projects/{id}/workspace", s.setProjectWorkspace)

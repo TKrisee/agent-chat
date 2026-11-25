@@ -125,7 +125,7 @@ func (s *Service) holdCanResolve(tx *sql.Tx, h activeHold) (bool, error) {
 }
 func (s *Service) holdCanResolveExcluding(tx *sql.Tx, h activeHold, excludeJob string, requireRootMessage bool) (bool, error) {
 	var valid, other, approvals int
-	err := tx.QueryRow(`SELECT (SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id JOIN agents a ON a.id=p.po_id AND a.project_id=p.id AND a.role='po' WHERE t.id=? AND p.id=? AND p.po_id=? AND p.stopped=0 AND t.status='blocked' AND t.owner_id=p.po_id), (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain')), (SELECT count(*) FROM approvals WHERE task_id=?)`, h.task, h.project, h.po, h.task, excludeJob, h.task).Scan(&valid, &other, &approvals)
+	err := tx.QueryRow(`SELECT (SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id JOIN agents a ON a.id=p.po_id AND a.project_id=p.id AND a.role='po' WHERE t.id=? AND p.id=? AND p.po_id=? AND p.stopped=0 AND t.status='blocked' AND t.owner_id=p.po_id), (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain')), (SELECT count(*) FROM approvals WHERE task_id=?)`, h.task, h.project, h.po, h.task, excludeJob, h.task).Scan(&valid, &other, &approvals)
 	if err != nil {
 		return false, err
 	}
