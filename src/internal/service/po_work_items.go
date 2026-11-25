@@ -68,7 +68,7 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 	}
 	id = rows[0]
 	var busy int
-	if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE agent_id=? AND kind='work' AND status IN ('pending','submitted','running','uncertain')`, id).Scan(&busy); err != nil {
+	if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE agent_id=? AND kind='work' AND status='uncertain'`, id).Scan(&busy); err != nil {
 		return err
 	}
 	if busy != 0 {

@@ -108,6 +108,7 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 			  (j.status IN ('submitted','running') OR
 			    (j.status='pending' AND ?=0 AND NOT EXISTS
 			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1) AND
+			        (j.kind!='work' OR NOT EXISTS (SELECT 1 FROM jobs lane WHERE lane.agent_id=j.agent_id AND lane.kind='work' AND lane.id!=j.id AND (lane.status IN ('submitted','running','uncertain') OR (lane.status='pending' AND lane.rowid<j.rowid)))) AND
 			        (j.kind!='work' OR EXISTS(SELECT 1 FROM project_workspace_roots r WHERE r.project_id=j.project_id) OR NOT EXISTS
 			         (SELECT 1 FROM jobs w WHERE w.id!=j.id AND w.project_id=j.project_id AND w.kind='work' AND w.status IN ('submitted','running','uncertain')))))`
 		args := []any{now(), paused}

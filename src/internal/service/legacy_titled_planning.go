@@ -12,6 +12,7 @@ import (
 
 const legacyTitledPlanningDiagnostic = "invalid runtime result: group post outside project scope"
 const legacyAssignmentLineageDiagnostic = "invalid runtime result: original PO assignment is unavailable"
+const legacyBusyPlanDiagnostic = "invalid runtime result: worker has unsettled work"
 
 type legacyTitledPlan struct {
 	job        job
@@ -38,7 +39,7 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 	if err != nil {
 		return out, false, err
 	}
-	if out.job.Agent != po || (out.job.Kind != "assignment" && out.job.Kind != "po_followup") || status != "completed" || (diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyAssignmentLineageDiagnostic) || len(payload) == 0 || len(payload) > 1<<20 {
+	if out.job.Agent != po || (out.job.Kind != "assignment" && out.job.Kind != "po_followup") || status != "completed" || (diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyAssignmentLineageDiagnostic && diagnostic != legacyBusyPlanDiagnostic) || len(payload) == 0 || len(payload) > 1<<20 {
 		return out, false, nil
 	}
 	out.job.Project = project
@@ -56,7 +57,11 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 		}
 	}
 	var other int
-	err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=?)+(SELECT count(*) FROM po_work_items WHERE parent_task_id=?)+(SELECT count(*) FROM po_followups WHERE trigger_id=?)`, task, task, task, out.job.ID).Scan(&other)
+	if diagnostic == legacyBusyPlanDiagnostic {
+		err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE (task_id=? OR task_id IN (SELECT child_task_id FROM po_work_items WHERE parent_task_id=?)) AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=? OR task_id IN (SELECT child_task_id FROM po_work_items WHERE parent_task_id=?))+(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.status!='completed')+(SELECT count(*) FROM po_followups WHERE trigger_id=?)`, task, task, task, task, task, out.job.ID).Scan(&other)
+	} else {
+		err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=?)+(SELECT count(*) FROM po_work_items WHERE parent_task_id=?)+(SELECT count(*) FROM po_followups WHERE trigger_id=?)`, task, task, task, out.job.ID).Scan(&other)
+	}
 	if err != nil || other != 0 {
 		return out, false, err
 	}
@@ -78,6 +83,44 @@ func (s *Service) legacyTitledPlanning(tx *sql.Tx, task string) (out legacyTitle
 		if err != nil {
 			return out, false, err
 		}
+	}
+	if diagnostic == legacyBusyPlanDiagnostic {
+		if out.job.Kind != "po_followup" {
+			return out, false, nil
+		}
+		_, assignment, ok, err := s.recoveredTitledAssignment(tx, task, project, po)
+		if err != nil {
+			return out, false, err
+		}
+		if !ok || assignment != out.assignment {
+			return out, false, nil
+		}
+		f, err := readPOFollowup(tx, out.job.Source)
+		if err != nil {
+			return out, false, err
+		}
+		if f.assignment != assignment || f.phase != "assigned" || f.ordinal != 1 {
+			return out, false, nil
+		}
+		var valid int
+		if err = tx.QueryRow(`SELECT count(*) FROM jobs j JOIN po_followups f ON f.source_id=? JOIN po_planning_wakes pw ON pw.source_id=f.source_id JOIN messages m ON m.id=f.source_id WHERE j.id=f.trigger_id AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND j.status='completed' AND m.task_id=j.task_id AND m.project_id=j.project_id AND m.sender='service' AND m.recipient=? AND m.role='system'`, out.job.Source, task, project, po, po).Scan(&valid); err != nil {
+			return out, false, err
+		}
+		if valid != 1 {
+			return out, false, nil
+		}
+		var completed, unproven int
+		if err = tx.QueryRow(`SELECT count(*),COALESCE(sum(CASE WHEN EXISTS(SELECT 1 FROM messages w JOIN agents a ON a.id=w.sender AND a.role='worker' AND a.project_id=w.project_id JOIN messages r ON r.task_id=w.task_id AND r.project_id=w.project_id AND r.sender=? AND r.recipient=? AND r.role='po' AND r.seq>w.seq WHERE w.task_id=c.id AND w.project_id=c.project_id AND w.recipient=? AND w.role='worker') THEN 0 ELSE 1 END),0) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.status='completed'`, po, po, po, task).Scan(&completed, &unproven); err != nil {
+			return out, false, err
+		}
+		if completed == 0 || unproven != 0 {
+			return out, false, nil
+		}
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacySafePlanningInspector)
+		if !ok {
+			return out, false, nil
+		}
+		return out, inspector.IsLegacySafePlanning(context.Background(), payload, project), nil
 	}
 	if diagnostic == legacyAssignmentLineageDiagnostic {
 		if out.job.Kind != "po_followup" {
