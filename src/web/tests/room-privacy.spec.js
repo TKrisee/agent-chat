@@ -26,6 +26,10 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await group.fill('Shared untagged message');
   await group.press('Enter');
   await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
+  // The visible post can precede the send acknowledgement that unlocks group mentions.
+  await expect(page.locator('#composer')).toHaveAttribute('aria-busy','false');
+  await expect(group).toBeEditable();
+  await expect(group).toHaveValue('');
   const lead = page.locator('[data-agent]').first();
   await expect(lead).toBeVisible();
   const leadId = await lead.getAttribute('data-agent');
