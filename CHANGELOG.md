@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.1](https://github.com/TKrisee/agent-chat/compare/v0.13.0...v0.13.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* let operators recover held PO work after runner failures ([2c1b848](https://github.com/TKrisee/agent-chat/commit/2c1b848bfe3dd61348e44a7cdc037bad1f388f70))
+
 ## [0.13.0](https://github.com/TKrisee/agent-chat/compare/v0.12.1...v0.13.0) (2026-11-25)
 
 
