@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/TKrisee/agent-chat/compare/v0.9.0...v0.9.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* refresh the UI after switching Codex CLI sources ([6b3bbc3](https://github.com/TKrisee/agent-chat/commit/6b3bbc35950d3f6e7560a2a334fbf35ef68196e9))
+
 ## [0.9.0](https://github.com/TKrisee/agent-chat/compare/v0.8.1...v0.9.0) (2026-11-25)
 
 
