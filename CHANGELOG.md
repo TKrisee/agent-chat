@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/TKrisee/agent-chat/compare/v0.7.0...v0.8.0) (2026-11-25)
+
+
+### Features
+
+* install pinned Codex on first use ([3effc38](https://github.com/TKrisee/agent-chat/commit/3effc389bccd99d0477feca13d91496027bc9746))
+
 ## [0.7.0](https://github.com/TKrisee/agent-chat/compare/v0.6.2...v0.7.0) (2026-11-25)
 
 
