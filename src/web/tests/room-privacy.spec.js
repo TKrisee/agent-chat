@@ -38,7 +38,9 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await group.press('End');
   await group.pressSequentially(' Shared tagged message');
   await group.press('Enter');
-  await expect(page.locator('.chat').getByText('Shared tagged message', {exact:false})).toBeVisible();
+  const taggedPost = page.locator('.chat article.message').filter({has:page.locator('.message-meta strong').getByText('operator', {exact:true})}).filter({hasText:'Shared tagged message'});
+  await expect(taggedPost).toHaveCount(1);
+  await expect(taggedPost).toBeVisible();
   await expect(page.locator('.chat').getByText('PO replied in the project group:', {exact:false})).toBeVisible({timeout:20000});
   await expect(page.locator('#composer')).toHaveAttribute('aria-busy','false');
   await lead.click();
