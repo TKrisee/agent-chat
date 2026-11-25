@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.1](https://github.com/TKrisee/agent-chat/compare/v0.14.0...v0.14.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* keep valid titled group posts from stranding PO plans ([f5db85d](https://github.com/TKrisee/agent-chat/commit/f5db85d60ac3c41cb9e5d34e1153bab521f6bc67))
+
 ## [0.14.0](https://github.com/TKrisee/agent-chat/compare/v0.13.2...v0.14.0) (2026-11-25)
 
 
