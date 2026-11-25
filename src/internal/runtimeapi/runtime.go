@@ -152,6 +152,12 @@ type CodexSetupStatus struct {
 	CanSelectManaged, CanSelectOverride             bool
 }
 type CodexSourceSelector interface{ SelectSource(string) }
+
+// LegacyReviewConflictInspector uses the configured jq to recognize one
+// historical rejected result shape without exposing its content.
+type LegacyReviewConflictInspector interface {
+	IsLegacyReviewConflict(context.Context, []byte) bool
+}
 type CodexSetup interface {
 	StartSetup(context.Context)
 	SetupStatus() CodexSetupStatus
