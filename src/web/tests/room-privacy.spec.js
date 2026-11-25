@@ -162,5 +162,7 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   await composer.fill('/workspace /tmp/My Project');
   await composer.press('Enter');
   await expect.poll(()=>workspacePath).toBe('/tmp/My Project');
-  await expect(page.getByRole('status').filter({hasText:'Project workspace updated.'})).toBeVisible();
+  const workspaceReceipt=page.getByRole('status').filter({hasText:'Project workspace updated.'});
+  await expect(workspaceReceipt).toBeVisible();
+  await expect(workspaceReceipt).toHaveCount(0,{timeout:8000});
 });
