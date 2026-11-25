@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.2](https://github.com/TKrisee/agent-chat/compare/v0.6.1...v0.6.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* give Root current project handoff status ([98f078e](https://github.com/TKrisee/agent-chat/commit/98f078e40da73ee80817f628f69cf28a095a8982))
+* let project stops proceed during message sends ([53e1062](https://github.com/TKrisee/agent-chat/commit/53e10626df36a10d2fb94ab0cd9e169611b0fc3c))
+
 ## [0.6.1](https://github.com/TKrisee/agent-chat/compare/v0.6.0...v0.6.1) (2026-11-24)
 
 
