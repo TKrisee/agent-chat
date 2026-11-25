@@ -36,3 +36,33 @@ func (r *Runner) IsLegacyStructuredHold(ctx context.Context, payload []byte) boo
 	cmd.Stderr = io.Discard
 	return cmd.Run() == nil
 }
+
+// IsLegacyTitledPlanning accepts only the historical harmless title error and
+// planning proposals; the caller must independently verify task provenance.
+func (r *Runner) IsLegacyTitledPlanning(ctx context.Context, payload []byte, project string) bool {
+	if len(payload) == 0 || len(payload) > 1<<20 || project == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	const filter = `
+def nonblank: type == "string" and (gsub("^\\s+|\\s+$"; "") | length > 0);
+type == "object" and (keys == ["actions","attachments","text"]) and
+(.text | type == "string") and (.attachments == []) and
+(.actions | type == "array" and length > 0) and
+all(.actions[];
+  type == "object" and
+  ((keys == ["body","project","recipient","title","type"]) or (keys == ["body","project","recipient","task","title","type"])) and
+  ([.type,.project,.title,.body,.recipient,(.task // "")] | all(.[]; type == "string")) and
+  ((.task // "") == "") and
+  if .type == "post_group" then .project == $project and .recipient == "" and (.body | nonblank)
+  elif .type == "create_worker" then (.project == "" or .project == $project) and (.title | nonblank and (test("\\s") | not)) and .body == "" and .recipient == ""
+  elif .type == "queue_work_item" then (.project == "" or .project == $project) and (.title | nonblank) and (.body | nonblank) and (.recipient | nonblank)
+  else false end) and
+any(.actions[]; .type == "post_group" and (.title | nonblank))`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, filter)
+	cmd.Stdin = bytes.NewReader(payload)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}

@@ -159,6 +159,11 @@ type CodexSourceSelector interface{ SelectSource(string) }
 type LegacyReviewConflictInspector interface {
 	IsLegacyReviewConflict(context.Context, []byte) bool
 }
+
+// LegacyTitledPlanningInspector recognizes a narrowly bounded rejected PO plan.
+type LegacyTitledPlanningInspector interface {
+	IsLegacyTitledPlanning(context.Context, []byte, string) bool
+}
 type LegacyStructuredHoldInspector interface {
 	IsLegacyStructuredHold(context.Context, []byte) bool
 }

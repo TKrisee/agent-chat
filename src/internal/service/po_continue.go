@@ -79,7 +79,35 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			if !ok {
-				return fmt.Errorf("%w: PO continuation unavailable", errConflict)
+				planning, found, err := s.legacyTitledPlanning(tx, r.PathValue("id"))
+				if err != nil {
+					return err
+				}
+				if !found {
+					return fmt.Errorf("%w: PO continuation unavailable", errConflict)
+				}
+				if err := addMessage(tx, id, operator, planning.job.Agent, "operator", note, planning.job.Project, planning.job.Task); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE tasks SET status='assigned' WHERE id=? AND project_id=? AND owner_id=? AND status='blocked'`, planning.job.Task, planning.job.Project, planning.job.Agent)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errConflict
+				}
+				if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id) VALUES(?,?,1,'assigned',?,?)`, id, planning.job.ID, planning.assignment, id); err != nil {
+					return err
+				}
+				a, err := getAgent(tx, planning.job.Agent)
+				if err != nil {
+					return err
+				}
+				return s.enqueue(tx, a, planning.job.Project, planning.job.Task, id, "po_followup", "Continue the same assignment using the pinned original brief and operator instruction. The prior titled project post was rejected before its actions were applied; plan the next safe steps without assuming they committed or replaying effects. Preserve all stops and scope constraints.")
 			}
 			a, err := getAgent(tx, legacy.job.Agent)
 			if err != nil {
