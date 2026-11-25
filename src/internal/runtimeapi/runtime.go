@@ -181,3 +181,8 @@ type CodexSetup interface {
 type LegacyChildReportInspector interface {
 	IsLegacyChildReport(context.Context, []byte, string, string) bool
 }
+
+// LegacyChildGroupRecipientInspector recognizes the exact pre-apply room-recipient error.
+type LegacyChildGroupRecipientInspector interface {
+	IsLegacyChildGroupRecipient(context.Context, []byte, string, string) bool
+}

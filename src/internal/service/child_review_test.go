@@ -161,3 +161,81 @@ func TestChildReviewReportAndSiblingWork(t *testing.T) {
 		})
 	}
 }
+
+func TestLegacyChildExactGroupRecipientRecovery(t *testing.T) {
+	for _, tc := range []struct {
+		name, group, recipient, fence string
+		want                          int
+	}{
+		{"same group", "group:alpha", "worker", "", 202},
+		{"cross group", "group:other", "worker", "", 409},
+		{"wrong reviewed worker", "group:alpha", "other", "", 409},
+		{"stopped project", "group:alpha", "worker", "stop", 409},
+		{"uncertain child", "group:alpha", "worker", "uncertain", 409},
+		{"changed parent owner", "group:alpha", "worker", "owner", 409},
+		{"independent sibling running", "group:alpha", "worker", "sibling", 202},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, j, parent, worker, other := childReviewFixture(t)
+			defer s.Close()
+			installReviewInspector(t, s)
+			recipient := worker
+			if tc.recipient == "other" {
+				recipient = other
+			}
+			payload := fmt.Sprintf(`{"text":"","actions":[{"type":"accept_result","project":"alpha","title":"","body":"","recipient":%q},{"type":"report","project":"alpha","title":"","body":"Reviewed QA evidence.","recipient":%q},{"type":"queue_work_item","project":"alpha","title":"Next independent item","body":"Continue safe work.","recipient":%q},{"type":"post_group","project":"alpha","title":"QA update","body":"Evidence requires follow-up.","recipient":%q}],"attachments":[]}`, recipient, recipient, other, tc.group)
+			if _, err := s.db.Exec("UPDATE jobs SET status='completed',diagnostic=?,result=? WHERE id=?", legacyTitledPlanningDiagnostic, []byte(payload), j.ID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.db.Exec("UPDATE tasks SET status='blocked' WHERE id=?", j.Task); err != nil {
+				t.Fatal(err)
+			}
+			switch tc.fence {
+			case "stop":
+				_, _ = s.db.Exec("UPDATE projects SET stopped=1 WHERE id='alpha'")
+			case "uncertain":
+				_, _ = s.db.Exec("UPDATE jobs SET status='uncertain' WHERE task_id=? AND kind='work'", j.Task)
+			case "owner":
+				_, _ = s.db.Exec("UPDATE tasks SET owner_id=? WHERE id=?", other, parent)
+			case "sibling":
+				if err := s.write(func(tx *sql.Tx) error {
+					child, source := newID(), newID()
+					if _, err := tx.Exec(`INSERT INTO tasks VALUES(?,'alpha','independent','queued',?)`, child, other); err != nil {
+						return err
+					}
+					if _, err := tx.Exec(`INSERT INTO po_work_items VALUES(?,?)`, parent, child); err != nil {
+						return err
+					}
+					if err := addMessage(tx, source, j.Agent, other, "po", "independent work", "alpha", child); err != nil {
+						return err
+					}
+					_, err := tx.Exec(`INSERT INTO jobs(id,agent_id,project_id,task_id,source_id,kind,status,request,next_at) VALUES(?,?,'alpha',?,?,'work','running',?,0)`, newID(), other, child, source, []byte("{}"))
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			id := newID()
+			if code := postContinuationID(s, j.Task, "Review this existing worker evidence without replaying it.", id); code != tc.want {
+				t.Fatalf("continuation=%d want=%d", code, tc.want)
+			}
+			if tc.want == 202 {
+				if code := postContinuationID(s, j.Task, "Review this existing worker evidence without replaying it.", id); code != 202 {
+					t.Fatalf("replay=%d", code)
+				}
+				var count int
+				if err := s.db.QueryRow("SELECT count(*) FROM jobs WHERE task_id=? AND source_id=?", j.Task, id).Scan(&count); err != nil || count != 1 {
+					t.Fatalf("jobs=%d err=%v", count, err)
+				}
+				var status string
+				if err := s.db.QueryRow("SELECT status FROM tasks WHERE id=?", j.Task).Scan(&status); err != nil || status != "review" {
+					t.Fatalf("task status=%s err=%v", status, err)
+				}
+				var stored int
+				if err := s.db.QueryRow("SELECT count(*) FROM messages WHERE id=? AND role='worker' AND text='receipt'", j.Source).Scan(&stored); err != nil || stored != 1 {
+					t.Fatalf("worker receipt=%d err=%v", stored, err)
+				}
+			}
+		})
+	}
+}

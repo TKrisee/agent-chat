@@ -81,12 +81,12 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	if err != nil {
 		return
 	}
-	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic) {
+	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic) {
 		return
 	}
 	out.job.Task = task
 	out.job.Project = project
-	out.childReport = diagnostic == legacyChildReportDiagnostic
+	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic
 	if out.childReport {
 		var parent string
 		err = tx.QueryRow(`SELECT i.parent_task_id FROM po_work_items i JOIN tasks p ON p.id=i.parent_task_id JOIN projects pr ON pr.id=p.project_id AND pr.po_id=p.owner_id WHERE i.child_task_id=? AND p.project_id=? AND p.owner_id=? AND p.status='assigned' AND pr.stopped=0`, task, project, po).Scan(&parent)
@@ -144,6 +144,13 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	}
 	if !notesOK {
 		return out, false, nil
+	}
+	if out.childReport && diagnostic == legacyTitledPlanningDiagnostic {
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyChildGroupRecipientInspector)
+		if !ok || len(payload) == 0 || len(payload) > 1<<20 {
+			return out, false, nil
+		}
+		return out, inspector.IsLegacyChildGroupRecipient(context.Background(), payload, project, worker), nil
 	}
 	if out.childReport {
 		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyChildReportInspector)
