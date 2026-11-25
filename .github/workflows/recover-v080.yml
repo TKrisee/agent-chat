@@ -1,0 +1,83 @@
+name: Recover v0.8.0 publication
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  recover:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Verify exact tested package run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          run=45576119905
+          sha=a188da77d8fa8b6ee9db3b179939cf61fd7a133f
+          [[ "$(gh api "repos/$REPO/git/ref/heads/main" | jq -er '.object.sha')" == "$WORKFLOW_SHA" ]]
+          git merge-base --is-ancestor "$sha" "$WORKFLOW_SHA"
+          [[ "$(git diff --name-only "$sha" "$WORKFLOW_SHA")" == '.github/workflows/recover-v080.yml' ]]
+          workflow=$(gh api "repos/$REPO/actions/workflows/rebuild-distribution.yml" | jq -er '.id')
+          gh api "repos/$REPO/actions/runs/$run" | jq -e --arg sha "$sha" --argjson workflow "$workflow" '.head_sha == $sha and .workflow_id == $workflow and .event == "workflow_dispatch" and .status == "completed"' >/dev/null
+          gh api "repos/$REPO/actions/runs/$run/jobs?per_page=100" | jq -e '
+            [.jobs[] | select(.name | startswith("package ("))] as $jobs |
+            ($jobs | length) == 3 and all($jobs[]; .status == "completed" and .conclusion == "success") and
+            all(["linux-amd64","darwin-arm64","windows-amd64"][]; . as $platform | [$jobs[] | select(.name | contains($platform))] | length == 1)' >/dev/null
+          gh api "repos/$REPO/actions/runs/$run/artifacts?per_page=100" | jq -e '
+            [.artifacts[] | select(.expired == false and (.name | startswith("agentchat-"))) | {name,id}] | sort_by(.name) == [
+              {name:"agentchat-darwin-arm64",id:15004401898},
+              {name:"agentchat-linux-amd64",id:15004851243},
+              {name:"agentchat-windows-amd64",id:15003174938}]' >/dev/null
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: agentchat-*
+          path: artifacts
+          merge-multiple: true
+          run-id: 45576119905
+          github-token: ${{ github.token }}
+      - name: Recover exact draft and publish verified artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha=a188da77d8fa8b6ee9db3b179939cf61fd7a133f
+          old=92670b37d48947474aebfd90cf4ae7723f433c56
+          tag=v0.8.0
+          cd artifacts
+          printf 'version 0.8.0\n' > agentchat-update.txt
+          for file in agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip; do
+            test -f "$file"
+            expected=$(cut -d' ' -f1 "$file.sha256")
+            [[ "$expected" =~ ^[0-9a-f]{64}$ && "$(sha256sum "$file" | cut -d' ' -f1)" == "$expected" ]]
+            printf '%s %s\n' "$expected" "$file" >> agentchat-update.txt
+          done
+          [[ "$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')" == "$WORKFLOW_SHA" ]]
+          gh api "repos/$GH_REPO/git/matching-refs/tags/$tag" | jq -e --arg ref "refs/tags/$tag" '[.[] | select(.ref == $ref)] | length == 0' >/dev/null
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" | jq -s '[.[][] | select(.tag_name == "v0.8.0") | {id,draft,target_commitish}]' > "$RUNNER_TEMP/draft-metadata.json"
+          jq -c '.' "$RUNNER_TEMP/draft-metadata.json"
+          count=$(jq -er 'length' "$RUNNER_TEMP/draft-metadata.json")
+          if [[ "$count" == 0 ]]; then
+            id=$(gh api --method POST "repos/$GH_REPO/releases" -f tag_name="$tag" -f name="$tag" -f target_commitish="$sha" -F draft=true | jq -er --arg sha "$sha" --arg tag "$tag" 'select(.draft == true and .tag_name == $tag and .target_commitish == $sha) | .id')
+          elif [[ "$count" == 1 ]]; then
+            id=$(jq -er --arg old "$old" --arg sha "$sha" '.[0] | select(.draft == true and (.target_commitish == $old or .target_commitish == $sha)) | .id' "$RUNNER_TEMP/draft-metadata.json")
+            gh api --method PATCH "repos/$GH_REPO/releases/$id" -f target_commitish="$sha" | jq -e --arg sha "$sha" --arg tag "$tag" '.draft == true and .tag_name == $tag and .target_commitish == $sha' >/dev/null
+          else
+            echo 'Ambiguous release identity; refusing publication' >&2; exit 1
+          fi
+          [[ "$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')" == "$WORKFLOW_SHA" ]]
+          gh release upload "$tag" agentchat-update.txt agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip --clobber
+          gh api --method PATCH "repos/$GH_REPO/releases/$id" -F draft=false >/dev/null
