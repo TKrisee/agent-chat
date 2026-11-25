@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.2](https://github.com/TKrisee/agent-chat/compare/v0.15.1...v0.15.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* confirm original scope drafts after rejected reviews ([e7e0b21](https://github.com/TKrisee/agent-chat/commit/e7e0b217b8b36ad727354255dad6fdc411926677))
+
 ## [0.15.1](https://github.com/TKrisee/agent-chat/compare/v0.15.0...v0.15.1) (2026-11-25)
 
 
