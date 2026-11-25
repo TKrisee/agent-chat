@@ -336,12 +336,22 @@ func TestCapacityRetryAndProjectStopKeepOtherProjectMoving(t *testing.T) {
 	defer runTest(t, s, r)()
 	post(t, server.URL, newID(), "root", "Start project hold: wait for provider", 201)
 	await(t, server.URL, func(s State) bool {
+		capacityPending, planningSettled := false, false
 		for _, job := range s.Jobs {
-			if job.Project == "hold" && job.Status == "pending" && job.Diagnostic == "capacity rejected" {
-				return true
+			if job.Project != "hold" {
+				continue
+			}
+			if job.Status == "uncertain" {
+				t.Fatalf("unexpected uncertain job before queue-only stop: %+v", job)
+			}
+			if job.Kind == "work" && job.Status == "pending" && job.Diagnostic == "capacity rejected" {
+				capacityPending = true
+			}
+			if job.Kind == "po_followup" && job.Status == "completed" && job.Diagnostic == "" {
+				planningSettled = true
 			}
 		}
-		return false
+		return capacityPending && planningSettled
 	})
 	call(t, server.URL+"/api/projects/hold/stop", "POST", nil, 200)
 	post(t, server.URL, newID(), "root", "Start project other: keep moving", 201)
