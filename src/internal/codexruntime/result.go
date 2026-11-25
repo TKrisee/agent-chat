@@ -18,7 +18,7 @@ import (
 
 // The native CLI validates this response shape. jq independently validates and
 // extracts the resulting JSON; the Go adapter never parses JSON itself.
-const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","request_approval","post_group","hold_task"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","request_approval","post_group","hold_task","resolve_hold"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"task":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
 // Workers may report group coordination without receiving orchestration actions.
 const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient"],"properties":{"type":{"type":"string","enum":["post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
@@ -32,7 +32,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 func actionAllowed(role, action string) bool {
 	switch role {
 	case "root":
-		return action == "create_project" || action == "delegate" || action == "stop_project" || action == "resume_project" || action == "set_project_goal" || action == "set_project_goal_status" || action == "request_approval"
+		return action == "create_project" || action == "delegate" || action == "stop_project" || action == "resume_project" || action == "resolve_hold" || action == "set_project_goal" || action == "set_project_goal_status" || action == "request_approval"
 	case "po":
 		return action == "queue_worker" || action == "accept_result" || action == "report" || action == "request_approval" || action == "post_group" || action == "hold_task"
 	case "worker":
@@ -46,10 +46,10 @@ const extractFilter = `
  def exact($keys): type == "object" and (keys | sort) == ($keys | sort);
  def strings_for($keys): . as $v | all($keys[]; ($v[.] | type) == "string");
  if ((exact(["text","actions","attachments"]) or ($worker=="yes" and exact(["text","attachments"]))) and (.text|type)=="string" and ((has("actions") and (.actions|type)=="array") or ($worker=="yes" and (has("actions")|not))) and (.attachments|type)=="array" and
-     all((.actions // [])[]; exact(["type","project","title","body","recipient"]) and strings_for(["type","project","title","body","recipient"])) and
+     all((.actions // [])[]; (exact(["type","project","title","body","recipient"]) or exact(["type","project","title","body","recipient","task"])) and strings_for(["type","project","title","body","recipient"]) and ((has("task")|not) or (.task|type)=="string")) and
      all(.attachments[]; exact(["path","name","media_type"]) and strings_for(["path","name","media_type"])))
  then (["text",(.text|@base64)]|@tsv),
-      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64)]|@tsv),
+      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64),((.task // "")|@base64)]|@tsv),
       (.attachments[] | ["attachment",(.path|@base64),(.name|@base64),(.media_type|@base64)]|@tsv)
  else error("invalid structured result") end`
 
@@ -172,7 +172,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			}
 			result.Text = values[0]
 		case "action":
-			if len(values) != 5 {
+			if len(values) != 6 {
 				return result, errors.New("malformed action")
 			}
 			if !actionAllowed(req.Role, values[0]) {
@@ -181,7 +181,10 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				}
 				return result, errRoleAction
 			}
-			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4]})
+			if values[5] != "" && values[0] != "resolve_hold" {
+				return result, errRoleAction
+			}
+			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5]})
 		case "attachment":
 			if len(values) != 3 {
 				return result, errors.New("malformed attachment")

@@ -126,6 +126,19 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 			return fmt.Errorf("decode durable job %s: %w", candidate.ID, err)
 		}
 		if candidate.Status == "pending" && candidate.Request.Role == "root" && candidate.Kind == "operator_message" && !strings.HasPrefix(candidate.Request.Instructions, "App-owned status snapshot v1 at ") {
+			a, err := getAgent(tx, root)
+			if err != nil {
+				return err
+			}
+			var parent string
+			err = tx.QueryRow(`SELECT parent_id FROM message_replies WHERE message_id=?`, candidate.Source).Scan(&parent)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			candidate.Request.Context, err = s.runtimeContext(tx, a, "", "", parent, "operator_message", candidate.Source)
+			if err != nil {
+				return err
+			}
 			snapshot, err := s.statusSnapshot(tx)
 			if err != nil {
 				return err

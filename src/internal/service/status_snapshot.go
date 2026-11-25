@@ -2,6 +2,7 @@ package service
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,15 +44,24 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 	}
 	if err == nil {
 		fmt.Fprintf(&out, "newest_blocked project=%s task=%s owner=%s", strconv.Quote(blockedProject), strconv.Quote(blockedID), strconv.Quote(blockedOwner))
-		var kind, status, diagnostic string
-		e := tx.QueryRow(`SELECT kind,status,COALESCE(diagnostic,'') FROM jobs WHERE task_id=? AND status IN ('completed','uncertain') AND diagnostic IS NOT NULL AND diagnostic<>'' ORDER BY rowid DESC LIMIT 1`, blockedID).Scan(&kind, &status, &diagnostic)
-		if e != nil && e != sql.ErrNoRows {
-			return "", e
+		h, active, err := s.activeTaskHold(tx, blockedID)
+		if err != nil {
+			return "", err
 		}
-		if e == nil {
-			fmt.Fprintf(&out, " latest_rejected_job_kind=%s latest_rejected_job_status=%s reason=%s", strconv.Quote(kind), strconv.Quote(status), statusReason(status, diagnostic))
+		if active {
+			fmt.Fprintf(&out, " active_hold=true phase=%s escalation_ready=%t", strconv.Quote(h.phase), h.rootMessage != "")
+			out.WriteByte('\n')
+		} else {
+			var kind, status, diagnostic string
+			e := tx.QueryRow(`SELECT kind,status,COALESCE(diagnostic,'') FROM jobs WHERE task_id=? AND status IN ('completed','uncertain') AND diagnostic IS NOT NULL AND diagnostic<>'' ORDER BY rowid DESC LIMIT 1`, blockedID).Scan(&kind, &status, &diagnostic)
+			if e != nil && e != sql.ErrNoRows {
+				return "", e
+			}
+			if e == nil {
+				fmt.Fprintf(&out, " latest_rejected_job_kind=%s latest_rejected_job_status=%s reason=%s", strconv.Quote(kind), strconv.Quote(status), statusReason(status, diagnostic))
+			}
+			out.WriteByte('\n')
 		}
-		out.WriteByte('\n')
 	}
 	projects, err := querySlice(tx, `SELECT p.id,p.stopped,COALESCE(g.status,'none'),
  (SELECT COUNT(*) FROM tasks t WHERE t.project_id=p.id AND t.status IN ('assigned','queued','review','accepted','blocked')),
@@ -70,6 +80,7 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 		projects = projects[:20]
 	}
 	for _, p := range projects {
+		holdJobs := map[string]string{}
 		admission := "open"
 		if p.stopped {
 			admission = "stopped"
@@ -105,6 +116,14 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 			}
 		}
 		for _, t := range tasks {
+			var latestHold string
+			e := tx.QueryRow(`SELECT job_id FROM task_holds WHERE task_id=? ORDER BY rowid DESC LIMIT 1`, t.id).Scan(&latestHold)
+			if e != nil && !errors.Is(e, sql.ErrNoRows) {
+				return "", e
+			}
+			if e == nil {
+				holdJobs[t.id] = latestHold
+			}
 			_, _, _, continuation, err := poContinuation(tx, t.id)
 			if err != nil {
 				return "", err
@@ -113,6 +132,16 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 				_, continuation, err = s.legacyReviewRecovery(tx, t.id)
 				if err != nil {
 					return "", err
+				}
+			}
+			if t.status == "blocked" {
+				h, active, err := s.activeTaskHold(tx, t.id)
+				if err != nil {
+					return "", err
+				}
+				if active {
+					holdJobs[t.id] = h.job
+					fmt.Fprintf(&out, "  active_hold task=%s phase=%s escalation_message=%s (older rejections are historical)\n", strconv.Quote(t.id), strconv.Quote(h.phase), strconv.Quote(h.rootMessage))
 				}
 			}
 			fmt.Fprintf(&out, "  task=%s status=%s owner=%s po_continuation_available=%t\n", strconv.Quote(t.id), strconv.Quote(t.status), strconv.Quote(t.owner), continuation)
@@ -161,7 +190,17 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 			}
 		}
 		for _, j := range jobs {
-			fmt.Fprintf(&out, "  job=%s task=%s agent=%s kind=%s status=%s reason=%s\n", strconv.Quote(j.id), strconv.Quote(j.task), strconv.Quote(j.agent), strconv.Quote(j.kind), strconv.Quote(j.status), statusReason(j.status, j.diagnostic))
+			reason := statusReason(j.status, j.diagnostic)
+			if held := holdJobs[j.task]; held != "" && j.diagnostic != "" {
+				var older bool
+				if err := tx.QueryRow(`SELECT (SELECT rowid FROM jobs WHERE id=?) < (SELECT rowid FROM jobs WHERE id=?)`, j.id, held).Scan(&older); err != nil {
+					return "", err
+				}
+				if older {
+					reason = "historical_rejection"
+				}
+			}
+			fmt.Fprintf(&out, "  job=%s task=%s agent=%s kind=%s status=%s reason=%s\n", strconv.Quote(j.id), strconv.Quote(j.task), strconv.Quote(j.agent), strconv.Quote(j.kind), strconv.Quote(j.status), reason)
 		}
 	}
 	return out.String(), nil

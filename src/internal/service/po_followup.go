@@ -95,7 +95,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		}
 	}
 	if f.ordinal >= 2 {
-		return s.escalatePOHold(tx, j, a, phase, "The project owner did not choose a next task action after two follow-up turns. The task needs a decision; no further work was dispatched by the service.")
+		return s.escalatePOHold(tx, j, a, phase, "The project owner did not choose a next task action after two follow-up turns. The task needs a decision; no further work was dispatched by the service.", false)
 	}
 	f.ordinal++
 	id := newID()
@@ -119,7 +119,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	}
 	return s.enqueue(tx, a, j.Project, j.Task, id, "po_followup", instruction)
 }
-func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason string) error {
+func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason string, explicit bool) error {
 	if err := moveTask(tx, j, phase, "blocked", a.ID, a.ID); err != nil {
 		return err
 	}
@@ -132,6 +132,31 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 	source := newID()
 	if err := addMessage(tx, source, a.ID, root, a.Role, "This task is blocked and needs operator attention. The operator has the detailed reason.", j.Project, j.Task); err != nil {
 		return err
+	}
+	if explicit {
+		assignment, err := poAssignmentSource(tx, j, a.ID)
+		if err != nil {
+			return err
+		}
+		var note, review string
+		switch j.Kind {
+		case "po_continue":
+			note = j.Source
+		case "review":
+			review = j.Source
+		case "po_followup":
+			f, err := readPOFollowup(tx, j.Source)
+			if err != nil {
+				return err
+			}
+			note, review = f.note, f.review
+		}
+		if (phase == "review" || phase == "accepted") && review == "" {
+			return fmt.Errorf("%w: held review receipt unavailable", errWorkflow)
+		}
+		if _, err := tx.Exec(`INSERT INTO task_holds(job_id,task_id,project_id,po_id,phase,assignment_id,note_id,review_id,root_source_id,status) VALUES(?,?,?,?,?,?,?,?,?,'active')`, j.ID, j.Task, j.Project, a.ID, phase, assignment, nullIfEmpty(note), nullIfEmpty(review), source); err != nil {
+			return err
+		}
 	}
 	manager, err := getAgent(tx, root)
 	if err != nil {
@@ -158,5 +183,5 @@ func (s *Service) poHoldAction(tx *sql.Tx, j job, a agent, action runtimeapi.Act
 	if owner != a.ID || stopped != 0 || (phase != "assigned" && phase != "review" && phase != "accepted") {
 		return fmt.Errorf("%w: task hold scope changed", errWorkflow)
 	}
-	return s.escalatePOHold(tx, j, a, phase, action.Body)
+	return s.escalatePOHold(tx, j, a, phase, action.Body, true)
 }

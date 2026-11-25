@@ -66,6 +66,7 @@ type Result struct {
 
 type Action struct {
 	Type      string `json:"type"`
+	Task      string `json:"task,omitempty"`
 	Project   string `json:"project"`
 	Title     string `json:"title"`
 	Body      string `json:"body"`
@@ -157,6 +158,9 @@ type CodexSourceSelector interface{ SelectSource(string) }
 // historical rejected result shape without exposing its content.
 type LegacyReviewConflictInspector interface {
 	IsLegacyReviewConflict(context.Context, []byte) bool
+}
+type LegacyStructuredHoldInspector interface {
+	IsLegacyStructuredHold(context.Context, []byte) bool
 }
 type CodexSetup interface {
 	StartSetup(context.Context)

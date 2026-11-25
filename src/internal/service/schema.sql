@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS po_followups (
  UNIQUE(trigger_id,phase,ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS task_holds (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id), task_id TEXT NOT NULL REFERENCES tasks(id),
+ project_id TEXT NOT NULL REFERENCES projects(id), po_id TEXT NOT NULL REFERENCES agents(id),
+ phase TEXT NOT NULL CHECK(phase IN ('assigned','review','accepted')),
+ assignment_id TEXT NOT NULL REFERENCES messages(id), note_id TEXT REFERENCES messages(id), review_id TEXT REFERENCES messages(id),
+ root_source_id TEXT NOT NULL REFERENCES messages(id), root_message_id TEXT REFERENCES messages(id),
+ status TEXT NOT NULL CHECK(status IN ('active','resolved'))
+);
+
 CREATE TABLE IF NOT EXISTS project_goals (
  project_id TEXT PRIMARY KEY REFERENCES projects(id),
  objective TEXT NOT NULL,
