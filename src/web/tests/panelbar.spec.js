@@ -103,10 +103,11 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
 });
 
 test('setup keeps chat unavailable until a retry is ready', async ({page, serviceURL}) => {
-  let phase='downloading', source='managed', retries=0, switches=0;
+  let phase='downloading', source='managed', retries=0, switches=0, navigations=0;
+  page.on('framenavigated', frame=>{if(frame===page.mainFrame())navigations++;});
   const headers=()=>({'X-AgentChat-Codex-State':phase,'X-AgentChat-Codex-Source':source,'X-AgentChat-Codex-Managed-Version':'0.172.0','X-AgentChat-Codex-Can-Select-Managed':'true','X-AgentChat-Codex-Can-Select-Override':'true'});
   await page.route('**/api/codex-setup**', route => {
-    if(route.request().url().endsWith('/source')){switches++;source=route.request().postData()==='source=override'?'override':'managed';return route.fulfill({status:202,headers:headers()});}
+    if(route.request().url().endsWith('/source')){switches++;source=route.request().postData()==='source=override'?'override':'managed';if(source==='managed')phase='downloading';return route.fulfill({status:202,headers:headers()});}
     if(route.request().method()==='POST'){retries++;phase='ready';return route.fulfill({status:202,headers:{...headers(),'X-AgentChat-Codex-State':'downloading'}});}
     return route.fulfill({status:200,headers:headers(),body:phase==='error'?'Download failed.':''});
   });
@@ -120,10 +121,15 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   await expect.poll(()=>retries).toBe(1);
   await expect(page.getByRole('status').filter({hasText:'Codex is ready'})).toContainText('Managed version 0.172.0', {timeout:10000});
   await page.getByRole('button',{name:'Use external CLI'}).click();
-  await expect.poll(()=>switches).toBe(1);
-  await expect(page.getByRole('status').filter({hasText:'Codex is ready'})).toContainText('Managed version 0.172.0');
+  await expect.poll(()=>navigations).toBe(2);
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
   await expect(page.getByText('External CLI selected')).toBeVisible();
   await page.getByRole('button',{name:'Use managed CLI'}).click();
+  await expect(page.getByRole('status').filter({hasText:'Downloading Codex…'})).toBeVisible();
+  expect(navigations).toBe(2);
+  phase='ready';
+  await expect.poll(()=>navigations,{timeout:10000}).toBe(3);
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
   await expect(page.getByText('Managed CLI selected')).toBeVisible();
   expect(switches).toBe(2);
   await page.getByRole('button',{name:/Root conversation/}).click();

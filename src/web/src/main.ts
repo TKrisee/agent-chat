@@ -78,6 +78,7 @@ async function loadWeeklyUsage(body?:URLSearchParams):Promise<void> {
 }
 function weeklyLabel():string {return weeklyUsage?.known?`Weekly · ${weeklyUsage.remaining}% left`:'Weekly · unavailable';}
 type SetupState='checking'|'downloading'|'ready'|'error'|'not_required';
+let pendingSourceReload:'managed'|'override'|null=null;
 let setupState:SetupState='checking';let setupSource='';let setupVersion='';let setupError='';let setupReady=false;let setupBlocked=false;let setupBusy=false;let setupCanRetry=false;let setupCanManaged=false;let setupCanOverride=false;let setupSwitchError='';let dataStarted=false;
 function setupMarkup():string {
  const label=setupState==='checking'?'Preparing Codex…':setupState==='downloading'?'Downloading Codex…':setupState==='ready'?'Codex is ready':setupState==='not_required'?'Codex is not required in this mode':'Codex setup could not finish';
@@ -85,6 +86,7 @@ function setupMarkup():string {
 }
 async function checkSetup(retry=false, source?:'managed'|'override'):Promise<void>{
  if(setupBusy)return;setupBusy=true;
+ const priorSource=setupSource;
  const previous=[setupState,setupSource,setupVersion,setupError,setupReady,setupCanRetry,setupCanManaged,setupCanOverride].join('|');
  if(source){setupSwitchError='';render();}
  else if(retry){setupState='checking';setupCanRetry=false;render();}
@@ -94,12 +96,14 @@ async function checkSetup(retry=false, source?:'managed'|'override'):Promise<voi
   const next=r.headers.get('X-AgentChat-Codex-State');
   if(next!=='downloading' && next!=='ready' && next!=='error' && next!=='not_required')throw new Error('Waiting for the Agent Chat service.');
   setupState=next;setupSource=r.headers.get('X-AgentChat-Codex-Source')||'';setupCanManaged=r.headers.get('X-AgentChat-Codex-Can-Select-Managed')==='true';setupCanOverride=r.headers.get('X-AgentChat-Codex-Can-Select-Override')==='true';setupVersion=r.headers.get('X-AgentChat-Codex-Managed-Version')||'';
+  if(source && r.status===202 && source!==priorSource && setupSource===source)pendingSourceReload=source;
+  else if(pendingSourceReload && setupSource!==pendingSourceReload)pendingSourceReload=null;
   setupCanRetry=next==='error';setupError=next==='error'?(await r.text()):'';
   setupReady=next==='ready'||next==='not_required';
   if(!setupReady){setupBlocked=true;settingsOpen=true;}
-  else {if(!setupBlocked && !source)settingsOpen=false;if(!dataStarted){dataStarted=true;void refresh();void updateRequest();void loadWeeklyUsage();}}
+  else {if(!setupBlocked && !source && !pendingSourceReload)settingsOpen=false;if(!dataStarted){dataStarted=true;void refresh();void updateRequest();void loadWeeklyUsage();}}
  } catch {if(source)setupSwitchError='Could not confirm the CLI selection. Check setup before trying again.';else {setupState='error';setupError='Waiting for the Agent Chat service.';setupCanRetry=false;setupReady=false;setupBlocked=true;settingsOpen=true;}}
- finally{setupBusy=false;const current=[setupState,setupSource,setupVersion,setupError,setupReady,setupCanRetry,setupCanManaged,setupCanOverride].join('|');if(source || retry || previous!==current)render();}
+ finally{setupBusy=false;const current=[setupState,setupSource,setupVersion,setupError,setupReady,setupCanRetry,setupCanManaged,setupCanOverride].join('|');if(source || retry || previous!==current)render();if(pendingSourceReload && setupState==='ready' && setupSource===pendingSourceReload && !hasUnsentWork() && !expectedUpdate && !updateRestarting && !updateBusy && !reloadTriggered){reloadTriggered=true;pendingSourceReload=null;window.location.reload();}}
 }
 function settingsMarkup():string {const u=weeklyUsage;return `<section class="settings-page" aria-label="Settings" ${settingsOpen?'':'hidden'}><div class="settings-content">${setupMarkup()}${setupReady?`<div id="update-panel" class="update-panel" hidden></div><h2>Weekly allowance</h2><p>${esc(weeklyLabel())}${u?.paused?' · New work held':''}</p>${u?.reset?`<p class="settings-muted">Resets ${esc(new Date(u.reset*1000).toLocaleString())}</p>`:''}${weeklyError?`<p role="alert" class="settings-error">${esc(weeklyError)}</p>`:''}${!u?'<p class="settings-muted">Allowance settings are unavailable right now.</p>':`<form id="guard-settings"><label class="guard-switch"><input type="checkbox" name="enabled" ${guardEnabled?'checked':''}> Pause new work when the weekly reserve is reached</label><label>Warn when remaining allowance is at or below <span><input name="warn" type="number" min="0" max="100" step="1" value="${esc(guardWarn)}" required> %</span></label><label>Pause new work when remaining allowance is at or below <span><input name="reserve" type="number" min="0" max="100" step="1" value="${esc(guardReserve)}" required> %</span></label><p class="settings-muted">When enabled, queued work waits if allowance information is unavailable or reaches the reserve. It resumes when enough allowance is available; work already running can finish.</p><button type="submit" ${savingGuard?'disabled':''}>${savingGuard?'Saving…':'Save settings'}</button></form>`}`:''}</div></section>`;}
 const workPanelKey = 'agent-chat.work-panel';
@@ -528,7 +532,7 @@ document.addEventListener('pointerdown',e=>{if(!(e.target instanceof Node) || !a
 document.addEventListener('keydown',e=>{const menu=app.querySelector<HTMLElement>('#attachment-menu');if(e.key==='Escape' && menu && !menu.hidden){e.preventDefault();e.stopPropagation();closeAttachmentMenu(true);}},true);
 const readReceipts = new ReadReceipts({messages:()=>state.messages,recipient:()=>recipient,obstructed:()=>!setupReady || settingsOpen || !selectionReady || mobileNav || !!document.querySelector('dialog.attachment-preview[open]'),eligible:m=>readable(m as Message),refresh});
 render(); void checkSetup();
-window.setInterval(()=>{if(!document.hidden && !setupReady)void checkSetup();},2000);
+window.setInterval(()=>{if(!document.hidden && (!setupReady || pendingSourceReload))void checkSetup();},2000);
 window.setInterval(()=>{if(setupReady && !document.hidden && !settingsOpen && !settingsDirty && !savingGuard)void loadWeeklyUsage();},60000);
 window.setInterval(()=>{if(setupReady && !document.hidden)void updateRequest();},5000);
 // Refresh in the background without interrupting a draft or an in-flight send.
