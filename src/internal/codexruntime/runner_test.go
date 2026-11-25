@@ -627,3 +627,16 @@ func TestCleanupFailureDoesNotInvalidateCapacityOrBlockRetry(t *testing.T) {
 		t.Fatalf("cleanup blocked exact retry: %v", err)
 	}
 }
+
+// Strict structured output requires every object property to be required.
+func TestOutputSchemasRequireEveryObjectProperty(t *testing.T) {
+	for name, schema := range map[string]string{"root-and-po": outputSchema, "worker": workerOutputSchema} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.Command("jq", "-e", `[.. | objects | select(.type == "object") | ((.properties | keys | sort) == (.required | sort))] | all`)
+			cmd.Stdin = strings.NewReader(schema)
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("schema properties must all be required: %v: %s", err, output)
+			}
+		})
+	}
+}

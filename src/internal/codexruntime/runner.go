@@ -320,7 +320,7 @@ func prompt(req runtimeapi.Request) string {
 	} else if req.Role == "worker" {
 		b.WriteString("\nReturn only the requested text and workspace attachments; do not propose actions.\n")
 	} else {
-		b.WriteString("\nReturn the requested structured response. Actions and attachments are proposals for the Agent Chat service to validate; never claim an external action completed without evidence.\n")
+		b.WriteString("\nReturn the requested structured response. Every action must include a task string; use the exact task ID for resolve_hold and an empty task string for all other actions. Actions and attachments are proposals for the Agent Chat service to validate; never claim an external action completed without evidence.\n")
 	}
 	return b.String()
 }
