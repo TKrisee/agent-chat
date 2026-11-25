@@ -12,20 +12,33 @@ export class ReadReceipts {
   private readonly inFlight = new Set<string>();
   private readonly attempted = new Set<string>();
   private scheduled = false;
+  private scrollTimer: number | undefined;
+  private refreshAfterScroll = false;
   constructor(private readonly options: Options) {
     window.addEventListener('focus', () => { this.attempted.clear(); this.schedule(); });
     document.addEventListener('visibilitychange', () => {
       if (!document.hidden) { this.attempted.clear(); this.schedule(); }
     });
-    document.addEventListener('scroll', () => this.schedule(), true);
+    document.addEventListener('scroll', () => this.onScroll(), {capture:true,passive:true});
     document.addEventListener('close', () => this.schedule(), true);
     window.addEventListener('resize', () => this.schedule());
     window.visualViewport?.addEventListener('resize', () => this.schedule());
-    window.visualViewport?.addEventListener('scroll', () => this.schedule());
+    window.visualViewport?.addEventListener('scroll', () => this.onScroll(), {passive:true});
   }
-  contextChanged() { this.attempted.clear(); this.schedule(); }
+  private onScroll() {
+    if (!this.options.recipient().startsWith('group:')) { this.schedule(); return; }
+    const target = this.options.recipient();
+    window.clearTimeout(this.scrollTimer);
+    this.scrollTimer = window.setTimeout(() => {
+      this.scrollTimer = undefined;
+      if (target !== this.options.recipient()) return;
+      if (this.refreshAfterScroll) { this.refreshAfterScroll = false; void this.options.refresh(); }
+      this.schedule();
+    }, 180);
+  }
+  contextChanged() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.refreshAfterScroll = false; this.attempted.clear(); this.schedule(); }
   schedule() {
-    if (this.scheduled) return;
+    if (this.scheduled || this.scrollTimer !== undefined) return;
     this.scheduled = true;
     requestAnimationFrame(() => { this.scheduled = false; void this.observe(); });
   }
@@ -42,7 +55,7 @@ export class ReadReceipts {
     return !!hit && (element === hit || element.contains(hit));
   }
   private async observe() {
-    if (document.hidden || !document.hasFocus() || this.options.obstructed()) return;
+    if (this.scrollTimer !== undefined || document.hidden || !document.hasFocus() || this.options.obstructed()) return;
     const viewport = document.querySelector<HTMLElement>('#chat-scroll');
     if (!viewport) return;
     const target = this.options.recipient();
@@ -60,7 +73,10 @@ export class ReadReceipts {
     ids.forEach(id => { this.attempted.add(id); this.inFlight.add(id); });
     try {
       const response = await fetch('/api/messages/read', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_ids:ids})});
-      if (response.status === 204) await this.options.refresh();
+      if (response.status === 204 && target === this.options.recipient()) {
+        if (this.scrollTimer !== undefined) this.refreshAfterScroll = true;
+        else await this.options.refresh();
+      }
     } catch { /* A later visibility transition may retry; do not spin. */ }
     finally { ids.forEach(id => this.inFlight.delete(id)); }
   }

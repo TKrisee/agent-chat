@@ -51,3 +51,20 @@ func TestPOMultiWorkerActionContract(t *testing.T) {
 		t.Fatal("private chat was given task dispatch guidance")
 	}
 }
+
+func TestGroupReplyContract(t *testing.T) {
+	r, req, _ := setup(t)
+	req.Role, req.Kind, req.ProjectID = "worker", "work", "alpha"
+	t.Setenv("FAKE_RESULT", `{"text":"","actions":[{"type":"post_group","project":"alpha","title":"","body":"Reply","recipient":"","reply_to":"message-1"}],"attachments":[]}`)
+	result, err := r.Execute(context.Background(), req)
+	if err != nil || len(result.Actions) != 1 || result.Actions[0].ReplyTo != "message-1" {
+		t.Fatalf("reply decode: %+v, %v", result, err)
+	}
+	cmd := exec.Command(r.cfg.JQPath, "-e", `.properties.actions.items | ((.required | index("reply_to")) != null) and (.properties.reply_to.type == "string")`, filepath.Join(r.dir(req.ID), "schema.json"))
+	if err := cmd.Run(); err != nil {
+		t.Fatal("reply_to absent from strict worker schema")
+	}
+	if !strings.Contains(prompt(req), "exact message id") {
+		t.Fatal("reply guidance absent")
+	}
+}

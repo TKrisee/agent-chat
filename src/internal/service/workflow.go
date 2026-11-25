@@ -293,6 +293,9 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 				args = append(args, id)
 			}
 		}
+		// Carry authenticated parent-task decisions into a child review without widening rooms.
+		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages WHERE id IN (SELECT f.note_id FROM po_followups f JOIN jobs j ON j.source_id=f.source_id JOIN po_work_items i ON i.parent_task_id=j.task_id WHERE i.child_task_id=? AND j.project_id=? AND j.agent_id=? AND f.note_id IS NOT NULL) AND sender=? AND recipient=? AND role='operator' AND room_id=? ORDER BY seq DESC LIMIT 12)`
+		args = append(args, task, project, a.ID, operator, a.ID, directRoom(operator, a.ID))
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
 		args = append(args, f.assignment, f.note, f.review)
 	}
@@ -483,6 +486,9 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		if action.Task != "" && action.Type != "resolve_hold" {
 			return fmt.Errorf("%w: task field is reserved for resolve_hold", errWorkflow)
 		}
+		if action.ReplyTo != "" && action.Type != "post_group" {
+			return fmt.Errorf("%w: reply_to is reserved for project group posts", errWorkflow)
+		}
 		if action.Type == "resolve_hold" && len(result.Actions) != 1 {
 			return fmt.Errorf("%w: resolve_hold must be a separate action", errWorkflow)
 		}
@@ -563,21 +569,66 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			}
 		}
 	}
-	for _, action := range result.Actions {
-		if j.Kind == "approval_denied" || action.Type == "request_approval" && len(result.Actions) != 1 {
-			return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
-		}
-		if err := s.applyAction(tx, a, j, action); err != nil {
+	planningJob := j
+	var childParent string
+	if a.Role == "po" {
+		err := tx.QueryRow(`SELECT parent_task_id FROM po_work_items WHERE child_task_id=?`, j.Task).Scan(&childParent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
+		}
+	}
+	hasPlanning := false
+	for _, action := range result.Actions {
+		if action.Type == "queue_work_item" || action.Type == "create_worker" {
+			hasPlanning = true
+		}
+	}
+	if childParent != "" && hasPlanning {
+		if _, err := activeReviewWorker(tx, j, a.ID); err != nil {
+			return err
+		}
+		planningJob.Task = childParent
+		if err := parentTaskOwned(tx, planningJob, a); err != nil {
+			return err
+		}
+		if _, err := s.poAssignmentSource(tx, planningJob, a.ID); err != nil {
+			return err
+		}
+	}
+	for pass := 0; pass < 2; pass++ {
+		for _, action := range result.Actions {
+			planning := childParent != "" && hasPlanning && (action.Type == "queue_work_item" || action.Type == "create_worker")
+			if (pass == 0 && planning) || (pass == 1 && !planning) {
+				continue
+			}
+			if j.Kind == "approval_denied" || action.Type == "request_approval" && len(result.Actions) != 1 {
+				return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
+			}
+			if planning {
+				var status string
+				if err := tx.QueryRow(`SELECT status FROM tasks WHERE id=? AND project_id=? AND owner_id=?`, j.Task, j.Project, a.ID).Scan(&status); err != nil {
+					return err
+				}
+				if status != "completed" {
+					return fmt.Errorf("%w: review must be accepted and reported before planning", errWorkflow)
+				}
+				if err := s.applyAction(tx, a, planningJob, action); err != nil {
+					return err
+				}
+			} else if err := s.applyAction(tx, a, j, action); err != nil {
+				return err
+			}
 		}
 	}
 	if a.Role == "po" {
 		if err := s.maybeFollowParent(tx, j); err != nil {
 			return err
 		}
-		for _, action := range result.Actions {
-			if action.Type == "queue_work_item" {
-				return s.followWorkPlanning(tx, j, a)
+		if childParent == "" {
+			for _, action := range result.Actions {
+				if action.Type == "queue_work_item" {
+					return s.followWorkPlanning(tx, j, a)
+				}
 			}
 		}
 	}
@@ -601,7 +652,20 @@ func groupMessageResult(tx *sql.Tx, a agent, j job, result runtimeapi.Result, fi
 	if err != nil {
 		return err
 	}
-	_, err = outputMessage(tx, a, recipient, j, result.Text, files)
+	id, err := outputMessage(tx, a, recipient, j, result.Text, files)
+	if err != nil {
+		return err
+	}
+	return attachGroupReply(tx, id, source, j.Project)
+}
+
+// attachGroupReply only links an extant message in the same project group.
+// A missing or inaccessible target leaves the new message standalone.
+func attachGroupReply(tx *sql.Tx, messageID, parentID, project string) error {
+	if parentID == "" {
+		return nil
+	}
+	_, err := tx.Exec(`INSERT INTO message_replies(message_id,parent_id) SELECT child.id,parent.id FROM messages child JOIN messages parent ON parent.id=? AND parent.room_id=? AND parent.project_id=? WHERE child.id=? AND child.room_id=? AND child.project_id=? AND child.id<>parent.id`, parentID, groupPrefix+project, project, messageID, groupPrefix+project, project)
 	return err
 }
 
@@ -759,7 +823,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		}
 		return moveTask(tx, j, "review", "accepted", a.ID, a.ID)
 	case "report":
-		if action.Recipient != "" && action.Recipient != root || strings.TrimSpace(action.Body) == "" {
+		if strings.TrimSpace(action.Body) == "" {
 			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
 		}
 		var parent string
@@ -768,11 +832,21 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			return err
 		}
 		if parent != "" {
+			worker, err := activeReviewWorker(tx, j, a.ID)
+			if err != nil {
+				return err
+			}
+			if action.Recipient != "" && action.Recipient != root && action.Recipient != worker {
+				return fmt.Errorf("%w: child report recipient differs from the reviewed worker", errWorkflow)
+			}
 			if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
 				return err
 			}
 			_, err = outputMessage(tx, a, a.ID, j, action.Body, nil)
 			return err
+		}
+		if action.Recipient != "" && action.Recipient != root {
+			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
 		}
 		var total, incomplete int
 		if err := tx.QueryRow(`SELECT count(*),COALESCE(sum(CASE WHEN c.status!='completed' THEN 1 ELSE 0 END),0) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=?`, j.Task).Scan(&total, &incomplete); err != nil {
@@ -1055,5 +1129,9 @@ func postGroupAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error
 	if valid != 1 {
 		return fmt.Errorf("%w: group author not a project member", errWorkflow)
 	}
-	return addMessage(tx, newID(), a.ID, groupPrefix+j.Project, a.Role, action.Body, j.Project, "")
+	id := newID()
+	if err := addMessage(tx, id, a.ID, groupPrefix+j.Project, a.Role, action.Body, j.Project, ""); err != nil {
+		return err
+	}
+	return attachGroupReply(tx, id, action.ReplyTo, j.Project)
 }

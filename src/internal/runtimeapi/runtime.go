@@ -66,6 +66,7 @@ type Result struct {
 
 type Action struct {
 	Type      string `json:"type"`
+	ReplyTo   string `json:"reply_to,omitempty"`
 	Task      string `json:"task,omitempty"`
 	Project   string `json:"project"`
 	Title     string `json:"title"`
@@ -174,4 +175,9 @@ type CodexSetup interface {
 	StartSetup(context.Context)
 	SetupStatus() CodexSetupStatus
 	RetrySetup() bool
+}
+
+// LegacyChildReportInspector recognizes a narrowly scoped rejected child review.
+type LegacyChildReportInspector interface {
+	IsLegacyChildReport(context.Context, []byte, string, string) bool
 }

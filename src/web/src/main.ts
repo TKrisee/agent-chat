@@ -256,7 +256,7 @@ function memberActivity(agent:Agent):{label:string;active:boolean} {
  if(jobs.some(j=>j.status==='running'))return {label:'Working',active:true};
  if(jobs.some(j=>j.status==='submitted'))return {label:'Starting',active:false};
  if(jobs.some(j=>j.status==='pending'))return {label:'Queued',active:false};
- if(jobs.some(j=>j.status==='uncertain') || state.tasks.some(t=>t.owner_id===agent.id && t.status==='blocked'))return {label:'Needs attention',active:false};
+ if(jobs.at(-1)?.status==='uncertain' || state.tasks.some(t=>t.owner_id===agent.id && t.status==='blocked'))return {label:'Needs attention',active:false};
  if(jobs.at(-1)?.status==='completed' && jobs.at(-1)?.diagnostic?.trim())return {label:'Failed',active:false};
  return {label:'Idle',active:false};
 }
@@ -266,7 +266,7 @@ function agentActivity(target:string): {label:string; detail?:string; guidance?:
  const groupProject=state.projects.find(p=>'group:'+p.id===target);
  const jobs=groupProject ? state.jobs.filter(j=>j.project_id===groupProject.id && j.kind==='project_message') : state.jobs.filter(j=>j.agent_id===target && j.kind!=='project_message');
  const newest=(status:string)=>[...jobs].reverse().find(j=>j.status===status);
- const current=newest('running') || newest('submitted') || newest('pending') || newest('uncertain');
+ const current=newest('running') || newest('submitted') || newest('pending') || (jobs.at(-1)?.status==='uncertain' ? jobs.at(-1) : undefined);
  if(current){const reason=current.diagnostic?.trim();
   const label=current.status==='running'?'Working':current.status==='submitted'?(reason?'Starting · retrying':'Starting'):current.status==='pending'?(reason?'Queued · retrying':'Queued'):'Blocked · uncertain';
   const guidance=current.status==='uncertain'?'The outcome is unknown. Ask Root to check the outcome before trying again.':reason?'Waiting to retry automatically. No action needed now.':undefined;

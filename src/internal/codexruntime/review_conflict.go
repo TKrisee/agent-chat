@@ -75,3 +75,30 @@ all(.actions[];
 	cmd.Stderr = io.Discard
 	return cmd.Run() == nil
 }
+
+// IsLegacyChildReport verifies the exact harmless historical recipient mismatch.
+func (r *Runner) IsLegacyChildReport(ctx context.Context, payload []byte, project, worker string) bool {
+	if len(payload) == 0 || len(payload) > 1<<20 || project == "" || worker == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	const filter = `
+def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
+type=="object" and (keys==["actions","attachments","text"]) and (.text|type=="string") and (.attachments==[]) and
+(.actions|type=="array" and length>0) and
+all(.actions[]; type=="object" and ((keys==["body","project","recipient","title","type"]) or (keys==["body","project","recipient","task","title","type"])) and ([.type,.project,.title,.body,.recipient,(.task//"")]|all(.[];type=="string")) and (.task//"")=="" and .project==$project and
+ if .type=="accept_result" then .recipient==$worker
+ elif .type=="report" then .recipient==$worker and (.body|nonblank)
+ elif .type=="post_group" then .recipient=="" and (.body|nonblank)
+ elif .type=="create_worker" then .recipient=="" and .body=="" and (.title|nonblank and (test("\\s")|not))
+ elif .type=="queue_work_item" then (.recipient|nonblank) and (.title|nonblank) and (.body|nonblank)
+ else false end) and
+([.actions[]|select(.type=="accept_result")]|length==1) and ([.actions[]|select(.type=="report")]|length==1) and
+((.actions|map(.type)|index("accept_result")) < (.actions|map(.type)|index("report")))`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, "--arg", "worker", worker, filter)
+	cmd.Stdin = bytes.NewReader(payload)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}

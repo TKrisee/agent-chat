@@ -193,3 +193,11 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   await page.getByRole('button',{name:/Root conversation/}).click();
   await expect(page.locator('[data-message-id="m5"]')).not.toHaveClass(/operator-mention/);
 });
+
+test('agent status uses the latest settled run while retaining earlier uncertainty', async ({page, serviceURL}) => {
+  const state = `{"projects":[],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"}],"tasks":[],"jobs":[{"id":"old","agent_id":"root","status":"uncertain","diagnostic":"Earlier outcome unknown"},{"id":"new","agent_id":"root","status":"completed"}],"messages":[]}`;
+  await page.route('**/api/state', route => route.fulfill({status:200,contentType:'application/json',body:state}));
+  await page.goto(serviceURL);
+  await expect(page.locator('.composer-heading')).toContainText('Idle');
+  await expect(page.locator('.composer-heading')).not.toContainText('Blocked · uncertain');
+});
