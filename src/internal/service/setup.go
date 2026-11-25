@@ -37,6 +37,9 @@ func (s *Service) writeSetup(w http.ResponseWriter, code int) {
 	if status.Version != "" {
 		w.Header().Set("X-AgentChat-Codex-Version", status.Version)
 	}
+	if status.ManagedVersion != "" {
+		w.Header().Set("X-AgentChat-Codex-Managed-Version", status.ManagedVersion)
+	}
 	w.WriteHeader(code)
 	if status.Message != "" {
 		_, _ = w.Write([]byte(status.Message))

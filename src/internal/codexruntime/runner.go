@@ -97,8 +97,11 @@ func New(cfg Config) (*Runner, error) {
 			r.setupPath = cfg.CodexPath
 		}
 	}
+	spec, e := lockedBundle(runtime.GOOS + "-" + runtime.GOARCH)
+	if e == nil {
+		r.setupState.ManagedVersion = spec.version
+	}
 	if cfg.CodexPath == "" {
-		spec, e := lockedBundle(runtime.GOOS + "-" + runtime.GOARCH)
 		if e != nil {
 			r.setupState.State = "error"
 			r.setupState.Message = setupError(e)

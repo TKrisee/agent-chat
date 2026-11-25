@@ -81,7 +81,7 @@ type SetupState='checking'|'downloading'|'ready'|'error'|'not_required';
 let setupState:SetupState='checking';let setupSource='';let setupVersion='';let setupError='';let setupReady=false;let setupBlocked=false;let setupBusy=false;let setupCanRetry=false;let dataStarted=false;
 function setupMarkup():string {
  const label=setupState==='checking'?'Preparing Codex…':setupState==='downloading'?'Downloading Codex…':setupState==='ready'?'Codex is ready':setupState==='not_required'?'Codex is not required in this mode':'Codex setup could not finish';
- return `<section class="setup-section" aria-label="Codex setup"><h2>Codex setup</h2><p role="status">${esc(label)}${setupState==='ready' && setupSource==='managed' && setupVersion?` · ${esc(setupVersion)}`:''}</p>${setupState==='error' && setupError?`<p class="settings-error">${esc(setupError)}</p>`:''}${setupState==='error' && setupCanRetry?'<button type="button" id="setup-retry">Retry setup</button>':''}</section>`;
+ return `<section class="setup-section" aria-label="Codex setup"><h2>Codex setup</h2><p role="status">${esc(label)}${setupVersion?` · Managed version ${esc(setupVersion)}`:''}</p>${setupSource==='override'?'<p>External CLI selected</p>':''}${setupState==='error' && setupError?`<p class="settings-error">${esc(setupError)}</p>`:''}${setupState==='error' && setupCanRetry?'<button type="button" id="setup-retry">Retry setup</button>':''}</section>`;
 }
 async function checkSetup(retry=false):Promise<void>{
  if(setupBusy)return;setupBusy=true;
@@ -92,7 +92,7 @@ async function checkSetup(retry=false):Promise<void>{
   if(!r.ok)throw new Error('Waiting for the Agent Chat service.');
   const next=r.headers.get('X-AgentChat-Codex-State');
   if(next!=='downloading' && next!=='ready' && next!=='error' && next!=='not_required')throw new Error('Waiting for the Agent Chat service.');
-  setupState=next;setupSource=r.headers.get('X-AgentChat-Codex-Source')||'';setupVersion=r.headers.get('X-AgentChat-Codex-Version')||'';
+  setupState=next;setupSource=r.headers.get('X-AgentChat-Codex-Source')||'';setupVersion=r.headers.get('X-AgentChat-Codex-Managed-Version')||'';
   setupCanRetry=next==='error';setupError=next==='error'?(await r.text()):'';
   setupReady=next==='ready'||next==='not_required';
   if(!setupReady){setupBlocked=true;settingsOpen=true;}

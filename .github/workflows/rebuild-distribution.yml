@@ -211,6 +211,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v7
         with:
           pattern: agentchat-*
@@ -222,26 +226,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release.outputs.tag || inputs.release_tag }}
           SHA: ${{ needs.guard.outputs.sha }}
+          WORKFLOW_SHA: ${{ needs.guard.outputs.sha }}
           PREVIOUS: ${{ inputs.previous_target_sha }}
         shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')" == "$SHA" ]]
-          if [[ -n "$PREVIOUS" ]]; then
-            [[ "$PREVIOUS" =~ ^[0-9a-f]{40}$ && "$PREVIOUS" != "$SHA" ]]
-            gh api "repos/$GH_REPO/compare/$PREVIOUS...$SHA" | jq -e --arg old "$PREVIOUS" '.status == "ahead" and .merge_base_commit.sha == $old' >/dev/null
-            gh api "repos/$GH_REPO/git/matching-refs/tags/$TAG" | jq -e --arg ref "refs/tags/$TAG" '[.[] | select(.ref == $ref)] | length == 0' >/dev/null
-            id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" --arg old "$PREVIOUS" '[.[][] | select(.tag_name == $tag)] | if length == 1 and .[0].draft == true and .[0].target_commitish == $old then .[0].id else error("unique prior-target draft required") end')
-            gh api --method PATCH "repos/$GH_REPO/releases/$id" -f target_commitish="$SHA" | jq -e --arg sha "$SHA" --arg tag "$TAG" '.draft == true and .tag_name == $tag and .target_commitish == $sha' >/dev/null
-          else
-            id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" --arg sha "$SHA" '[.[][] | select(.draft == true and .tag_name == $tag and .target_commitish == $sha)] | if length == 1 then .[0].id else error("matching draft required") end')
-          fi
-          cd artifacts
-          printf 'version %s\n' "${TAG#v}" > agentchat-update.txt
-          for file in agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip; do
-            test -f "$file"
-            printf '%s %s\n' "$(sha256sum "$file" | cut -d' ' -f1)" "$file" >> agentchat-update.txt
-          done
-          gh release upload "$TAG" agentchat-update.txt agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip --clobber
-          gh api --method PATCH "repos/$GH_REPO/releases/$id" -F draft=false >/dev/null
+        run: bash .github/scripts/publish-tested-release.sh
