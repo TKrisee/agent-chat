@@ -149,3 +149,12 @@ func killProcess(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+func processFailureCode(cmd *exec.Cmd) string {
+	if cmd.ProcessState != nil {
+		if code := cmd.ProcessState.ExitCode(); code > 0 {
+			return fmt.Sprintf("exit:%d", code)
+		}
+	}
+	return "wait_failed"
+}

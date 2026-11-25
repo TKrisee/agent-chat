@@ -446,7 +446,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 			}
 			return zero, err
 		}
-		return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
+		return zero, executionFailure(dir, contextFailureCode(err))
 	}
 
 	cmd := exec.Command(codexPath, args...)
@@ -501,7 +501,13 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 			_ = killProcess(cmd)
 			_ = cmd.Wait()
 		}
-		return zero, fmt.Errorf("%w: process launch or containment failed: %v", ErrUnknown, err)
+		if cmd.Process != nil {
+			return zero, executionFailure(dir, "containment_failed")
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return zero, executionFailure(dir, contextFailureCode(err))
+		}
+		return zero, executionFailure(dir, "launch_failed")
 	}
 	defer cleanup()
 	runtimeapi.NotifyStart(ctx)
@@ -512,10 +518,10 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	case <-runCtx.Done():
 		_ = killProcess(cmd)
 		<-waited
-		return zero, fmt.Errorf("%w: %v", ErrUnknown, runCtx.Err())
+		return zero, executionFailure(dir, contextFailureCode(runCtx.Err()))
 	}
 	if err != nil {
-		return zero, fmt.Errorf("%w: native process exited unsuccessfully", ErrUnknown)
+		return zero, executionFailure(dir, processFailureCode(cmd))
 	}
 	digest, err := r.resultDigest(dir)
 	if err != nil {

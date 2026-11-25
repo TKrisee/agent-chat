@@ -211,6 +211,12 @@ func (s *Service) resolveHold(tx *sql.Tx, j job, action runtimeapi.Action) error
 			return fmt.Errorf("%w: specify the exact held task", errWorkflow)
 		}
 	}
+	return s.applyHoldResolution(tx, h, text, newID())
+}
+
+// applyHoldResolution executes the shared held-task transition after authorization.
+func (s *Service) applyHoldResolution(tx *sql.Tx, h activeHold, text, note string) error {
+	var err error
 	if h.legacy {
 		_, err = tx.Exec(`INSERT INTO task_holds(job_id,task_id,project_id,po_id,phase,assignment_id,note_id,review_id,root_source_id,root_message_id,status) VALUES(?,?,?,?,?,?,?,?,?,?,'active')`, h.job, h.task, h.project, h.po, h.phase, h.assignment, nullIfEmpty(h.note), nullIfEmpty(h.review), h.rootSource, h.rootMessage)
 		if err != nil {
@@ -233,7 +239,6 @@ func (s *Service) resolveHold(tx *sql.Tx, j job, action runtimeapi.Action) error
 	if err != nil || n != 1 {
 		return fmt.Errorf("%w: held task changed", errWorkflow)
 	}
-	note := newID()
 	if err := addMessage(tx, note, operator, h.po, "operator", text, h.project, h.task); err != nil {
 		return err
 	}

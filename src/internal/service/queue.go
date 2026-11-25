@@ -207,7 +207,11 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 			return s.disposition(j.ID, "pending", "execution withheld before launch", 0)
 		}
 		if ctx.Err() != nil {
-			return s.disposition(j.ID, "uncertain", "interrupted; execution outcome requires review", 0)
+			reason := unknownDiagnostic(runner, j.Request)
+			if reason == defaultUnknownDiagnostic {
+				reason = "interrupted; execution outcome requires review"
+			}
+			return s.disposition(j.ID, "uncertain", reason, 0)
 		}
 		if delay, ok := capacityDelay(err); ok {
 			if delay <= 0 {

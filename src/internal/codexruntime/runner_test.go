@@ -155,6 +155,18 @@ func TestFailedAndInterruptedRunsNeverReplay(t *testing.T) {
 			if err != nil || state != runtimeapi.Unknown {
 				t.Fatalf("recovery %v %v", state, err)
 			}
+			restarted, err := New(r.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reason, err := restarted.Diagnostic(req)
+			want := "exited with code 23"
+			if mode == "hang" {
+				want = "exceeded its deadline"
+			}
+			if err != nil || !strings.Contains(reason, want) {
+				t.Fatalf("durable diagnostic %q: %v", reason, err)
+			}
 			_, err = r.Execute(context.Background(), req)
 			if !errors.Is(err, ErrUnknown) || launchCount(t) != 1 {
 				t.Fatalf("replayed effect %v count %d", err, launchCount(t))
@@ -194,6 +206,9 @@ func TestRunningLockAndCancellation(t *testing.T) {
 	_, state, err = r.Recover(context.Background(), req)
 	if err != nil || state != runtimeapi.Unknown {
 		t.Fatalf("after cancel %v %v", state, err)
+	}
+	if reason, err := r.Diagnostic(req); err != nil || !strings.Contains(reason, "was cancelled") {
+		t.Fatalf("cancel diagnostic %q: %v", reason, err)
 	}
 }
 
@@ -509,6 +524,9 @@ func TestRetryMarkerConsumedBeforePossibleLaunch(t *testing.T) {
 	}
 	if _, state, err := r.Recover(context.Background(), req); err != nil || state != runtimeapi.Unknown {
 		t.Fatalf("unknown after launch attempt: %v %v", state, err)
+	}
+	if reason, err := r.Diagnostic(req); err != nil || !strings.Contains(reason, "could not be launched") {
+		t.Fatalf("launch diagnostic %q: %v", reason, err)
 	}
 }
 

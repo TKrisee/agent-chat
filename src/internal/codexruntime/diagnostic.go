@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"agentchat/src/internal/runtimeapi"
 )
@@ -57,6 +59,59 @@ func validationFailure(dir string, err error) error {
 	return errors.Join(ErrUnknown, errors.New(validationReasons[code]))
 }
 
+// executionReason accepts only fixed classifications and bounded numeric
+// process outcomes; native output and error strings never enter the journal.
+func executionReason(code string) (string, bool) {
+	switch code {
+	case "launch_failed":
+		return "Native process could not be launched; the run remains uncertain.", true
+	case "containment_failed":
+		return "Native process containment failed after launch; effects remain uncertain.", true
+	case "cancelled":
+		return "Native run was cancelled; effects remain uncertain.", true
+	case "deadline":
+		return "Native run exceeded its deadline; effects remain uncertain.", true
+	case "wait_failed":
+		return "Native process did not finish successfully; effects remain uncertain.", true
+	}
+	for _, prefix := range []string{"exit:", "signal:"} {
+		if !strings.HasPrefix(code, prefix) {
+			continue
+		}
+		part := strings.TrimPrefix(code, prefix)
+		n, err := strconv.ParseUint(part, 10, 32)
+		if err != nil || n == 0 || strconv.FormatUint(n, 10) != part || (prefix == "signal:" && n > 127) {
+			return "", false
+		}
+		if prefix == "exit:" {
+			return "Native process exited with code " + part + "; effects remain uncertain.", true
+		}
+		return "Native process terminated by signal " + part + "; effects remain uncertain.", true
+	}
+	return "", false
+}
+
+func executionFailure(dir, code string) error {
+	reason, ok := executionReason(code)
+	if !ok {
+		return errors.Join(ErrUnknown, errors.New("native execution diagnostic was invalid"))
+	}
+	if err := syncFile(filepath.Join(dir, "execution"), []byte(code)); err != nil {
+		return errors.Join(ErrUnknown, errors.New("native execution diagnostic could not be persisted"))
+	}
+	if err := syncDir(dir); err != nil {
+		return errors.Join(ErrUnknown, errors.New("native execution diagnostic could not be persisted"))
+	}
+	return errors.Join(ErrUnknown, errors.New(reason))
+}
+
+func contextFailureCode(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "deadline"
+	}
+	return "cancelled"
+}
+
 // Diagnostic exposes only a bounded static reason, never native output or
 // credentials. Recover still returns Unknown and never repeats a native run.
 func (r *Runner) Diagnostic(req runtimeapi.Request) (string, error) {
@@ -85,7 +140,23 @@ func (r *Runner) Diagnostic(req runtimeapi.Request) (string, error) {
 	}
 	f, err := os.Open(filepath.Join(dir, "validation"))
 	if os.IsNotExist(err) {
-		return "", nil
+		f, err = os.Open(filepath.Join(dir, "execution"))
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		defer f.Close()
+		code, err := io.ReadAll(io.LimitReader(f, 65))
+		if err != nil || len(code) > 64 {
+			return "", errors.New("invalid execution diagnostic")
+		}
+		reason, ok := executionReason(string(code))
+		if !ok {
+			return "", errors.New("invalid execution diagnostic")
+		}
+		return reason, nil
 	}
 	if err != nil {
 		return "", err

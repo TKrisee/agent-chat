@@ -57,6 +57,7 @@ type Task struct {
 	Owner                string `json:"owner_id"`
 	RetryHandoffEligible bool   `json:"retry_handoff_eligible"`
 	ContinuePOEligible   bool   `json:"continue_po_eligible"`
+	ResolveHoldEligible  bool   `json:"resolve_hold_eligible"`
 }
 
 type Agent struct {
@@ -223,6 +224,16 @@ func (s *Service) state() (State, error) {
 		}
 		for i := range view.Tasks {
 			if view.Tasks[i].Status == "blocked" {
+				h, found, holdErr := s.activeTaskHold(tx, view.Tasks[i].ID)
+				if holdErr != nil {
+					return holdErr
+				}
+				if found {
+					view.Tasks[i].ResolveHoldEligible, holdErr = s.holdCanResolve(tx, h)
+					if holdErr != nil {
+						return holdErr
+					}
+				}
 				view.Tasks[i].RetryHandoffEligible, err = handoffEligible(tx, view.Tasks[i].ID, "blocked", "", true)
 				if err != nil {
 					return err
@@ -291,6 +302,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	})
 	mux.HandleFunc("POST /api/tasks/{id}/retry-handoff", s.retryHandoff)
 	mux.HandleFunc("POST /api/tasks/{id}/continue-po", s.continuePO)
+	mux.HandleFunc("POST /api/tasks/{id}/resolve-hold", s.operatorResolveHold)
 	mux.HandleFunc("POST /api/projects/{id}/workspace", s.setProjectWorkspace)
 	mux.HandleFunc("POST /api/messages", s.postMessage)
 	mux.HandleFunc("POST /api/messages/upload", s.postMessageUpload)
