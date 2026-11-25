@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/TKrisee/agent-chat/compare/v0.14.3...v0.14.4) (2026-11-25)
+
+
+### Bug Fixes
+
+* keep child reviews moving and chat context responsive ([898b4f0](https://github.com/TKrisee/agent-chat/commit/898b4f0878bd0ee417328df2520be41f1b586828))
+
 ## [0.14.3](https://github.com/TKrisee/agent-chat/compare/v0.14.2...v0.14.3) (2026-11-25)
 
 
