@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.5](https://github.com/TKrisee/agent-chat/compare/v0.14.4...v0.14.5) (2026-11-25)
+
+
+### Bug Fixes
+
+* accept an explicit same-room recipient on agent group posts ([1671276](https://github.com/TKrisee/agent-chat/commit/16712762b6a042fcc7820e5d427a52b176c41978))
+* recover child reviews rejected for an equivalent group recipient ([6598580](https://github.com/TKrisee/agent-chat/commit/6598580dbceaa9af13c2c236cd43712b96add331))
+
 ## [0.14.4](https://github.com/TKrisee/agent-chat/compare/v0.14.3...v0.14.4) (2026-11-25)
 
 
