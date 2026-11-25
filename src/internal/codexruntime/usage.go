@@ -23,7 +23,11 @@ else ($w | min_by([100-.usedPercent,(.resetsAt // 999999999999)])) as $m | "know
 
 func (r *Runner) ReadWeeklyUsage(ctx context.Context) (runtimeapi.WeeklyUsage, error) {
 	var result runtimeapi.WeeklyUsage
-	cmd := exec.CommandContext(ctx, r.cfg.CodexPath, "app-server")
+	codexPath, err := r.readyExecutable()
+	if err != nil {
+		return result, err
+	}
+	cmd := exec.CommandContext(ctx, codexPath, "app-server")
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return result, err

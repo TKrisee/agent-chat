@@ -11,8 +11,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -39,6 +41,10 @@ type Runner struct {
 	start              func(*exec.Cmd) error
 	prune              func(string, string) error
 	afterRetryConsumed func()
+	setupMu            sync.RWMutex
+	setupState         runtimeapi.CodexSetupStatus
+	setupCtx           context.Context
+	setupPath          string
 }
 
 var _ runtimeapi.Runner = (*Runner)(nil)
@@ -48,12 +54,7 @@ func New(cfg Config) (*Runner, error) {
 		return nil, errors.New("state directory must be absolute")
 	}
 	var err error
-	if cfg.CodexPath == "" {
-		cfg.CodexPath, err = exec.LookPath("codex")
-		if err != nil {
-			return nil, err
-		}
-	}
+
 	if cfg.JQPath == "" {
 		cfg.JQPath, err = exec.LookPath("jq")
 		if err != nil {
@@ -82,7 +83,30 @@ func New(cfg Config) (*Runner, error) {
 	if !privateStateDirectory(info) {
 		return nil, errors.New("state directory must be private")
 	}
-	return &Runner{cfg: cfg, start: func(cmd *exec.Cmd) error { return cmd.Start() }, prune: pruneCapacity}, nil
+	source := "managed"
+	if cfg.CodexPath != "" {
+		source = "override"
+	}
+	r := &Runner{cfg: cfg, start: func(cmd *exec.Cmd) error { return cmd.Start() }, prune: pruneCapacity, setupState: runtimeapi.CodexSetupStatus{State: "downloading", Source: source}}
+	if cfg.CodexPath != "" {
+		if _, err := exec.LookPath(cfg.CodexPath); err != nil {
+			r.setupState.State = "error"
+			r.setupState.Message = "Configured Codex executable is unavailable."
+		} else {
+			r.setupState.State = "ready"
+			r.setupPath = cfg.CodexPath
+		}
+	}
+	if cfg.CodexPath == "" {
+		spec, e := lockedBundle(runtime.GOOS + "-" + runtime.GOARCH)
+		if e != nil {
+			r.setupState.State = "error"
+			r.setupState.Message = setupError(e)
+		} else {
+			r.setupState.Version = spec.version
+		}
+	}
+	return r, nil
 }
 
 func fingerprint(req runtimeapi.Request) string {
@@ -303,6 +327,10 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	if err := validate(req); err != nil {
 		return zero, err
 	}
+	codexPath, err := r.readyExecutable()
+	if err != nil {
+		return zero, err
+	}
 	body := prompt(req)
 	if len(body) > 2<<20 {
 		return zero, errors.New("run prompt exceeds bounded input size")
@@ -415,7 +443,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		return zero, fmt.Errorf("%w: %v", ErrUnknown, err)
 	}
 
-	cmd := exec.Command(r.cfg.CodexPath, args...)
+	cmd := exec.Command(codexPath, args...)
 	configureProcess(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Stdin = strings.NewReader(body)

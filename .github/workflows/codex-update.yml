@@ -1,0 +1,194 @@
+name: Update pinned Codex
+
+on:
+  schedule:
+    - cron: '17 8 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: pinned-codex-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Prepare stable candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=$(git rev-parse HEAD)
+          gh api repos/openai/codex/releases/latest > "$RUNNER_TEMP/codex-release.json"
+          jq -e '
+            def sha($name):
+              [.assets[] | select(.name == $name and .state == "uploaded") | .digest] as $d |
+              if ($d | length) == 1 and ($d[0] | type == "string" and test("^sha256:[a-f0-9]{64}$"))
+              then $d[0][7:] else error("missing or invalid asset digest: " + $name) end;
+            select(.draft == false and .prerelease == false) |
+            {version:(.tag_name | capture("^rust-v(?<v>[0-9]+\\.[0-9]+\\.[0-9]+)$").v), packages:{
+              "darwin-arm64":{asset:"codex-package-aarch64-apple-darwin.tar.gz",sha256:sha("codex-package-aarch64-apple-darwin.tar.gz")},
+              "linux-amd64":{asset:"codex-package-x86_64-unknown-linux-musl.tar.gz",sha256:sha("codex-package-x86_64-unknown-linux-musl.tar.gz")},
+              "windows-amd64":{asset:"codex-package-x86_64-pc-windows-msvc.tar.gz",sha256:sha("codex-package-x86_64-pc-windows-msvc.tar.gz")}
+            }}' "$RUNNER_TEMP/codex-release.json" > "$RUNNER_TEMP/codex-lock.json"
+          jq -r '(["version",.version] | @tsv), (["darwin-arm64",.packages["darwin-arm64"].asset,.packages["darwin-arm64"].sha256] | @tsv), (["linux-amd64",.packages["linux-amd64"].asset,.packages["linux-amd64"].sha256] | @tsv), (["windows-amd64",.packages["windows-amd64"].asset,.packages["windows-amd64"].sha256] | @tsv)' "$RUNNER_TEMP/codex-lock.json" > "$RUNNER_TEMP/codex-lock.tsv"
+          jq -Rn -e '[inputs | select(length>0) | split("\t")] | if length==4 and .[0][0]=="version" and (.[0]|length)==2 and (.[0][1]|test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and .[1][0]=="darwin-arm64" and .[2][0]=="linux-amd64" and .[3][0]=="windows-amd64" and all(.[1:][]; length==3 and (.[2]|test("^[a-f0-9]{64}$"))) then {version:.[0][1],packages:{"darwin-arm64":{asset:.[1][1],sha256:.[1][2]},"linux-amd64":{asset:.[2][1],sha256:.[2][2]},"windows-amd64":{asset:.[3][1],sha256:.[3][2]}}} else error("invalid current lock") end' < src/internal/codexruntime/codex-lock.tsv > "$RUNNER_TEMP/current-lock.json"
+          version=$(jq -er '.version' "$RUNNER_TEMP/codex-lock.json")
+          current=$(jq -er '.version' "$RUNNER_TEMP/current-lock.json")
+          if ! jq -en --arg next "$version" --arg current "$current" '($next|split(".")|map(tonumber)) > ($current|split(".")|map(tonumber))' >/dev/null; then
+            if [ "$version" = "$current" ] && ! jq -e --slurpfile candidate "$RUNNER_TEMP/codex-lock.json" '.packages == $candidate[0].packages' "$RUNNER_TEMP/current-lock.json" >/dev/null; then
+              echo 'The digest of an already pinned release changed; refusing to update.' >&2
+              exit 1
+            fi
+            # A prior run may have merged the pin but stopped at a release PR
+            # or draft. Do not silently report completion or publish unrelated work.
+            owner=${GH_REPO%%/*}
+            gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f "head=$owner:release-please--branches--main--components--agentchat" -f base=main > "$RUNNER_TEMP/open-release-prs.json"
+            gh api "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+            open_prs=$(jq -er 'length' "$RUNNER_TEMP/open-release-prs.json")
+            drafts=$(jq -er '[.[] | select(.draft == true)] | length' "$RUNNER_TEMP/releases.json")
+            if [ "$open_prs" -gt 0 ] || [ "$drafts" -gt 0 ]; then
+              echo '::warning::The pin is current, but a release PR or draft remains. Review the prior workflow and resume its exact-SHA release gate if appropriate.'
+              echo 'The Codex pin is current. A release PR or draft remains; inspect the earlier gate before resuming publication.' >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'No newer stable Codex release.'
+            fi
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          branch="automation/codex-${version}-${base:0:12}"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git fetch origin "refs/heads/$branch:refs/remotes/origin/$branch"
+            candidate=$(git rev-parse "refs/remotes/origin/$branch")
+            [ "$(git rev-parse "$candidate^1")" = "$base" ]
+            [ "$(git diff --name-only "$base" "$candidate")" = 'src/internal/codexruntime/codex-lock.tsv' ]
+            git show "$candidate:src/internal/codexruntime/codex-lock.tsv" > "$RUNNER_TEMP/existing-lock.tsv"
+            cmp "$RUNNER_TEMP/existing-lock.tsv" "$RUNNER_TEMP/codex-lock.tsv"
+          else
+            git switch -c "$branch"
+            cp "$RUNNER_TEMP/codex-lock.tsv" src/internal/codexruntime/codex-lock.tsv
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add src/internal/codexruntime/codex-lock.tsv
+            git commit -m "fix: update pinned Codex to $version"
+            candidate=$(git rev-parse HEAD)
+            git push origin "HEAD:refs/heads/$branch"
+          fi
+          printf 'changed=true\nbase=%s\nbranch=%s\nsha=%s\nversion=%s\n' "$base" "$branch" "$candidate" "$version" >> "$GITHUB_OUTPUT"
+      - name: Open or reuse the candidate PR
+        id: proposal
+        if: steps.candidate.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+          VERSION: ${{ steps.candidate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner=${GH_REPO%%/*}
+          gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f "head=$owner:$BRANCH" -f base=main > "$RUNNER_TEMP/existing-pr.json"
+          pr=$(jq -er --arg sha "$CANDIDATE" 'if length == 0 then 0 elif length == 1 and .[0].head.sha == $sha then .[0].number else error("unexpected matching PR") end' "$RUNNER_TEMP/existing-pr.json")
+          if [ "$pr" = 0 ]; then
+            gh api --method POST "repos/$GH_REPO/pulls" -f title="fix: update pinned Codex to $VERSION" -f head="$BRANCH" -f base=main \
+              -f body='Updates the pinned official stable Codex packages. An explicitly dispatched native package gate must pass before this PR can advance.' > "$RUNNER_TEMP/new-pr.json"
+            pr=$(jq -er '.number' "$RUNNER_TEMP/new-pr.json")
+          fi
+          printf 'number=%s\n' "$pr" >> "$GITHUB_OUTPUT"
+      - name: Run the package gate on the exact candidate
+        if: steps.candidate.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GH_REPO/actions/workflows/rebuild-distribution.yml/dispatches" \
+            -f ref="$BRANCH" -f 'inputs[test_only]=true' -f "inputs[expected_sha]=$CANDIDATE" > "$RUNNER_TEMP/candidate-run.json"
+          run_id=$(jq -er '.workflow_run_id | select(type == "number")' "$RUNNER_TEMP/candidate-run.json")
+          gh run watch "$run_id" --exit-status
+          gh api "repos/$GH_REPO/actions/runs/$run_id" | jq -e --arg sha "$CANDIDATE" '.head_sha == $sha and .event == "workflow_dispatch" and .conclusion == "success"' >/dev/null
+      - name: Run browser and service validation on the exact candidate
+        if: steps.candidate.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GH_REPO/actions/workflows/ci.yml/dispatches" \
+            -f ref="$BRANCH" > "$RUNNER_TEMP/validation-run.json"
+          run_id=$(jq -er '.workflow_run_id | select(type == "number")' "$RUNNER_TEMP/validation-run.json")
+          gh run watch "$run_id" --exit-status
+          gh api "repos/$GH_REPO/actions/runs/$run_id" | jq -e --arg sha "$CANDIDATE" '.head_sha == $sha and .event == "workflow_dispatch" and .conclusion == "success"' >/dev/null
+      - name: Advance the tested candidate
+        if: steps.candidate.outputs.changed == 'true'
+        env:
+          BASE: ${{ steps.candidate.outputs.base }}
+          BRANCH: ${{ steps.candidate.outputs.branch }}
+          CANDIDATE: ${{ steps.candidate.outputs.sha }}
+          PR: ${{ steps.proposal.outputs.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          owner=${GH_REPO%%/*}
+          pr=$PR
+          current=$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')
+          if [ "$current" != "$BASE" ]; then
+            echo 'Main advanced after the candidate was prepared; leaving the tested PR for review.'
+            exit 0
+          fi
+          # Respect review, branch and ruleset policy. A refusal leaves the PR open.
+          if ! gh pr merge "$pr" --merge --match-head-commit "$CANDIDATE"; then
+            echo 'Merge was not permitted; the tested PR remains open.'
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/pulls/$pr" > "$RUNNER_TEMP/merged-pr.json"
+          merge_sha=$(jq -er 'select(.merged == true) | .merge_commit_sha' "$RUNNER_TEMP/merged-pr.json")
+          gh api "repos/$GH_REPO/git/commits/$merge_sha" > "$RUNNER_TEMP/merge-commit.json"
+          jq -e --arg base "$BASE" --arg head "$CANDIDATE" '.parents | length == 2 and .[0].sha == $base and .[1].sha == $head' "$RUNNER_TEMP/merge-commit.json" >/dev/null
+          candidate_tree=$(gh api "repos/$GH_REPO/git/commits/$CANDIDATE" | jq -er '.tree.sha')
+          [ "$(jq -er '.tree.sha' "$RUNNER_TEMP/merge-commit.json")" = "$candidate_tree" ]
+          gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GH_REPO/actions/workflows/rebuild-distribution.yml/dispatches" \
+            -f ref=main -f "inputs[expected_sha]=$merge_sha" > "$RUNNER_TEMP/release-run.json"
+          run_id=$(jq -er '.workflow_run_id | select(type == "number")' "$RUNNER_TEMP/release-run.json")
+          gh run watch "$run_id" --exit-status
+          gh api "repos/$GH_REPO/actions/runs/$run_id" | jq -e --arg sha "$merge_sha" '.head_sha == $sha and .event == "workflow_dispatch" and .conclusion == "success"' >/dev/null
+          # Release Please first opens a metadata-only release PR. Advance only
+          # that PR against the exact gated source; a policy refusal leaves it open.
+          release_branch='release-please--branches--main--components--agentchat'
+          gh api --method GET "repos/$GH_REPO/pulls" -f state=open -f "head=$owner:$release_branch" -f base=main > "$RUNNER_TEMP/release-prs.json"
+          release_pr=$(jq -er --arg base "$merge_sha" --arg repo "$GH_REPO" '
+            if length == 1 and .[0].base.sha == $base and .[0].head.repo.full_name == $repo and .[0].user.login == "github-actions[bot]"
+            then .[0].number else error("expected one Release Please PR on the gated base") end' "$RUNNER_TEMP/release-prs.json")
+          release_head=$(jq -er '.[0].head.sha' "$RUNNER_TEMP/release-prs.json")
+          gh api "repos/$GH_REPO/pulls/$release_pr/files?per_page=100" | jq -e '
+            (map(.filename) | sort) == [".release-please-manifest.json","CHANGELOG.md"] and all(.[]; .status == "modified")' >/dev/null
+          [ "$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')" = "$merge_sha" ]
+          if ! gh pr merge "$release_pr" --merge --match-head-commit "$release_head"; then
+            echo 'Release PR requires review or policy approval; it remains open.'
+            exit 0
+          fi
+          gh api "repos/$GH_REPO/pulls/$release_pr" > "$RUNNER_TEMP/merged-release-pr.json"
+          release_sha=$(jq -er 'select(.merged == true) | .merge_commit_sha' "$RUNNER_TEMP/merged-release-pr.json")
+          gh api "repos/$GH_REPO/git/commits/$release_sha" | jq -e --arg base "$merge_sha" --arg head "$release_head" '.parents | length == 2 and .[0].sha == $base and .[1].sha == $head' >/dev/null
+          gh api --method POST -H 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GH_REPO/actions/workflows/rebuild-distribution.yml/dispatches" \
+            -f ref=main -f "inputs[expected_sha]=$release_sha" > "$RUNNER_TEMP/final-run.json"
+          final_run=$(jq -er '.workflow_run_id | select(type == "number")' "$RUNNER_TEMP/final-run.json")
+          gh run watch "$final_run" --exit-status
+          gh api "repos/$GH_REPO/actions/runs/$final_run" | jq -e --arg sha "$release_sha" '.head_sha == $sha and .event == "workflow_dispatch" and .conclusion == "success"' >/dev/null

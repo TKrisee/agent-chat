@@ -1,0 +1,4 @@
+version	0.172.0
+darwin-arm64	codex-package-aarch64-apple-darwin.tar.gz	0970016d48209a09c4039139629ed79b4a31c5e3d864e792c043419d98fa6466
+linux-amd64	codex-package-x86_64-unknown-linux-musl.tar.gz	63e3b00065ed7f62166d0522e17f663cb866a31d80d03e63365482ed34a1d991
+windows-amd64	codex-package-x86_64-pc-windows-msvc.tar.gz	b723674d7caf26a3f55121a02d6cad8f3ac8ddf5860747a6edde1c904cf593af

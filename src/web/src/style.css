@@ -136,3 +136,8 @@
 .scope-detail { margin-top:8px; padding:9px 10px; border-radius:7px; background:#fff; color:#34483c; font-size:12px; }
 .scope-detail[hidden] { display:none; }
 .scope-detail pre { margin:0; white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; line-height:1.5; }
+.conversation-navigation[hidden],.sidebar-tools button[hidden] { display:none!important; }
+.setup-section { margin-bottom:24px; padding-bottom:16px; border-bottom:1px solid #e1e9df; }
+.setup-section h2 { font-size:16px; }.setup-section p { margin:8px 0; }
+.setup-section button { border:0; border-radius:9px; padding:8px 12px; background:#285a48; color:#fff; font-weight:700; }
+.setup-section button:focus-visible { outline:2px solid #769e7d; outline-offset:2px; }

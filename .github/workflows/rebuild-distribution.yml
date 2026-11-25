@@ -3,20 +3,54 @@ name: Go distribution
 on:
   push:
   pull_request:
-    paths: ['src/**', '.github/workflows/rebuild-distribution.yml']
+    paths: ['src/**', 'third_party/codex/**', '.github/workflows/rebuild-distribution.yml']
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing stable release tag to retry asset publication
+        description: Existing draft release tag to retry asset publication
         required: false
         type: string
+      expected_sha:
+        description: Exact source commit expected for a manual run
+        required: true
+        type: string
+      test_only:
+        description: Test candidate source without creating or publishing a release
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+          EXPECTED: ${{ inputs.expected_sha }}
+          TEST_ONLY: ${{ inputs.test_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            [[ "$EXPECTED" =~ ^[0-9a-f]{40}$ && "$EXPECTED" == "$SHA" ]]
+          fi
+          if [[ "$EVENT" != pull_request && "$TEST_ONLY" != true ]]; then
+            current=$(gh api "repos/$REPO/git/ref/heads/main" | jq -er '.object.sha')
+            [[ "$current" == "$SHA" ]]
+          fi
+          printf 'sha=%s\n' "$SHA" >> "$GITHUB_OUTPUT"
   release:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: guard
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.test_only != true && inputs.release_tag == '')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,10 +64,22 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      - name: Pin new draft to tested source commit
+        if: steps.release.outputs.release_created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+          SHA: ${{ needs.guard.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          id=$(gh api --paginate "repos/$REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" '[.[][] | select(.draft == true and .tag_name == $tag)] | if length == 1 then .[0].id else error("unique draft required") end')
+          gh api --method PATCH "repos/$REPO/releases/$id" -f target_commitish="$SHA" >/dev/null
 
   package:
-    needs: release
-    if: always() && (needs.release.result == 'success' || needs.release.result == 'skipped')
+    needs: [guard, release]
+    if: always() && needs.guard.result == 'success' && (needs.release.result == 'success' || needs.release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -54,6 +100,8 @@ jobs:
       RELEASE_TAG: ${{ needs.release.outputs.tag || inputs.release_tag }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.sha }}
       - uses: actions/setup-go@v6
         with:
           go-version-file: src/go.mod
@@ -89,7 +137,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item -Recurse web/dist dist/web
           Copy-Item -Recurse packaging dist/packaging
-          Copy-Item README.md dist/README.md
+          Copy-Item ../README.md dist/README.md
+          Copy-Item ../third_party/codex/LICENSE dist/CODEX-LICENSE
+          Copy-Item ../third_party/codex/NOTICE dist/CODEX-NOTICE
+      - name: Verify pinned native Codex package
+        run: ./packaging/bundle-codex.ps1 -Platform '${{ matrix.platform }}'
       - name: Test Windows process containment
         if: runner.os == 'Windows'
         run: |
@@ -132,6 +184,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
           $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          go run ./cmd/packagecheck check $archive
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
       - uses: actions/upload-artifact@v6
         with:
@@ -141,8 +195,8 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [release, package]
-    if: always() && needs.package.result == 'success' && (needs.release.outputs.created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
+    needs: [guard, release, package]
+    if: always() && needs.package.result == 'success' && inputs.test_only != true && (needs.release.outputs.created == 'true' || (github.event_name == 'workflow_dispatch' && inputs.release_tag != ''))
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -157,10 +211,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.release.outputs.tag || inputs.release_tag }}
+          SHA: ${{ needs.guard.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$(gh api "repos/$GH_REPO/git/ref/heads/main" | jq -er '.object.sha')" == "$SHA" ]]
+          id=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" | jq -ers --arg tag "$TAG" --arg sha "$SHA" '[.[][] | select(.draft == true and .tag_name == $tag and .target_commitish == $sha)] | if length == 1 then .[0].id else error("matching draft required") end')
           cd artifacts
           printf 'version %s\n' "${TAG#v}" > agentchat-update.txt
           for file in agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip; do
@@ -168,3 +225,4 @@ jobs:
             printf '%s %s\n' "$(sha256sum "$file" | cut -d' ' -f1)" "$file" >> agentchat-update.txt
           done
           gh release upload "$TAG" agentchat-update.txt agentchat-linux-amd64.tar.gz agentchat-darwin-arm64.tar.gz agentchat-windows-amd64.zip --clobber
+          gh api --method PATCH "repos/$GH_REPO/releases/$id" -F draft=false >/dev/null

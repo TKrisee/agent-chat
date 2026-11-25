@@ -7,7 +7,6 @@
     <string>-runtime</string><string>codex</string>
     <string>-data</string><string>/ABSOLUTE/PATH/TO/agentchat-data</string>
     <string>-listen</string><string>127.0.0.1:8877</string>
-    <string>-codex-path</string><string>/ABSOLUTE/PATH/TO/codex</string>
     <string>-jq-path</string><string>/ABSOLUTE/PATH/TO/jq</string>
   </array>
   <key>RunAtLoad</key><true/>

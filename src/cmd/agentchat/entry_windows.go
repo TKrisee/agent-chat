@@ -128,7 +128,7 @@ func installService(args []string) error {
 	for _, item := range []struct {
 		name, value string
 		required    bool
-	}{{"data", *data, true}, {"static", *static, false}, {"codex-path", *codex, *runtimeMode == "codex"}, {"jq-path", *jq, *runtimeMode == "codex"}} {
+	}{{"data", *data, true}, {"static", *static, false}, {"codex-path", *codex, false}, {"jq-path", *jq, *runtimeMode == "codex"}} {
 		if item.value == "" && item.required {
 			return fmt.Errorf("-%s is required", item.name)
 		}

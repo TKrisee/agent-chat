@@ -53,6 +53,9 @@ func agentGuide(role, kind string, shared bool) string {
 }
 
 func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, instructions string) error {
+	if !s.runtimeReady() {
+		return fmt.Errorf("%w: Codex setup is not ready", errConflict)
+	}
 	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
 	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind {
 		var objective string

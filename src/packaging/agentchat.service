@@ -6,7 +6,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/ABSOLUTE/PATH/TO/agentchat
-ExecStart=/ABSOLUTE/PATH/TO/agentchat/agentchat -runtime codex -data /ABSOLUTE/PATH/TO/agentchat-data -static /ABSOLUTE/PATH/TO/agentchat/web -listen 127.0.0.1:8877 -codex-path /ABSOLUTE/PATH/TO/codex -jq-path /ABSOLUTE/PATH/TO/jq
+ExecStart=/ABSOLUTE/PATH/TO/agentchat/agentchat -runtime codex -data /ABSOLUTE/PATH/TO/agentchat-data -static /ABSOLUTE/PATH/TO/agentchat/web -listen 127.0.0.1:8877 -jq-path /ABSOLUTE/PATH/TO/jq
 Restart=on-failure
 RestartSec=5
 

@@ -8,6 +8,7 @@ import (
 )
 
 func init() {
+	resolveCodexCLI = codexruntime.ResolveCLI
 	makeCodexRuntime = func(stateDir, codexPath, jqPath string) (runtimeapi.Runner, error) {
 		return codexruntime.New(codexruntime.Config{StateDir: stateDir, CodexPath: codexPath, JQPath: jqPath})
 	}

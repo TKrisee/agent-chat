@@ -25,6 +25,7 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 	default:
 		return fmt.Errorf("%w: runner already active", errConflict)
 	}
+	s.ConfigureRuntime(ctx, runner)
 	go s.pollUsage(ctx, runner)
 	tick := time.NewTicker(s.opts.Poll)
 	defer tick.Stop()
@@ -71,6 +72,9 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 }
 
 func (s *Service) claim(active map[string]bool) (*job, error) {
+	if !s.runtimeReady() {
+		return nil, nil
+	}
 	var selected *job
 	err := s.write(func(tx *sql.Tx) error {
 		var enabled bool

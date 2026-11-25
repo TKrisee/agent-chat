@@ -101,3 +101,21 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await page.getByRole('button', {name:/Root conversation/}).click();
   await expect(header.getByRole('heading', {name:'Root'})).toBeVisible();
 });
+
+test('setup keeps chat unavailable until a retry is ready', async ({page, serviceURL}) => {
+  let phase='downloading', retries=0;
+  await page.route('**/api/codex-setup**', route => {
+    if(route.request().method()==='POST'){retries++;phase='ready';return route.fulfill({status:202,headers:{'X-AgentChat-Codex-State':'downloading','X-AgentChat-Codex-Source':'managed'}});}
+    return route.fulfill({status:200,headers:{'X-AgentChat-Codex-State':phase,'X-AgentChat-Codex-Source':'managed','X-AgentChat-Codex-Version':'0.172.0'},body:phase==='error'?'Download failed.':''});
+  });
+  await page.goto(serviceURL);
+  await expect(page.getByText('Downloading Codex…')).toBeVisible();
+  await expect(page.getByRole('button',{name:/Root conversation/})).toBeHidden();
+  await expect(page.getByLabel('Message Root')).toBeHidden();
+  phase='error';
+  await page.getByRole('button',{name:'Retry setup'}).click({timeout:10000});
+  await expect.poll(()=>retries).toBe(1);
+  await expect(page.getByText('Codex is ready', {exact:false})).toBeVisible({timeout:10000});
+  await page.getByRole('button',{name:/Root conversation/}).click();
+  await expect(page.getByLabel('Message Root')).toBeVisible();
+});

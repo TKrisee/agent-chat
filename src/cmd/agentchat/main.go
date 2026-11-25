@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,12 +23,58 @@ import (
 
 var releaseBaseURL = "https://github.com/TKrisee/agent-chat/releases"
 
+var resolveCodexCLI func(context.Context, string, string) (string, error)
 var makeCodexRuntime func(stateDir, codexPath, jqPath string) (runtimeapi.Runner, error)
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "codex" {
+		if err := codexCLI(os.Args[2:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	if err := entry(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// codexCLI exposes the same managed package for explicit login and inspection.
+func codexCLI(args []string) error {
+	if len(args) == 0 || (args[0] != "login" && args[0] != "version" && args[0] != "path") {
+		return errors.New("usage: agentchat codex login|version|path -data <directory> [-codex-path <override>]")
+	}
+	action := args[0]
+	fs := flag.NewFlagSet("codex "+action, flag.ContinueOnError)
+	data := fs.String("data", "./data", "service data directory")
+	override := fs.String("codex-path", "", "explicit Codex executable")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 || *data == "" {
+		return errors.New("invalid Codex command arguments")
+	}
+	if resolveCodexCLI == nil {
+		return errors.New("Codex CLI requires build tag codexruntime")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	path, err := resolveCodexCLI(ctx, *data, *override)
+	if err != nil {
+		return fmt.Errorf("Codex setup failed: %w", err)
+	}
+	if action == "path" {
+		fmt.Println(path)
+		return nil
+	}
+	arg := "login"
+	if action == "version" {
+		arg = "--version"
+	}
+	cmd := exec.Command(path, arg)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func run(ctx context.Context, stop context.CancelFunc, ready func()) error {
@@ -73,6 +120,7 @@ func run(ctx context.Context, stop context.CancelFunc, ready func()) error {
 	default:
 		return fmt.Errorf("unknown runtime %q", *mode)
 	}
+	s.ConfigureRuntime(ctx, runner)
 	var ui http.Handler
 	if *static != "" {
 		info, err := os.Stat(*static)
