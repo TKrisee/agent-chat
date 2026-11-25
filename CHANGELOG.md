@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.12.0](https://github.com/TKrisee/agent-chat/compare/v0.11.0...v0.12.0) (2026-11-25)
+
+
+### Features
+
+* isolate worker workspaces and repair conflicting PO reviews ([2d1fcf2](https://github.com/TKrisee/agent-chat/commit/2d1fcf2f9d28b410c984a7ee63c923242487625d))
+
+
+### Bug Fixes
+
+* include the legacy review conflict inspector ([16c75ea](https://github.com/TKrisee/agent-chat/commit/16c75ea27a09feded04dc54f121e9c93e54c7457))
+
 ## [0.11.0](https://github.com/TKrisee/agent-chat/compare/v0.10.0...v0.11.0) (2026-11-25)
 
 
