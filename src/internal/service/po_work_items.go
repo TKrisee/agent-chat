@@ -1,0 +1,186 @@
+package service
+
+import (
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+
+	"agentchat/src/internal/runtimeapi"
+)
+
+type workItemPlanningError struct{ message string }
+
+func (e *workItemPlanningError) Error() string { return e.message }
+func (e *workItemPlanningError) Unwrap() error { return errWorkflow }
+func workItemPlanning(message string) error    { return &workItemPlanningError{message: message} }
+
+func parentTaskOwned(tx *sql.Tx, j job, po agent) error {
+	var n int
+	err := tx.QueryRow(`SELECT count(*) FROM tasks t JOIN projects p ON p.id=t.project_id WHERE t.id=? AND t.project_id=? AND t.owner_id=? AND t.status='assigned' AND p.po_id=? AND p.stopped=0 AND NOT EXISTS(SELECT 1 FROM po_work_items WHERE child_task_id=t.id)`, j.Task, j.Project, po.ID, po.ID).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		return fmt.Errorf("%w: parent task unavailable", errWorkflow)
+	}
+	return nil
+}
+func (s *Service) createProjectWorker(tx *sql.Tx, j job, po agent, action runtimeapi.Action) error {
+	if err := parentTaskOwned(tx, j, po); err != nil {
+		return err
+	}
+	if err := validateDisplayName(action.Title); err != nil || len(action.Title) > 100 || action.Body != "" || action.Recipient != "" {
+		return workItemPlanning("worker requires an exact name only")
+	}
+	var count int
+	if err := tx.QueryRow("SELECT count(*) FROM agents WHERE project_id=? AND name=?", j.Project, action.Title).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
+		return workItemPlanning("worker name already exists; use the registered roster")
+	}
+	_, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", newID(), action.Title, j.Project, s.opts.WorkerModel, s.opts.Effort)
+	return err
+}
+func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi.Action) error {
+	if err := parentTaskOwned(tx, j, po); err != nil {
+		return err
+	}
+	if strings.TrimSpace(action.Title) == "" || strings.TrimSpace(action.Body) == "" || action.Recipient == "" {
+		return workItemPlanning("work item requires title, instructions, and worker")
+	}
+	var duplicate int
+	if err := tx.QueryRow(`SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND lower(trim(c.title))=lower(trim(?))`, j.Task, action.Title).Scan(&duplicate); err != nil {
+		return err
+	}
+	if duplicate != 0 {
+		return workItemPlanning("work item title already exists; use the recorded item and do not duplicate work")
+	}
+	var worker agent
+	var id string
+	rows, err := querySlice(tx, `SELECT id FROM agents WHERE project_id=? AND role='worker' AND (id=? OR name=?)`, func(rows *sql.Rows) (string, error) { var id string; e := rows.Scan(&id); return id, e }, j.Project, action.Recipient, action.Recipient)
+	if err != nil {
+		return err
+	}
+	if len(rows) != 1 {
+		return workItemPlanning("worker must identify one same-project worker")
+	}
+	id = rows[0]
+	var busy int
+	if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE agent_id=? AND kind='work' AND status IN ('pending','submitted','running','uncertain')`, id).Scan(&busy); err != nil {
+		return err
+	}
+	if busy != 0 {
+		return fmt.Errorf("%w: worker has unsettled work", errWorkflow)
+	}
+	worker, err = getAgent(tx, id)
+	if err != nil {
+		return err
+	}
+	child, source := newID(), newID()
+	if _, err = tx.Exec(`INSERT INTO tasks(id,project_id,title,status,owner_id) VALUES(?,?,?,'queued',?)`, child, j.Project, action.Title, id); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO po_work_items(parent_task_id,child_task_id) VALUES(?,?)`, j.Task, child); err != nil {
+		return err
+	}
+	if err = addMessage(tx, source, po.ID, id, "po", action.Body, j.Project, child); err != nil {
+		return err
+	}
+	if err = workflowNotice(tx, j.Project, "work-item:"+child, "The project owner queued a work item for a worker."); err != nil {
+		return err
+	}
+	return s.enqueue(tx, worker, j.Project, child, source, "work", action.Body)
+}
+func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
+	var parent string
+	err := tx.QueryRow(`SELECT parent_task_id FROM po_work_items WHERE child_task_id=?`, j.Task).Scan(&parent)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var parentStatus, poID string
+	var stopped, open, busy int
+	err = tx.QueryRow(`SELECT t.status,t.owner_id,p.stopped,(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=t.id AND c.status IN ('queued','review','accepted')),(SELECT count(*) FROM jobs q WHERE q.task_id=t.id AND q.kind='po_followup' AND q.status IN ('pending','submitted','running')) FROM tasks t JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id WHERE t.id=? AND t.project_id=?`, parent, j.Project).Scan(&parentStatus, &poID, &stopped, &open, &busy)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if parentStatus != "assigned" || stopped != 0 || open != 0 || busy != 0 {
+		return nil
+	}
+	var trigger, assignment string
+	err = tx.QueryRow(`SELECT j.id,j.source_id FROM jobs j WHERE j.task_id=? AND j.agent_id=? AND j.kind='assignment' AND j.status='completed' AND COALESCE(j.diagnostic,'')='' ORDER BY j.rowid DESC LIMIT 1`, parent, poID).Scan(&trigger, &assignment)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: parent assignment unavailable", errWorkflow)
+	}
+	if err != nil {
+		return err
+	}
+	// Each completed parent turn starts a distinct child-work round.
+	if err = tx.QueryRow(`SELECT id FROM jobs WHERE task_id=? AND agent_id=? AND kind IN ('assignment','po_continue','po_followup') AND status='completed' ORDER BY rowid DESC LIMIT 1`, parent, poID).Scan(&trigger); err != nil {
+		return err
+	}
+	rows, err := querySlice(tx, `SELECT c.title,c.status,COALESCE((SELECT m.text FROM messages m WHERE m.task_id=c.id AND m.sender=? AND m.recipient=? ORDER BY m.seq DESC LIMIT 1),'') FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? ORDER BY c.rowid`, func(rows *sql.Rows) (string, error) {
+		var title, status, text string
+		e := rows.Scan(&title, &status, &text)
+		if len(text) > 2000 {
+			text = text[:2000]
+		}
+		return title + " [" + status + "]: " + text, e
+	}, poID, poID, parent)
+	if err != nil {
+		return err
+	}
+	summary := "Work item outcomes:\n" + strings.Join(rows, "\n")
+	if len(summary) > 64000 {
+		return fmt.Errorf("%w: too many work item outcomes", errWorkflow)
+	}
+	source := newID()
+	if err = addMessage(tx, source, "service", poID, "system", summary, j.Project, parent); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id) VALUES(?,?,1,'assigned',?)`, source, trigger, assignment); err != nil {
+		return err
+	}
+	po, err := getAgent(tx, poID)
+	if err != nil {
+		return err
+	}
+	return s.enqueue(tx, po, j.Project, parent, source, "po_followup", "Review the recorded child work item outcomes. Continue independent authorized work via new work items, or report the completed full scope only after all required child work is complete. Preserve stops and uncertain effects; do not repeat prior work.")
+}
+
+// A successful dispatch is progress and warrants one coalesced planning turn.
+// If the PO has nothing else to dispatch while children run, it may wait.
+func (s *Service) followWorkPlanning(tx *sql.Tx, j job, po agent) error {
+	if err := parentTaskOwned(tx, j, po); err != nil {
+		return err
+	}
+	var busy int
+	if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND kind='po_followup' AND status IN ('pending','submitted','running')`, j.Task, j.ID).Scan(&busy); err != nil {
+		return err
+	}
+	if busy != 0 {
+		return nil
+	}
+	assignment, err := poAssignmentSource(tx, j, po.ID)
+	if err != nil {
+		return err
+	}
+	source := newID()
+	if err = addMessage(tx, source, "service", po.ID, "system", "A work item was queued. Plan other independent authorized work now, or wait for current outcomes.", j.Project, j.Task); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id) VALUES(?,?,1,'assigned',?)`, source, j.ID, assignment); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`INSERT INTO po_planning_wakes(source_id) VALUES(?)`, source); err != nil {
+		return err
+	}
+	return s.enqueue(tx, po, j.Project, j.Task, source, "po_followup", "Continue planning the original parent assignment. Queue other independent work items if ready; otherwise wait for current child outcomes. Never repeat uncertain effects or bypass stops.")
+}

@@ -106,3 +106,12 @@ CREATE TABLE IF NOT EXISTS workflow_notices (
  event_key TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
  project_id TEXT NOT NULL REFERENCES projects(id)
 );
+
+CREATE TABLE IF NOT EXISTS po_work_items (
+ parent_task_id TEXT NOT NULL REFERENCES tasks(id),
+ child_task_id TEXT PRIMARY KEY REFERENCES tasks(id)
+);
+CREATE INDEX IF NOT EXISTS po_work_items_parent ON po_work_items(parent_task_id);
+CREATE TABLE IF NOT EXISTS po_planning_wakes (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id)
+);

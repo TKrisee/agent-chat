@@ -155,7 +155,7 @@ func TestProjectGroupMessages(t *testing.T) {
 					}
 					ownerStartIndex = i
 					continue
-				case "The project owner queued work for a worker.":
+				case "The project owner queued work for a worker.", "The project owner queued a work item for a worker.":
 					workerQueueIndex = i
 					continue
 				case "Root sent the project owner a request for scope assessment.", "Worker run launched.", "The project owner completed the task and sent the report to Root.":

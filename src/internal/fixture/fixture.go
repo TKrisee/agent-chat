@@ -146,7 +146,43 @@ func execute(req runtimeapi.Request) (runtimeapi.Result, error) {
 		case "project_message":
 			return runtimeapi.Result{Text: "PO replied in the project group: " + body}, nil
 		case "assignment":
+			const fixtureWorker = "Fixture-Worker"
+			_, roster, found := strings.Cut(req.Instructions, "\nRegistered project workers: ")
+			if found {
+				roster, _, _ = strings.Cut(roster, "\n")
+			}
+			if found && strings.TrimSpace(roster) == "" {
+				return runtimeapi.Result{Actions: []runtimeapi.Action{
+					{Type: "create_worker", Title: fixtureWorker},
+					{Type: "queue_work_item", Title: "Fixture work", Body: body, Recipient: fixtureWorker},
+				}}, nil
+			}
+			if strings.Contains(roster, fixtureWorker+" (") {
+				return runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Title: "Fixture work", Body: body, Recipient: fixtureWorker}}}, nil
+			}
 			return runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_worker", Body: body}}}, nil
+		case "po_followup":
+			if strings.HasPrefix(body, "Review the recorded child work item outcomes.") {
+				for i := len(req.Context) - 1; i >= 0; i-- {
+					m := req.Context[i]
+					if m.Sender != "service" || !strings.HasPrefix(m.Text, "Work item outcomes:\n") {
+						continue
+					}
+					var reports []string
+					for _, line := range strings.Split(strings.TrimPrefix(m.Text, "Work item outcomes:\n"), "\n") {
+						_, report, ok := strings.Cut(line, " [completed]: ")
+						if !ok || strings.TrimSpace(report) == "" {
+							return runtimeapi.Result{Text: "Fixture work remains blocked or incomplete."}, nil
+						}
+						reports = append(reports, report)
+					}
+					if len(reports) > 0 {
+						return runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "report", Body: strings.Join(reports, "\n")}}}, nil
+					}
+				}
+				return runtimeapi.Result{}, fmt.Errorf("fixture parent review lacks work item outcomes")
+			}
+			return runtimeapi.Result{Text: "PO received your feedback: " + body}, nil
 		case "review":
 			for i := len(req.Context) - 1; i >= 0; i-- {
 				msg := req.Context[i]

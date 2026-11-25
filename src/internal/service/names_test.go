@@ -49,8 +49,8 @@ func TestProjectAndAgentNames(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows.Close()
-	if count != 2 {
-		t.Fatalf("got %d generated agents, want 2", count)
+	if count != 1 {
+		t.Fatalf("got %d generated agents, want 1 PO", count)
 	}
 	action.Project = "bad\u00a0name"
 	err = s.write(func(tx *sql.Tx) error { return s.rootAssignment(tx, agent{ID: root, Role: "root"}, job{}, action) })

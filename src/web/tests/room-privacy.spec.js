@@ -17,7 +17,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await scopeNotice.getByRole('button', {name:'Hide scope request'}).click();
   await expect(scopeNotice.locator('.scope-detail')).toBeHidden();
 
-  const dispatchNotice = page.getByRole('article', {name:'Agent Chat workflow notice'}).filter({hasText:'The project owner queued work for a worker.'});
+  const dispatchNotice = page.getByRole('article', {name:'Agent Chat workflow notice'}).filter({hasText:'The project owner queued a work item for a worker.'});
   await expect(dispatchNotice).toBeVisible({timeout:20000});
   await expect(dispatchNotice.locator('[data-reply]')).toHaveCount(0);
   await expect(dispatchNotice.getByRole('button', {name:'View scope request'})).toHaveCount(0);

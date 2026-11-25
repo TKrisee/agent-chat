@@ -13,7 +13,8 @@ import (
 )
 
 const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can send /continue <instruction> in that project’s group chat to continue the existing assignment without a new scope round; if several tasks are eligible, use /continue <full-task-UUID> <instruction>. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. When an active hold is shown and the operator clearly authorizes continuing that exact task, emit only resolve_hold with the exact task and project IDs, body copied exactly from the current operator message, and empty title and recipient. Use the linked Root escalation as context; if task or authorization is ambiguous, ask which task instead. The action resumes a PO decision, never directly dispatches work. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
-const poGuide = "You are responsible for this project. On scope_review, gather the relevant context from the project workspace and recent work. Return one text assessment to Root with what you verified, relevant dependencies, any correction or blocking question, and a recommended scope and acceptance criteria. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients. Do not include private handoff content. Wait for the final assignment before dispatching work. On assignment or task follow-up, promptly hand off actionable work and acceptance criteria with queue_worker when authorized. For a genuine blocker, deliberate hold, or an instruction that forbids dispatch, emit hold_task with the exact reason in body; for a required external decision use request_approval. A text or group update alone does not hold the task. Respect read-only, stop, production and prior uncertain-effect constraints. Avoid substantial implementation work in the handoff turn, and never redispatch a prior uncertain effect without verified authorization. For an active worker review, select only a registered project worker from the available roster; do not require a replacement worker unless explicitly provisioned. Use the actual project working directory and paths permitted by the configured sandbox, and report an unavailable external path instead of assuming access. For an active worker review emit accept_result with an empty recipient, then report to Root with a summary, or queue_worker with revision instructions. The service identifies the exact worker result from the review job. Its attachments are forwarded automatically when reporting; do not re-upload input attachment paths. Use request_approval when real operator approval is needed. Ordinary feedback can be answered in text."
+const poGuide = "You are the project owner. On scope_review assess the original request and context for Root; do not dispatch. After the finalized assignment, plan the full authorized scope, create a requirement-specific team using create_worker, and delegate distinct work items to registered same-project workers with queue_work_item. Specify each worker by exact name or ID, with a clear title and brief. You coordinate and review; do not perform leaf implementation yourself. The parent task stays open through multiple rounds. Review each child worker receipt with accept_result then report on that child; the service returns child outcomes for your next parent turn. Continue independent work after a blocker without repeating uncertain effects. Only report the parent to Root once every required work item is completed and the full scope is delivered. Preserve production stops, read-only restrictions, explicit holds and authorization boundaries. For a genuine blocker use hold_task with the exact reason, or request_approval only when operator approval is actually required. Existing queue_worker remains available for legacy tasks. Use post_group for ordinary shared updates; never publish private handoff content."
+
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
 const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
@@ -65,6 +66,30 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		}
 		if err == nil {
 			guide += "\nCurrent active PO goal (project context, subject to the current assignment): " + objective
+		}
+		roster, err := querySlice(tx, `SELECT id,name FROM agents WHERE project_id=? AND role='worker' ORDER BY name,id`, func(rows *sql.Rows) (string, error) {
+			var id, name string
+			err := rows.Scan(&id, &name)
+			return name + " (" + id + ")", err
+		}, project)
+		if err != nil {
+			return err
+		}
+		guide += "\nRegistered project workers: " + strings.Join(roster, ", ")
+		outcomes, err := querySlice(tx, `SELECT c.title,c.status,COALESCE((SELECT m.text FROM messages m WHERE m.task_id=c.id AND m.sender=? AND m.recipient=? AND m.role='po' ORDER BY m.seq DESC LIMIT 1),'') FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? ORDER BY c.rowid`, func(rows *sql.Rows) (string, error) {
+			var title, status, detail string
+			err := rows.Scan(&title, &status, &detail)
+			runes := []rune(detail)
+			if len(runes) > 1500 {
+				detail = string(runes[:1500]) + "…"
+			}
+			return title + " [" + status + "]: " + detail, err
+		}, a.ID, a.ID, task)
+		if err != nil {
+			return err
+		}
+		if len(outcomes) > 0 {
+			guide += "\nRecorded child work items:\n" + strings.Join(outcomes, "\n")
 		}
 	}
 	if a.Role == "root" && (kind == "operator_message" || kind == "approval_approved") {
@@ -218,7 +243,7 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 			return nil, err
 		}
 		var valid int
-		err = tx.QueryRow(`SELECT count(*) FROM jobs j JOIN messages m ON m.id=? WHERE j.id=? AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND m.task_id=j.task_id AND m.project_id=j.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=?`, f.assignment, f.trigger, task, project, a.ID, root, a.ID, directRoom(root, a.ID)).Scan(&valid)
+		err = tx.QueryRow(`SELECT count(*) FROM jobs j JOIN messages m ON m.id=? WHERE j.id=? AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND (m.task_id=j.task_id OR EXISTS(SELECT 1 FROM po_work_items i WHERE i.child_task_id=j.task_id AND i.parent_task_id=m.task_id)) AND m.project_id=j.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=?`, f.assignment, f.trigger, task, project, a.ID, root, a.ID, directRoom(root, a.ID)).Scan(&valid)
 		if err != nil {
 			return nil, err
 		}
@@ -379,6 +404,26 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 					return err
 				}
 			}
+			var planning *workItemPlanningError
+			if errors.As(invalid, &planning) && len(files) == 0 && len(uploads) == 0 {
+				a, err := getAgent(tx, j.Agent)
+				if err != nil {
+					return err
+				}
+				if a.Role == "po" && (j.Kind == "assignment" || j.Kind == "po_continue" || j.Kind == "po_followup") && parentTaskOwned(tx, j, a) == nil {
+					var other int
+					if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=? AND status IN ('pending','denied'))`, j.Task, j.ID, j.Task).Scan(&other); err != nil {
+						return err
+					}
+					if other == 0 {
+						if err = s.poFollowThrough(tx, j, a, runtimeapi.Result{}, planning.Error()); err != nil {
+							return err
+						}
+						_, err = tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, invalid.Error(), j.ID)
+						return err
+					}
+				}
+			}
 			var fieldErr *scopeFieldError
 			if j.Kind == "scope_decision" && errors.As(invalid, &fieldErr) && len(files) == 0 && len(uploads) == 0 {
 				eligible, err := handoffEligible(tx, j.Task, "assigned", j.ID, false)
@@ -401,6 +446,9 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 			diagnostic = invalid.Error()
 			if j.Task != "" {
 				if _, err := tx.Exec("UPDATE tasks SET status='blocked' WHERE id=? AND status!='completed'", j.Task); err != nil {
+					return err
+				}
+				if err := s.maybeFollowParent(tx, j); err != nil {
 					return err
 				}
 			}
@@ -445,7 +493,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			switch action.Type {
 			case "hold_task":
 				hold = true
-			case "accept_result", "report", "queue_worker", "request_approval":
+			case "accept_result", "report", "queue_worker", "queue_work_item", "create_worker", "request_approval":
 				advance = true
 			}
 		}
@@ -521,6 +569,16 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		}
 		if err := s.applyAction(tx, a, j, action); err != nil {
 			return err
+		}
+	}
+	if a.Role == "po" {
+		if err := s.maybeFollowParent(tx, j); err != nil {
+			return err
+		}
+		for _, action := range result.Actions {
+			if action.Type == "queue_work_item" {
+				return s.followWorkPlanning(tx, j, a)
+			}
 		}
 	}
 	return s.poFollowThrough(tx, j, a, result)
@@ -687,6 +745,10 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		return s.poHoldAction(tx, j, a, action)
 	case "queue_worker":
 		return s.queueWorker(tx, j, a, action)
+	case "create_worker":
+		return s.createProjectWorker(tx, j, a, action)
+	case "queue_work_item":
+		return s.queuePOWorkItem(tx, j, a, action)
 	case "accept_result":
 		worker, err := activeReviewWorker(tx, j, a.ID)
 		if err != nil {
@@ -700,7 +762,30 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		if action.Recipient != "" && action.Recipient != root || strings.TrimSpace(action.Body) == "" {
 			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
 		}
-		if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
+		var parent string
+		err := tx.QueryRow("SELECT parent_task_id FROM po_work_items WHERE child_task_id=?", j.Task).Scan(&parent)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if parent != "" {
+			if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
+				return err
+			}
+			_, err = outputMessage(tx, a, a.ID, j, action.Body, nil)
+			return err
+		}
+		var total, incomplete int
+		if err := tx.QueryRow(`SELECT count(*),COALESCE(sum(CASE WHEN c.status!='completed' THEN 1 ELSE 0 END),0) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=?`, j.Task).Scan(&total, &incomplete); err != nil {
+			return err
+		}
+		if total > 0 {
+			if incomplete != 0 {
+				return fmt.Errorf("%w: required work items are incomplete", errWorkflow)
+			}
+			if err := moveTask(tx, j, "assigned", "completed", a.ID, a.ID); err != nil {
+				return err
+			}
+		} else if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
 			return err
 		}
 		if err := workflowNotice(tx, j.Project, "complete:"+j.ID, "The project owner completed the task and sent the report to Root."); err != nil {
@@ -710,7 +795,18 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		if err != nil {
 			return err
 		}
-		if err := shareAcceptedWorkerAttachments(tx, j, a.ID, id); err != nil {
+		if total > 0 {
+			// Forward only the latest worker receipt behind each completed child report.
+			_, err = tx.Exec(`INSERT INTO attachment_shares(message_id,attachment_id)
+			 SELECT ?,links.attachment_id FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id AND c.status='completed'
+			 JOIN messages m ON m.id=(SELECT w.id FROM messages w JOIN agents wa ON wa.id=w.sender AND wa.project_id=w.project_id AND wa.role='worker' WHERE w.task_id=c.id AND w.project_id=c.project_id AND w.recipient=? AND w.role='worker' ORDER BY w.seq DESC LIMIT 1)
+			 JOIN message_attachments links ON links.message_id=m.id
+			 WHERE i.parent_task_id=? AND EXISTS(SELECT 1 FROM messages r WHERE r.task_id=c.id AND r.project_id=c.project_id AND r.sender=? AND r.recipient=? AND r.role='po' AND r.seq>m.seq)
+			 ON CONFLICT(message_id,attachment_id) DO NOTHING`, id, a.ID, j.Task, a.ID, a.ID)
+			if err != nil {
+				return err
+			}
+		} else if err := shareAcceptedWorkerAttachments(tx, j, a.ID, id); err != nil {
 			return err
 		}
 		manager, err := getAgent(tx, root)
@@ -790,8 +886,7 @@ func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.A
 			action.Project, action.Project, poID, s.workspace(action.Project)); err != nil {
 			return err
 		}
-		for _, member := range []agent{{ID: poID, Name: action.Project + "-PO", Role: "po", Model: s.opts.POModel},
-			{ID: newID(), Name: action.Project + "-Worker", Role: "worker", Model: s.opts.WorkerModel}} {
+		for _, member := range []agent{{ID: poID, Name: action.Project + "-PO", Role: "po", Model: s.opts.POModel}} {
 			if err := validateDisplayName(member.Name); err != nil {
 				return fmt.Errorf("%w: agent name %v", errWorkflow, err)
 			}

@@ -53,7 +53,7 @@ func storedMessageForTest(t *testing.T, s *Service, id string) Message {
 func internalMessageID(t *testing.T, s *Service, task, role, recipient string) string {
 	t.Helper()
 	var id string
-	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role=? AND recipient=? ORDER BY seq DESC LIMIT 1", task, role, recipient).Scan(&id); err != nil {
+	if err := s.db.QueryRow("SELECT id FROM messages WHERE (task_id=? OR task_id IN (SELECT child_task_id FROM po_work_items WHERE parent_task_id=?)) AND role=? AND recipient=? ORDER BY seq DESC LIMIT 1", task, task, role, recipient).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
 	return id
@@ -136,13 +136,13 @@ func await(t *testing.T, base string, ready func(State) bool) State {
 }
 
 func completedTasks(s State) int {
-	count := 0
-	for _, task := range s.Tasks {
-		if task.Status == "completed" {
-			count++
+	completed := make(map[string]bool)
+	for _, m := range s.Messages {
+		if m.Sender == root && m.Recipient == operator && m.Task != "" {
+			completed[m.Task] = true
 		}
 	}
-	return count
+	return len(completed)
 }
 
 func hasMessage(s State, from, to, text string) bool {
@@ -181,7 +181,7 @@ func TestHTTPVerticalSliceAndRestart(t *testing.T) {
 	state := await(t, second.URL, func(s State) bool {
 		return completedTasks(s) == 1 && hasMessage(s, "root", "operator", "PO reviewed: Completed: check launch")
 	})
-	if len(state.Projects) != 1 || len(state.Tasks) != 1 || state.Jobs[0].ID != submitted.ID || len(state.Jobs) != 7 {
+	if len(state.Projects) != 1 || len(state.Tasks) != 2 || state.Jobs[0].ID != submitted.ID || len(state.Jobs) != 9 {
 		t.Fatalf("duplicate work after restart: %+v", state)
 	}
 	acceptedMessages := 0
@@ -238,13 +238,17 @@ func TestHTTPVerticalSliceAndRestart(t *testing.T) {
 	state = await(t, third.URL, func(s State) bool {
 		return completedTasks(s) == 2 && hasMessage(s, "root", "operator", "PO reviewed: Completed: verify logs")
 	})
-	if len(state.Projects) != 1 || state.Projects[0].PO != po || len(state.Tasks) != 2 || len(state.Jobs) != 15 {
+	if len(state.Projects) != 1 || state.Projects[0].PO != po || len(state.Tasks) != 4 || len(state.Jobs) != 19 {
 		t.Fatalf("delegation failed or duplicated: %+v", state)
 	}
 	if earlier := assertReportAttachment(t, s, state, state.Tasks[0].ID, "check launch"); earlier != attachment {
 		t.Fatalf("attachment changed on restart: %+v != %+v", earlier, attachment)
 	}
-	later := assertReportAttachment(t, s, state, state.Tasks[1].ID, "verify logs")
+	var laterTask string
+	if err := s.db.QueryRow("SELECT parent_task_id FROM po_work_items ORDER BY rowid DESC LIMIT 1").Scan(&laterTask); err != nil {
+		t.Fatal(err)
+	}
+	later := assertReportAttachment(t, s, state, laterTask, "verify logs")
 	if later.ID == attachment.ID {
 		t.Fatal("attachment was shared across tasks")
 	}
@@ -260,7 +264,7 @@ func assertReportAttachment(t *testing.T, s *Service, state State, task, title s
 	t.Helper()
 	var original, poReport, operatorReport AttachmentRef
 	var workerID, poID string
-	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role='worker' ORDER BY seq DESC LIMIT 1", task).Scan(&workerID); err != nil {
+	if err := s.db.QueryRow("SELECT id FROM messages WHERE (task_id=? OR task_id IN (SELECT child_task_id FROM po_work_items WHERE parent_task_id=?)) AND role='worker' ORDER BY seq DESC LIMIT 1", task, task).Scan(&workerID); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.db.QueryRow("SELECT id FROM messages WHERE task_id=? AND role='po' AND recipient='root' ORDER BY seq DESC LIMIT 1", task).Scan(&poID); err != nil {
@@ -670,7 +674,7 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 	state := await(t, server.URL, func(s State) bool {
 		return len(s.Jobs) > 0 && s.Jobs[0].Diagnostic != "" || hasMessage(s, "root", "operator", report)
 	})
-	if len(state.Projects) != 1 || len(state.Tasks) != 1 || state.Tasks[0].Status != "completed" || len(state.Jobs) != 7 {
+	if len(state.Projects) != 1 || len(state.Tasks) != 2 || state.Tasks[0].Status != "completed" || len(state.Jobs) != 9 {
 		t.Fatalf("Slate Smoke workflow failed: projects=%+v tasks=%+v jobs=%+v", state.Projects, state.Tasks, state.Jobs)
 	}
 	project, task := state.Projects[0], state.Tasks[0]
@@ -686,7 +690,7 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 	accepted := internal.Attachments[0]
 	var relayed AttachmentRef
 	for _, m := range state.Messages {
-		if m.Task != task.ID || len(m.Attachments) != 1 {
+		if (m.Task != task.ID && m.Task != internal.Task) || len(m.Attachments) != 1 {
 			continue
 		}
 		if m.Role == "worker" && m.Recipient == project.PO {
@@ -708,7 +712,7 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 		t.Fatalf("duplicate or missing forwarded artifact: stored=%d po=%d root=%d err=%v", stored, poNominations.Load(), rootNominations.Load(), err)
 	}
 	valid := runtimeapi.Attachment{Path: filepath.Join(s.dir, "attachments", accepted.ID), Name: accepted.Name, MediaType: accepted.MediaType}
-	workerReview := job{Agent: project.PO, Project: project.ID, Task: task.ID, Source: workerSource, Kind: "review", Request: runtimeapi.Request{Role: "po", Workspace: s.workspace(project.ID)}}
+	workerReview := job{Agent: project.PO, Project: project.ID, Task: internal.Task, Source: workerSource, Kind: "review", Request: runtimeapi.Request{Role: "po", Workspace: s.workspace(project.ID)}}
 	validResult := runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "report"}}, Attachments: []runtimeapi.Attachment{valid}}
 	before, err := s.uploadAttachments(s.db, workerReview, validResult)
 	if err != nil || len(before) != 0 {
@@ -785,7 +789,7 @@ func TestSlateSmokeCreatesServiceOwnedPOAndDeliversChecklist(t *testing.T) {
 	state = await(t, server.URL, func(s State) bool {
 		return hasMessage(s, "service", "operator", "delegation requires the existing project and its PO")
 	})
-	if len(state.Projects) != 1 || len(state.Tasks) != 1 || len(state.Jobs) != 9 || createProposals.Load() != 2 {
+	if len(state.Projects) != 1 || len(state.Tasks) != 2 || len(state.Jobs) != 11 || createProposals.Load() != 2 {
 		t.Fatalf("project, task or runtime submission duplicated: jobs=%+v proposals=%d", state.Jobs, createProposals.Load())
 	}
 }

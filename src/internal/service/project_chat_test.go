@@ -66,7 +66,7 @@ func TestProjectAgentDirectChat(t *testing.T) {
 		return completedTasks(state) == 1 && hasMessage(state, root, operator, "PO reviewed: Completed: check launch")
 	})
 	var worker, po string
-	if len(initial.Agents) != 3 || len(initial.Projects) != 1 || len(initial.Tasks) != 1 {
+	if len(initial.Agents) != 3 || len(initial.Projects) != 1 || len(initial.Tasks) != 2 {
 		t.Fatalf("unexpected project roster: %+v", initial.Agents)
 	}
 	po = initial.Projects[0].PO
@@ -88,7 +88,7 @@ func TestProjectAgentDirectChat(t *testing.T) {
 		}
 	}
 	task := initial.Tasks[0]
-	if worker == "" || len(initial.Jobs) != 7 {
+	if worker == "" || len(initial.Jobs) != 9 {
 		t.Fatalf("unexpected task jobs: %+v", initial.Jobs)
 	}
 	message := func(state State, id string) Message {
@@ -101,6 +101,12 @@ func TestProjectAgentDirectChat(t *testing.T) {
 		return state.Messages[i]
 	}
 	var taskResult string
+	var relevant []Job
+	for _, j := range initial.Jobs {
+		if j.Kind != "po_followup" {
+			relevant = append(relevant, j)
+		}
+	}
 	for i, want := range []struct{ kind, agent, from, to string }{
 		{"operator_message", root, operator, root},
 		{"scope_review", po, root, po},
@@ -110,11 +116,11 @@ func TestProjectAgentDirectChat(t *testing.T) {
 		{"review", po, worker, po},
 		{"project_report", root, po, root},
 	} {
-		j := initial.Jobs[i]
+		j := relevant[i]
 		m := message(initial, j.Source)
 		if j.Kind != want.kind || j.Agent != want.agent || j.Status != "completed" ||
 			m.Sender != want.from || m.Recipient != want.to || m.Task != j.Task ||
-			(i == 0 && j.Source != start) || (i > 0 && (j.Task != task.ID || j.Project != "atlas")) {
+			(i == 0 && j.Source != start) || (i > 0 && (j.Project != "atlas" || ((j.Kind != "work" && j.Kind != "review") && j.Task != task.ID))) {
 			t.Fatalf("wrong activity source for job %+v: %+v", j, m)
 		}
 		if want.kind == "review" {

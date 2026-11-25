@@ -315,6 +315,9 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
+	if req.Role == "po" && req.TaskID != "" && req.Kind != "scope_review" {
+		b.WriteString("\nPlan the whole authorized scope and coordinate workers; workers implement leaf items and you review their results. Provision the needed team and delegate distinct work items over multiple turns. Review each child result, and report the parent outcome only after all required items are confirmed. Continue independent authorized work when an item is blocked; after two further failed permitted approaches on the same blocked item, stop that item and escalate its exact blocker. Never repeat an uncertain effect. For create_worker use title as the exact agent name with no whitespace; leave project, body, recipient and task empty, or use the exact current project in project. For queue_work_item use a scoped title and body, the exact same-project worker ID or name in recipient, and an empty task; project may be empty or the exact current project. The service validates every proposal.\n")
+	}
 	if req.Role == "worker" && req.Kind == "work" {
 		b.WriteString("\nReturn the requested text, workspace attachments, and optional post_group actions for project coordination; do not propose orchestration actions.\n")
 	} else if req.Role == "worker" {

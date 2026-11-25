@@ -107,7 +107,9 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 			WHERE j.next_at<=? AND
 			  (j.status IN ('submitted','running') OR
 			    (j.status='pending' AND ?=0 AND NOT EXISTS
-			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1)))`
+			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1) AND
+			        (j.kind!='work' OR EXISTS(SELECT 1 FROM project_workspace_roots r WHERE r.project_id=j.project_id) OR NOT EXISTS
+			         (SELECT 1 FROM jobs w WHERE w.id!=j.id AND w.project_id=j.project_id AND w.kind='work' AND w.status IN ('submitted','running','uncertain')))))`
 		args := []any{now(), paused}
 		if len(active) != 0 {
 			query += " AND j.agent_id NOT IN (" + strings.Repeat("?,", len(active)-1) + "?)"
@@ -289,7 +291,10 @@ func (s *Service) disposition(id, status, diagnostic string, delay time.Duration
 			return err
 		}
 		if project.Valid && task.Valid {
-			return workflowNotice(tx, project.String, "blocked:"+id, "A task could not continue and needs attention.")
+			if err := workflowNotice(tx, project.String, "blocked:"+id, "A task could not continue and needs attention."); err != nil {
+				return err
+			}
+			return s.maybeFollowParent(tx, job{ID: id, Task: task.String, Project: project.String})
 		}
 		return nil
 	})

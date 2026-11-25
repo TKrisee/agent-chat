@@ -26,6 +26,9 @@ func TestWorkflowNoticesReflectCommittedTransitions(t *testing.T) {
 	if err := s.db.QueryRow("SELECT id,owner_id FROM tasks WHERE project_id='atlas'").Scan(&task, &po); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := s.db.Exec("INSERT INTO agents VALUES(?,'NoticeWorker','worker','atlas','model','medium')", newID()); err != nil {
+		t.Fatal(err)
+	}
 	if err := s.db.QueryRow("SELECT id FROM agents WHERE project_id='atlas' AND role='worker'").Scan(&worker); err != nil {
 		t.Fatal(err)
 	}

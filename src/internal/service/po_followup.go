@@ -21,7 +21,14 @@ func readPOFollowup(tx *sql.Tx, source string) (f poFollowup, err error) {
 func poAssignmentSource(tx *sql.Tx, j job, po string) (string, error) {
 	var id string
 	var count int
-	err := tx.QueryRow(`SELECT count(*),COALESCE(min(m.id),'') FROM jobs a JOIN messages m ON m.id=a.source_id WHERE a.task_id=? AND a.project_id=? AND a.agent_id=? AND a.kind='assignment' AND (a.status='completed' OR a.id=?) AND COALESCE(a.diagnostic,'')='' AND m.task_id=a.task_id AND m.project_id=a.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0`, j.Task, j.Project, po, j.ID, root, po, directRoom(root, po)).Scan(&count, &id)
+	assignmentTask := j.Task
+	var parent string
+	if err := tx.QueryRow("SELECT parent_task_id FROM po_work_items WHERE child_task_id=?", j.Task).Scan(&parent); err == nil {
+		assignmentTask = parent
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	err := tx.QueryRow(`SELECT count(*),COALESCE(min(m.id),'') FROM jobs a JOIN messages m ON m.id=a.source_id WHERE a.task_id=? AND a.project_id=? AND a.agent_id=? AND a.kind='assignment' AND (a.status='completed' OR a.id=?) AND COALESCE(a.diagnostic,'')='' AND m.task_id=a.task_id AND m.project_id=a.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0`, assignmentTask, j.Project, po, j.ID, root, po, directRoom(root, po)).Scan(&count, &id)
 	if err != nil {
 		return "", err
 	}
@@ -35,7 +42,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		return nil
 	}
 	for _, action := range result.Actions {
-		if action.Type != "post_group" && action.Type != "accept_result" {
+		if action.Type != "post_group" && action.Type != "accept_result" && action.Type != "create_worker" {
 			return nil
 		}
 	}
@@ -58,13 +65,27 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	if other != 0 || approvals != 0 {
 		return nil
 	}
+	var children int
+	if err := tx.QueryRow(`SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.status IN ('queued','review','accepted')`, j.Task).Scan(&children); err != nil {
+		return err
+	}
+	if children != 0 && len(correction) == 0 {
+		return nil
+	}
 	f := poFollowup{trigger: j.ID, phase: phase}
 	if j.Kind == "po_followup" {
 		f, err = readPOFollowup(tx, j.Source)
 		if err != nil {
 			return err
 		}
-		if f.phase != phase {
+		var planning int
+		if err = tx.QueryRow(`SELECT count(*) FROM po_planning_wakes WHERE source_id=?`, j.Source).Scan(&planning); err != nil {
+			return err
+		}
+		if planning != 0 {
+			f.trigger = j.ID
+			f.ordinal = 0
+		} else if f.phase != phase {
 			f.ordinal = 0
 		}
 		f.phase = phase
@@ -107,11 +128,11 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	}
 	instruction := "Make the next safe decision for this same task using the pinned original assignment and task-scoped operator instructions. When instructions differ, follow the latest one within existing safety and authorization boundaries. Preserve scope, explicit holds, read-only and production restrictions; do not repeat prior effects or assume authorization. If a genuine blocker or deliberate hold prevents progress, use hold_task with its exact reason."
 	if len(correction) > 0 {
-		instruction += " The prior proposal was rejected before applying it: " + correction[0] + " Choose either hold_task alone (optionally with a group post), or an appropriate review action; do not combine them."
+		instruction += " The prior proposal was rejected before applying it: " + correction[0] + " Correct the stated issue without repeating effects; choose a valid next action or an explicit hold."
 	}
 	switch phase {
 	case "assigned":
-		instruction += " If authorized and actionable, use queue_worker; otherwise use hold_task or request_approval."
+		instruction += " If authorized and actionable, create the required team and use queue_work_item for independent work; use queue_worker only for legacy tasks. Otherwise use hold_task or request_approval."
 	case "review":
 		instruction += " Review the pinned worker result. Use accept_result then report if accepted, queue_worker for a justified revision, or hold_task/request_approval."
 	case "accepted":
