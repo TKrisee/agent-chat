@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/TKrisee/agent-chat/compare/v0.17.0...v0.18.0) (2026-11-26)
+
+
+### Features
+
+* add one-shot workers and route operator group replies ([1d23ae5](https://github.com/TKrisee/agent-chat/commit/1d23ae5d3ff28ba4208218f6348389dee209950d))
+
 ## [0.17.0](https://github.com/TKrisee/agent-chat/compare/v0.16.3...v0.17.0) (2026-11-26)
 
 
