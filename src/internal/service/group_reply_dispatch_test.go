@@ -62,6 +62,9 @@ func TestGroupReplyWakesOriginalAgent(t *testing.T) {
 	if err != nil || j == nil || j.Agent != po {
 		t.Fatalf("explicit override %v %v", j, err)
 	}
+	if err := s.complete(*j, runtimeapi.Result{Text: "answer"}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	for _, p := range []string{serviceParent, operatorParent, ""} {
 		if _, err := s.userMessage(context.Background(), newID(), "", "alpha", "no target", p, nil); err != nil {
 			t.Fatal(err)
@@ -69,6 +72,9 @@ func TestGroupReplyWakesOriginalAgent(t *testing.T) {
 		j, err = s.claim(nil)
 		if err != nil || j == nil || j.Agent != po {
 			t.Fatalf("PO fallback %v %v", j, err)
+		}
+		if err := s.complete(*j, runtimeapi.Result{Text: "answer"}, nil, nil, nil); err != nil {
+			t.Fatal(err)
 		}
 	}
 	if err := s.db.QueryRow(`SELECT count(*) FROM jobs WHERE kind=? AND status='pending'`, groupMessageKind).Scan(&count); err != nil || count != 0 {
