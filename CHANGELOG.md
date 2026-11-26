@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/TKrisee/agent-chat/compare/v0.18.15...v0.19.0) (2026-11-26)
+
+
+### Features
+
+* schedule dependent PO work items ([b1922f9](https://github.com/TKrisee/agent-chat/commit/b1922f924cacf9f32b2ed2fc3876404da0edb53d))
+
 ## [0.18.15](https://github.com/TKrisee/agent-chat/compare/v0.18.14...v0.18.15) (2026-11-26)
 
 
