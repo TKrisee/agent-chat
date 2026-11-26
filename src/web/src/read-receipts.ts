@@ -17,6 +17,7 @@ export class ReadReceipts {
   private markingRoom = false;
   private readonly scrolledVisible = new Set<string>();
   private userScrollUntil = 0;
+  private pausedForJump = false;
   constructor(private readonly options: Options) {
     window.addEventListener('focus', () => { this.attempted.clear(); this.schedule(); });
     document.addEventListener('visibilitychange', () => {
@@ -24,7 +25,7 @@ export class ReadReceipts {
     });
     const userScroll = (event: Event) => {
       const viewport = document.querySelector<HTMLElement>('#chat-scroll');
-      if (event.isTrusted && viewport && event.target instanceof Node && viewport.contains(event.target)) this.userScrollUntil = Date.now() + 600;
+      if (event.isTrusted && viewport && event.target instanceof Node && viewport.contains(event.target)) { this.pausedForJump = false; this.userScrollUntil = Date.now() + 600; }
     };
     document.addEventListener('wheel', userScroll, {capture:true,passive:true});
     document.addEventListener('touchmove', userScroll, {capture:true,passive:true});
@@ -36,6 +37,7 @@ export class ReadReceipts {
     window.visualViewport?.addEventListener('scroll', () => this.onScroll(), {passive:true});
   }
   private onScroll() {
+    if (this.pausedForJump) return;
     if (!this.options.recipient().startsWith('group:')) { this.schedule(); return; }
     if (Date.now() <= this.userScrollUntil) this.collectScrolledVisible();
     const target = this.options.recipient();
@@ -47,7 +49,8 @@ export class ReadReceipts {
       this.schedule();
     }, 180);
   }
-  contextChanged() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.refreshAfterScroll = false; this.scrolledVisible.clear(); this.userScrollUntil = 0; this.attempted.clear(); this.schedule(); }
+  contextChanged() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.refreshAfterScroll = false; this.scrolledVisible.clear(); this.userScrollUntil = 0; this.pausedForJump = false; this.attempted.clear(); this.schedule(); }
+  pauseForJump() { window.clearTimeout(this.scrollTimer); this.scrollTimer = undefined; this.scrolledVisible.clear(); this.userScrollUntil = 0; this.pausedForJump = true; }
   async markCurrentRoomRead() {
     const target = this.options.recipient();
     if (!target.startsWith('group:') || this.options.obstructed() || this.markingRoom) return;
@@ -68,7 +71,7 @@ export class ReadReceipts {
     return fetch('/api/messages/read', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message_ids:ids})});
   }
   schedule() {
-    if (this.scheduled || this.scrollTimer !== undefined) return;
+    if (this.pausedForJump || this.scheduled || this.scrollTimer !== undefined) return;
     this.scheduled = true;
     requestAnimationFrame(() => { this.scheduled = false; void this.observe(); });
   }
@@ -95,7 +98,7 @@ export class ReadReceipts {
     });
   }
   private async observe() {
-    if (this.markingRoom || this.scrollTimer !== undefined || document.hidden || !document.hasFocus() || this.options.obstructed()) return;
+    if (this.pausedForJump || this.markingRoom || this.scrollTimer !== undefined || document.hidden || !document.hasFocus() || this.options.obstructed()) return;
     const viewport = document.querySelector<HTMLElement>('#chat-scroll');
     if (!viewport) return;
     const target = this.options.recipient();

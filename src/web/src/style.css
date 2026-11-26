@@ -155,3 +155,5 @@
 .unread-divider{display:flex;align-items:center;gap:10px;margin:18px 0 8px;color:#657d6a;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
 .unread-divider:before,.unread-divider:after{content:"";height:1px;flex:1;background:#bdcdbd}
 .task-history{font-size:12px;color:#64736a;margin-top:8px;overflow-wrap:anywhere}.task-history summary{cursor:pointer;font-weight:600}.task-history p{margin:4px 0;white-space:pre-wrap}
+.group-unread-banner #jump-group-read{padding:0;color:inherit;font-weight:600;text-align:left;text-decoration:none}
+.group-unread-banner #jump-group-read:focus-visible{outline:2px solid #315c49;outline-offset:3px;border-radius:2px}
