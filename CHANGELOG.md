@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.13](https://github.com/TKrisee/agent-chat/compare/v0.18.12...v0.18.13) (2026-11-26)
+
+
+### Bug Fixes
+
+* jump from reply quotes to original messages ([6d6cb05](https://github.com/TKrisee/agent-chat/commit/6d6cb0598fc8c67a897450ddc665e4f2d89125dd))
+
 ## [0.18.12](https://github.com/TKrisee/agent-chat/compare/v0.18.11...v0.18.12) (2026-11-26)
 
 
