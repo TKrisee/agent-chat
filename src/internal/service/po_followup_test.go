@@ -120,8 +120,8 @@ func TestPOFollowThroughAssignmentAndBound(t *testing.T) {
 		if err := s.db.QueryRow("SELECT count(*) FROM po_followups").Scan(&n); err != nil || phase != "blocked" || n != 2 {
 			t.Fatalf("phase %s followups %d %v", phase, n, err)
 		}
-		if err := s.db.QueryRow("SELECT count(*) FROM jobs WHERE task_id=? AND kind='task_blocked'", task).Scan(&n); err != nil || n != 1 {
-			t.Fatalf("missing Root escalation %d %v", n, err)
+		if err := s.db.QueryRow("SELECT count(*) FROM jobs WHERE task_id=? AND kind='task_blocked'", task).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("unexpected vague Root escalation %d %v", n, err)
 		}
 	})
 }

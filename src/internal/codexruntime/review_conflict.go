@@ -3,11 +3,31 @@ package codexruntime
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"os/exec"
+	"strings"
 	"time"
 )
+
+// IsLegacyProgress proves an exact explicitly Root-addressed action; callers
+// independently verify the job, sender, task, room and unique provenance.
+func (r *Runner) IsLegacyProgress(ctx context.Context, payload []byte, project, body string) bool {
+	if len(payload) == 0 || len(payload) > 1<<20 || project == "" || strings.TrimSpace(body) == "" || len(body) > 64<<10 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	const filter = `split("\n") | if length!=2 then false else (.[0]|@base64d|fromjson) as $result | (.[1]|@base64d) as $body |
+  ($result|type)=="object" and ($result.actions|type)=="array" and
+  ([ $result.actions[] | select(type=="object" and .type=="report_progress" and .body==$body and (.project=="" or .project==$project) and (.recipient=="" or .recipient=="root") and .title=="" and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and ((keys-["type","project","title","body","recipient","task","reply_to"])==[]) ) ] | length)==1 end`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "-R", "-s", "--arg", "project", project, filter)
+	cmd.Stdin = bytes.NewBufferString(base64.StdEncoding.EncodeToString(payload) + "\n" + base64.StdEncoding.EncodeToString([]byte(body)))
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}
 
 // jq is the sole parser for the persisted provider result. No payload is logged.
 func (r *Runner) IsLegacyReviewConflict(ctx context.Context, payload []byte) bool {

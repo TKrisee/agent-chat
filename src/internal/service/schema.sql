@@ -137,6 +137,9 @@ CREATE TABLE IF NOT EXISTS po_report_recoveries (
 CREATE TABLE IF NOT EXISTS po_progress_notes (
  message_id TEXT PRIMARY KEY REFERENCES messages(id)
 );
+CREATE TABLE IF NOT EXISTS po_explicit_progress (
+ message_id TEXT PRIMARY KEY REFERENCES po_progress_notes(message_id)
+);
 
 CREATE TABLE IF NOT EXISTS root_owned_holds (
  job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id)

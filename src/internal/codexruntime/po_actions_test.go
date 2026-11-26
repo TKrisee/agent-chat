@@ -129,3 +129,14 @@ func TestRootOwnedHoldContract(t *testing.T) {
 		})
 	}
 }
+
+func TestRootBlockedPromptUsesRecordedDecision(t *testing.T) {
+	_, req, _ := setup(t)
+	req.Role, req.Kind = "root", "task_blocked"
+	guide := prompt(req)
+	for _, text := range []string{"concrete blocker", "only when a specific real decision or request is recorded", "Never ask a generic question", "Do not assume legacy or operator-owned holds allow autonomous resolution"} {
+		if !strings.Contains(guide, text) {
+			t.Fatalf("missing guidance: %s", text)
+		}
+	}
+}

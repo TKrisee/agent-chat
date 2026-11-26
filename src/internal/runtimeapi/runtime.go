@@ -173,6 +173,9 @@ type LegacySafePlanningInspector interface {
 type LegacyMixedApprovalInspector interface {
 	IsLegacyMixedApproval(context.Context, []byte, string) bool
 }
+type LegacyProgressInspector interface {
+	IsLegacyProgress(context.Context, []byte, string, string) bool
+}
 type LegacyStructuredHoldInspector interface {
 	IsLegacyStructuredHold(context.Context, []byte) bool
 }

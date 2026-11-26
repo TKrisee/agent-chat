@@ -25,6 +25,9 @@ func (s *Service) reportPOProgress(tx *sql.Tx, j job, po agent, action runtimeap
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO po_progress_notes(message_id) VALUES(?)`, id)
+	if _, err = tx.Exec(`INSERT INTO po_progress_notes(message_id) VALUES(?)`, id); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO po_explicit_progress(message_id) VALUES(?)`, id)
 	return err
 }

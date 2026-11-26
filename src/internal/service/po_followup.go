@@ -166,6 +166,31 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 	if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 		return err
 	}
+	if !explicit {
+		var shared string
+		err := tx.QueryRow(`SELECT m.text FROM po_explicit_progress p JOIN messages m ON m.id=p.message_id WHERE m.project_id=? AND m.task_id=? AND m.sender=? AND m.recipient=? AND m.role='po' AND m.room_id=? AND length(trim(m.text))>0 ORDER BY m.seq DESC LIMIT 1`, j.Project, j.Task, a.ID, root, directRoom(a.ID, root)).Scan(&shared)
+		if errors.Is(err, sql.ErrNoRows) {
+			shared, err = s.legacyExhaustionProgress(tx, j, a)
+			if err != nil {
+				return err
+			}
+			if shared == "" {
+				return nil
+			}
+		}
+		if err != nil {
+			return err
+		}
+		source := newID()
+		if err := addMessage(tx, source, a.ID, root, a.Role, shared, j.Project, j.Task); err != nil {
+			return err
+		}
+		manager, err := getAgent(tx, root)
+		if err != nil {
+			return err
+		}
+		return s.enqueue(tx, manager, j.Project, j.Task, source, "task_blocked", "The PO follow-through exhausted its bounded attempts. The source is the PO's explicitly Root-addressed task progress. Summarize the recorded blocker and ask only a specific decision actually requested in that source; do not invent missing details or ask a generic question.")
+	}
 	protected, err := poHasPrivateOperatorInput(tx, j, a)
 	if err != nil {
 		return err
