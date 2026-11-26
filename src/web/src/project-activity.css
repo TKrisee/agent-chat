@@ -5,6 +5,7 @@
 .pa-team li { display:flex; align-items:center; gap:7px; min-width:0; padding:5px 0; font-size:12px; }
 .pa-team strong { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .pa-team small { margin-left:auto; color:#718477; font-size:10px; text-align:right; }
+.pa-team .pa-model { display:block; color:#64786d; overflow-wrap:anywhere; }
 .project-activity>details { margin-top:10px; border-top:1px solid #e1e9df; padding-top:9px; }
 .project-activity>details>summary { cursor:pointer; font-size:12px; font-weight:700; color:#52675a; }
 .project-activity summary small { float:right; font-size:10px; color:#718477; }

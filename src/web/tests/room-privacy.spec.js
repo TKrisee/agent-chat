@@ -223,3 +223,15 @@ test('work panel distinguishes superseded attempts from current uncertainty', as
   await blocked.getByText('Details',{exact:true}).click();
   await expect(blocked).toContainText('Current outcome unknown');
 });
+
+test('team panel shows configured model IDs when available', async ({page, serviceURL}) => {
+  const state = `{"projects":[{"id":"atlas","name":"Atlas","status":"running","po_id":"po"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"gpt-6.2-sol"},{"id":"po","name":"Atlas-PO","role":"po","project_id":"atlas","status":"idle","model":"gpt-6.1-terra"},{"id":"worker","name":"Builder","role":"worker","project_id":"atlas","status":"idle","model":"gpt-6.2-sol"},{"id":"missing","name":"Helper","role":"worker","project_id":"atlas","status":"idle"}],"tasks":[],"jobs":[],"messages":[]}`;
+  await page.route('**/api/state', route=>route.fulfill({status:200,contentType:'application/json',body:state}));
+  await page.goto(serviceURL);
+  await page.locator('[data-project="atlas"]').click();
+  const team=page.getByLabel('Atlas activity').locator('.pa-team');
+  await expect(team.locator('li').filter({hasText:'Root'}).locator('.pa-model')).toHaveText('gpt-6.2-sol');
+  await expect(team.locator('li').filter({hasText:'Atlas-PO'}).locator('.pa-model')).toHaveText('gpt-6.1-terra');
+  await expect(team.locator('li').filter({hasText:'Builder'}).locator('.pa-model')).toHaveText('gpt-6.2-sol');
+  await expect(team.locator('li').filter({hasText:'Helper'}).locator('.pa-model')).toHaveCount(0);
+});
