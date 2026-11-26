@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.2](https://github.com/TKrisee/agent-chat/compare/v0.19.1...v0.19.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* drain active jobs before applying updates ([22019c6](https://github.com/TKrisee/agent-chat/commit/22019c6a45cf222695ea7af1a7c8e0762d9782b9))
+
 ## [0.19.1](https://github.com/TKrisee/agent-chat/compare/v0.19.0...v0.19.1) (2026-11-26)
 
 
