@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.7](https://github.com/TKrisee/agent-chat/compare/v0.18.6...v0.18.7) (2026-11-26)
+
+
+### Bug Fixes
+
+* correct rejected child reviews before planning ([ae1ced3](https://github.com/TKrisee/agent-chat/commit/ae1ced3d4f75cc1ec83f89e2292f5907dcc9c46f))
+
 ## [0.18.6](https://github.com/TKrisee/agent-chat/compare/v0.18.5...v0.18.6) (2026-11-26)
 
 
