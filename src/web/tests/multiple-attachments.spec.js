@@ -2,12 +2,12 @@ import { test, expect } from './fixture.js';
 
 test('select and drop multiple files in a project message', async ({ page, serviceURL }) => {
   await page.goto(serviceURL);
-  await page.getByLabel('Message Root').fill('Start project atlas: Check multiple attachments');
+  await page.getByLabel('Message Root').fill('Start project attachment-fixture: Check multiple attachments');
   await page.getByLabel('Message Root').press('Enter');
-  const project = page.locator('[data-project="atlas"]');
+  const project = page.locator('[data-project="attachment-fixture"]');
   await expect(project).toBeVisible({timeout: 20000});
   await project.click();
-  const composer = page.getByLabel('Message atlas chat');
+  const composer = page.getByLabel('Message attachment-fixture chat');
   await page.getByRole('button', {name:'Add attachment'}).click();
   const chooser = page.waitForEvent('filechooser');
   await page.getByRole('button', {name:'Upload a file'}).click();
