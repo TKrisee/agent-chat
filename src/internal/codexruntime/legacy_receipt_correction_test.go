@@ -40,3 +40,18 @@ func TestLegacyReceiptCorrectionProof(t *testing.T) {
 		t.Fatal("attachment accepted for other diagnostic")
 	}
 }
+
+func TestLegacyReceiptAttachmentProof(t *testing.T) {
+	r, _, _ := setup(t)
+	const path = "/managed/attachments/id"
+	const payload = `{"text":"review","actions":[{"type":"accept_result","project":"alpha","title":"review","body":"done","recipient":"worker"},{"type":"report_progress","project":"alpha","title":"","body":"update","recipient":"root"}],"attachments":[{"path":"/managed/attachments/id","name":"receipt","media_type":"text/markdown"}]}`
+	if !r.IsLegacyReceiptAttachment(context.Background(), []byte(payload), "alpha", "worker", path, "receipt", "text/markdown") {
+		t.Fatal("valid pinned receipt rejected")
+	}
+	if r.IsLegacyReceiptAttachment(context.Background(), []byte(payload), "alpha", "worker", path, "other", "text/markdown") {
+		t.Fatal("wrong receipt accepted")
+	}
+	if r.IsLegacyReceiptAttachment(context.Background(), []byte(strings.Replace(payload, `"report_progress"`, `"queue_work_item"`, 1)), "alpha", "worker", path, "receipt", "text/markdown") {
+		t.Fatal("unrelated action accepted")
+	}
+}

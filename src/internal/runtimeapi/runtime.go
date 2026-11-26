@@ -211,6 +211,9 @@ type LegacyChildReportInspector interface {
 type LegacyChildProgressInspector interface {
 	IsLegacyChildProgress(context.Context, []byte, string, string) bool
 }
+type LegacyReceiptAttachmentInspector interface {
+	IsLegacyReceiptAttachment(context.Context, []byte, string, string, string, string, string) bool
+}
 
 // LegacyChildGroupRecipientInspector recognizes the exact pre-apply room-recipient error.
 type LegacyChildGroupRecipientInspector interface {

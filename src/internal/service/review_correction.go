@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 )
 
 type reviewConflictError struct{}
@@ -94,13 +95,14 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	if err != nil {
 		return
 	}
-	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyChildProgressDiagnostic && diagnostic != legacyChildPlanningOrderDiagnostic && diagnostic != legacyChildParentUnavailableDiagnostic) {
+	attachmentConflict := strings.HasPrefix(diagnostic, `invalid runtime result: attachment "`) && strings.HasSuffix(diagnostic, `": path is outside the workspace`)
+	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (!attachmentConflict && diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyChildProgressDiagnostic && diagnostic != legacyChildPlanningOrderDiagnostic && diagnostic != legacyChildParentUnavailableDiagnostic) {
 		return
 	}
 	out.job.Task = task
 	out.job.Project = project
 	planningCorrection := diagnostic == legacyChildPlanningOrderDiagnostic || diagnostic == legacyChildParentUnavailableDiagnostic
-	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic || diagnostic == legacyChildProgressDiagnostic || planningCorrection
+	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic || diagnostic == legacyChildProgressDiagnostic || planningCorrection || attachmentConflict
 	out.progressConflict = diagnostic == legacyChildProgressDiagnostic
 	if out.childReport {
 		var parent string
@@ -111,6 +113,16 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 		}
 		if err != nil {
 			return out, false, err
+		}
+		if attachmentConflict {
+			if parentStatus != "assigned" {
+				return out, false, nil
+			}
+			var conflicts int
+			if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM task_holds WHERE task_id=? AND status='active')+(SELECT count(*) FROM approvals WHERE task_id=? AND status='pending')`, parent, parent, parent).Scan(&conflicts); err != nil || conflicts != 0 {
+				return out, false, err
+			}
+			out.blockedParent = parent
 		}
 		if planningCorrection {
 			out.blockedParent = parent
@@ -135,7 +147,7 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 				return out, false, nil
 			}
 			out.blockedParent = parent
-		} else if parentStatus != "blocked" {
+		} else if parentStatus != "blocked" && !attachmentConflict {
 			if planningCorrection {
 				err = tx.QueryRow(`SELECT count(*) FROM jobs x WHERE x.task_id=? AND x.status='uncertain' AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=x.task_id AND c.review_job_id=x.id)`, parent).Scan(&parentUnsettled)
 			} else {
@@ -153,6 +165,12 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain')),(SELECT count(*) FROM approvals WHERE task_id=?)`, task, task).Scan(&other, &approvals)
 	if err != nil || other != 0 || approvals != 0 {
 		return
+	}
+	if attachmentConflict {
+		var holds int
+		if err = tx.QueryRow(`SELECT count(*) FROM task_holds WHERE task_id=? AND status='active'`, task).Scan(&holds); err != nil || holds != 0 {
+			return out, false, err
+		}
 	}
 	worker, e := activeReviewWorker(tx, out.job, po)
 	if errors.Is(e, errWorkflow) {
@@ -189,6 +207,21 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	}
 	if !notesOK {
 		return out, false, nil
+	}
+	if attachmentConflict {
+		var count int
+		var id, name, media string
+		if err = tx.QueryRow(`SELECT count(DISTINCT a.id),COALESCE(min(a.id),''),COALESCE(min(a.name),''),COALESCE(min(a.media_type),'') FROM message_attachments link JOIN attachments a ON a.id=link.attachment_id WHERE link.message_id=?`, out.job.Source).Scan(&count, &id, &name, &media); err != nil {
+			return out, false, err
+		}
+		if count != 1 || !clientID.MatchString(id) || diagnostic != fmt.Sprintf("invalid runtime result: attachment %q: path is outside the workspace", name) {
+			return out, false, nil
+		}
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyReceiptAttachmentInspector)
+		if !ok {
+			return out, false, nil
+		}
+		return out, inspector.IsLegacyReceiptAttachment(context.Background(), payload, project, worker, filepath.Join(s.dir, "attachments", id), name, media), nil
 	}
 	if planningCorrection {
 		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyReceiptCorrectionInspector)

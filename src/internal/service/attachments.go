@@ -26,9 +26,10 @@ type attachmentData struct {
 	Content             []byte
 }
 
-// Strip only exact service-owned attachments that the same result will have
-// forwarded from its authorized source message by the existing report path.
-// Other references remain subject to workspace upload validation.
+// Strip only exact service-owned attachments already on an authorized source
+// message. Reports forward those attachments through the existing report path;
+// without a report they remain on the original receipt. Other references stay
+// subject to workspace upload validation.
 type attachmentQuerier interface {
 	Query(string, ...any) (*sql.Rows, error)
 }
@@ -41,16 +42,6 @@ func (s *Service) uploadAttachments(db attachmentQuerier, j job, result runtimea
 	query := ""
 	switch {
 	case j.Request.Role == "po" && (j.Kind == "review" || j.Kind == "approval_approved" || j.Kind == "po_followup"):
-		reports := false
-		for _, action := range result.Actions {
-			if action.Type == "report" {
-				reports = true
-				break
-			}
-		}
-		if !reports {
-			return refs, nil
-		}
 		query = `SELECT a.id,a.name,a.media_type FROM message_attachments link
 			JOIN attachments a ON a.id=link.attachment_id
 			JOIN messages m ON m.id=link.message_id
