@@ -33,7 +33,13 @@ func (r *Runner) LegacyAttachmentDeclarations(ctx context.Context, payload []byt
 	if cmd.Run() != nil {
 		return nil, false
 	}
-	rows := strings.Split(strings.TrimSuffix(out.b.String(), "\n"), "\n")
+	return parseAttachmentDeclarations(out.b.String())
+}
+
+// jq on Windows may emit CRLF; declaration fields are base64-encoded, so
+// normalizing line endings cannot alter a declared path or name.
+func parseAttachmentDeclarations(output string) ([]runtimeapi.Attachment, bool) {
+	rows := strings.Split(strings.TrimSuffix(strings.ReplaceAll(output, "\r\n", "\n"), "\n"), "\n")
 	header := strings.Split(rows[0], "\t")
 	if len(header) != 2 || header[0] != "count" {
 		return nil, false

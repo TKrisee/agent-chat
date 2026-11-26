@@ -2,10 +2,22 @@ package codexruntime
 
 import (
 	"context"
+	"encoding/base64"
 	"testing"
 
 	"agentchat/src/internal/runtimeapi"
 )
+
+func TestAttachmentDeclarationLineEndings(t *testing.T) {
+	encode := func(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
+	for _, eol := range []string{"\n", "\r\n"} {
+		output := "count\t1" + eol + encode("C:\\workspace\\evidence.md") + "\t" + encode("evidence.md") + "\t" + encode("text/markdown") + eol
+		got, ok := parseAttachmentDeclarations(output)
+		if !ok || len(got) != 1 || got[0].Path != "C:\\workspace\\evidence.md" {
+			t.Fatalf("%q: %+v %v", eol, got, ok)
+		}
+	}
+}
 
 func TestPinnedAttachmentAlias(t *testing.T) {
 	r, req, _ := setup(t)
