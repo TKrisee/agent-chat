@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.14](https://github.com/TKrisee/agent-chat/compare/v0.18.13...v0.18.14) (2026-11-26)
+
+
+### Bug Fixes
+
+* separate evidence handoffs from hold approvals ([bcf3cdc](https://github.com/TKrisee/agent-chat/commit/bcf3cdc23d1de1f25e9a8dda187a4587445a7cf1))
+
 ## [0.18.13](https://github.com/TKrisee/agent-chat/compare/v0.18.12...v0.18.13) (2026-11-26)
 
 
