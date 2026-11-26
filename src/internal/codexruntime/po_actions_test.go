@@ -11,6 +11,7 @@ import (
 func TestPOMultiWorkerActionContract(t *testing.T) {
 	for _, tc := range []struct{ name, payload string }{
 		{"create_worker", `{"text":"","actions":[{"type":"create_worker","project":"alpha","title":"worker_two","body":"","recipient":""}],"attachments":[]}`},
+		{"create_one_shot_worker", `{"text":"","actions":[{"type":"create_one_shot_worker","project":"alpha","title":"worker_one","body":"","recipient":""}],"attachments":[]}`},
 		{"queue_work_item", `{"text":"","actions":[{"type":"queue_work_item","project":"alpha","title":"First item","body":"Implement the scoped item.","recipient":"worker_two","task":""}],"attachments":[]}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -26,13 +27,13 @@ func TestPOMultiWorkerActionContract(t *testing.T) {
 			if len(result.Actions) != 1 || result.Actions[0].Type != tc.name || result.Actions[0].Task != "" {
 				t.Fatalf("decoded action %+v", result.Actions)
 			}
-			cmd := exec.Command(r.cfg.JQPath, "-e", `.properties.actions.items | ((.required|sort)==(.properties|keys|sort)) and ((.properties.type.enum|index("create_worker"))!=null) and ((.properties.type.enum|index("queue_work_item"))!=null)`, filepath.Join(r.dir(req.ID), "schema.json"))
+			cmd := exec.Command(r.cfg.JQPath, "-e", `.properties.actions.items | ((.required|sort)==(.properties|keys|sort)) and ((.properties.type.enum|index("create_worker"))!=null) and ((.properties.type.enum|index("create_one_shot_worker"))!=null) and ((.properties.type.enum|index("queue_work_item"))!=null)`, filepath.Join(r.dir(req.ID), "schema.json"))
 			if err := cmd.Run(); err != nil {
 				t.Fatal("PO schema missing actions or required fields")
 			}
 		})
 	}
-	for _, action := range []string{"create_worker", "queue_work_item"} {
+	for _, action := range []string{"create_worker", "create_one_shot_worker", "queue_work_item"} {
 		if actionAllowed("root", action) || actionAllowed("worker", action) {
 			t.Fatalf("%s allowed outside PO role", action)
 		}

@@ -40,8 +40,15 @@ func (s *Service) createProjectWorker(tx *sql.Tx, j job, po agent, action runtim
 	if count != 0 {
 		return workItemPlanning("worker name already exists; use the registered roster")
 	}
-	_, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", newID(), action.Title, j.Project, s.opts.WorkerModel, s.opts.Effort)
-	return err
+	id := newID()
+	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, s.opts.WorkerModel, s.opts.Effort); err != nil {
+		return err
+	}
+	if action.Type == "create_one_shot_worker" {
+		_, err := tx.Exec("INSERT INTO one_shot_workers(agent_id) VALUES(?)", id)
+		return err
+	}
+	return nil
 }
 func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi.Action) error {
 	if err := parentTaskOwned(tx, j, po); err != nil {
@@ -67,6 +74,13 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 		return workItemPlanning("worker must identify one same-project worker")
 	}
 	id = rows[0]
+	var alreadyBound int
+	if err := tx.QueryRow(`SELECT count(*) FROM one_shot_workers WHERE agent_id=? AND child_task_id IS NOT NULL`, id).Scan(&alreadyBound); err != nil {
+		return err
+	}
+	if alreadyBound != 0 {
+		return workItemPlanning("one-shot worker already has its work item")
+	}
 	var busy int
 	if err := tx.QueryRow(`SELECT count(*) FROM jobs WHERE agent_id=? AND kind='work' AND status='uncertain'`, id).Scan(&busy); err != nil {
 		return err
@@ -83,6 +97,9 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 		return err
 	}
 	if _, err = tx.Exec(`INSERT INTO po_work_items(parent_task_id,child_task_id) VALUES(?,?)`, j.Task, child); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(`UPDATE one_shot_workers SET child_task_id=? WHERE agent_id=? AND child_task_id IS NULL`, child, id); err != nil {
 		return err
 	}
 	if err = addMessage(tx, source, po.ID, id, "po", action.Body, j.Project, child); err != nil {

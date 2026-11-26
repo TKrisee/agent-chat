@@ -270,6 +270,7 @@ func (s *Service) userMessageWithFiles(ctx context.Context, id, to, project, tex
 			return err
 		}
 		var targets []agent
+		implicitDispatch := false
 		messageProject := project
 		if kind == groupMessageKind {
 			targets, err = groupTargets(tx, project, mentions)
@@ -291,6 +292,31 @@ func (s *Service) userMessageWithFiles(ctx context.Context, id, to, project, tex
 			if err := checkReplyParent(tx, parent, to, project); err != nil {
 				return err
 			}
+			if kind == groupMessageKind && len(mentions) == 0 {
+				var sender string
+				err := tx.QueryRow(`SELECT m.sender FROM messages m WHERE m.id=? AND m.room_id=? AND m.project_id=? AND `+groupMemberSender, parent, to, project).Scan(&sender)
+				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return err
+				}
+				if err == nil {
+					targets, err = groupTargets(tx, project, []string{sender})
+					if err != nil {
+						return err
+					}
+					implicitDispatch = true
+				}
+			}
+		}
+		if kind == groupMessageKind && len(mentions) == 0 && !implicitDispatch {
+			var po string
+			if err := tx.QueryRow(`SELECT po_id FROM projects WHERE id=?`, project).Scan(&po); err != nil {
+				return err
+			}
+			targets, err = groupTargets(tx, project, []string{po})
+			if err != nil {
+				return err
+			}
+			implicitDispatch = true
 		}
 		if err := addMessage(tx, id, operator, to, "operator", text, messageProject, ""); err != nil {
 			return err
@@ -307,7 +333,11 @@ func (s *Service) userMessageWithFiles(ctx context.Context, id, to, project, tex
 		}
 		for _, a := range targets {
 			if kind == groupMessageKind {
-				if _, err := tx.Exec("INSERT INTO message_mentions(message_id,agent_id) VALUES(?,?)", id, a.ID); err != nil {
+				table := "message_mentions"
+				if implicitDispatch {
+					table = "message_implicit_dispatch"
+				}
+				if _, err := tx.Exec("INSERT INTO "+table+"(message_id,agent_id) VALUES(?,?)", id, a.ID); err != nil {
 					return err
 				}
 			}

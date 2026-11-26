@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('root','po','worker')),
   project_id TEXT REFERENCES projects(id), model TEXT NOT NULL, effort TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS one_shot_workers (
+ agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+ child_task_id TEXT UNIQUE REFERENCES tasks(id)
+);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('assigned','queued','review','accepted','completed','blocked')),
@@ -29,6 +33,10 @@ CREATE TABLE IF NOT EXISTS message_mentions (
   message_id TEXT NOT NULL REFERENCES messages(id),
   agent_id TEXT NOT NULL REFERENCES agents(id),
   PRIMARY KEY(message_id,agent_id)
+);
+CREATE TABLE IF NOT EXISTS message_implicit_dispatch (
+ message_id TEXT PRIMARY KEY REFERENCES messages(id),
+ agent_id TEXT NOT NULL REFERENCES agents(id)
 );
 CREATE TABLE IF NOT EXISTS operator_message_reads (
   message_id TEXT PRIMARY KEY REFERENCES messages(id),

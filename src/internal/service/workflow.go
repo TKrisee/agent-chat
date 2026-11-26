@@ -18,7 +18,7 @@ const poGuide = "You are the project owner. On scope_review assess the original 
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
 const workerChatGuide = "You are a project worker in a direct conversation with the operator. Answer the operator in text. Use relevant project work history for context. This message is independent of task assignments, so do not start or change a task or emit orchestration actions. You may attach regular files from your workspace."
-const groupChatGuide = "The operator explicitly mentioned you in the shared project group conversation. Your text and any attached regular workspace files will be shared with the project group. Use the shared history for context. Answer without orchestration actions or relays."
+const groupChatGuide = "The operator addressed you in the shared project group conversation by mention, direct reply, or an ordinary PO-directed group message. Your text and any attached regular workspace files will be shared with the project group. Use the shared history for context. Answer without orchestration actions or relays."
 
 // workflowDefaults are app-owned guidance, subordinate to the task, project
 // instructions, and the runtime's permission and safety requirements.
@@ -71,7 +71,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		if err == nil {
 			guide += "\nCurrent active PO goal (project context, subject to the current assignment): " + objective
 		}
-		roster, err := querySlice(tx, `SELECT id,name FROM agents WHERE project_id=? AND role='worker' ORDER BY name,id`, func(rows *sql.Rows) (string, error) {
+		roster, err := querySlice(tx, `SELECT id,name FROM agents a WHERE project_id=? AND role='worker' AND NOT EXISTS(SELECT 1 FROM one_shot_workers o WHERE o.agent_id=a.id AND o.child_task_id IS NOT NULL) ORDER BY name,id`, func(rows *sql.Rows) (string, error) {
 			var id, name string
 			err := rows.Scan(&id, &name)
 			return name + " (" + id + ")", err
@@ -535,7 +535,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			switch action.Type {
 			case "hold_task":
 				hold = true
-			case "accept_result", "report", "queue_worker", "queue_work_item", "create_worker", "request_approval":
+			case "accept_result", "report", "queue_worker", "queue_work_item", "create_worker", "create_one_shot_worker", "request_approval":
 				advance = true
 			}
 		}
@@ -626,7 +626,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	}
 	hasPlanning := false
 	for _, action := range result.Actions {
-		if action.Type == "queue_work_item" || action.Type == "create_worker" {
+		if action.Type == "queue_work_item" || action.Type == "create_worker" || action.Type == "create_one_shot_worker" {
 			hasPlanning = true
 		}
 	}
@@ -644,7 +644,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	}
 	for pass := 0; pass < 2; pass++ {
 		for _, action := range result.Actions {
-			planning := childParent != "" && hasPlanning && (action.Type == "queue_work_item" || action.Type == "create_worker")
+			planning := childParent != "" && hasPlanning && (action.Type == "queue_work_item" || action.Type == "create_worker" || action.Type == "create_one_shot_worker")
 			if (pass == 0 && planning) || (pass == 1 && !planning) {
 				continue
 			}
@@ -691,14 +691,14 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 func groupMessageResult(tx *sql.Tx, a agent, j job, result runtimeapi.Result, files []attachmentData) error {
 	if (a.Role != "po" && a.Role != "worker") || j.Task != "" || len(result.Actions) != 0 ||
 		(strings.TrimSpace(result.Text) == "" && len(files) == 0) {
-		return fmt.Errorf("%w: project group response requires a mentioned agent and text or attachments without orchestration actions", errWorkflow)
+		return fmt.Errorf("%w: project group response requires an addressed agent and text or attachments without orchestration actions", errWorkflow)
 	}
 	recipient := groupPrefix + j.Project
 	var source string
 	err := tx.QueryRow(`SELECT m.id FROM messages m JOIN projects p ON p.id=m.project_id
-		JOIN message_mentions target ON target.message_id=m.id AND target.agent_id=?
 		WHERE m.id=? AND m.project_id=? AND m.recipient=? AND m.sender=? AND m.role='operator' AND m.task_id IS NULL
-		AND (?='worker' OR p.po_id=?)`, a.ID, j.Source, j.Project, recipient, operator, a.Role, a.ID).Scan(&source)
+		AND (EXISTS(SELECT 1 FROM message_mentions target WHERE target.message_id=m.id AND target.agent_id=?) OR EXISTS(SELECT 1 FROM message_implicit_dispatch target WHERE target.message_id=m.id AND target.agent_id=?))
+		AND (?='worker' OR p.po_id=?)`, j.Source, j.Project, recipient, operator, a.ID, a.ID, a.Role, a.ID).Scan(&source)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: exact project group source unavailable", errWorkflow)
 	}
@@ -867,7 +867,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		return s.reportPOProgress(tx, j, a, action)
 	case "queue_worker":
 		return s.queueWorker(tx, j, a, action)
-	case "create_worker":
+	case "create_worker", "create_one_shot_worker":
 		return s.createProjectWorker(tx, j, a, action)
 	case "queue_work_item":
 		return s.queuePOWorkItem(tx, j, a, action)
@@ -1144,8 +1144,8 @@ func (s *Service) queueWorker(tx *sql.Tx, j job, po agent, action runtimeapi.Act
 	if strings.TrimSpace(action.Body) == "" {
 		return fmt.Errorf("%w: worker assignment needs instructions", errWorkflow)
 	}
-	query := "SELECT id FROM agents WHERE project_id=? AND role='worker'"
-	args := []any{j.Project}
+	query := "SELECT id FROM agents WHERE project_id=? AND role='worker' AND NOT EXISTS (SELECT 1 FROM one_shot_workers o WHERE o.agent_id=agents.id AND (o.child_task_id IS NULL OR o.child_task_id<>?))"
+	args := []any{j.Project, j.Task}
 	if action.Recipient != "" {
 		query += " AND id=?"
 		args = append(args, action.Recipient)

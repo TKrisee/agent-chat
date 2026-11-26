@@ -10,7 +10,7 @@ import (
 
 func TestNewJobActionSchema(t *testing.T) {
 	for _, tc := range []struct{ role, kind, filter string }{
-		{"po", "assignment", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) == null and (.properties.actions.items.properties.type.enum | index("queue_work_item")) != null`},
+		{"po", "assignment", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) == null and (.properties.actions.items.properties.type.enum | index("queue_work_item")) != null and (.properties.actions.items.properties.type.enum | index("create_one_shot_worker")) != null`},
 		{"po", "po_continue", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) == null and (.properties.actions.items.properties.type.enum | index("report_progress")) != null`},
 		{"po", "scope_review", `.properties.actions.items.properties.type.enum == ["post_group"]`},
 		{"po", "operator_message", `.properties.actions.items.properties.type.enum == ["request_approval"]`},

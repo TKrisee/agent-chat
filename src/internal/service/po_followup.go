@@ -58,7 +58,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		return nil
 	}
 	for _, action := range result.Actions {
-		if action.Type != "post_group" && action.Type != "accept_result" && action.Type != "create_worker" && action.Type != "report_progress" {
+		if action.Type != "post_group" && action.Type != "accept_result" && action.Type != "create_worker" && action.Type != "create_one_shot_worker" && action.Type != "report_progress" {
 			return nil
 		}
 	}

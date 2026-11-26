@@ -32,7 +32,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 // actionTypes is the single role allowlist used for new schemas and decoding.
 var actionTypes = map[string][]string{
 	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold"},
-	"po":     {"queue_worker", "create_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
+	"po":     {"queue_worker", "create_worker", "create_one_shot_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
 	"worker": {"post_group"},
 }
 

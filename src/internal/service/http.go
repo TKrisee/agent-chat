@@ -61,13 +61,15 @@ type Task struct {
 }
 
 type Agent struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Role    string `json:"role"`
-	Project string `json:"project_id"`
-	Parent  string `json:"parent_id,omitempty"`
-	Status  string `json:"status"`
-	Model   string `json:"model"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	Role           string `json:"role"`
+	Project        string `json:"project_id"`
+	Parent         string `json:"parent_id,omitempty"`
+	Status         string `json:"status"`
+	Model          string `json:"model"`
+	OneShot        bool   `json:"one_shot,omitempty"`
+	OneShotRetired bool   `json:"one_shot_retired,omitempty"`
 }
 
 type Approval struct {
@@ -272,12 +274,17 @@ func (s *Service) state() (State, error) {
 		view.Agents, err = querySlice(tx, `SELECT a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,
 			CASE WHEN p.stopped=1 THEN 'stopped' WHEN EXISTS(SELECT 1 FROM jobs j
 			WHERE j.agent_id=a.id AND j.status IN ('submitted','running')) THEN 'busy' ELSE 'idle' END,
-			CASE WHEN a.role='po' AND a.id=po.id THEN ? WHEN a.role='worker' THEN COALESCE(po.id,'') ELSE '' END
+			CASE WHEN a.role='po' AND a.id=po.id THEN ? WHEN a.role='worker' THEN COALESCE(po.id,'') ELSE '' END,
+			EXISTS(SELECT 1 FROM one_shot_workers o WHERE o.agent_id=a.id),
+			EXISTS(SELECT 1 FROM one_shot_workers o JOIN tasks t ON t.id=o.child_task_id AND t.status='completed' WHERE o.agent_id=a.id
+			 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE (j.agent_id=a.id OR j.task_id=t.id) AND j.status IN ('pending','submitted','running','uncertain'))
+			 AND NOT EXISTS(SELECT 1 FROM approvals x WHERE x.task_id=t.id AND x.status='pending')
+			 AND NOT EXISTS(SELECT 1 FROM task_holds h WHERE h.task_id=t.id AND h.status='active'))
 			FROM agents a LEFT JOIN projects p ON p.id=a.project_id
 			LEFT JOIN agents po ON po.id=p.po_id AND po.role='po' AND po.project_id=p.id
 			ORDER BY a.rowid`, func(rows *sql.Rows) (Agent, error) {
 			var a Agent
-			err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Status, &a.Parent)
+			err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Status, &a.Parent, &a.OneShot, &a.OneShotRetired)
 			return a, err
 		}, root)
 		if err != nil {

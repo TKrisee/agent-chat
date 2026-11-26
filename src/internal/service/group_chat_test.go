@@ -108,11 +108,19 @@ func TestProjectGroupMessages(t *testing.T) {
 	broadcast := newID()
 	postGroup(broadcast, "atlas", "shared notice for anyone", "", 201)
 	postGroup(broadcast, "atlas", "shared notice for anyone", "", 200, []string{}...)
-	announced := state()
+	announced := await(t, base, func(state State) bool {
+		return hasMessage(state, po, group, "PO replied in the project group: shared notice for anyone")
+	})
 	notice := message(announced, func(m Message) bool { return m.ID == broadcast })
-	if notice.Sender != operator || notice.Project != "atlas" || notice.Recipient != group || len(notice.MentionIDs) != 0 ||
-		len(announced.Messages) != len(before.Messages)+1 || !slices.Equal(announced.Jobs, before.Jobs) {
-		t.Fatal("an unmentioned post should persist once and wake nobody")
+	if notice.Sender != operator || notice.Project != "atlas" || notice.Recipient != group || len(notice.MentionIDs) != 0 {
+		t.Fatal("unmentioned post was not persisted correctly")
+	}
+	var dispatches int
+	if err := s.db.QueryRow("SELECT count(*) FROM jobs WHERE source_id=? AND agent_id=? AND kind='project_message'", broadcast, po).Scan(&dispatches); err != nil || dispatches != 1 {
+		t.Fatalf("unmentioned post dispatched %d times to PO: %v", dispatches, err)
+	}
+	if req := request(); req.Kind != groupMessageKind || !contains(req, broadcast) {
+		t.Fatalf("unmentioned post did not reach PO: %+v", req)
 	}
 	postGroup(broadcast, "atlas", "shared notice for anyone", "", 409, po)
 
@@ -163,6 +171,9 @@ func TestProjectGroupMessages(t *testing.T) {
 				default:
 					t.Fatalf("unexpected service group notice: %+v", m)
 				}
+			}
+			if m.Sender == po && m.Text == "PO replied in the project group: shared notice for anyone" && m.GroupRecipient == group {
+				continue
 			}
 			if (m.ID != first && m.ID != broadcast) || m.GroupRecipient != group {
 				t.Fatalf("unexpected group context: %+v", m)
