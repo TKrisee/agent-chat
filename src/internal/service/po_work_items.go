@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"agentchat/src/internal/runtimeapi"
 )
@@ -140,21 +141,51 @@ func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	if err = tx.QueryRow(`SELECT id FROM jobs WHERE task_id=? AND agent_id=? AND kind IN ('assignment','po_continue','po_followup') AND status='completed' ORDER BY rowid DESC LIMIT 1`, parent, poID).Scan(&trigger); err != nil {
 		return err
 	}
-	rows, err := querySlice(tx, `SELECT c.title,c.status,COALESCE((SELECT m.text FROM messages m WHERE m.task_id=c.id AND m.sender=? AND m.recipient=? ORDER BY m.seq DESC LIMIT 1),'') FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? ORDER BY c.rowid`, func(rows *sql.Rows) (string, error) {
-		var title, status, text string
-		e := rows.Scan(&title, &status, &text)
+	type outcome struct{ id, line string }
+	rows, err := querySlice(tx, `SELECT c.id,c.title,c.status,COALESCE((SELECT m.text FROM messages m WHERE m.task_id=c.id AND m.sender=? AND m.recipient=? ORDER BY m.seq DESC LIMIT 1),'') FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? ORDER BY c.rowid`, func(rows *sql.Rows) (outcome, error) {
+		var id, title, status, text string
+		e := rows.Scan(&id, &title, &status, &text)
+		text = strings.ToValidUTF8(text, "�")
 		if len(text) > 2000 {
-			text = text[:2000]
+			end := 1997
+			for end > 0 && !utf8.RuneStart(text[end]) {
+				end--
+			}
+			text = text[:end] + "…"
 		}
-		return title + " [" + status + "]: " + text, e
+		return outcome{id, strings.ToValidUTF8(title, "�") + " [" + status + "]: " + text}, e
 	}, poID, poID, parent)
 	if err != nil {
 		return err
 	}
-	summary := "Work item outcomes:\n" + strings.Join(rows, "\n")
-	if len(summary) > 64000 {
-		return fmt.Errorf("%w: too many work item outcomes", errWorkflow)
+	// Include the triggering child, then the newest other outcomes; retain their
+	// original order and leave room for an explicit omission notice.
+	selected := make([]bool, len(rows))
+	used := 0
+	for i, row := range rows {
+		if row.id == j.Task && len(row.line)+1 <= 64000-256 {
+			selected[i] = true
+			used += len(row.line) + 1
+			break
+		}
 	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		if !selected[i] && used+len(rows[i].line)+1 <= 64000-256 {
+			selected[i] = true
+			used += len(rows[i].line) + 1
+		}
+	}
+	lines := make([]string, 0, len(rows))
+	for i, row := range rows {
+		if selected[i] {
+			lines = append(lines, row.line)
+		}
+	}
+	summary := "Work item outcomes:\n"
+	if omitted := len(rows) - len(lines); omitted > 0 {
+		summary += fmt.Sprintf("%d other outcomes omitted from this summary; records remain available.\n", omitted)
+	}
+	summary += strings.Join(lines, "\n")
 	source := newID()
 	if err = addMessage(tx, source, "service", poID, "system", summary, j.Project, parent); err != nil {
 		return err
