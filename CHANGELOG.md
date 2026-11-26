@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/TKrisee/agent-chat/compare/v0.18.2...v0.18.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* recover independent PO reviews from existing worker receipts ([0ac6f66](https://github.com/TKrisee/agent-chat/commit/0ac6f66cc2a40d4573e58ba20905dcd169afa505))
+
 ## [0.18.2](https://github.com/TKrisee/agent-chat/compare/v0.18.1...v0.18.2) (2026-11-26)
 
 
