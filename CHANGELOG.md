@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/TKrisee/agent-chat/compare/v0.16.0...v0.16.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* finish PO reports from accepted child results ([5b94c36](https://github.com/TKrisee/agent-chat/commit/5b94c36bd1854cf7cb45314d924c5862c8c5b685))
+
 ## [0.16.0](https://github.com/TKrisee/agent-chat/compare/v0.15.2...v0.16.0) (2026-11-25)
 
 
