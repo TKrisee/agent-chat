@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 )
 
 type reviewConflictError struct{}
@@ -15,6 +16,13 @@ func (*reviewConflictError) Error() string {
 	return errWorkflow.Error() + ": hold_task cannot be combined with accept_result, report, queue_worker, or request_approval; choose a hold or a review action"
 }
 func (*reviewConflictError) Unwrap() error { return errWorkflow }
+
+type childPlanningConflictError struct{}
+
+func (*childPlanningConflictError) Error() string {
+	return errWorkflow.Error() + ": review the exact child receipt with accept_result and report before independent planning"
+}
+func (*childPlanningConflictError) Unwrap() error { return errWorkflow }
 
 func reviewCorrectionEligible(tx *sql.Tx, j job) (bool, error) {
 	if j.Kind != "review" && j.Kind != "po_followup" {
@@ -53,6 +61,8 @@ func reviewCorrectionEligible(tx *sql.Tx, j job) (bool, error) {
 const legacyReviewDiagnostic = "invalid runtime result: task owner or status changed"
 const legacyChildReportDiagnostic = "invalid runtime result: report requires Root and a body"
 const legacyChildProgressDiagnostic = "invalid runtime result: progress task unavailable"
+const legacyChildPlanningOrderDiagnostic = "invalid runtime result: review must be accepted and reported before planning"
+const legacyChildParentUnavailableDiagnostic = "invalid runtime result: parent task unavailable"
 
 type legacyReview struct {
 	job              job
@@ -84,12 +94,13 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	if err != nil {
 		return
 	}
-	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyChildProgressDiagnostic) {
+	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyChildProgressDiagnostic && diagnostic != legacyChildPlanningOrderDiagnostic && diagnostic != legacyChildParentUnavailableDiagnostic) {
 		return
 	}
 	out.job.Task = task
 	out.job.Project = project
-	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic || diagnostic == legacyChildProgressDiagnostic
+	planningCorrection := diagnostic == legacyChildPlanningOrderDiagnostic || diagnostic == legacyChildParentUnavailableDiagnostic
+	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic || diagnostic == legacyChildProgressDiagnostic || planningCorrection
 	out.progressConflict = diagnostic == legacyChildProgressDiagnostic
 	if out.childReport {
 		var parent string
@@ -101,8 +112,18 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 		if err != nil {
 			return out, false, err
 		}
+		if planningCorrection {
+			out.blockedParent = parent
+			var conflicts int
+			if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs x WHERE x.task_id=? AND x.status='uncertain' AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=x.task_id AND c.review_job_id=x.id))+(SELECT count(*) FROM task_holds WHERE task_id=? AND status='active')`, parent, parent).Scan(&conflicts); err != nil {
+				return out, false, err
+			}
+			if conflicts != 0 {
+				return out, false, nil
+			}
+		}
 		var parentUnsettled int
-		if parentStatus == "blocked" {
+		if parentStatus == "blocked" && !planningCorrection {
 			if diagnostic != legacyChildProgressDiagnostic {
 				return out, false, nil
 			}
@@ -110,12 +131,19 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 			if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM task_holds WHERE task_id=? AND status='active'),(SELECT count(*) FROM approvals WHERE task_id=? AND status='pending')`, parent, parent, parent).Scan(&parentUnsettled, &pending); err != nil {
 				return out, false, err
 			}
-			if parentUnsettled != 0 || pending != 1 {
+			if parentUnsettled != 0 || (diagnostic == legacyChildProgressDiagnostic && pending != 1) {
 				return out, false, nil
 			}
 			out.blockedParent = parent
-		} else if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status='uncertain')+(SELECT count(*) FROM approvals WHERE task_id=?)`, parent, parent).Scan(&parentUnsettled); err != nil {
-			return out, false, err
+		} else if parentStatus != "blocked" {
+			if planningCorrection {
+				err = tx.QueryRow(`SELECT count(*) FROM jobs x WHERE x.task_id=? AND x.status='uncertain' AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=x.task_id AND c.review_job_id=x.id)`, parent).Scan(&parentUnsettled)
+			} else {
+				err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status='uncertain')+(SELECT count(*) FROM approvals WHERE task_id=?)`, parent, parent).Scan(&parentUnsettled)
+			}
+			if err != nil {
+				return out, false, err
+			}
 		}
 		if parentUnsettled != 0 {
 			return out, false, nil
@@ -161,6 +189,22 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	}
 	if !notesOK {
 		return out, false, nil
+	}
+	if planningCorrection {
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyReceiptCorrectionInspector)
+		if !ok || len(payload) == 0 || len(payload) > 1<<20 {
+			return out, false, nil
+		}
+		var count int
+		var attachmentID string
+		if err := tx.QueryRow(`SELECT count(DISTINCT a.id),COALESCE(min(a.id),'') FROM message_attachments link JOIN attachments a ON a.id=link.attachment_id WHERE link.message_id=?`, out.job.Source).Scan(&count, &attachmentID); err != nil {
+			return out, false, err
+		}
+		allowed := ""
+		if count == 1 && clientID.MatchString(attachmentID) {
+			allowed = filepath.Join(s.dir, "attachments", attachmentID)
+		}
+		return out, inspector.IsLegacyReceiptCorrection(context.Background(), payload, project, worker, diagnostic, allowed), nil
 	}
 	if diagnostic == legacyChildProgressDiagnostic {
 		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyChildProgressInspector)

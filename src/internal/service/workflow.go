@@ -422,7 +422,8 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 		}
 		if invalid != nil {
 			var reviewErr *reviewConflictError
-			if errors.As(invalid, &reviewErr) && len(files) == 0 && len(uploads) == 0 {
+			var childPlanningErr *childPlanningConflictError
+			if (errors.As(invalid, &reviewErr) || errors.As(invalid, &childPlanningErr)) && len(files) == 0 && len(uploads) == 0 {
 				ok, err := reviewCorrectionEligible(tx, j)
 				if err != nil {
 					return err
@@ -432,7 +433,7 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 					if err != nil {
 						return err
 					}
-					if err := s.poFollowThrough(tx, j, a, runtimeapi.Result{}, reviewErr.Error()); err != nil {
+					if err := s.poFollowThrough(tx, j, a, runtimeapi.Result{}, invalid.Error()); err != nil {
 						return err
 					}
 					_, err = tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, invalid.Error(), j.ID)
@@ -537,7 +538,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			result.Text = ""
 		}
 		var childReceiptOnly int
-		if err := tx.QueryRow(`SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&childReceiptOnly); err != nil {
+		if err := tx.QueryRow(`SELECT (SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?)+(SELECT count(*) FROM po_child_receipt_corrections WHERE source_id=? AND task_id=?)`, j.Source, j.Task, j.Source, j.Task).Scan(&childReceiptOnly); err != nil {
 			return err
 		}
 		if childReceiptOnly != 0 {
@@ -676,6 +677,9 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		}
 		planningJob.Task = childParent
 		if err := parentTaskOwned(tx, planningJob, a); err != nil {
+			if errors.Is(err, errWorkflow) {
+				return &childPlanningConflictError{}
+			}
 			return err
 		}
 		if _, err := s.poAssignmentSource(tx, planningJob, a.ID); err != nil {
@@ -704,7 +708,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 					return err
 				}
 				if status != "completed" {
-					return fmt.Errorf("%w: review must be accepted and reported before planning", errWorkflow)
+					return &childPlanningConflictError{}
 				}
 				if err := s.applyAction(tx, a, planningJob, action); err != nil {
 					return err

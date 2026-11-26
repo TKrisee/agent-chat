@@ -145,7 +145,7 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 		}
 		if candidate.Status == "pending" && candidate.Kind == "po_followup" {
 			var childReceiptOnly int
-			if err := tx.QueryRow(`SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?`, candidate.Source, candidate.Task).Scan(&childReceiptOnly); err != nil {
+			if err := tx.QueryRow(`SELECT (SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?)+(SELECT count(*) FROM po_child_receipt_corrections WHERE source_id=? AND task_id=?)`, candidate.Source, candidate.Task, candidate.Source, candidate.Task).Scan(&childReceiptOnly); err != nil {
 				return err
 			}
 			if childReceiptOnly != 0 {

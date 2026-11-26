@@ -180,6 +180,9 @@ type LegacyProgressInspector interface {
 type LegacyApprovalPlanningInspector interface {
 	IsLegacyApprovalPlanning(context.Context, []byte, []byte, string) bool
 }
+type LegacyReceiptCorrectionInspector interface {
+	IsLegacyReceiptCorrection(context.Context, []byte, string, string, string, string) bool
+}
 type LegacyStructuredHoldInspector interface {
 	IsLegacyStructuredHold(context.Context, []byte) bool
 }

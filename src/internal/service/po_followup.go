@@ -142,11 +142,23 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,?,?,?,?,?)`, id, f.trigger, f.ordinal, f.phase, f.assignment, nullIfEmpty(f.note), nullIfEmpty(f.review)); err != nil {
 		return err
 	}
+	if len(correction) > 0 && correction[0] == (&childPlanningConflictError{}).Error() {
+		var parent string
+		if err := tx.QueryRow(`SELECT parent_task_id FROM po_work_items WHERE child_task_id=?`, j.Task).Scan(&parent); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO po_child_receipt_corrections(source_id,task_id,review_job_id,parent_task_id) VALUES(?,?,?,?)`, id, j.Task, j.ID, parent); err != nil {
+			return err
+		}
+	}
 	instruction := "Make the next safe decision for this same task using the pinned original assignment and task-scoped operator instructions. When instructions differ, follow the latest one within existing safety and authorization boundaries. Preserve scope, explicit holds, read-only and production restrictions; do not repeat prior effects or assume authorization. If a genuine blocker or deliberate hold prevents progress, use hold_task with its exact reason."
 	if len(correction) > 0 {
 		instruction += " The prior proposal was rejected before applying it: " + correction[0] + " Correct the stated issue without repeating effects; choose a valid next action or an explicit hold."
 		if correction[0] == fmt.Sprintf("%v: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow) {
 			instruction += " No actions from that proposal were applied. Put independent dispatch in a separate response, and submit each operator approval request alone. Use current receipts and preserve the authorized scope."
+		}
+		if correction[0] == (&childPlanningConflictError{}).Error() {
+			instruction += " This turn is receipt-only: return accept_result then report, optionally report_progress; no other actions or attachments. Plan independent work in a later parent turn."
 		}
 	}
 	switch phase {
