@@ -103,10 +103,27 @@ function appendTokens(root: HTMLElement, tokens: Token[]): void {
 }
 
 /** Render untrusted message text without changing the source used for copy/reply. */
-export function renderMessageMarkdown(container: HTMLElement, source: string): void {
+export function renderMessageMarkdown(container: HTMLElement, source: string, mentionNames: string[] = []): void {
   container.classList.add('message-markdown');
   container.replaceChildren();
   appendTokens(container, markdown.parse(source, {}));
+  const names=[...new Set(mentionNames.filter(Boolean))].sort((a,b)=>b.length-a.length);
+  if(!names.length)return;
+  const pattern=new RegExp(`(^|[^\\p{L}\\p{N}\\p{M}_@])(@(?:${names.map(name=>name.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')).join('|')}))(?![\\p{L}\\p{N}\\p{M}_@-]|\\.[a-z0-9])`,'giu');
+  const walker=document.createTreeWalker(container,NodeFilter.SHOW_TEXT);
+  const nodes:Text[]=[];
+  while(walker.nextNode()){const node=walker.currentNode as Text;if(!node.parentElement?.closest('a,code,pre'))nodes.push(node);}
+  for(const node of nodes){
+    const value=node.data;const fragment=document.createDocumentFragment();let end=0;pattern.lastIndex=0;
+    for(const match of value.matchAll(pattern)){
+      const start=match.index!+match[1].length, finish=start+match[2].length;
+      const word=value.slice(0,start).split(/\s/).pop() || '';
+      if(/(?:https?:\/\/|www\.)/i.test(word))continue;
+      fragment.append(document.createTextNode(value.slice(end,start)));
+      const highlight=document.createElement('span');highlight.className='message-mention';highlight.textContent=value.slice(start,finish);fragment.append(highlight);end=finish;
+    }
+    if(end){fragment.append(document.createTextNode(value.slice(end)));node.replaceWith(fragment);}
+  }
 }
 
 /** Match an operator address in message prose, excluding quoted and code content. */

@@ -4,6 +4,9 @@ test.use({deviceScaleFactor:1});
 
 test('channel header retains panel controls on desktop and mobile', async ({ page, serviceURL }) => {
   let saved = '';
+  // The fixture service is shared between specs; keep this empty-project layout deterministic.
+  const state = `{"projects":[],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"}],"tasks":[],"jobs":[],"messages":[],"approvals":[]}`;
+  await page.route('**/api/state', route => route.fulfill({status:200,contentType:'application/json',body:state}));
   await page.route('**/api/usage**', async route => {
     if (route.request().method() === 'POST') saved = route.request().postData() || '';
     await route.fulfill({status:200, headers:{
@@ -80,6 +83,7 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await expect(page.locator('#work-panel')).toBeHidden();
   await right.click();
   await expect(page.locator('#work-panel')).toBeVisible();
+  await expect.poll(() => page.locator('#work-panel').evaluate(el => Math.abs(el.getBoundingClientRect().bottom - window.innerHeight))).toBeLessThan(2);
   await left.click();
   await expect(left).toHaveAttribute('aria-expanded', 'true');
   await expect(page.getByText('Projects will appear here.')).toBeVisible();
