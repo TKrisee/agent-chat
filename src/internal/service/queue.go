@@ -166,6 +166,19 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 					return err
 				}
 			}
+			if candidate.Request.Role == "po" && childReceiptOnly == 0 && reportOnly == 0 {
+				var parentPlanning int
+				if err := tx.QueryRow(`SELECT count(*) FROM po_followups f JOIN tasks t ON t.id=? AND t.project_id=? AND t.owner_id=? AND t.status='assigned' JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id AND p.stopped=0 WHERE f.source_id=? AND f.phase='assigned' AND NOT EXISTS(SELECT 1 FROM po_work_items i WHERE i.child_task_id=t.id)`, candidate.Task, candidate.Project, candidate.Agent, candidate.Source).Scan(&parentPlanning); err != nil {
+					return err
+				}
+				if parentPlanning == 1 {
+					candidate.Request.ParentPlanning = true
+					candidate.request, err = json.Marshal(candidate.Request)
+					if err != nil {
+						return err
+					}
+				}
+			}
 		}
 		if candidate.Status == "pending" && candidate.Request.Role == "root" && candidate.Kind == "operator_message" && !strings.HasPrefix(candidate.Request.Instructions, "App-owned status snapshot v1 at ") {
 			a, err := getAgent(tx, root)

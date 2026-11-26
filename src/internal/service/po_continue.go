@@ -74,6 +74,34 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if !eligible {
+			ambiguous, ambiguityOK, err := s.parentAmbiguityRecoveryEligible(tx, r.PathValue("id"))
+			if err != nil {
+				return err
+			}
+			if ambiguityOK {
+				if err := addMessage(tx, id, operator, ambiguous.po, "operator", note, ambiguous.project, r.PathValue("id")); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE tasks SET status='assigned' WHERE id=? AND project_id=? AND owner_id=? AND status='blocked'`, r.PathValue("id"), ambiguous.project, ambiguous.po)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errConflict
+				}
+				if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id) VALUES(?,?,1,'assigned',?,?)`, id, ambiguous.failed, ambiguous.assignment, id); err != nil {
+					return err
+				}
+				a, err := getAgent(tx, ambiguous.po)
+				if err != nil {
+					return err
+				}
+				return s.enqueue(tx, a, ambiguous.project, r.PathValue("id"), id, "po_followup", "The prior parent proposal was rejected before app actions applied; do not replay it. Completed child receipts have already been reviewed. Review and accept worker results only within their own receipt-pinned child review, never as parent actions. Use the original assignment and operator note to continue independent authorized work; preserve production stops, unresolved effects and all existing child states.")
+			}
 			planning, planningOK, err := s.approvalPlanningRecoveryEligible(tx, r.PathValue("id"))
 			if err != nil {
 				return err

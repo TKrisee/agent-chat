@@ -950,7 +950,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 				return nil
 			}
 			if matched > 1 {
-				return fmt.Errorf("%w: completed child recipient is ambiguous", errWorkflow)
+				return workItemPlanning("completed child recipient is ambiguous; accept each result only in its receipt-pinned child review, and plan or report the parent separately")
 			}
 		}
 		parentErr := parentTaskOwned(tx, j, a)

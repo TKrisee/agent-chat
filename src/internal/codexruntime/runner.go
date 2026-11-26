@@ -155,6 +155,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.ChildReceiptOnly {
 		add("child-receipt-only")
 	}
+	if req.ParentPlanning {
+		add("parent-planning")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -180,6 +183,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.ChildReceiptOnly && (req.Role != "po" || req.Kind != "po_followup" || req.ReportOnly) {
 		return errors.New("child receipt-only requires a PO follow-up")
+	}
+	if req.ParentPlanning && (req.Role != "po" || req.Kind != "po_followup" || req.TaskID == "" || req.ReportOnly || req.ChildReceiptOnly) {
+		return errors.New("parent planning requires an unrestricted PO parent follow-up")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")
@@ -334,6 +340,9 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
+	if req.ParentPlanning {
+		b.WriteString("\nThis is parent planning, not a child review. Completed child receipts are already recorded; do not accept them again. Continue authorized planning or report the parent outcome when ready.\n")
+	}
 	if (req.Role == "po" || req.Role == "worker") && req.ProjectID != "" && req.TaskID != "" && req.Kind != "operator_message" && req.Kind != "project_message" {
 		b.WriteString("\nWorkspace policy: An empty app-provided job directory is scratch, not an instruction to copy the project. For Git work, when authorized and permitted by the sandbox, reuse an existing isolated worktree or branch for the same owner, repository and work lane; keep concurrent work isolated. For small changes prefer an appropriately scoped checkout or sparse scope when practical. Do not recursively copy a full repository, generated dependencies or caches. For non-Git work, prefer the existing authorized workspace or a small local patch instead of a blanket copy. Preserve unmerged, dirty, uncertain and evidence-bearing work; do not reuse another owner's lane or overwrite unresolved work. Put deliverable artifacts and evidence in durable authorized project or app storage. Clean only scratch explicitly designated disposable; never delete source, workspaces, caches or evidence merely because a job ended.\n")
 		if req.Scratch != "" {

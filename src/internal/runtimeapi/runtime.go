@@ -39,6 +39,7 @@ type Request struct {
 	Scratch          string    `json:"scratch,omitempty"`
 	ReportOnly       bool      `json:"report_only,omitempty"`
 	ChildReceiptOnly bool      `json:"child_receipt_only,omitempty"`
+	ParentPlanning   bool      `json:"parent_planning,omitempty"`
 	Model            string    `json:"model"`
 	Effort           string    `json:"effort"`
 	Instructions     string    `json:"instructions"`
@@ -176,6 +177,9 @@ type LegacyMixedApprovalInspector interface {
 }
 type LegacyProgressInspector interface {
 	IsLegacyProgress(context.Context, []byte, string, string) bool
+}
+type LegacyParentPairInspector interface {
+	LegacyParentPairs(context.Context, []byte, string) (string, string, string, string, bool)
 }
 type LegacyApprovalPlanningInspector interface {
 	IsLegacyApprovalPlanning(context.Context, []byte, []byte, string) bool

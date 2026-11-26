@@ -65,3 +65,27 @@ func TestChildReceiptRecoverySchema(t *testing.T) {
 		t.Fatalf("schema: %v %s", err, out)
 	}
 }
+
+func TestParentPlanningSchema(t *testing.T) {
+	req := runtimeapi.Request{Role: "po", Kind: "po_followup", TaskID: "parent"}
+	original := fingerprint(req)
+	req.ParentPlanning = true
+	if fingerprint(req) == original {
+		t.Fatal("parent planning intent not bound")
+	}
+	cmd := exec.Command("jq", "-e", `(.properties.actions.items.properties.type.enum|index("accept_result"))==null and (.properties.actions.items.properties.type.enum|index("report"))!=null and (.properties.actions.items.properties.type.enum|index("queue_work_item"))!=null`)
+	cmd.Stdin = strings.NewReader(newJobSchema(req))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("schema: %v %s", err, output)
+	}
+	if !strings.Contains(prompt(req), "do not accept them again") {
+		t.Fatal("missing parent guidance")
+	}
+	req.ParentPlanning = false
+	req.ChildReceiptOnly = true
+	cmd = exec.Command("jq", "-e", `(.properties.actions.items.properties.type.enum|index("accept_result"))!=null`)
+	cmd.Stdin = strings.NewReader(newJobSchema(req))
+	if err := cmd.Run(); err != nil {
+		t.Fatal("child review lost accept_result")
+	}
+}

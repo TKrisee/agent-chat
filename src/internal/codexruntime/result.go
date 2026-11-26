@@ -58,6 +58,8 @@ func newJobSchema(req runtimeapi.Request) string {
 			ok = action == "accept_result" || action == "report" || action == "report_progress"
 		case req.ReportOnly:
 			ok = action == "report"
+		case req.ParentPlanning:
+			ok = action != "accept_result"
 		case req.Kind == "project_message" || req.Kind == "approval_denied":
 			ok = false
 		case req.Role == "worker" && req.Kind != "work":
