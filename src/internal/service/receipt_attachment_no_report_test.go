@@ -15,6 +15,10 @@ func TestReviewCanReferencePinnedAttachmentWithoutReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	pinned := runtimeapi.Attachment{Path: filepath.Join(s.dir, "attachments", id), Name: "evidence", MediaType: "text/markdown"}
+	unrelated, err := s.uploadAttachments(s.db, j, runtimeapi.Result{Attachments: []runtimeapi.Attachment{pinned}})
+	if err != nil || len(unrelated) != 1 {
+		t.Fatalf("unrelated no-report result was exempted: %v %v", unrelated, err)
+	}
 	result := runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "accept_result", Recipient: worker}, {Type: "report_progress", Recipient: root, Body: "Receipt accepted."}}, Attachments: []runtimeapi.Attachment{pinned}}
 	foreign := result
 	foreign.Attachments = []runtimeapi.Attachment{{Path: filepath.Join(s.dir, "attachments", newID()), Name: "evidence", MediaType: "text/markdown"}}

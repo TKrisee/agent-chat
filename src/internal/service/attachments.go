@@ -42,6 +42,17 @@ func (s *Service) uploadAttachments(db attachmentQuerier, j job, result runtimea
 	query := ""
 	switch {
 	case j.Request.Role == "po" && (j.Kind == "review" || j.Kind == "approval_approved" || j.Kind == "po_followup"):
+		reports := false
+		for _, action := range result.Actions {
+			if action.Type == "report" {
+				reports = true
+				break
+			}
+		}
+		receiptReview := (j.Kind == "review" || j.Kind == "po_followup") && len(result.Actions) == 2 && result.Actions[0].Type == "accept_result" && result.Actions[1].Type == "report_progress"
+		if !reports && !receiptReview {
+			return refs, nil
+		}
 		query = `SELECT a.id,a.name,a.media_type FROM message_attachments link
 			JOIN attachments a ON a.id=link.attachment_id
 			JOIN messages m ON m.id=link.message_id
