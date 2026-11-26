@@ -14,6 +14,12 @@ test('unread banner jumps to latest read without marking messages read', async (
   await expect(page.locator('[data-message-id="m5"]')).toBeInViewport();
   expect(reads).toBe(0);
   await expect(page.locator('.group-unread-banner')).toBeVisible();
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await expect(page.locator('.group-unread-banner')).toHaveCount(0);
+  await page.waitForResponse(response => response.url().endsWith('/api/state'), {timeout:10000});
+  await expect(page.locator('.group-unread-banner')).toHaveCount(0);
+  await page.locator('[data-project="atlas"]').click();
+  await expect(page.locator('.group-unread-banner')).toBeVisible();
   await page.getByRole('button',{name:'Mark as read'}).click();
   await expect.poll(()=>reads).toBeGreaterThan(0);
 });
