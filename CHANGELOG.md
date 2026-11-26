@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.18.11](https://github.com/TKrisee/agent-chat/compare/v0.18.10...v0.18.11) (2026-11-26)
+
+
+### Bug Fixes
+
+* highlight chat mentions and isolate sidebar coverage ([d3459d7](https://github.com/TKrisee/agent-chat/commit/d3459d7ffe4d45c920ee8f9cf105217735251f3a))
+* preserve chat scroll and align mobile layout ([d41ecb4](https://github.com/TKrisee/agent-chat/commit/d41ecb4e18ea6695ee29f64a7305427a0383a454))
+* support larger attachment batches and image galleries ([88f82b3](https://github.com/TKrisee/agent-chat/commit/88f82b33b859fb5cf997a0a0e0362b32206526dd))
+
 ## [0.18.10](https://github.com/TKrisee/agent-chat/compare/v0.18.9...v0.18.10) (2026-11-26)
 
 
