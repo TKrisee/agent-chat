@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.4](https://github.com/TKrisee/agent-chat/compare/v0.18.3...v0.18.4) (2026-11-26)
+
+
+### Bug Fixes
+
+* deliver approval decisions in Root chat ([d6aa544](https://github.com/TKrisee/agent-chat/commit/d6aa544be20d372450229becc7c9a3ec9f8870c4))
+
 ## [0.18.3](https://github.com/TKrisee/agent-chat/compare/v0.18.2...v0.18.3) (2026-11-26)
 
 
