@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.15](https://github.com/TKrisee/agent-chat/compare/v0.18.14...v0.18.15) (2026-11-26)
+
+
+### Bug Fixes
+
+* bound parent outcome summaries without losing reviews ([65101a8](https://github.com/TKrisee/agent-chat/commit/65101a8bfca54226fc5500af2250e05f6cbb1cd1))
+
 ## [0.18.14](https://github.com/TKrisee/agent-chat/compare/v0.18.13...v0.18.14) (2026-11-26)
 
 
