@@ -25,7 +25,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await expect(page.locator('[data-agent]').first()).toHaveAttribute('aria-label', /(?:Idle|Working|Starting|Queued|Needs attention|Failed|Stopped|Status unavailable)/);
   await group.fill('Shared untagged message');
   await group.press('Enter');
-  await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
+  await expect(page.locator('.chat p').getByText('Shared untagged message', {exact:true})).toBeVisible();
   // The visible post can precede the send acknowledgement that unlocks group mentions.
   await expect(page.locator('#composer')).toHaveAttribute('aria-busy','false');
   await expect(group).toBeEditable();
@@ -68,7 +68,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await direct.press('Enter');
   await directReady;
   await project.click();
-  await expect(page.locator('.chat').getByText('Shared untagged message', {exact:true})).toBeVisible();
+  await expect(page.locator('.chat p').getByText('Shared untagged message', {exact:true})).toBeVisible();
   await expect(page.getByText('Private direct message', {exact:true})).toHaveCount(0);
   await page.getByRole('button', {name:/Root conversation/}).click();
   const rootComposer=page.getByLabel('Message Root');
