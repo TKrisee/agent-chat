@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.5](https://github.com/TKrisee/agent-chat/compare/v0.18.4...v0.18.5) (2026-11-26)
+
+
+### Bug Fixes
+
+* add notes and highlight pending approvals ([4b8d48f](https://github.com/TKrisee/agent-chat/commit/4b8d48fd2622d3d297d6e9bbfaf011feea3d15e2))
+
 ## [0.18.4](https://github.com/TKrisee/agent-chat/compare/v0.18.3...v0.18.4) (2026-11-26)
 
 
