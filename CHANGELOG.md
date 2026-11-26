@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/TKrisee/agent-chat/compare/v0.16.3...v0.17.0) (2026-11-26)
+
+
+### Features
+
+* show agent models in the project sidebar ([3a0a060](https://github.com/TKrisee/agent-chat/commit/3a0a060047db6eb38ec3f7ce82da3714908d19be))
+
 ## [0.16.3](https://github.com/TKrisee/agent-chat/compare/v0.16.2...v0.16.3) (2026-11-26)
 
 
