@@ -140,6 +140,12 @@ CREATE TABLE IF NOT EXISTS po_report_recoveries (
  child_id TEXT NOT NULL REFERENCES tasks(id),
  failed_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id)
 );
+CREATE TABLE IF NOT EXISTS approval_planning_recoveries (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id),
+ task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+ failed_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+ decision_id TEXT NOT NULL REFERENCES messages(id)
+);
 CREATE TABLE IF NOT EXISTS po_child_receipt_recoveries (
  source_id TEXT PRIMARY KEY REFERENCES messages(id),
  task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),

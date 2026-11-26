@@ -258,6 +258,15 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		if err != nil {
 			return nil, err
 		}
+		var approvedDecision string
+		err = tx.QueryRow(`SELECT decision_id FROM approval_planning_recoveries WHERE source_id=? AND task_id=?`, source[0], task).Scan(&approvedDecision)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if approvedDecision != "" {
+			query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id=? AND task_id=? AND project_id=? AND sender=? AND recipient=? AND room_id=?`
+			args = append(args, approvedDecision, task, project, operator, a.ID, directRoom(operator, a.ID))
+		}
 		var valid int
 		err = tx.QueryRow(`SELECT count(*) FROM jobs j JOIN messages m ON m.id=? WHERE j.id=? AND j.task_id=? AND j.project_id=? AND j.agent_id=? AND (m.task_id=j.task_id OR EXISTS(SELECT 1 FROM po_work_items i WHERE i.child_task_id=j.task_id AND i.parent_task_id=m.task_id)) AND m.project_id=j.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=?`, f.assignment, f.trigger, task, project, a.ID, root, a.ID, directRoom(root, a.ID)).Scan(&valid)
 		if err != nil {
@@ -506,6 +515,27 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
 	}
 	if j.Kind == "po_followup" {
+		var approvalPlanning int
+		if err := tx.QueryRow(`SELECT count(*) FROM approval_planning_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&approvalPlanning); err != nil {
+			return err
+		}
+		if approvalPlanning != 0 {
+			work, progress := 0, 0
+			for _, action := range result.Actions {
+				switch action.Type {
+				case "queue_work_item":
+					work++
+				case "report_progress":
+					progress++
+				default:
+					return fmt.Errorf("%w: approval recovery permits one new work item and optional progress", errWorkflow)
+				}
+			}
+			if a.Role != "po" || work > 1 || progress > 1 || len(files) != 0 || len(result.Attachments) != 0 {
+				return fmt.Errorf("%w: approval recovery permits one new work item and optional progress", errWorkflow)
+			}
+			result.Text = ""
+		}
 		var childReceiptOnly int
 		if err := tx.QueryRow(`SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&childReceiptOnly); err != nil {
 			return err
@@ -918,6 +948,13 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			if matched > 1 {
 				return fmt.Errorf("%w: completed child recipient is ambiguous", errWorkflow)
 			}
+		}
+		parentErr := parentTaskOwned(tx, j, a)
+		if parentErr != nil && !errors.Is(parentErr, errWorkflow) {
+			return parentErr
+		}
+		if parentErr == nil {
+			return workItemPlanning("accept worker results only in the receipt-pinned child review; the parent must plan independent work or report a blocker")
 		}
 		worker, err := activeReviewWorker(tx, j, a.ID)
 		if err != nil {

@@ -74,6 +74,37 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if !eligible {
+			planning, planningOK, err := s.approvalPlanningRecoveryEligible(tx, r.PathValue("id"))
+			if err != nil {
+				return err
+			}
+			if planningOK {
+				if err := addMessage(tx, id, operator, planning.po, "operator", note, planning.project, r.PathValue("id")); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE tasks SET status='assigned' WHERE id=? AND project_id=? AND owner_id=? AND status='blocked'`, r.PathValue("id"), planning.project, planning.po)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errConflict
+				}
+				if _, err = tx.Exec(`INSERT INTO approval_planning_recoveries(source_id,task_id,failed_job_id,decision_id) VALUES(?,?,?,?)`, id, r.PathValue("id"), planning.failed, planning.decision); err != nil {
+					return err
+				}
+				if _, err = tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id) VALUES(?,?,1,'assigned',?,?)`, id, planning.failed, planning.assignment, id); err != nil {
+					return err
+				}
+				a, err := getAgent(tx, planning.po)
+				if err != nil {
+					return err
+				}
+				return s.enqueue(tx, a, planning.project, r.PathValue("id"), id, "po_followup", "The operator requests fresh planning for this same assignment. Two prior proposals were rejected before their app actions applied: do not replay them. Read the exact approved decision receipt, original assignment and operator note. This turn permits at most one new queue_work_item and one optional report_progress; no other actions or attachments. Preserve all blocked child work, production stops and scope. Review each worker receipt on its own child task; do not accept child results from the parent. Never repeat uncertain work.")
+			}
 			approval, approvalOK, err := s.legacyMixedApprovalRecovery(tx, r.PathValue("id"))
 			if err != nil {
 				return err
