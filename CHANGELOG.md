@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.12](https://github.com/TKrisee/agent-chat/compare/v0.18.11...v0.18.12) (2026-11-26)
+
+
+### Bug Fixes
+
+* keep the unread banner out of settings ([1eebb10](https://github.com/TKrisee/agent-chat/commit/1eebb101433160d92999bd52eb45fffa5751b83d))
+
 ## [0.18.11](https://github.com/TKrisee/agent-chat/compare/v0.18.10...v0.18.11) (2026-11-26)
 
 
