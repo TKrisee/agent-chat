@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type AttachmentRef struct {
@@ -74,13 +75,14 @@ type Agent struct {
 }
 
 type Approval struct {
-	ID          string `json:"id"`
-	Project     string `json:"project_id"`
-	Task        string `json:"task_id"`
-	RequestedBy string `json:"requested_by"`
-	Title       string `json:"title"`
-	Body        string `json:"body"`
-	Status      string `json:"status"`
+	DecisionNote string `json:"decision_note,omitempty"`
+	ID           string `json:"id"`
+	Project      string `json:"project_id"`
+	Task         string `json:"task_id"`
+	RequestedBy  string `json:"requested_by"`
+	Title        string `json:"title"`
+	Body         string `json:"body"`
+	Status       string `json:"status"`
 }
 
 type Job struct {
@@ -292,10 +294,10 @@ func (s *Service) state() (State, error) {
 		if err != nil {
 			return err
 		}
-		view.Approvals, err = querySlice(tx, `SELECT id,COALESCE(project_id,''),COALESCE(task_id,''),
-			requested_by,title,body,status FROM approvals ORDER BY rowid`, func(rows *sql.Rows) (Approval, error) {
+		view.Approvals, err = querySlice(tx, `SELECT a.id,COALESCE(a.project_id,''),COALESCE(a.task_id,''),
+			a.requested_by,a.title,a.body,a.status,COALESCE(n.note,'') FROM approvals a LEFT JOIN approval_decision_notes n ON n.approval_id=a.id ORDER BY a.rowid`, func(rows *sql.Rows) (Approval, error) {
 			var a Approval
-			err := rows.Scan(&a.ID, &a.Project, &a.Task, &a.RequestedBy, &a.Title, &a.Body, &a.Status)
+			err := rows.Scan(&a.ID, &a.Project, &a.Task, &a.RequestedBy, &a.Title, &a.Body, &a.Status, &a.DecisionNote)
 			return a, err
 		})
 		if err != nil {
@@ -564,6 +566,7 @@ func updateStop(tx *sql.Tx, id string, stopped bool) (int, error) {
 func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Decision string `json:"decision"`
+		Note     string `json:"note"`
 	}
 	if err := requestJSON(w, r, &body); err != nil {
 		httpFailure(w, err)
@@ -571,6 +574,11 @@ func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.Decision != "approved" && body.Decision != "denied" {
 		httpFailure(w, fmt.Errorf("%w: decision must be approved or denied", errInvalid))
+		return
+	}
+	body.Note = strings.TrimSpace(body.Note)
+	if !utf8.ValidString(body.Note) || len(body.Note) > 4096 {
+		httpFailure(w, fmt.Errorf("%w: decision note must be at most 4096 UTF-8 bytes", errInvalid))
 		return
 	}
 	id := r.PathValue("id")
@@ -585,6 +593,16 @@ func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if status == body.Decision {
+			if body.Note != "" {
+				var saved string
+				err := tx.QueryRow("SELECT note FROM approval_decision_notes WHERE approval_id=?", id).Scan(&saved)
+				if errors.Is(err, sql.ErrNoRows) || (err == nil && saved != body.Note) {
+					return fmt.Errorf("%w: approval decision note already recorded", errConflict)
+				}
+				if err != nil {
+					return err
+				}
+			}
 			return nil
 		}
 		if status != "pending" {
@@ -593,12 +611,20 @@ func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
 		if _, err := tx.Exec("UPDATE approvals SET status=? WHERE id=?", body.Decision, id); err != nil {
 			return err
 		}
+		if body.Note != "" {
+			if _, err := tx.Exec("INSERT INTO approval_decision_notes(approval_id,note) VALUES(?,?)", id, body.Note); err != nil {
+				return err
+			}
+		}
 		a, err := getAgent(tx, who)
 		if err != nil {
 			return err
 		}
 		messageID := newID()
 		text := "Operator " + body.Decision + " “" + title + "”.\n" + request
+		if body.Note != "" {
+			text += "\n\nOperator decision note: " + body.Note
+		}
 		if err := addMessage(tx, messageID, operator, who, "operator", text, project, task); err != nil {
 			return err
 		}
