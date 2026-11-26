@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.1](https://github.com/TKrisee/agent-chat/compare/v0.19.0...v0.19.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* limit receipt reuse to PO review decisions ([e4ef95d](https://github.com/TKrisee/agent-chat/commit/e4ef95d3cffcac644040065dd904884cec30e045))
+* retain pinned attachments in PO reviews ([a52e19d](https://github.com/TKrisee/agent-chat/commit/a52e19d7922fa4866ac6f4c280998e68da61e30e))
+
 ## [0.19.0](https://github.com/TKrisee/agent-chat/compare/v0.18.15...v0.19.0) (2026-11-26)
 
 
