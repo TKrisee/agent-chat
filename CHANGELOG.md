@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.2](https://github.com/TKrisee/agent-chat/compare/v0.18.1...v0.18.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* give Root the verified details behind blocked work ([f95598f](https://github.com/TKrisee/agent-chat/commit/f95598f2124290d29286f3ade018b9e5e889791c))
+
 ## [0.18.1](https://github.com/TKrisee/agent-chat/compare/v0.18.0...v0.18.1) (2026-11-26)
 
 
