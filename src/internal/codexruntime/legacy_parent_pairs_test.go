@@ -13,6 +13,14 @@ func TestLegacyParentPairs(t *testing.T) {
 	if !ok || a != "First" || b != "worker-a" || c != "Second" || d != "worker-b" {
 		t.Fatal("valid pairs not extracted")
 	}
+	withEmpty := strings.ReplaceAll(payload, `"type":`, `"depends_on":[],"type":`)
+	if _, _, _, _, ok := r.LegacyParentPairs(context.Background(), []byte(withEmpty), "alpha"); !ok {
+		t.Fatal("empty dependency fields rejected")
+	}
+	withDependency := strings.Replace(withEmpty, `"depends_on":[]`, `"depends_on":["unrelated"]`, 1)
+	if _, _, _, _, ok := r.LegacyParentPairs(context.Background(), []byte(withDependency), "alpha"); ok {
+		t.Fatal("unproven dependency accepted")
+	}
 	for _, bad := range []string{strings.Replace(payload, `"Second"`, `"Other"`, 1), strings.Replace(payload, `"accept_result"`, `"stop_project"`, 1), strings.Replace(payload, `"attachments":[]`, `"attachments":[{}]`, 1)} {
 		_, _, _, _, ok := r.LegacyParentPairs(context.Background(), []byte(bad), "alpha")
 		if ok {

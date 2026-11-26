@@ -56,6 +56,19 @@ func TestPOMultiWorkerActionContract(t *testing.T) {
 	}
 }
 
+func TestWorkItemDependenciesDecode(t *testing.T) {
+	r, req, _ := setup(t)
+	req.Role, req.Kind, req.ProjectID = "po", "assignment", "alpha"
+	t.Setenv("FAKE_RESULT", `{"text":"","actions":[{"type":"queue_work_item","project":"alpha","title":"Second","body":"Work","recipient":"worker","depends_on":["First item","Review, notes"]}],"attachments":[]}`)
+	result, err := r.Execute(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Actions) != 1 || strings.Join(result.Actions[0].DependsOn, "|") != "First item|Review, notes" {
+		t.Fatalf("dependencies: %+v", result.Actions)
+	}
+}
+
 func TestGroupReplyContract(t *testing.T) {
 	r, req, _ := setup(t)
 	req.Role, req.Kind, req.ProjectID = "worker", "work", "alpha"

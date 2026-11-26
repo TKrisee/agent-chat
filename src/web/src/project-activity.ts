@@ -3,7 +3,7 @@ export type ActivityProject = {id:string; name:string; po_id:string; goal_object
 export type ActivityAgent = {id:string; name:string; role:string; project_id:string; status:string; model?:string; parent_id?:string; one_shot_retired?:boolean};
 export type ActivityJob = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; source_id?:string; kind?:string; superseded?:boolean};
 export type ActivityMessage = {id:string; room_id:string; sender:string; recipient:string; text:string; at:string; project_id?:string};
-export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean};
+export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string; waiting_on_dependencies?:boolean; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean};
 export type ActivityState = {projects:ActivityProject[]; agents:ActivityAgent[]; jobs:ActivityJob[]; messages:ActivityMessage[]; tasks:ActivityTask[]};
 const escape = (value:unknown) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 const short = (value:string, limit:number) => Array.from(value).slice(0,limit).join('') + (Array.from(value).length > limit ? '…' : '');
@@ -23,7 +23,7 @@ export function renderProjectActivity(state:ActivityState, projectId:string, roo
  const team=members.filter(a=>!a.one_shot_retired).map(teamRow).join('');
  const past=members.filter(a=>a.one_shot_retired);
  const pastTeam=past.length?`<details data-diagnostic="panel:past-team:${escape(projectId)}" ${isOpen('panel:past-team:'+projectId)}><summary>Past one-shot workers (${past.length})</summary><ul class="pa-team">${past.map(teamRow).join('')}</ul></details>`:'';
- const work=tasks.map(t=>{const attempts=jobs.filter(j=>j.task_id===t.id && !j.superseded);const latest=attempts.at(-1);const status=latest && ['pending','submitted','running'].includes(latest.status)?({pending:'Queued',submitted:'Starting',running:'Working'} as Record<string,string>)[latest.status]:latest?.status==='uncertain'?'Needs attention':latest?.status==='completed' && latest.diagnostic?.trim()?'Failed':t.status;return `<li><strong>${escape(t.title)}</strong><small>${escape(status)} · ${escape(who(t.owner_id))}</small>${diagnostics(t)}</li>`;}).join('');
+ const work=tasks.map(t=>{const attempts=jobs.filter(j=>j.task_id===t.id && !j.superseded);const latest=attempts.at(-1);const status=t.waiting_on_dependencies?'Waiting on dependencies':latest && ['pending','submitted','running'].includes(latest.status)?({pending:'Queued',submitted:'Starting',running:'Working'} as Record<string,string>)[latest.status]:latest?.status==='uncertain'?'Needs attention':latest?.status==='completed' && latest.diagnostic?.trim()?'Failed':t.status;return `<li><strong>${escape(t.title)}</strong><small>${escape(status)} · ${escape(who(t.owner_id))}</small>${diagnostics(t)}</li>`;}).join('');
  const messages=state.messages.filter(m=>m.room_id===roomId).slice(-8).reverse();
  const exchanges=messages.map(m=>`<li><small>${escape(who(m.sender))} · ${escape(time(m.at))}</small><p>${escape(short(m.text,180))}</p></li>`).join('');
  const goal=project.goal_objective?`<details data-diagnostic="panel:goal:${escape(projectId)}" ${isOpen('panel:goal:'+projectId)}><summary>PO goal <small>${escape(project.goal_status || '')}</small></summary><p class="pa-goal">${escape(project.goal_objective)}</p></details>`:'';

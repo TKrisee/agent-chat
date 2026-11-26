@@ -20,7 +20,7 @@ func (r *Runner) IsLegacyApprovalPlanning(ctx context.Context, prior, approved [
 	const filter = `
 def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
 def shape: type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and (.actions|type=="array" and length>0 and length<=12);
-def common: type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to"])==[]) and ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and (.project=="" or .project==$project);
+def common: type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on"])==[]) and ((has("depends_on")|not) or .depends_on==[]) and ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and (.project=="" or .project==$project);
 def progress: .type=="report_progress" and .title=="" and (.body|nonblank) and (.recipient=="" or .recipient=="root");
 split("\n") | if length!=2 then false else (.[0]|@base64d|fromjson) as $prior | (.[1]|@base64d|fromjson) as $approved |
 ($prior|shape) and ($approved|shape) and

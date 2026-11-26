@@ -147,12 +147,16 @@ func (r *Runner) RetrySetup() bool {
 	return true
 }
 func (r *Runner) readyExecutable() (string, error) {
+	path, _, err := r.readyExecutableSource()
+	return path, err
+}
+func (r *Runner) readyExecutableSource() (string, string, error) {
 	r.setupMu.RLock()
 	defer r.setupMu.RUnlock()
 	if r.setupState.State != "ready" || r.setupPath == "" {
-		return "", errors.New("Codex setup is not ready")
+		return "", "", errors.New("Codex setup is not ready")
 	}
-	return r.setupPath, nil
+	return r.setupPath, r.setupState.Source, nil
 }
 
 // ResolveCLI prepares the same managed package for explicit version/login commands.

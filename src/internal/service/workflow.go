@@ -532,6 +532,11 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	if len(result.Text) > 128*1024 || len(result.Actions) > 12 {
 		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
 	}
+	for _, action := range result.Actions {
+		if len(action.DependsOn) != 0 && action.Type != "queue_work_item" {
+			return fmt.Errorf("%w: dependencies require a work item", errWorkflow)
+		}
+	}
 	if j.Kind == "po_followup" {
 		var approvalPlanning int
 		if err := tx.QueryRow(`SELECT count(*) FROM approval_planning_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&approvalPlanning); err != nil {

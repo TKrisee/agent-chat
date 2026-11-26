@@ -65,6 +65,23 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 	if duplicate != 0 {
 		return workItemPlanning("work item title already exists; use the recorded item and do not duplicate work")
 	}
+	var prerequisites []string
+	seen := make(map[string]bool)
+	for _, title := range action.DependsOn {
+		var id string
+		err := tx.QueryRow(`SELECT c.id FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.title=?`, j.Task, title).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) || title == "" {
+			return workItemPlanning("dependency must name an existing earlier work item in this parent")
+		}
+		if err != nil {
+			return err
+		}
+		if seen[id] {
+			return workItemPlanning("duplicate work item dependency")
+		}
+		seen[id] = true
+		prerequisites = append(prerequisites, id)
+	}
 	var worker agent
 	var id string
 	rows, err := querySlice(tx, `SELECT id FROM agents WHERE project_id=? AND role='worker' AND (id=? OR name=?)`, func(rows *sql.Rows) (string, error) { var id string; e := rows.Scan(&id); return id, e }, j.Project, action.Recipient, action.Recipient)
@@ -100,6 +117,11 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 	if _, err = tx.Exec(`INSERT INTO po_work_items(parent_task_id,child_task_id) VALUES(?,?)`, j.Task, child); err != nil {
 		return err
 	}
+	for _, id := range prerequisites {
+		if _, err = tx.Exec(`INSERT INTO po_work_dependencies(child_task_id,prerequisite_task_id) VALUES(?,?)`, child, id); err != nil {
+			return err
+		}
+	}
 	if _, err = tx.Exec(`UPDATE one_shot_workers SET child_task_id=? WHERE agent_id=? AND child_task_id IS NULL`, child, id); err != nil {
 		return err
 	}
@@ -122,7 +144,7 @@ func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	}
 	var parentStatus, poID string
 	var stopped, open, busy int
-	err = tx.QueryRow(`SELECT t.status,t.owner_id,p.stopped,(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=t.id AND c.status IN ('queued','review','accepted')),(SELECT count(*) FROM jobs q WHERE q.task_id=t.id AND q.kind='po_followup' AND q.status IN ('pending','submitted','running')) FROM tasks t JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id WHERE t.id=? AND t.project_id=?`, parent, j.Project).Scan(&parentStatus, &poID, &stopped, &open, &busy)
+	err = tx.QueryRow(`SELECT t.status,t.owner_id,p.stopped,(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=t.id AND c.status IN ('queued','review','accepted') AND NOT (c.status='queued' AND EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=c.id AND prerequisite.status!='completed'))),(SELECT count(*) FROM jobs q WHERE q.task_id=t.id AND q.kind='po_followup' AND q.status IN ('pending','submitted','running')) FROM tasks t JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id WHERE t.id=? AND t.project_id=?`, parent, j.Project).Scan(&parentStatus, &poID, &stopped, &open, &busy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

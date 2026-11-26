@@ -21,7 +21,7 @@ func (r *Runner) LegacyParentPairs(ctx context.Context, payload []byte, project 
 	const filter = `
 def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
 if type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and ([.actions[]?.type]==["accept_result","report","accept_result","report"]) and
-all(.actions[];type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to"])==[]) and ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and (.project=="" or .project==$project) and (.title|nonblank) and
+all(.actions[];type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on"])==[]) and ((has("depends_on")|not) or .depends_on==[]) and ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and (.project=="" or .project==$project) and (.title|nonblank) and
 if .type=="accept_result" then (.recipient|nonblank) else (.recipient=="" or .recipient=="root") and (.body|nonblank) end) and .actions[0].title==.actions[1].title and .actions[2].title==.actions[3].title and .actions[0].title!=.actions[2].title
 then [.actions[0].title,.actions[0].recipient,.actions[2].title,.actions[2].recipient]|map(@base64)|@tsv else error("not a parent pair") end`
 	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "-r", "--arg", "project", project, filter)

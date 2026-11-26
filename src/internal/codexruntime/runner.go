@@ -388,6 +388,7 @@ func prompt(req runtimeapi.Request) string {
 		b.WriteString("\nWhen the operator requests a one-shot worker, use create_one_shot_worker with the exact worker name in title; project may be empty or the current project, and body, recipient, task and reply_to must be empty. Bind that worker to one appropriate child using queue_work_item. Review its result normally; do not reuse it for another child or bypass recovery safeguards.\n")
 		b.WriteString("\nAn approval request must be the only action in its response: never combine request_approval with progress, worker creation, dispatch, posts or any other action. Nothing in a rejected mixed response was applied. Continue independent work that does not need approval in separate turns; a denial never authorizes dispatch of the denied work.\n")
 		b.WriteString("\nYou are the PO, not Root: never emit resolve_hold. If a continuation says a hold is already resolved, follow its recorded decision and use only PO actions for the current task.\n")
+		b.WriteString("For queue_work_item, put exact case-sensitive titles of prerequisite sibling work items in depends_on; choose existing siblings or earlier queue_work_item actions in this same response. Use an empty array for independent work and for every other action. Queue independent scoped assignments together when appropriate; dependent work waits for PO-reviewed completion. Include authorized artifact paths or links and expected inputs in each deferred brief: the dependency does not forward private reviews. Never infer completion or bypass an approval, stop, or uncertain effect. If the runtime offers native subagents, you may use bounded read-only planning or analysis within the current authorization; durable project implementation, ownership and review still belong to Agent Chat workers and their recorded tasks.\n")
 		b.WriteString("\nPlan the whole authorized scope and coordinate workers; workers implement leaf items and you review their results. Provision the needed team and delegate distinct work items over multiple turns. Review each child result, and report the parent outcome only after all required items are confirmed. Continue independent authorized work when an item is blocked; after two further failed permitted approaches on the same blocked item, stop that item and escalate its exact blocker. Never repeat an uncertain effect. For create_worker use title as the exact agent name with no whitespace; leave project, body, recipient and task empty, or use the exact current project in project. For queue_work_item use a scoped title and body, the exact same-project worker ID or name in recipient, and an empty task; project may be empty or the exact current project. The service validates every proposal.\n")
 	}
 	if req.Role == "worker" && req.Kind == "work" {
@@ -411,7 +412,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	if err := validate(req); err != nil {
 		return zero, err
 	}
-	codexPath, err := r.readyExecutable()
+	codexPath, source, err := r.readyExecutableSource()
 	if err != nil {
 		return zero, err
 	}
@@ -498,6 +499,9 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		}
 	}
 	args := []string{"exec", "--ephemeral", "--color", "never", "--skip-git-repo-check", "--cd", req.Workspace, "--output-schema", filepath.Join(dir, "schema.json"), "--output-last-message", filepath.Join(dir, "result.json")}
+	if source == "managed" && req.Role == "po" && (req.Kind == "scope_review" || req.Kind == "assignment" || req.Kind == "po_continue" || req.Kind == "po_followup" || req.Kind == "review") {
+		args = append(args, "--enable", "multi_agent_v2")
+	}
 	if req.Scratch != "" {
 		args = append(args, "--add-dir", req.Scratch)
 	}

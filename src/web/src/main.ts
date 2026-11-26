@@ -7,7 +7,7 @@ import {renderMessageMarkdown, mentionsOperator} from './message-markdown';
 type Attachment = {id:string; name:string; media_type:string; url:string};
 type Message = {id:string; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]; approval_id?:string};
 type Project = {id:string; name:string; status:string; po_id:string; goal_objective?:string; goal_status?:string};
-type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean; resolve_hold_eligible?:boolean};
+type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; waiting_on_dependencies?:boolean; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean; resolve_hold_eligible?:boolean};
 type Job = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string; superseded?:boolean};
 type Agent = {id:string; name:string; role:string; project_id:string; status:string; model:string; parent_id?:string; one_shot_retired?:boolean};
 type Approval = {id:string;status:string;decision_note?:string};
@@ -300,7 +300,7 @@ function attachments(items:Attachment[]):string {
 function memberActivity(agent:Agent):{label:string;active:boolean} {
  if(loading || stateStale)return {label:'Status unavailable',active:false};
  if(agent.status==='stopped')return {label:'Stopped',active:false};
- const jobs=state.jobs.filter(j=>j.agent_id===agent.id);
+ const jobs=state.jobs.filter(j=>j.agent_id===agent.id && !(j.status==='pending' && state.tasks.some(t=>t.id===j.task_id && t.waiting_on_dependencies)));
  if(jobs.some(j=>j.status==='running'))return {label:'Working',active:true};
  if(jobs.some(j=>j.status==='submitted'))return {label:'Starting',active:false};
  if(jobs.some(j=>j.status==='pending'))return {label:'Queued',active:false};
@@ -312,7 +312,7 @@ function agentActivity(target:string): {label:string; detail?:string; guidance?:
  if(loading) return {label:'Loading',busy:false};
  if(stateStale) return {label:'Status unavailable',busy:false};
  const groupProject=state.projects.find(p=>'group:'+p.id===target);
- const jobs=groupProject ? state.jobs.filter(j=>j.project_id===groupProject.id && j.kind==='project_message') : state.jobs.filter(j=>j.agent_id===target && j.kind!=='project_message');
+ const jobs=groupProject ? state.jobs.filter(j=>j.project_id===groupProject.id && j.kind==='project_message') : state.jobs.filter(j=>j.agent_id===target && j.kind!=='project_message' && !(j.status==='pending' && state.tasks.some(t=>t.id===j.task_id && t.waiting_on_dependencies)));
  const newest=(status:string)=>[...jobs].reverse().find(j=>j.status===status);
  const current=newest('running') || newest('submitted') || newest('pending') || (jobs.at(-1)?.status==='uncertain' ? jobs.at(-1) : undefined);
  if(current){const reason=current.diagnostic?.trim();

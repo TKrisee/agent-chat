@@ -76,13 +76,14 @@ type Result struct {
 }
 
 type Action struct {
-	Type      string `json:"type"`
-	ReplyTo   string `json:"reply_to,omitempty"`
-	Task      string `json:"task,omitempty"`
-	Project   string `json:"project"`
-	Title     string `json:"title"`
-	Body      string `json:"body"`
-	Recipient string `json:"recipient"`
+	Type      string   `json:"type"`
+	DependsOn []string `json:"depends_on,omitempty"`
+	ReplyTo   string   `json:"reply_to,omitempty"`
+	Task      string   `json:"task,omitempty"`
+	Project   string   `json:"project"`
+	Title     string   `json:"title"`
+	Body      string   `json:"body"`
+	Recipient string   `json:"recipient"`
 }
 
 type Attachment struct {

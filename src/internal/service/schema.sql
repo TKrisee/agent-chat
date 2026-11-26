@@ -142,6 +142,11 @@ CREATE TABLE IF NOT EXISTS po_work_items (
  child_task_id TEXT PRIMARY KEY REFERENCES tasks(id)
 );
 CREATE INDEX IF NOT EXISTS po_work_items_parent ON po_work_items(parent_task_id);
+CREATE TABLE IF NOT EXISTS po_work_dependencies (
+ child_task_id TEXT NOT NULL REFERENCES po_work_items(child_task_id),
+ prerequisite_task_id TEXT NOT NULL REFERENCES po_work_items(child_task_id),
+ PRIMARY KEY(child_task_id, prerequisite_task_id)
+);
 CREATE TABLE IF NOT EXISTS po_planning_wakes (
  source_id TEXT PRIMARY KEY REFERENCES messages(id)
 );

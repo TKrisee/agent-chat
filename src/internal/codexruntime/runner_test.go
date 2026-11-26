@@ -100,6 +100,36 @@ func TestWorkerScratchIsWritableAndBoundToReceipt(t *testing.T) {
 	}
 }
 
+func TestManagedPOSubagentOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		source, role, kind string
+		enabled            bool
+	}{
+		{"managed", "po", "assignment", true}, {"managed", "po", "scope_review", true},
+		{"managed", "po", "review", true}, {"managed", "po", "operator_message", false},
+		{"managed", "worker", "work", false}, {"override", "po", "assignment", false},
+	} {
+		t.Run(tc.source+"/"+tc.role+"/"+tc.kind, func(t *testing.T) {
+			r, req, dir := setup(t)
+			r.setupState.Source = tc.source
+			req.Role, req.Kind = tc.role, tc.kind
+			argsPath := filepath.Join(dir, "args")
+			t.Setenv("FAKE_ARGS", argsPath)
+			t.Setenv("FAKE_RESULT", `{"text":"done","actions":[],"attachments":[]}`)
+			if _, err := r.Execute(context.Background(), req); err != nil {
+				t.Fatal(err)
+			}
+			args, err := os.ReadFile(argsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains("\n"+string(args)+"\n", "\n--enable\nmulti_agent_v2\n"); got != tc.enabled {
+				t.Fatalf("opt-in = %v, want %v", got, tc.enabled)
+			}
+		})
+	}
+}
+
 func setup(t *testing.T) (*Runner, runtimeapi.Request, string) {
 	t.Helper()
 	tmp := t.TempDir()

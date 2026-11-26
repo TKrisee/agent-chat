@@ -18,10 +18,10 @@ import (
 
 // The native CLI validates this response shape. jq independently validates and
 // extracts the resulting JSON; the Go adapter never parses JSON itself.
-const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","task","reply_to"],"properties":{"reply_to":{"type":"string"},"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","report_progress","request_approval","post_group","hold_task","resolve_hold","create_worker","queue_work_item"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"task":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+const outputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","task","reply_to","depends_on"],"properties":{"depends_on":{"type":"array","items":{"type":"string"}},"reply_to":{"type":"string"},"type":{"type":"string","enum":["create_project","delegate","stop_project","resume_project","set_project_goal","set_project_goal_status","queue_worker","accept_result","report","report_progress","request_approval","post_group","hold_task","resolve_hold","create_worker","queue_work_item"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"task":{"type":"string"},"recipient":{"type":"string","description":"For a final scope delegate, use empty or the exact appointed PO ID; follow the role guide for other actions."}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
 // Workers may report group coordination without receiving orchestration actions.
-const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","reply_to"],"properties":{"reply_to":{"type":"string"},"type":{"type":"string","enum":["post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
+const workerOutputSchema = `{"type":"object","additionalProperties":false,"required":["text","actions","attachments"],"properties":{"text":{"type":"string"},"actions":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["type","project","title","body","recipient","reply_to","depends_on"],"properties":{"depends_on":{"type":"array","items":{"type":"string"}},"reply_to":{"type":"string"},"type":{"type":"string","enum":["post_group"]},"project":{"type":"string"},"title":{"type":"string"},"body":{"type":"string"},"recipient":{"type":"string"}}}},"attachments":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","name","media_type"],"properties":{"path":{"type":"string"},"name":{"type":"string"},"media_type":{"type":"string"}}}}}}`
 
 var errWorkerAction = errors.New("worker result contains orchestration actions")
 var errRoleAction = errors.New("result contains an action outside the recorded role")
@@ -96,10 +96,10 @@ const extractFilter = `
  def exact($keys): type == "object" and (keys | sort) == ($keys | sort);
  def strings_for($keys): . as $v | all($keys[]; ($v[.] | type) == "string");
  if ((exact(["text","actions","attachments"]) or ($worker=="yes" and exact(["text","attachments"]))) and (.text|type)=="string" and ((has("actions") and (.actions|type)=="array") or ($worker=="yes" and (has("actions")|not))) and (.attachments|type)=="array" and
-     all((.actions // [])[]; ((keys - ["type","project","title","body","recipient","task","reply_to"]) == []) and strings_for(["type","project","title","body","recipient"]) and ((has("task")|not) or (.task|type)=="string") and ((has("reply_to")|not) or (.reply_to|type)=="string")) and
+     all((.actions // [])[]; ((keys - ["type","project","title","body","recipient","task","reply_to","depends_on"]) == []) and strings_for(["type","project","title","body","recipient"]) and ((has("task")|not) or (.task|type)=="string") and ((has("reply_to")|not) or (.reply_to|type)=="string") and ((has("depends_on")|not) or ((.depends_on|type)=="array" and all(.depends_on[]; type=="string" and length>0)))) and
      all(.attachments[]; exact(["path","name","media_type"]) and strings_for(["path","name","media_type"])))
  then (["text",(.text|@base64)]|@tsv),
-      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64),((.task // "")|@base64),((.reply_to // "")|@base64)]|@tsv),
+      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64),((.task // "")|@base64),((.reply_to // "")|@base64),(((.depends_on // [])|map(@base64)|join(","))|@base64)]|@tsv),
       (.attachments[] | ["attachment",(.path|@base64),(.name|@base64),(.media_type|@base64)]|@tsv)
  else error("invalid structured result") end`
 
@@ -248,7 +248,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			}
 			result.Text = values[0]
 		case "action":
-			if len(values) != 7 {
+			if len(values) != 8 {
 				return result, errors.New("malformed action")
 			}
 			if !actionAllowed(req.Role, values[0]) {
@@ -278,7 +278,20 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if values[0] == "resolve_hold" && req.Kind == "task_blocked" && (req.TaskID == "" || values[5] != req.TaskID || values[1] != req.ProjectID || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "") {
 				return result, errRoleAction
 			}
-			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6]})
+			var dependencies []string
+			if values[7] != "" {
+				if values[0] != "queue_work_item" {
+					return result, errRoleAction
+				}
+				for _, encoded := range strings.Split(values[7], ",") {
+					decoded, err := base64.StdEncoding.DecodeString(encoded)
+					if err != nil {
+						return result, errResultShape
+					}
+					dependencies = append(dependencies, string(decoded))
+				}
+			}
+			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6], DependsOn: dependencies})
 		case "attachment":
 			if len(values) != 3 {
 				return result, errors.New("malformed attachment")

@@ -52,14 +52,15 @@ type Project struct {
 }
 
 type Task struct {
-	ID                   string `json:"id"`
-	Project              string `json:"project_id"`
-	Title                string `json:"title"`
-	Status               string `json:"status"`
-	Owner                string `json:"owner_id"`
-	RetryHandoffEligible bool   `json:"retry_handoff_eligible"`
-	ContinuePOEligible   bool   `json:"continue_po_eligible"`
-	ResolveHoldEligible  bool   `json:"resolve_hold_eligible"`
+	ID                    string `json:"id"`
+	Project               string `json:"project_id"`
+	Title                 string `json:"title"`
+	Status                string `json:"status"`
+	Owner                 string `json:"owner_id"`
+	RetryHandoffEligible  bool   `json:"retry_handoff_eligible"`
+	ContinuePOEligible    bool   `json:"continue_po_eligible"`
+	ResolveHoldEligible   bool   `json:"resolve_hold_eligible"`
+	WaitingOnDependencies bool   `json:"waiting_on_dependencies"`
 }
 
 type Agent struct {
@@ -221,9 +222,9 @@ func (s *Service) state() (State, error) {
 		if err != nil {
 			return err
 		}
-		view.Tasks, err = querySlice(tx, "SELECT id,project_id,title,status,owner_id FROM tasks ORDER BY rowid", func(rows *sql.Rows) (Task, error) {
+		view.Tasks, err = querySlice(tx, `SELECT t.id,t.project_id,t.title,t.status,t.owner_id,EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks p ON p.id=d.prerequisite_task_id WHERE d.child_task_id=t.id AND p.status!='completed') AND t.status='queued' FROM tasks t ORDER BY t.rowid`, func(rows *sql.Rows) (Task, error) {
 			var t Task
-			err := rows.Scan(&t.ID, &t.Project, &t.Title, &t.Status, &t.Owner)
+			err := rows.Scan(&t.ID, &t.Project, &t.Title, &t.Status, &t.Owner, &t.WaitingOnDependencies)
 			return t, err
 		})
 		if err != nil {
