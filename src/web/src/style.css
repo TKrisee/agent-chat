@@ -86,6 +86,7 @@
 .attachment-image-grid .attachment-tile small { display:none; }
 @media(min-width:900px) { .attachment-image-grid { grid-template-columns:repeat(3,minmax(0,1fr)); } }
 .compose-box textarea { resize:none; height:auto; max-height:min(240px, 35dvh); overflow-y:auto; }
+.compose-box textarea { font-size:14px; line-height:1.45; color:#4e5952; }
 /* Panel controls remain in the channel header when panels are closed. */
 .channel-header .rail-toggle,.channel-header .work-toggle { display:grid; flex:none; align-self:center; place-items:center; width:28px; height:28px; margin:0; padding:3px; border:1px solid #dce4d8; border-radius:8px; background:#fff; color:#315d49; }
 .channel-header .work-toggle { margin-left:auto; }
@@ -105,6 +106,7 @@
 @media(max-width:760px) {
  .sidebar { display:flex; transform:translateX(-105%); visibility:hidden; pointer-events:none; transition:transform .18s ease, visibility 0s linear .18s; }
  .sidebar.open { transform:translateX(0); visibility:visible; pointer-events:auto; transition:transform .18s ease, visibility 0s; }
+ .context:not(.collapsed) { position:fixed; top:52px; bottom:0; max-height:none; }
  .context.collapsed { width:0; padding:0; border-width:0; }
 }
 @media(prefers-reduced-motion:reduce) { .sidebar,.sidebar.open,.context,.context.collapsed,.context-body { transition:none; } }

@@ -237,6 +237,20 @@ const quote = (id:string, messages:Message[]) => {const m=messages.find(x=>x.id=
 const retryReady = new Set<string>();
 const conflicts = new Set<string>();
 let renderedRecipient = ''; let scrollByRecipient = new Map<string,number>();
+type ScrollAnchor = {target:string; epoch:number; width:number; height:number; bottom:boolean; id?:string; offset:number};
+let resizeAnchor:ScrollAnchor | undefined;
+function rememberScroll(scroll:HTMLElement):void {
+ const top=scroll.getBoundingClientRect().top;
+ const item=Array.from(scroll.querySelectorAll<HTMLElement>('[data-message-id]')).find(el=>el.getBoundingClientRect().bottom>top);
+ resizeAnchor={target:recipient,epoch:selectionEpoch,width:window.innerWidth,height:window.innerHeight,bottom:scroll.scrollHeight-scroll.clientHeight-scroll.scrollTop<3,id:item?.dataset.messageId,offset:item ? item.getBoundingClientRect().top-top : 0};
+}
+function restoreResizeAnchor():void {
+ const saved=resizeAnchor, scroll=app.querySelector<HTMLElement>('#chat-scroll');
+ if(!saved || !scroll || saved.target!==recipient || saved.epoch!==selectionEpoch || settingsOpen)return;
+ if(saved.bottom)scroll.scrollTop=scroll.scrollHeight;
+ else if(saved.id){const item=Array.from(scroll.querySelectorAll<HTMLElement>('[data-message-id]')).find(el=>el.dataset.messageId===saved.id);if(item)scroll.scrollTop+=item.getBoundingClientRect().top-scroll.getBoundingClientRect().top-saved.offset;}
+ scrollByRecipient.set(recipient,scroll.scrollTop);rememberScroll(scroll);
+}
 let sendScrollIntent:{target:string;id:string;epoch:number;confirmed:boolean}|null=null;
 function confirmSendScroll(target:string,id:string):void {if(sendScrollIntent?.target===target && sendScrollIntent.id===id)sendScrollIntent.confirmed=true;}
 const esc = (s:unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
@@ -374,6 +388,7 @@ function render() {
   readReceipts.pauseForJump();
   scroll.scrollTop += element.getBoundingClientRect().top-scroll.getBoundingClientRect().top;
   scrollByRecipient.set(recipient,scroll.scrollTop);
+  rememberScroll(scroll);
  });
  app.querySelector<HTMLButtonElement>('#open-settings')!.onclick=openSettings;
  const weeklyButton=app.querySelector<HTMLButtonElement>('#weekly-control')!;
@@ -510,7 +525,8 @@ function render() {
   const divider = newScroll.querySelector<HTMLElement>('.unread-divider');
   if (divider) newScroll.scrollTop += divider.getBoundingClientRect().top - newScroll.getBoundingClientRect().top;
  }
- if(scrollToSent){scrollByRecipient.set(recipient,newScroll.scrollTop);sendScrollIntent=null;}
+ if(scrollToSent){scrollByRecipient.set(recipient,newScroll.scrollTop);sendScrollIntent=null;rememberScroll(newScroll);}
+ if(!resizeAnchor || resizeAnchor.target!==recipient || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight))rememberScroll(newScroll);
  app.querySelector<HTMLElement>('.content')!.scrollTop=same ? oldContentTop : 0;
  app.querySelector<HTMLElement>('#work-panel-content')!.scrollTop=same ? oldPanelTop : 0;
  renderedRecipient=recipient;
@@ -661,7 +677,8 @@ function resizeComposer(input:HTMLTextAreaElement):void {
  input.style.height=`${input.scrollHeight}px`;
 }
 narrowLayout.addEventListener('change',()=>{mobileNav=false;readReceipts.contextChanged();render();});
-window.addEventListener('resize',()=>{const input=app.querySelector<HTMLTextAreaElement>('#message');if(input)resizeComposer(input);});
+document.addEventListener('scroll',event=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(event.target===scroll && scroll && (!resizeAnchor || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight)))rememberScroll(scroll);},{capture:true,passive:true});
+window.addEventListener('resize',()=>{const input=app.querySelector<HTMLTextAreaElement>('#message');if(input)resizeComposer(input);requestAnimationFrame(restoreResizeAnchor);});
 function closeAttachmentMenu(restoreFocus=false):void {
  attachmentMenuTarget='';
  const menu=app.querySelector<HTMLElement>('#attachment-menu');
