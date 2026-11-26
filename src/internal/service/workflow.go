@@ -848,9 +848,15 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			strings.TrimSpace(action.Title) == "" || strings.TrimSpace(action.Body) == "" {
 			return fmt.Errorf("%w: invalid operator approval scope or reason", errWorkflow)
 		}
-		_, err := tx.Exec("INSERT INTO approvals VALUES (?,?,?,?,?,?,'pending')",
-			newID(), nullIfEmpty(j.Project), nullIfEmpty(j.Task), a.ID, action.Title, action.Body)
-		return err
+		id := newID()
+		if _, err := tx.Exec("INSERT INTO approvals VALUES (?,?,?,?,?,?,'pending')",
+			id, nullIfEmpty(j.Project), nullIfEmpty(j.Task), a.ID, action.Title, action.Body); err != nil {
+			return err
+		}
+		if a.Role == "po" {
+			return deliverApproval(tx, id, j.Project, j.Task, action.Title, action.Body)
+		}
+		return nil
 	}
 	if a.Role == "root" && j.Kind == "task_blocked" && action.Type == "resolve_hold" {
 		return s.resolveHold(tx, j, action)

@@ -22,6 +22,7 @@ type AttachmentRef struct {
 }
 
 type Message struct {
+	ApprovalID     string          `json:"approval_id,omitempty"`
 	NoticeDetail   string          `json:"notice_detail,omitempty"`
 	RoomID         string          `json:"room_id"`
 	ID             string          `json:"id"`
@@ -129,8 +130,9 @@ func (s *Service) state() (State, error) {
 	err := s.write(func(tx *sql.Tx) error {
 		var err error
 		view.Messages, err = querySlice(tx, `SELECT m.id,m.sender,m.recipient,m.role,m.text,m.at,
-			COALESCE(m.task_id,''),COALESCE(m.project_id,''),COALESCE(reply.parent_id,''),receipt.read_at,m.room_id
+			COALESCE(m.task_id,''),COALESCE(m.project_id,''),COALESCE(reply.parent_id,''),receipt.read_at,m.room_id,COALESCE(delivery.approval_id,'')
 			FROM messages m
+			LEFT JOIN approval_deliveries delivery ON delivery.message_id=m.id
 			LEFT JOIN message_replies reply ON reply.message_id=m.id
 			LEFT JOIN operator_message_reads receipt ON receipt.message_id=m.id
             WHERE m.room_id IS NOT NULL AND ((m.room_id LIKE 'dm:%' AND (m.sender='operator' OR m.recipient='operator'))
@@ -139,7 +141,7 @@ func (s *Service) state() (State, error) {
 			var millis int64
 			var readMillis sql.NullInt64
 			err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Role, &m.Text, &millis,
-				&m.Task, &m.Project, &m.ReplyTo, &readMillis, &m.RoomID)
+				&m.Task, &m.Project, &m.ReplyTo, &readMillis, &m.RoomID, &m.ApprovalID)
 			m.At = time.UnixMilli(millis).UTC()
 			if readMillis.Valid {
 				at := time.UnixMilli(readMillis.Int64).UTC()

@@ -157,3 +157,4 @@
 .task-history{font-size:12px;color:#64736a;margin-top:8px;overflow-wrap:anywhere}.task-history summary{cursor:pointer;font-weight:600}.task-history p{margin:4px 0;white-space:pre-wrap}
 .group-unread-banner #jump-group-read{padding:0;color:inherit;font-weight:600;text-align:left;text-decoration:none}
 .group-unread-banner #jump-group-read:focus-visible{outline:2px solid #315c49;outline-offset:3px;border-radius:2px}
+.approval-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:10px}.approval-controls button{padding:5px 11px;border:1px solid #afc2b0;border-radius:7px;background:#edf4eb;color:#294b3e;font-size:12px;font-weight:700}.approval-controls button:disabled{opacity:.55;cursor:wait}.approval-controls [role=alert]{color:#8c4c39;font-size:12px}.approval-status{margin-top:8px;color:#64786d;font-size:12px;font-weight:700}

@@ -139,7 +139,10 @@ func (s *Service) initialize() error {
 		}
 		_, err := tx.Exec("INSERT OR IGNORE INTO agents VALUES (?,?,?,?,?,?)",
 			root, "Root", "root", nil, s.opts.RootModel, s.opts.Effort)
-		return err
+		if err != nil {
+			return err
+		}
+		return deliverPendingApprovals(tx)
 	})
 }
 

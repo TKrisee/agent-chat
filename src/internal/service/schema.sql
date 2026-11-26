@@ -61,6 +61,10 @@ CREATE TABLE IF NOT EXISTS approvals (
   requested_by TEXT NOT NULL REFERENCES agents(id), title TEXT NOT NULL, body TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('pending','approved','denied'))
 );
+CREATE TABLE IF NOT EXISTS approval_deliveries (
+ approval_id TEXT PRIMARY KEY REFERENCES approvals(id),
+ message_id TEXT NOT NULL REFERENCES messages(id)
+);
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY, agent_id TEXT NOT NULL REFERENCES agents(id),
   project_id TEXT REFERENCES projects(id), task_id TEXT REFERENCES tasks(id),
