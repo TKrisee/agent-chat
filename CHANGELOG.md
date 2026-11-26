@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.2](https://github.com/TKrisee/agent-chat/compare/v0.16.1...v0.16.2) (2026-11-26)
+
+
+### Bug Fixes
+
+* move superseded work warnings into history ([01ace7e](https://github.com/TKrisee/agent-chat/commit/01ace7eb5b171b5945ab0a7dc00a6555b38b70c0))
+
 ## [0.16.1](https://github.com/TKrisee/agent-chat/compare/v0.16.0...v0.16.1) (2026-11-26)
 
 
