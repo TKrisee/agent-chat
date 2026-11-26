@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.8](https://github.com/TKrisee/agent-chat/compare/v0.18.7...v0.18.8) (2026-11-26)
+
+
+### Bug Fixes
+
+* separate parent planning from child result acceptance ([001e357](https://github.com/TKrisee/agent-chat/commit/001e35763b3dfa7045d8e9531e2cd9e3f946e4be))
+
 ## [0.18.7](https://github.com/TKrisee/agent-chat/compare/v0.18.6...v0.18.7) (2026-11-26)
 
 
