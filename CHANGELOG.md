@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.3](https://github.com/TKrisee/agent-chat/compare/v0.16.2...v0.16.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* let POs self-correct mixed approval responses ([fc2a972](https://github.com/TKrisee/agent-chat/commit/fc2a97251558b2269c13356763fea5981c2303c6))
+
 ## [0.16.2](https://github.com/TKrisee/agent-chat/compare/v0.16.1...v0.16.2) (2026-11-26)
 
 
