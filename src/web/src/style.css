@@ -22,6 +22,8 @@
 .chat-scroll{padding:24px min(4%,38px) 12px}.intro{gap:12px;padding-bottom:14px}.intro-icon{width:40px;height:40px;border-radius:12px;font-size:21px}.message{gap:9px;margin-top:13px;border-radius:8px}.message-avatar{width:28px;height:28px;font-size:11px}.message-text{margin-top:3px;line-height:1.5}.composer{padding:8px min(4%,38px) 14px}.composer-heading{margin-bottom:5px}.compose-box{padding:8px 10px}.compose-box textarea{min-height:36px}.sidebar{padding:18px 12px 12px}.brand{padding:0 6px 20px}.projects-heading{margin-top:18px}.conversation{padding:7px 9px}.context:not(.collapsed){padding:12px 14px}.attachment{padding:6px}.attachment img{width:48px;height:42px}.attachments{margin-top:8px;gap:8px}
 @media(hover:hover){.message:hover,.message:focus-within{background:#f0f5ed;box-shadow:0 0 0 5px #f0f5ed}}
 .message:has(:focus-visible){background:#f0f5ed;box-shadow:0 0 0 5px #f0f5ed}
+button.reply-quote{display:block;max-width:100%;border-top:0;border-right:0;border-bottom:0;text-align:left;font:inherit;font-size:.85rem;cursor:pointer}
+button.reply-quote:focus-visible{outline:2px solid #5149bc;outline-offset:2px}
 @media(max-width:760px){.chat-scroll{padding:18px 14px 10px}.composer{padding:7px 14px 12px}.context:not(.collapsed){padding:10px 12px}}
 @media(hover:none){.message-actions button{min-height:36px;padding:5px 9px}.attachment-download{width:40px;height:40px}}
 .message-text.message-markdown{line-height:1.45}.message-text.message-markdown p{margin:.1em 0}
