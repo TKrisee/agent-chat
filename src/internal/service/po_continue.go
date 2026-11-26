@@ -74,6 +74,34 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if !eligible {
+			approval, approvalOK, err := s.legacyMixedApprovalRecovery(tx, r.PathValue("id"))
+			if err != nil {
+				return err
+			}
+			if approvalOK {
+				if err := addMessage(tx, id, operator, approval.job.Agent, "operator", note, approval.job.Project, approval.job.Task); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE tasks SET status='assigned' WHERE id=? AND project_id=? AND owner_id=? AND status='blocked'`, approval.job.Task, approval.job.Project, approval.job.Agent)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errConflict
+				}
+				if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id) VALUES(?,?,1,'assigned',?,?)`, id, approval.job.ID, approval.assignment, id); err != nil {
+					return err
+				}
+				a, err := getAgent(tx, approval.job.Agent)
+				if err != nil {
+					return err
+				}
+				return s.enqueue(tx, a, approval.job.Project, approval.job.Task, id, "po_followup", "The prior proposal was rejected before any app actions applied because request_approval must be the only action in its response. Do not replay the rejected batch or assume any proposal applied. Reconsider the original assignment and operator note: dispatch independent authorized work in a separate turn, or request only the needed approval as a standalone action. Never dispatch denied work.")
+			}
 			report, reportOK, err := s.parentReportRecoveryEligible(tx, r.PathValue("id"))
 			if err != nil {
 				return err

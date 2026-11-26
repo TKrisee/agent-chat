@@ -37,7 +37,7 @@ func agentGuide(role, kind string, shared bool) string {
 		guide += "\nFor project reports and escalations, filter and summarize the facts for the operator; forward concrete questions or choices that require the operator's decision. Do not relay routine team chatter or private PO conversations."
 		guide += "\nOnly when the operator explicitly asks to set a PO goal, emit set_project_goal with the exact existing project ID, objective in body, and empty title and recipient. To change an existing goal only on explicit operator instruction, emit set_project_goal_status with the project ID and body exactly active, paused, or complete. These actions do not dispatch work."
 	case "po":
-		guide = poGuide
+		guide = poGuide + " Submit each operator approval request alone, with no other actions in that response. Send independent assignments in a separate valid response so unrelated work can continue; never dispatch work on an approval denial."
 		if kind == "operator_message" {
 			guide = poChatGuide
 		}
@@ -648,7 +648,13 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			if (pass == 0 && planning) || (pass == 1 && !planning) {
 				continue
 			}
-			if j.Kind == "approval_denied" || action.Type == "request_approval" && len(result.Actions) != 1 {
+			if j.Kind == "approval_denied" {
+				return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
+			}
+			if action.Type == "request_approval" && len(result.Actions) != 1 {
+				if a.Role == "po" && (j.Kind == "assignment" || j.Kind == "po_continue" || j.Kind == "po_followup") {
+					return workItemPlanning(fmt.Sprintf("%v: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow))
+				}
 				return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
 			}
 			if planning {

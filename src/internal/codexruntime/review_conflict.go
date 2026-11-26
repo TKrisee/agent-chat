@@ -38,6 +38,32 @@ func (r *Runner) IsLegacyStructuredHold(ctx context.Context, payload []byte) boo
 	return cmd.Run() == nil
 }
 
+// IsLegacyMixedApproval recognizes a rejected planning batch without applying it.
+func (r *Runner) IsLegacyMixedApproval(ctx context.Context, payload []byte, project string) bool {
+	if len(payload) == 0 || len(payload) > 1<<20 || project == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	const filter = `
+def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
+type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and
+(.actions|type=="array" and length>=2 and length<=12) and
+([.actions[]|select(.type=="request_approval")]|length)==1 and
+all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to"])==[]) and
+([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and (.task//"")=="" and (.reply_to//"")=="" and (.project=="" or .project==$project) and
+if .type=="create_worker" then (.title|nonblank and (test("\\s")|not)) and .body=="" and .recipient==""
+elif .type=="queue_work_item" then (.title|nonblank) and (.body|nonblank) and (.recipient|nonblank)
+elif .type=="request_approval" then (.title|nonblank) and (.body|nonblank) and (.recipient=="" or .recipient=="operator")
+elif .type=="report_progress" then .title=="" and (.body|nonblank) and (.recipient=="" or .recipient=="root")
+else false end)`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, filter)
+	cmd.Stdin = bytes.NewReader(payload)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}
+
 // IsLegacyTitledPlanning accepts only the historical harmless title error and
 // planning proposals; the caller must independently verify task provenance.
 func (r *Runner) IsLegacyTitledPlanning(ctx context.Context, payload []byte, project string) bool {

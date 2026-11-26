@@ -40,6 +40,13 @@ func (s *Service) poAssignmentSource(tx *sql.Tx, j job, po string) (string, erro
 		if ok {
 			return recovered, nil
 		}
+		recovered, ok, err = s.legacyApprovalAssignment(tx, assignmentTask, j.Project, po)
+		if err != nil {
+			return "", err
+		}
+		if ok {
+			return recovered, nil
+		}
 	}
 	if count != 1 {
 		return "", fmt.Errorf("%w: original PO assignment is unavailable", errWorkflow)
@@ -138,6 +145,9 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 	instruction := "Make the next safe decision for this same task using the pinned original assignment and task-scoped operator instructions. When instructions differ, follow the latest one within existing safety and authorization boundaries. Preserve scope, explicit holds, read-only and production restrictions; do not repeat prior effects or assume authorization. If a genuine blocker or deliberate hold prevents progress, use hold_task with its exact reason."
 	if len(correction) > 0 {
 		instruction += " The prior proposal was rejected before applying it: " + correction[0] + " Correct the stated issue without repeating effects; choose a valid next action or an explicit hold."
+		if correction[0] == fmt.Sprintf("%v: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow) {
+			instruction += " No actions from that proposal were applied. Put independent dispatch in a separate response, and submit each operator approval request alone. Use current receipts and preserve the authorized scope."
+		}
 	}
 	switch phase {
 	case "assigned":

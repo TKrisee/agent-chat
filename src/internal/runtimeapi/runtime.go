@@ -170,6 +170,9 @@ type LegacyTitledPlanningInspector interface {
 type LegacySafePlanningInspector interface {
 	IsLegacySafePlanning(context.Context, []byte, string) bool
 }
+type LegacyMixedApprovalInspector interface {
+	IsLegacyMixedApproval(context.Context, []byte, string) bool
+}
 type LegacyStructuredHoldInspector interface {
 	IsLegacyStructuredHold(context.Context, []byte) bool
 }
