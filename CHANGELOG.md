@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.6](https://github.com/TKrisee/agent-chat/compare/v0.18.5...v0.18.6) (2026-11-26)
+
+
+### Bug Fixes
+
+* recover approval planning after rejected parent results ([8b442cd](https://github.com/TKrisee/agent-chat/commit/8b442cd5969586db085969d6dab75ff66375cdbd))
+
 ## [0.18.5](https://github.com/TKrisee/agent-chat/compare/v0.18.4...v0.18.5) (2026-11-26)
 
 
