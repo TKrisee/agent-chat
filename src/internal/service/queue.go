@@ -143,6 +143,24 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 		if err := json.Unmarshal(candidate.request, &candidate.Request); err != nil {
 			return fmt.Errorf("decode durable job %s: %w", candidate.ID, err)
 		}
+		if candidate.Status == "pending" {
+			var first int
+			if err := tx.QueryRow(`SELECT count(*) FROM attachment_alias_first_claim WHERE job_id=?`, candidate.ID).Scan(&first); err != nil {
+				return err
+			}
+			if first == 1 {
+				if err := s.attachmentAliases(tx, &candidate.job); err != nil {
+					return err
+				}
+				candidate.request, err = json.Marshal(candidate.Request)
+				if err != nil {
+					return err
+				}
+				if _, err = tx.Exec(`DELETE FROM attachment_alias_first_claim WHERE job_id=?`, candidate.ID); err != nil {
+					return err
+				}
+			}
+		}
 		if candidate.Status == "pending" && candidate.Kind == "work" && candidate.Request.Role == "worker" {
 			var enabled int
 			if err := tx.QueryRow(`SELECT count(*) FROM operator_preview_workers WHERE agent_id=? AND project_id=?`, candidate.Agent, candidate.Project).Scan(&enabled); err != nil {

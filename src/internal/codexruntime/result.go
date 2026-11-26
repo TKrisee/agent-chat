@@ -138,6 +138,17 @@ func artifactPath(workspace, requested string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	workspacePath, err := filepath.Abs(workspace)
+	if err != nil {
+		return "", err
+	}
+	inside := func(base string) bool {
+		rel, e := filepath.Rel(base, filepath.Clean(requested))
+		return e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)) && !filepath.IsAbs(rel)
+	}
+	if !inside(root) && !inside(workspacePath) {
+		return "", errors.New("attachment must remain within the workspace")
+	}
 	path, err := filepath.EvalSymlinks(requested)
 	if err != nil {
 		return "", err
@@ -156,13 +167,28 @@ func artifactPath(workspace, requested string) (string, error) {
 // A service-owned input may be nominated redundantly by a PO or Root. It is
 // not read here; the service independently pins the exact source and forwards
 // its immutable attachment. Workers may return only workspace-authored files.
-func exactInput(req runtimeapi.Request, path, name, mediaType string) bool {
+func exactInput(req runtimeapi.Request, path, name, mediaType string) (string, bool) {
 	if req.Role != "po" && req.Role != "root" {
-		return false
+		return "", false
 	}
+	canonical := ""
 	for _, message := range req.Context {
 		for _, ref := range message.Attachments {
-			if ref.Path == path && ref.Name == name && ref.MediaType == mediaType {
+			if (ref.Path == path || (ref.SourcePath != "" && ref.SourcePath == path)) && ref.Path != "" && ref.Name == name && ref.MediaType == mediaType {
+				if canonical != "" && canonical != ref.Path {
+					return "", false
+				}
+				canonical = ref.Path
+			}
+		}
+	}
+	return canonical, canonical != ""
+}
+
+func declaredSourceAlias(req runtimeapi.Request, path string) bool {
+	for _, message := range req.Context {
+		for _, ref := range message.Attachments {
+			if ref.SourcePath != "" && ref.SourcePath == path {
 				return true
 			}
 		}
@@ -250,9 +276,12 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if len(values) != 3 {
 				return result, errors.New("malformed attachment")
 			}
-			if exactInput(req, values[0], values[1], values[2]) {
-				result.Attachments = append(result.Attachments, runtimeapi.Attachment{Path: values[0], Name: values[1], MediaType: values[2]})
+			if canonical, ok := exactInput(req, values[0], values[1], values[2]); ok {
+				result.Attachments = append(result.Attachments, runtimeapi.Attachment{Path: canonical, Name: values[1], MediaType: values[2]})
 				continue
+			}
+			if declaredSourceAlias(req, values[0]) {
+				return result, errResultAttachment
 			}
 			path, e := artifactPath(req.Workspace, values[0])
 			if e != nil {

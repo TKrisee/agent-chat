@@ -40,7 +40,7 @@ func (s *Service) uploadAttachments(db attachmentQuerier, j job, result runtimea
 	}
 	query := ""
 	switch {
-	case j.Request.Role == "po" && (j.Kind == "review" || j.Kind == "approval_approved"):
+	case j.Request.Role == "po" && (j.Kind == "review" || j.Kind == "approval_approved" || j.Kind == "po_followup"):
 		reports := false
 		for _, action := range result.Actions {
 			if action.Type == "report" {
@@ -60,6 +60,9 @@ func (s *Service) uploadAttachments(db attachmentQuerier, j job, result runtimea
 				AND w.project_id=latest.project_id AND w.role='worker'
 				WHERE latest.task_id=m.task_id AND latest.project_id=m.project_id
 				AND latest.recipient=m.recipient AND latest.role='worker' ORDER BY latest.seq DESC LIMIT 1)`
+		if j.Kind == "po_followup" {
+			query = strings.Replace(query, "WHERE m.id=?", "WHERE m.id=(SELECT review_id FROM po_followups WHERE source_id=?)", 1)
+		}
 		if j.Kind == "approval_approved" {
 			query = `SELECT a.id,a.name,a.media_type FROM message_attachments link
 				JOIN attachments a ON a.id=link.attachment_id

@@ -57,10 +57,15 @@ type Message struct {
 }
 
 type AttachmentRef struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	MediaType string `json:"media_type"`
-	Path      string `json:"path"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	MediaType  string `json:"media_type"`
+	Path       string `json:"path"`
+	SourcePath string `json:"source_path,omitempty"`
+}
+
+type LegacyAttachmentDeclarationInspector interface {
+	LegacyAttachmentDeclarations(context.Context, []byte) ([]Attachment, bool)
 }
 
 type Result struct {

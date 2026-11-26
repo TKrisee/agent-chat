@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   request BLOB NOT NULL, result BLOB, diagnostic TEXT, next_at INTEGER NOT NULL,
   UNIQUE(agent_id,source_id,kind)
 );
+CREATE TABLE IF NOT EXISTS attachment_alias_first_claim (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id)
+);
 CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,next_at);
 
 CREATE TABLE IF NOT EXISTS project_workspace_roots (

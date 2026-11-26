@@ -160,6 +160,9 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	if err == nil && kind == "work" {
 		_, err = tx.Exec("INSERT INTO job_scratch(job_id) VALUES(?)", id)
 	}
+	if err == nil && a.Role == "po" && (kind == "review" || kind == "po_followup") {
+		_, err = tx.Exec("INSERT INTO attachment_alias_first_claim(job_id) VALUES(?)", id)
+	}
 	return err
 }
 

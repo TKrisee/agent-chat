@@ -133,6 +133,10 @@ func fingerprint(req runtimeapi.Request) string {
 			add(a.Name)
 			add(a.MediaType)
 			add(a.Path)
+			if a.SourcePath != "" {
+				add("source-path")
+				add(a.SourcePath)
+			}
 		}
 		add("end-attachments")
 		if m.GroupRecipient != "" {
