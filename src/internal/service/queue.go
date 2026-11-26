@@ -144,6 +144,17 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 			return fmt.Errorf("decode durable job %s: %w", candidate.ID, err)
 		}
 		if candidate.Status == "pending" && candidate.Kind == "po_followup" {
+			var childReceiptOnly int
+			if err := tx.QueryRow(`SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?`, candidate.Source, candidate.Task).Scan(&childReceiptOnly); err != nil {
+				return err
+			}
+			if childReceiptOnly != 0 {
+				candidate.Request.ChildReceiptOnly = true
+				candidate.request, err = json.Marshal(candidate.Request)
+				if err != nil {
+					return err
+				}
+			}
 			var reportOnly int
 			if err := tx.QueryRow(`SELECT count(*) FROM po_report_recoveries WHERE source_id=? AND task_id=?`, candidate.Source, candidate.Task).Scan(&reportOnly); err != nil {
 				return err

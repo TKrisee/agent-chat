@@ -29,19 +29,20 @@ type DiagnosticReader interface {
 }
 
 type Request struct {
-	ID           string    `json:"id"`
-	AgentID      string    `json:"agent_id"`
-	Role         string    `json:"role"`
-	ProjectID    string    `json:"project_id"`
-	TaskID       string    `json:"task_id"`
-	Kind         string    `json:"kind,omitempty"`
-	Workspace    string    `json:"workspace"`
-	Scratch      string    `json:"scratch,omitempty"`
-	ReportOnly   bool      `json:"report_only,omitempty"`
-	Model        string    `json:"model"`
-	Effort       string    `json:"effort"`
-	Instructions string    `json:"instructions"`
-	Context      []Message `json:"context,omitempty"`
+	ID               string    `json:"id"`
+	AgentID          string    `json:"agent_id"`
+	Role             string    `json:"role"`
+	ProjectID        string    `json:"project_id"`
+	TaskID           string    `json:"task_id"`
+	Kind             string    `json:"kind,omitempty"`
+	Workspace        string    `json:"workspace"`
+	Scratch          string    `json:"scratch,omitempty"`
+	ReportOnly       bool      `json:"report_only,omitempty"`
+	ChildReceiptOnly bool      `json:"child_receipt_only,omitempty"`
+	Model            string    `json:"model"`
+	Effort           string    `json:"effort"`
+	Instructions     string    `json:"instructions"`
+	Context          []Message `json:"context,omitempty"`
 }
 
 type Message struct {
@@ -188,6 +189,9 @@ type CodexSetup interface {
 // LegacyChildReportInspector recognizes a narrowly scoped rejected child review.
 type LegacyChildReportInspector interface {
 	IsLegacyChildReport(context.Context, []byte, string, string) bool
+}
+type LegacyChildProgressInspector interface {
+	IsLegacyChildProgress(context.Context, []byte, string, string) bool
 }
 
 // LegacyChildGroupRecipientInspector recognizes the exact pre-apply room-recipient error.

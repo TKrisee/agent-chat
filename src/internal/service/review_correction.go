@@ -52,11 +52,14 @@ func reviewCorrectionEligible(tx *sql.Tx, j job) (bool, error) {
 
 const legacyReviewDiagnostic = "invalid runtime result: task owner or status changed"
 const legacyChildReportDiagnostic = "invalid runtime result: report requires Root and a body"
+const legacyChildProgressDiagnostic = "invalid runtime result: progress task unavailable"
 
 type legacyReview struct {
-	job         job
-	assignment  string
-	childReport bool
+	job              job
+	assignment       string
+	childReport      bool
+	progressConflict bool
+	blockedParent    string
 }
 
 // legacyReviewRecovery only recognizes the exact historical jq-proven conflict.
@@ -81,15 +84,17 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	if err != nil {
 		return
 	}
-	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic) {
+	if out.job.Agent != po || out.job.Kind != "review" || status != "completed" || (diagnostic != legacyReviewDiagnostic && diagnostic != legacyChildReportDiagnostic && diagnostic != legacyTitledPlanningDiagnostic && diagnostic != legacyChildProgressDiagnostic) {
 		return
 	}
 	out.job.Task = task
 	out.job.Project = project
-	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic
+	out.childReport = diagnostic == legacyChildReportDiagnostic || diagnostic == legacyTitledPlanningDiagnostic || diagnostic == legacyChildProgressDiagnostic
+	out.progressConflict = diagnostic == legacyChildProgressDiagnostic
 	if out.childReport {
 		var parent string
-		err = tx.QueryRow(`SELECT i.parent_task_id FROM po_work_items i JOIN tasks p ON p.id=i.parent_task_id JOIN projects pr ON pr.id=p.project_id AND pr.po_id=p.owner_id WHERE i.child_task_id=? AND p.project_id=? AND p.owner_id=? AND p.status='assigned' AND pr.stopped=0`, task, project, po).Scan(&parent)
+		var parentStatus string
+		err = tx.QueryRow(`SELECT i.parent_task_id,p.status FROM po_work_items i JOIN tasks p ON p.id=i.parent_task_id JOIN projects pr ON pr.id=p.project_id AND pr.po_id=p.owner_id WHERE i.child_task_id=? AND p.project_id=? AND p.owner_id=? AND p.status IN ('assigned','blocked') AND pr.stopped=0`, task, project, po).Scan(&parent, &parentStatus)
 		if errors.Is(err, sql.ErrNoRows) {
 			return out, false, nil
 		}
@@ -97,7 +102,19 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 			return out, false, err
 		}
 		var parentUnsettled int
-		if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status='uncertain')+(SELECT count(*) FROM approvals WHERE task_id=?)`, parent, parent).Scan(&parentUnsettled); err != nil {
+		if parentStatus == "blocked" {
+			if diagnostic != legacyChildProgressDiagnostic {
+				return out, false, nil
+			}
+			var pending int
+			if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM task_holds WHERE task_id=? AND status='active'),(SELECT count(*) FROM approvals WHERE task_id=? AND status='pending')`, parent, parent, parent).Scan(&parentUnsettled, &pending); err != nil {
+				return out, false, err
+			}
+			if parentUnsettled != 0 || pending != 1 {
+				return out, false, nil
+			}
+			out.blockedParent = parent
+		} else if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND status='uncertain')+(SELECT count(*) FROM approvals WHERE task_id=?)`, parent, parent).Scan(&parentUnsettled); err != nil {
 			return out, false, err
 		}
 		if parentUnsettled != 0 {
@@ -144,6 +161,13 @@ func (s *Service) legacyReviewRecovery(tx *sql.Tx, task string) (out legacyRevie
 	}
 	if !notesOK {
 		return out, false, nil
+	}
+	if diagnostic == legacyChildProgressDiagnostic {
+		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyChildProgressInspector)
+		if !ok || len(payload) == 0 || len(payload) > 1<<20 {
+			return out, false, nil
+		}
+		return out, inspector.IsLegacyChildProgress(context.Background(), payload, project, worker), nil
 	}
 	if out.childReport && diagnostic == legacyTitledPlanningDiagnostic {
 		inspector, ok := s.runtimeSetup().(runtimeapi.LegacyChildGroupRecipientInspector)

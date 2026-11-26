@@ -20,7 +20,7 @@ func TestRootOwnedHoldDecisionIsScopedAndBounded(t *testing.T) {
 			if tc.fence == "default" {
 				recipient = ""
 			}
-			if err := s.complete(j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Recipient: recipient, Body: "Choose a bounded diagnostic pass."}}}, nil, nil, nil); err != nil {
+			if err := s.complete(j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Title: "Decision needed", Recipient: recipient, Body: "Choose a bounded diagnostic pass."}}}, nil, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			rootJob, err := s.claim(nil)

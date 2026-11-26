@@ -122,6 +122,34 @@ all(.actions[];
 	return cmd.Run() == nil
 }
 
+// IsLegacyChildProgress recognizes a pre-apply child completion/progress conflict.
+func (r *Runner) IsLegacyChildProgress(ctx context.Context, payload []byte, project, worker string) bool {
+	if len(payload) == 0 || len(payload) > 1<<20 || project == "" || worker == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	const filter = `
+def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
+type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and
+(.actions|type=="array" and length>=3 and length<=12) and
+all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to"])==[]) and
+([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and (.task//"")=="" and (.reply_to//"")=="" and (.project=="" or .project==$project) and
+if .type=="accept_result" then (.recipient=="" or .recipient==$worker)
+elif .type=="report" then (.recipient=="" or .recipient=="root" or .recipient==$worker) and (.body|nonblank)
+elif .type=="queue_work_item" then (.title|nonblank) and (.body|nonblank) and (.recipient|nonblank)
+elif .type=="report_progress" then .title=="" and (.body|nonblank) and (.recipient=="" or .recipient=="root")
+else false end) and
+([.actions[]|select(.type=="accept_result")]|length)==1 and ([.actions[]|select(.type=="report")]|length)==1 and ([.actions[]|select(.type=="report_progress")]|length)==1 and
+((.actions|map(.type)|index("accept_result")) < (.actions|map(.type)|index("report"))) and
+((.actions|map(.type)|index("report")) < (.actions|map(.type)|index("report_progress")))`
+	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "--arg", "project", project, "--arg", "worker", worker, filter)
+	cmd.Stdin = bytes.NewReader(payload)
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
+}
+
 // IsLegacyChildReport verifies the exact harmless historical recipient mismatch.
 func (r *Runner) IsLegacyChildReport(ctx context.Context, payload []byte, project, worker string) bool {
 	if len(payload) == 0 || len(payload) > 1<<20 || project == "" || worker == "" {

@@ -54,6 +54,8 @@ func newJobSchema(req runtimeapi.Request) string {
 	for _, action := range actionTypes[req.Role] {
 		ok := true
 		switch {
+		case req.ChildReceiptOnly:
+			ok = action == "accept_result" || action == "report" || action == "report_progress"
 		case req.ReportOnly:
 			ok = action == "report"
 		case req.Kind == "project_message" || req.Kind == "approval_denied":
@@ -230,7 +232,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if values[0] == "report_progress" && (req.TaskID == "" || req.Kind == "scope_review" || req.Kind == "operator_message" || req.Kind == "project_message" || (values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
 				return result, errRoleAction
 			}
-			if values[0] == "hold_task" && ((values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
+			if values[0] == "hold_task" && ((values[1] != "" && values[1] != req.ProjectID) || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
 				return result, errRoleAction
 			}
 			if values[0] == "resolve_hold" && req.Kind == "task_blocked" && (req.TaskID == "" || values[5] != req.TaskID || values[1] != req.ProjectID || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "") {

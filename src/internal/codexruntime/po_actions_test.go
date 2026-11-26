@@ -130,6 +130,15 @@ func TestRootOwnedHoldContract(t *testing.T) {
 	}
 }
 
+func TestTitledHoldAccepted(t *testing.T) {
+	r, req, _ := setup(t)
+	req.Role, req.Kind = "po", "assignment"
+	t.Setenv("FAKE_RESULT", `{"text":"","actions":[{"type":"hold_task","project":"project","title":"Decision needed","body":"Choose a bounded next step.","recipient":"root","task":"","reply_to":""}],"attachments":[]}`)
+	if _, err := r.Execute(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRootBlockedPromptUsesRecordedDecision(t *testing.T) {
 	_, req, _ := setup(t)
 	req.Role, req.Kind = "root", "task_blocked"

@@ -133,6 +133,12 @@ CREATE TABLE IF NOT EXISTS po_report_recoveries (
  child_id TEXT NOT NULL REFERENCES tasks(id),
  failed_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id)
 );
+CREATE TABLE IF NOT EXISTS po_child_receipt_recoveries (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id),
+ task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+ review_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+ parent_task_id TEXT NOT NULL REFERENCES tasks(id)
+);
 
 CREATE TABLE IF NOT EXISTS po_progress_notes (
  message_id TEXT PRIMARY KEY REFERENCES messages(id)

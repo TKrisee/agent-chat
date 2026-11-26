@@ -189,9 +189,20 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id,review_id) VALUES(?,?,1,'review',?,?,?)`, id, legacy.job.ID, legacy.assignment, id, legacy.job.Source); err != nil {
 				return err
 			}
+			if legacy.blockedParent != "" {
+				if _, err := tx.Exec(`INSERT INTO po_child_receipt_recoveries(source_id,task_id,review_job_id,parent_task_id) VALUES(?,?,?,?)`, id, legacy.job.Task, legacy.job.ID, legacy.blockedParent); err != nil {
+					return err
+				}
+			}
 			instruction := "The operator explicitly asks you to continue the same review. The prior proposal was rejected: hold_task cannot be combined with accept_result, report, queue_worker, or request_approval. Read the pinned original assignment, worker receipt, and task-scoped operator instructions; when instructions differ, follow the latest one within existing safety and authorization boundaries. Choose either a hold or a valid review action; do not replay or assume completion of prior work."
-			if legacy.childReport {
+			if legacy.progressConflict {
+				instruction = "The operator explicitly asks you to continue the same review. The prior completion and progress proposal was rejected before app actions applied. Review the pinned original assignment, worker receipt and operator instructions; do not replay the saved batch, rerun the worker, or assume any proposal applied. Complete only the authorized review using the existing safeguards."
+			}
+			if legacy.childReport && !legacy.progressConflict {
 				instruction = "The operator explicitly asks you to continue the same child review. The prior review proposal was rejected before any action applied. Review the pinned original assignment and exact worker receipt, then make a fresh decision; do not replay worker work or assume earlier actions committed. Preserve production stops and all task-scoped constraints."
+			}
+			if legacy.blockedParent != "" {
+				instruction = "Review only the pinned existing worker receipt against the original assignment. Return accept_result followed by report, optionally report_progress; no other actions or attachments. Do not dispatch, rerun work, replay prior actions or change the parent approval. Respect production stops and all task-scoped constraints."
 			}
 			return s.enqueue(tx, a, legacy.job.Project, legacy.job.Task, id, "po_followup", instruction)
 		}

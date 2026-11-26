@@ -506,6 +506,16 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
 	}
 	if j.Kind == "po_followup" {
+		var childReceiptOnly int
+		if err := tx.QueryRow(`SELECT count(*) FROM po_child_receipt_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&childReceiptOnly); err != nil {
+			return err
+		}
+		if childReceiptOnly != 0 {
+			if a.Role != "po" || len(result.Actions) < 2 || len(result.Actions) > 3 || result.Actions[0].Type != "accept_result" || result.Actions[1].Type != "report" || (len(result.Actions) == 3 && result.Actions[2].Type != "report_progress") || len(files) != 0 || len(result.Attachments) != 0 {
+				return fmt.Errorf("%w: recovery permits only the child receipt review", errWorkflow)
+			}
+			result.Text = ""
+		}
 		var reportOnly int
 		if err := tx.QueryRow(`SELECT count(*) FROM po_report_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&reportOnly); err != nil {
 			return err
@@ -642,6 +652,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			return err
 		}
 	}
+	completedChildInResult := false
 	for pass := 0; pass < 2; pass++ {
 		for _, action := range result.Actions {
 			planning := childParent != "" && hasPlanning && (action.Type == "queue_work_item" || action.Type == "create_worker" || action.Type == "create_one_shot_worker")
@@ -668,8 +679,17 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 				if err := s.applyAction(tx, a, planningJob, action); err != nil {
 					return err
 				}
-			} else if err := s.applyAction(tx, a, j, action); err != nil {
-				return err
+			} else {
+				if action.Type == "report_progress" && completedChildInResult {
+					if err := s.reportPOProgress(tx, j, a, action, true); err != nil {
+						return err
+					}
+				} else if err := s.applyAction(tx, a, j, action); err != nil {
+					return err
+				}
+				if childParent != "" && action.Type == "report" {
+					completedChildInResult = true
+				}
 			}
 		}
 	}
@@ -864,7 +884,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	case "hold_task":
 		return s.poHoldAction(tx, j, a, action)
 	case "report_progress":
-		return s.reportPOProgress(tx, j, a, action)
+		return s.reportPOProgress(tx, j, a, action, false)
 	case "queue_worker":
 		return s.queueWorker(tx, j, a, action)
 	case "create_worker", "create_one_shot_worker":

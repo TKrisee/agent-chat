@@ -51,3 +51,17 @@ func TestReportRecoverySchemaAndFingerprint(t *testing.T) {
 		}
 	}
 }
+
+func TestChildReceiptRecoverySchema(t *testing.T) {
+	req := runtimeapi.Request{Role: "po", Kind: "po_followup"}
+	ordinary := fingerprint(req)
+	req.ChildReceiptOnly = true
+	if fingerprint(req) == ordinary {
+		t.Fatal("receipt intent not bound")
+	}
+	cmd := exec.Command("jq", "-e", `.properties.actions.items.properties.type.enum == ["accept_result","report","report_progress"]`)
+	cmd.Stdin = strings.NewReader(newJobSchema(req))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("schema: %v %s", err, out)
+	}
+}

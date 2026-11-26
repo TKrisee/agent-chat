@@ -152,6 +152,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.ReportOnly {
 		add("report-only")
 	}
+	if req.ChildReceiptOnly {
+		add("child-receipt-only")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -174,6 +177,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.ReportOnly && (req.Role != "po" || req.Kind != "po_followup") {
 		return errors.New("report-only requires a PO follow-up")
+	}
+	if req.ChildReceiptOnly && (req.Role != "po" || req.Kind != "po_followup" || req.ReportOnly) {
+		return errors.New("child receipt-only requires a PO follow-up")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")
