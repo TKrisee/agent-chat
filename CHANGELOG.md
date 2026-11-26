@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.10](https://github.com/TKrisee/agent-chat/compare/v0.18.9...v0.18.10) (2026-11-26)
+
+
+### Bug Fixes
+
+* reuse pinned worker attachments in PO reviews ([944b98d](https://github.com/TKrisee/agent-chat/commit/944b98d6332653f683f278fe1663e3f241bc38d6))
+
 ## [0.18.9](https://github.com/TKrisee/agent-chat/compare/v0.18.8...v0.18.9) (2026-11-26)
 
 
