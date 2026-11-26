@@ -8,7 +8,7 @@ type Attachment = {id:string; name:string; media_type:string; url:string};
 type Message = {id:string; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]};
 type Project = {id:string; name:string; status:string; po_id:string; goal_objective?:string; goal_status?:string};
 type Task = {id:string; project_id:string; title:string; status:string; owner_id:string; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean; resolve_hold_eligible?:boolean};
-type Job = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string};
+type Job = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string; superseded?:boolean};
 type Agent = {id:string; name:string; role:string; project_id:string; status:string; model:string; parent_id?:string};
 type State = {messages:Message[]; projects:Project[]; tasks:Task[]; agents:Agent[]; jobs:Job[]};
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -238,7 +238,13 @@ let renderedRecipient = ''; let scrollByRecipient = new Map<string,number>();
 let sendScrollIntent:{target:string;id:string;epoch:number;confirmed:boolean}|null=null;
 function confirmSendScroll(target:string,id:string):void {if(sendScrollIntent?.target===target && sendScrollIntent.id===id)sendScrollIntent.confirmed=true;}
 const esc = (s:unknown) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
-const taskDiagnostics = (task:Task) => state.jobs.filter(j=>j.task_id===task.id && j.project_id===task.project_id && j.status==='uncertain' && j.diagnostic?.trim()).map(j=>`<div class="task-diagnostic"><span>Outcome unknown. Ask Root to check before trying again.</span><details data-diagnostic="task:${esc(j.id)}" ${openDetails.has('task:'+j.id)?'open':''}><summary>Details</summary><p>${esc(j.diagnostic!.trim())}</p></details></div>`).join('');
+const taskDiagnostics = (task:Task) => {
+ const attempts=state.jobs.filter(j=>j.task_id===task.id && j.project_id===task.project_id && j.status==='uncertain' && j.diagnostic?.trim());
+ const current=attempts.filter(j=>!j.superseded).map(j=>`<div class="task-diagnostic"><span>Outcome unknown. Ask Root to check before trying again.</span><details data-diagnostic="task:${esc(j.id)}" ${openDetails.has('task:'+j.id)?'open':''}><summary>Details</summary><p>${esc(j.diagnostic!.trim())}</p></details></div>`).join('');
+ const past=attempts.filter(j=>j.superseded);
+ const history=past.length?`<details class="task-history" data-diagnostic="task-history:${esc(task.id)}" ${openDetails.has('task-history:'+task.id)?'open':''}><summary>Past attempts (${past.length})</summary><p>Previous effects remain unknown.</p>${past.map(j=>`<p>${esc(j.diagnostic!.trim())}</p>`).join('')}</details>`:'';
+ return current+history;
+};
 const safeURL = (a:Attachment) => `/api/attachments/${encodeURIComponent(a.id)}`;
 const name = (id:string) => id === 'root' ? 'Root' : state.projects.find(p=>'group:'+p.id===id)?.name ? `${state.projects.find(p=>'group:'+p.id===id)!.name} project chat` : state.agents.find(a=>a.id===id)?.name || id;
 const project = () => state.projects.find(p=>p.id===selectedProjectId);

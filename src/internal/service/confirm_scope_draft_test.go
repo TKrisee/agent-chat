@@ -74,6 +74,29 @@ func confirmScopeDraft(t *testing.T, s *Service, task, id, review, draft, confir
 	return w.Code
 }
 
+func TestStateProjectsOnlyConfirmedScopeReviewSupersession(t *testing.T) {
+	s, task, _, draft, review := uncertainScopeDraftFixture(t)
+	defer s.Close()
+	if code := confirmScopeDraft(t, s, task, newID(), review, draft, "effects-unknown"); code != 202 {
+		t.Fatalf("confirmation status %d", code)
+	}
+	other := newID()
+	if _, err := s.db.Exec(`INSERT INTO jobs(id,agent_id,project_id,task_id,source_id,kind,status,request,next_at,diagnostic) SELECT ?,agent_id,project_id,task_id,source_id,'po_followup','uncertain',request,0,'unknown' FROM jobs WHERE id=?`, other, review); err != nil {
+		t.Fatal(err)
+	}
+	state, err := s.state()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]Job{}
+	for _, job := range state.Jobs {
+		seen[job.ID] = job
+	}
+	if !seen[review].Superseded || seen[review].Status != "uncertain" || seen[other].Superseded || seen[other].Status != "uncertain" {
+		t.Fatalf("unexpected receipt projection: review=%+v other=%+v", seen[review], seen[other])
+	}
+}
+
 func TestConfirmScopeDraftPreservesUncertaintyAndFences(t *testing.T) {
 	for _, tc := range []struct {
 		name, fence string

@@ -201,3 +201,25 @@ test('agent status uses the latest settled run while retaining earlier uncertain
   await expect(page.locator('.composer-heading')).toContainText('Idle');
   await expect(page.locator('.composer-heading')).not.toContainText('Blocked · uncertain');
 });
+
+test('work panel distinguishes superseded attempts from current uncertainty', async ({page, serviceURL}) => {
+  const state = `{"projects":[{"id":"atlas","name":"Atlas","status":"running","po_id":"po"}],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle"},{"id":"po","name":"PO","role":"po","project_id":"atlas","status":"idle"}],"tasks":[{"id":"old-task","project_id":"atlas","title":"Finished review","status":"completed","owner_id":"po"},{"id":"blocked-task","project_id":"atlas","title":"Blocked passage","status":"blocked","owner_id":"po"}],"jobs":[{"id":"old","agent_id":"po","project_id":"atlas","task_id":"old-task","status":"uncertain","diagnostic":"Earlier provider outcome unknown","superseded":true},{"id":"done","agent_id":"po","project_id":"atlas","task_id":"old-task","status":"completed"},{"id":"blocked","agent_id":"po","project_id":"atlas","task_id":"blocked-task","status":"uncertain","diagnostic":"Current outcome unknown"}],"messages":[]}`;
+  await page.route('**/api/state', route=>route.fulfill({status:200,contentType:'application/json',body:state}));
+  await page.goto(serviceURL);
+  await page.locator('[data-project="atlas"]').click();
+  const panel=page.getByLabel('Atlas activity');
+  await panel.getByText('Work',{exact:false}).click();
+  const finished=panel.locator('.pa-work li').filter({hasText:'Finished review'});
+  const blocked=panel.locator('.pa-work li').filter({hasText:'Blocked passage'});
+  await expect(finished).toContainText('completed');
+  await expect(finished).not.toContainText('Ask Root');
+  const history=finished.locator('details.task-history');
+  await expect(history).not.toHaveAttribute('open');
+  await history.locator('summary').click();
+  await expect(history).toContainText('Earlier provider outcome unknown');
+  await expect(history).toContainText('Previous effects remain unknown');
+  await expect(blocked).toContainText('Needs attention');
+  await expect(blocked).toContainText('Ask Root to check');
+  await blocked.getByText('Details',{exact:true}).click();
+  await expect(blocked).toContainText('Current outcome unknown');
+});

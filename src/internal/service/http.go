@@ -89,6 +89,7 @@ type Job struct {
 	Source     string `json:"source_id"`
 	Status     string `json:"status"`
 	Diagnostic string `json:"diagnostic,omitempty"`
+	Superseded bool   `json:"superseded,omitempty"`
 }
 
 type State struct {
@@ -285,10 +286,11 @@ func (s *Service) state() (State, error) {
 		if err != nil {
 			return err
 		}
-		view.Jobs, err = querySlice(tx, `SELECT id,agent_id,COALESCE(project_id,''),COALESCE(task_id,''),
-			kind,source_id,status,COALESCE(diagnostic,'') FROM jobs ORDER BY rowid`, func(rows *sql.Rows) (Job, error) {
+		view.Jobs, err = querySlice(tx, `SELECT j.id,j.agent_id,COALESCE(j.project_id,''),COALESCE(j.task_id,''),
+			j.kind,j.source_id,j.status,COALESCE(j.diagnostic,''),
+			EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.review_job_id=j.id AND c.task_id=j.task_id AND c.confirmed_by='operator' AND c.effects_unknown_ack=1 AND j.kind='scope_review' AND j.status='uncertain') FROM jobs j ORDER BY j.rowid`, func(rows *sql.Rows) (Job, error) {
 			var j Job
-			err := rows.Scan(&j.ID, &j.Agent, &j.Project, &j.Task, &j.Kind, &j.Source, &j.Status, &j.Diagnostic)
+			err := rows.Scan(&j.ID, &j.Agent, &j.Project, &j.Task, &j.Kind, &j.Source, &j.Status, &j.Diagnostic, &j.Superseded)
 			return j, err
 		})
 		return err
