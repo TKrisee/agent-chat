@@ -74,6 +74,37 @@ func (s *Service) continuePO(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		if !eligible {
+			report, reportOK, err := s.parentReportRecoveryEligible(tx, r.PathValue("id"))
+			if err != nil {
+				return err
+			}
+			if reportOK {
+				if err := addMessage(tx, id, operator, report.po, "operator", note, report.project, r.PathValue("id")); err != nil {
+					return err
+				}
+				res, err := tx.Exec(`UPDATE tasks SET status='assigned' WHERE id=? AND project_id=? AND owner_id=? AND status='blocked'`, r.PathValue("id"), report.project, report.po)
+				if err != nil {
+					return err
+				}
+				n, err := res.RowsAffected()
+				if err != nil {
+					return err
+				}
+				if n != 1 {
+					return errConflict
+				}
+				if _, err := tx.Exec(`INSERT INTO po_report_recoveries(source_id,task_id,child_id,failed_job_id) VALUES(?,?,?,?)`, id, r.PathValue("id"), report.child, report.failed); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(`INSERT INTO po_followups(source_id,trigger_id,ordinal,phase,assignment_id,note_id) VALUES(?,?,1,'assigned',?,?)`, id, report.failed, report.assignment, id); err != nil {
+					return err
+				}
+				a, err := getAgent(tx, report.po)
+				if err != nil {
+					return err
+				}
+				return s.enqueue(tx, a, report.project, r.PathValue("id"), id, "po_followup", "Return exactly one report action addressed to Root with the final report in its body; leave response text empty and include no attachments or other actions. Use only the original assignment, operator note and validated completed child report below. Do not dispatch or repeat work.\nValidated child report:\n"+report.report)
+			}
 			legacy, ok, err := s.legacyReviewRecovery(tx, r.PathValue("id"))
 			if err != nil {
 				return err

@@ -119,6 +119,12 @@ CREATE INDEX IF NOT EXISTS po_work_items_parent ON po_work_items(parent_task_id)
 CREATE TABLE IF NOT EXISTS po_planning_wakes (
  source_id TEXT PRIMARY KEY REFERENCES messages(id)
 );
+CREATE TABLE IF NOT EXISTS po_report_recoveries (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id),
+ task_id TEXT NOT NULL UNIQUE REFERENCES tasks(id),
+ child_id TEXT NOT NULL REFERENCES tasks(id),
+ failed_job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id)
+);
 
 CREATE TABLE IF NOT EXISTS po_progress_notes (
  message_id TEXT PRIMARY KEY REFERENCES messages(id)

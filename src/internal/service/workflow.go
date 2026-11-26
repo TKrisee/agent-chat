@@ -505,6 +505,19 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	if len(result.Text) > 128*1024 || len(result.Actions) > 12 {
 		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
 	}
+	if j.Kind == "po_followup" {
+		var reportOnly int
+		if err := tx.QueryRow(`SELECT count(*) FROM po_report_recoveries WHERE source_id=? AND task_id=?`, j.Source, j.Task).Scan(&reportOnly); err != nil {
+			return err
+		}
+		if reportOnly != 0 {
+			if a.Role != "po" || len(result.Actions) != 1 || result.Actions[0].Type != "report" || (result.Actions[0].Recipient != "" && result.Actions[0].Recipient != root) || len(files) != 0 || len(result.Attachments) != 0 {
+				return fmt.Errorf("%w: recovery permits only the parent report", errWorkflow)
+			}
+			// The action is the sole authorized output; retain raw result in the job receipt.
+			result.Text = ""
+		}
+	}
 	for _, action := range result.Actions {
 		if action.Task != "" && action.Type != "resolve_hold" {
 			return fmt.Errorf("%w: task field is reserved for resolve_hold", errWorkflow)
@@ -853,6 +866,27 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	case "queue_work_item":
 		return s.queuePOWorkItem(tx, j, a, action)
 	case "accept_result":
+		if j.Kind == "po_followup" && action.Recipient != "" {
+			var matched int
+			err := tx.QueryRow(`SELECT count(DISTINCT c.id) FROM po_work_items i
+				JOIN tasks parent ON parent.id=i.parent_task_id AND parent.project_id=? AND parent.owner_id=? AND parent.status='assigned'
+				JOIN tasks c ON c.id=i.child_task_id AND c.project_id=? AND c.status='completed' AND c.owner_id=?
+				JOIN projects p ON p.id=c.project_id AND p.po_id=?
+				JOIN agents w ON w.id=? AND w.project_id=c.project_id AND w.role='worker'
+				JOIN messages m ON m.task_id=c.id AND m.project_id=c.project_id AND m.sender=w.id AND m.recipient=? AND m.role='worker'
+				JOIN jobs r ON r.source_id=m.id AND r.task_id=c.id AND r.project_id=c.project_id AND r.agent_id=? AND r.kind='review' AND r.status='completed' AND COALESCE(r.diagnostic,'')=''
+				JOIN messages report ON report.task_id=c.id AND report.project_id=c.project_id AND report.sender=? AND report.recipient IN (?,?) AND report.role='po' AND report.seq>m.seq
+				WHERE i.parent_task_id=?`, j.Project, a.ID, j.Project, a.ID, a.ID, action.Recipient, a.ID, a.ID, a.ID, a.ID, root, j.Task).Scan(&matched)
+			if err != nil {
+				return err
+			}
+			if matched == 1 {
+				return nil
+			}
+			if matched > 1 {
+				return fmt.Errorf("%w: completed child recipient is ambiguous", errWorkflow)
+			}
+		}
 		worker, err := activeReviewWorker(tx, j, a.ID)
 		if err != nil {
 			return err

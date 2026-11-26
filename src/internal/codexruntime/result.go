@@ -54,6 +54,8 @@ func newJobSchema(req runtimeapi.Request) string {
 	for _, action := range actionTypes[req.Role] {
 		ok := true
 		switch {
+		case req.ReportOnly:
+			ok = action == "report"
 		case req.Kind == "project_message" || req.Kind == "approval_denied":
 			ok = false
 		case req.Role == "worker" && req.Kind != "work":

@@ -149,6 +149,9 @@ func fingerprint(req runtimeapi.Request) string {
 		add("scratch")
 		add(req.Scratch)
 	}
+	if req.ReportOnly {
+		add("report-only")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -168,6 +171,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.Scratch != "" && (!filepath.IsAbs(req.Scratch) || req.Role != "worker" || req.Kind != "work") {
 		return errors.New("scratch requires an absolute path for a worker work job")
+	}
+	if req.ReportOnly && (req.Role != "po" || req.Kind != "po_followup") {
+		return errors.New("report-only requires a PO follow-up")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")

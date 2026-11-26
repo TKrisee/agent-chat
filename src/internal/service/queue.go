@@ -140,6 +140,19 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 		if err := json.Unmarshal(candidate.request, &candidate.Request); err != nil {
 			return fmt.Errorf("decode durable job %s: %w", candidate.ID, err)
 		}
+		if candidate.Status == "pending" && candidate.Kind == "po_followup" {
+			var reportOnly int
+			if err := tx.QueryRow(`SELECT count(*) FROM po_report_recoveries WHERE source_id=? AND task_id=?`, candidate.Source, candidate.Task).Scan(&reportOnly); err != nil {
+				return err
+			}
+			if reportOnly != 0 {
+				candidate.Request.ReportOnly = true
+				candidate.request, err = json.Marshal(candidate.Request)
+				if err != nil {
+					return err
+				}
+			}
+		}
 		if candidate.Status == "pending" && candidate.Request.Role == "root" && candidate.Kind == "operator_message" && !strings.HasPrefix(candidate.Request.Instructions, "App-owned status snapshot v1 at ") {
 			a, err := getAgent(tx, root)
 			if err != nil {

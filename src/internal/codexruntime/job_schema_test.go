@@ -31,3 +31,23 @@ func TestNewJobActionSchema(t *testing.T) {
 		})
 	}
 }
+
+func TestReportRecoverySchemaAndFingerprint(t *testing.T) {
+	request := runtimeapi.Request{Role: "po", Kind: "po_followup"}
+	ordinary := newJobSchema(request)
+	oldFingerprint := fingerprint(request)
+	request.ReportOnly = true
+	if fingerprint(request) == oldFingerprint {
+		t.Fatal("report-only intent must bind the receipt")
+	}
+	for _, tc := range []struct{ schema, filter string }{
+		{newJobSchema(request), `.properties.actions.items.properties.type.enum == ["report"]`},
+		{ordinary, `(.properties.actions.items.properties.type.enum | index("queue_work_item")) != null`},
+	} {
+		cmd := exec.Command("jq", "-e", tc.filter)
+		cmd.Stdin = strings.NewReader(tc.schema)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("schema: %v %s", err, out)
+		}
+	}
+}

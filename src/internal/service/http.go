@@ -248,6 +248,12 @@ func (s *Service) state() (State, error) {
 						return err
 					}
 				}
+				if !view.Tasks[i].ContinuePOEligible {
+					_, view.Tasks[i].ContinuePOEligible, err = s.parentReportRecoveryEligible(tx, view.Tasks[i].ID)
+					if err != nil {
+						return err
+					}
+				}
 			}
 			if view.Tasks[i].Status == "assigned" {
 				_, _, _, view.Tasks[i].ContinuePOEligible, err = poContinuation(tx, view.Tasks[i].ID)
