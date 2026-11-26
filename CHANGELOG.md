@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.9](https://github.com/TKrisee/agent-chat/compare/v0.18.8...v0.18.9) (2026-11-26)
+
+
+### Bug Fixes
+
+* deliver opted-in worker previews privately ([ad0a22d](https://github.com/TKrisee/agent-chat/commit/ad0a22db3b7aab4dc58878aed6986ac8de853c23))
+
 ## [0.18.8](https://github.com/TKrisee/agent-chat/compare/v0.18.7...v0.18.8) (2026-11-26)
 
 
