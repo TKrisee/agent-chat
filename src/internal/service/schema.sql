@@ -173,6 +173,11 @@ CREATE TABLE IF NOT EXISTS po_child_receipt_corrections (
 CREATE TABLE IF NOT EXISTS po_progress_notes (
  message_id TEXT PRIMARY KEY REFERENCES messages(id)
 );
+CREATE TABLE IF NOT EXISTS root_evidence_handoffs (
+ message_id TEXT PRIMARY KEY REFERENCES messages(id),
+ source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ project_id TEXT NOT NULL REFERENCES projects(id)
+);
 CREATE TABLE IF NOT EXISTS po_explicit_progress (
  message_id TEXT PRIMARY KEY REFERENCES po_progress_notes(message_id)
 );

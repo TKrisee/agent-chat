@@ -165,6 +165,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.OperatorPreviews {
 		add("operator-previews")
 	}
+	if req.AllowOperatorResolveHold {
+		add("allow-operator-resolve-hold")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -196,6 +199,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.OperatorPreviews && (req.Role != "worker" || req.Kind != "work") {
 		return errors.New("operator previews require a worker work job")
+	}
+	if req.AllowOperatorResolveHold && (req.Role != "root" || req.Kind != "operator_message") {
+		return errors.New("operator hold resolution requires a Root operator message")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")
@@ -360,6 +366,9 @@ func prompt(req runtimeapi.Request) string {
 		}
 	}
 	if req.Role == "root" {
+		if req.Kind == "operator_message" {
+			b.WriteString("\nTo forward evidence explicitly supplied by the operator to the relevant project's PO without resolving a hold, use handoff_evidence with the exact project ID and a concise body; leave other action fields empty. Do not treat historical quoted approvals as new authorizations. PO work and result acceptance remain with the PO.\n")
+		}
 		b.WriteString("\nWhen receiving project reports or escalations, summarize relevant facts for the operator and forward actual questions or choices needing their decision; do not relay routine team chatter or private PO conversations.\n")
 		if req.Kind == "task_blocked" {
 			b.WriteString("For a blocked-task escalation, summarize the concrete blocker using only PO evidence explicitly shared for this task; do not assume the operator has seen it. Distinguish operational decisions explicitly assigned to Root from decisions actually requiring the operator. For an active hold explicitly marked Root-owned, use resolve_hold with its exact project and task and your scoped decision in body, within the authorized scope and respecting stops, exhausted retry limits and approval boundaries. Do not assume legacy or operator-owned holds allow autonomous resolution. Ask the operator only when a specific real decision or request is recorded: state the exact requirement in plain language and any supplied options, tradeoffs, recommendation and independent constraints. Never ask a generic question about whether they need to decide. If ownership or the decision is unknown, report the known status or clarify through authorized project paths; never invent a decision, infer private PO details, or claim clarification was requested when it was not.\n")

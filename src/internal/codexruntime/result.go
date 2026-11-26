@@ -31,7 +31,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 
 // actionTypes is the single role allowlist used for new schemas and decoding.
 var actionTypes = map[string][]string{
-	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold"},
+	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold", "handoff_evidence"},
 	"po":     {"queue_worker", "create_worker", "create_one_shot_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
 	"worker": {"post_group", "send_operator_previews"},
 }
@@ -74,8 +74,12 @@ func newJobSchema(req runtimeapi.Request) string {
 			ok = action == "delegate"
 		case req.Role == "root" && req.Kind == "task_blocked":
 			ok = action == "resolve_hold" || action == "request_approval"
+		case req.Role == "root" && req.Kind == "operator_message":
+			ok = action != "resolve_hold" || req.AllowOperatorResolveHold
 		case req.Role == "root" && req.Kind != "operator_message" && req.Kind != "approval_approved":
 			ok = action == "request_approval"
+		case action == "handoff_evidence":
+			ok = false
 		}
 		if ok {
 			allowed = append(allowed, `"`+action+`"`)
@@ -257,6 +261,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				return result, errRoleAction
 			}
 			if values[6] != "" && values[0] != "post_group" {
+				return result, errRoleAction
+			}
+			if values[0] == "handoff_evidence" && (req.Role != "root" || req.Kind != "operator_message" || strings.TrimSpace(values[1]) == "" || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "" || values[6] != "") {
 				return result, errRoleAction
 			}
 			if values[0] == "send_operator_previews" && (req.Kind != "work" || !req.OperatorPreviews || values[1] != "" || values[2] != "" || values[3] != "" || values[4] != "" || values[5] != "" || values[6] != "") {

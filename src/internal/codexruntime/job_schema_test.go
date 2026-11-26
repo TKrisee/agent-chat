@@ -19,7 +19,7 @@ func TestNewJobActionSchema(t *testing.T) {
 		{"root", "approval_denied", `.properties.actions.maxItems == 0`},
 		{"worker", "project_message", `.properties.actions.maxItems == 0`},
 		{"root", "task_blocked", `.properties.actions.items.properties.type.enum == ["request_approval","resolve_hold"]`},
-		{"root", "operator_message", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) != null and (.properties.actions.items.properties.type.enum | index("delegate")) != null`},
+		{"root", "operator_message", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) == null and (.properties.actions.items.properties.type.enum | index("handoff_evidence")) != null and (.properties.actions.items.properties.type.enum | index("delegate")) != null`},
 	} {
 		t.Run(tc.role+"/"+tc.kind, func(t *testing.T) {
 			schema := newJobSchema(runtimeapi.Request{Role: tc.role, Kind: tc.kind})
@@ -29,6 +29,15 @@ func TestNewJobActionSchema(t *testing.T) {
 				t.Fatalf("schema check: %v %s", err, out)
 			}
 		})
+	}
+}
+
+func TestAuthorizedOperatorHoldSchema(t *testing.T) {
+	req := runtimeapi.Request{Role: "root", Kind: "operator_message", AllowOperatorResolveHold: true}
+	cmd := exec.Command("jq", "-e", `(.properties.actions.items.properties.type.enum | index("resolve_hold")) != null and (.properties.actions.items.properties.type.enum | index("handoff_evidence")) != null`)
+	cmd.Stdin = strings.NewReader(newJobSchema(req))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("schema check: %v %s", err, out)
 	}
 }
 

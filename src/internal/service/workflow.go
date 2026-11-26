@@ -151,6 +151,12 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	req := runtimeapi.Request{ID: id, AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
 		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history,
 		Instructions: guide + "\n\nEvent: " + kind + "\n" + instructions}
+	if a.ID == root && kind == "operator_message" {
+		req.AllowOperatorResolveHold, err = s.offerOperatorHoldResolution(tx, source)
+		if err != nil {
+			return err
+		}
+	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -204,6 +210,10 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		args = append(args, sharedArgs...)
 		query += " UNION SELECT * FROM (" + notice + ")"
 		args = append(args, project, groupRecipient)
+	}
+	if a.Role == "po" && project != "" && project == a.Project && task != "" && kind != "operator_message" && kind != groupMessageKind {
+		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN root_evidence_handoffs h ON h.message_id=m.id JOIN projects p ON p.id=h.project_id AND p.po_id=? WHERE h.project_id=? AND m.project_id=p.id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? ORDER BY m.seq DESC LIMIT 12)`
+		args = append(args, a.ID, project, root, a.ID, directRoom(root, a.ID))
 	}
 	if kind == "scope_review" {
 		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages
@@ -917,6 +927,8 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	}
 	if a.Role == "root" && (j.Kind == "operator_message" || j.Kind == "approval_approved") {
 		switch action.Type {
+		case "handoff_evidence":
+			return handoffEvidence(tx, j, action)
 		case "resolve_hold":
 			return s.resolveHold(tx, j, action)
 		case "set_project_goal", "set_project_goal_status":

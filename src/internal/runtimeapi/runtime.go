@@ -29,22 +29,23 @@ type DiagnosticReader interface {
 }
 
 type Request struct {
-	ID               string    `json:"id"`
-	AgentID          string    `json:"agent_id"`
-	Role             string    `json:"role"`
-	ProjectID        string    `json:"project_id"`
-	TaskID           string    `json:"task_id"`
-	Kind             string    `json:"kind,omitempty"`
-	Workspace        string    `json:"workspace"`
-	Scratch          string    `json:"scratch,omitempty"`
-	ReportOnly       bool      `json:"report_only,omitempty"`
-	ChildReceiptOnly bool      `json:"child_receipt_only,omitempty"`
-	ParentPlanning   bool      `json:"parent_planning,omitempty"`
-	OperatorPreviews bool      `json:"operator_previews,omitempty"`
-	Model            string    `json:"model"`
-	Effort           string    `json:"effort"`
-	Instructions     string    `json:"instructions"`
-	Context          []Message `json:"context,omitempty"`
+	ID                       string    `json:"id"`
+	AgentID                  string    `json:"agent_id"`
+	Role                     string    `json:"role"`
+	ProjectID                string    `json:"project_id"`
+	TaskID                   string    `json:"task_id"`
+	Kind                     string    `json:"kind,omitempty"`
+	Workspace                string    `json:"workspace"`
+	Scratch                  string    `json:"scratch,omitempty"`
+	ReportOnly               bool      `json:"report_only,omitempty"`
+	ChildReceiptOnly         bool      `json:"child_receipt_only,omitempty"`
+	ParentPlanning           bool      `json:"parent_planning,omitempty"`
+	OperatorPreviews         bool      `json:"operator_previews,omitempty"`
+	AllowOperatorResolveHold bool      `json:"allow_operator_resolve_hold,omitempty"`
+	Model                    string    `json:"model"`
+	Effort                   string    `json:"effort"`
+	Instructions             string    `json:"instructions"`
+	Context                  []Message `json:"context,omitempty"`
 }
 
 type Message struct {
