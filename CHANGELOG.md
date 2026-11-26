@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/TKrisee/agent-chat/compare/v0.18.0...v0.18.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* jump to the latest read group message ([9b11894](https://github.com/TKrisee/agent-chat/commit/9b11894c940509465087afcb87784e8f7f7bddd9))
+
 ## [0.18.0](https://github.com/TKrisee/agent-chat/compare/v0.17.0...v0.18.0) (2026-11-26)
 
 
