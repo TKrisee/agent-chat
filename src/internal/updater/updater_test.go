@@ -138,7 +138,7 @@ func TestManagedApplyRequiresStagedUpdateAndRequestsShutdown(t *testing.T) {
 	if w.status != http.StatusAccepted {
 		t.Fatalf("status %d body %s", w.status, w.body.String())
 	}
-	if w.header.Get("X-AgentChat-Update-State") != "restarting" {
+	if w.header.Get("X-AgentChat-Update-State") != "draining" {
 		t.Fatal("wrong state")
 	}
 	select {

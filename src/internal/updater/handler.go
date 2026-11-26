@@ -16,6 +16,8 @@ type Handler struct {
 	Client        Client
 	Root, Version string
 	Stop          context.CancelFunc
+	Drain         func() (<-chan struct{}, func(), error)
+	Lifetime      context.Context
 	mu            sync.Mutex
 	state         string
 	message       string
@@ -79,7 +81,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.URL.Path {
 	case "/api/update/check":
-		if h.state == "checking" || h.state == "downloading" {
+		if h.state == "checking" || h.state == "downloading" || h.state == "draining" || h.state == "restarting" {
 			http.Error(w, "update busy", http.StatusConflict)
 			return
 		}
@@ -114,29 +116,78 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "version already installed", 409)
 			return
 		}
-		if err := os.Rename(filepath.Join(h.stage, "payload"), dest); err != nil {
-			h.message = err.Error()
-			http.Error(w, "cannot install update", 500)
-			return
+		var ready <-chan struct{}
+		release := func() {}
+		if h.Drain != nil {
+			var err error
+			ready, release, err = h.Drain()
+			if err != nil {
+				http.Error(w, "cannot drain active work", http.StatusConflict)
+				return
+			}
+		} else {
+			ch := make(chan struct{})
+			close(ch)
+			ready = ch
 		}
-		os.Remove(h.stage)
-		h.stage = ""
-		tmp := filepath.Join(h.Root, "update-request.tmp")
-		if err := os.WriteFile(tmp, []byte(h.release.Version+"\n"), 0600); err != nil {
-			http.Error(w, "cannot request restart", 500)
-			return
-		}
-		if err := os.Rename(tmp, filepath.Join(h.Root, "update-request")); err != nil {
-			http.Error(w, "cannot request restart", 500)
-			return
-		}
-		h.state = "restarting"
-		go h.Stop()
+		h.state = "draining"
+		go h.applyAfterDrain(ready, release, dest)
 	default:
 		http.NotFound(w, r)
 		return
 	}
 	writeStatus(w, h.status(), http.StatusAccepted)
+}
+
+func (h *Handler) applyAfterDrain(ready <-chan struct{}, release func(), dest string) {
+	lifetime := h.Lifetime
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	select {
+	case <-lifetime.Done():
+		h.mu.Lock()
+		h.state, h.message = "error", "Update cancelled while waiting for active work."
+		h.mu.Unlock()
+		release()
+		return
+	case <-ready:
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	payload := filepath.Join(h.stage, "payload")
+	tmp := filepath.Join(h.Root, "update-request.tmp")
+	err := lifetime.Err()
+	if err == nil {
+		err = os.Rename(payload, dest)
+	}
+	if err == nil {
+		err = lifetime.Err()
+		if err == nil {
+			err = os.WriteFile(tmp, []byte(h.release.Version+"\n"), 0600)
+		}
+		if err == nil {
+			err = lifetime.Err()
+		}
+		if err == nil {
+			err = os.Rename(tmp, filepath.Join(h.Root, "update-request"))
+		}
+		if err != nil {
+			os.Remove(tmp)
+			if rollback := os.Rename(dest, payload); rollback != nil {
+				err = fmt.Errorf("%v; cannot restore staged update: %w", err, rollback)
+			}
+		}
+	}
+	if err != nil {
+		h.state, h.message = "error", "Update could not be applied: "+err.Error()
+		release()
+		return
+	}
+	os.Remove(h.stage)
+	h.stage = ""
+	h.state = "restarting"
+	go h.Stop()
 }
 func (h *Handler) check() {
 	rel, err := h.Client.Check(context.Background())

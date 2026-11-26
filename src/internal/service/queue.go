@@ -82,6 +82,10 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 				release()
 				s.startMu.Lock()
 				s.runningJobs--
+				if s.updateDrain != nil && s.runningJobs == 0 && !s.updateDrainReady {
+					close(s.updateDrain)
+					s.updateDrainReady = true
+				}
 				s.startMu.Unlock()
 				done <- attempt{j.Agent, err}
 			}()
@@ -106,6 +110,9 @@ func (s *Service) claim(active map[string]bool) (*job, error) {
 	return s.claimLocked(active)
 }
 func (s *Service) claimLocked(active map[string]bool) (*job, error) {
+	if s.updateDrain != nil {
+		return nil, nil
+	}
 	if !s.runtimeReady() {
 		return nil, nil
 	}

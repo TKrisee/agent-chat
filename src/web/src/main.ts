@@ -32,6 +32,8 @@ async function updateRequest(action=''):Promise<void>{
   const detail=await r.text();
   if(!r.ok){if(action==='apply'){expectedUpdate=null;updateRestarting=false;}throw new Error(detail||`Update request failed (${r.status}).`);}
   const available=r.headers.get('X-AgentChat-Update-Available')==='true';const current=r.headers.get('X-AgentChat-Update-Current')||'';const status=r.headers.get('X-AgentChat-Update-State')||'idle';
+  if(status==='draining' && expectedUpdate)expectedUpdate.started=Date.now();
+  if(status==='error' && expectedUpdate){expectedUpdate=null;updateRestarting=false;updateDeferred=false;}
   if(!action && expectedUpdate && available && current===expectedUpdate.version && r.headers.get('X-AgentChat-Update-Committed')==='true'){
    const health=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(8000)});
    if(health.ok){
@@ -43,7 +45,7 @@ async function updateRequest(action=''):Promise<void>{
    }
   }
   if(expireUpdate())return;
-  updateInfo={available,current,version:r.headers.get('X-AgentChat-Update-Version')||'',state:expectedUpdate?(updateDeferred?'deferred':'restarting'):status,error:status==='error'?detail:''};
+  updateInfo={available,current,version:r.headers.get('X-AgentChat-Update-Version')||'',state:status==='draining'?'draining':expectedUpdate?(updateDeferred?'deferred':'restarting'):status,error:status==='error'?detail:''};
   updateRestarting=!!expectedUpdate || status==='restarting';
  } catch(e) {
   if(expireUpdate())return;
@@ -62,7 +64,7 @@ function expireUpdate():boolean {
  expectedUpdate=null;updateRestarting=false;updateDeferred=false;updateUnconfirmed=true;
  updateInfo={available:true,current:updateInfo?.current||'',version:'',state:'error',error:'Update could not be confirmed. Check the running version.'};return true;
 }
-function renderUpdate():void{const el=app.querySelector<HTMLElement>('#update-panel');if(!el)return;const u=updateInfo;if(!u?.available){el.hidden=true;return;}el.hidden=false;const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';el.innerHTML=`<strong>App updates</strong><small>${esc(u.state==='deferred'?'Update ready. Finish or clear drafts to reload.':u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;el.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',e=>{const action=(e.currentTarget as HTMLButtonElement).dataset.updateAction!;void updateRequest(action);});}
+function renderUpdate():void{const el=app.querySelector<HTMLElement>('#update-panel');if(!el)return;const u=updateInfo;if(!u?.available){el.hidden=true;return;}el.hidden=false;const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';el.innerHTML=`<strong>App updates</strong><small>${esc(u.state==='deferred'?'Update ready. Finish or clear drafts to reload.':u.state==='draining'?'Waiting for active work…':u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;el.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',e=>{const action=(e.currentTarget as HTMLButtonElement).dataset.updateAction!;void updateRequest(action);});}
 type WeeklyUsage={known:boolean;remaining:number|null;reset:number|null;observed:number|null;enabled:boolean;warn:number;reserve:number;paused:boolean};
 let weeklyUsage:WeeklyUsage|null=null;let weeklyError='';let settingsOpen=true;let guardEnabled=false;let guardWarn='40';let guardReserve='30';let settingsDirty=false;let savingGuard=false;
 function numberHeader(r:Response,key:string):number|null {const raw=r.headers.get(key);if(raw===null || raw.trim()==='')return null;const n=Number(raw);return Number.isFinite(n)?n:null;}

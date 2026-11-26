@@ -6,11 +6,11 @@ test('reloads once only after the expected update is committed and healthy', asy
   await page.route('**/api/update**', async route => {
     const path=new URL(route.request().url()).pathname;
     if(path.endsWith('/download')) {phase='ready';return route.fulfill({status:202,headers:{'X-AgentChat-Update-Available':'true','X-AgentChat-Update-Current':'1.0.0','X-AgentChat-Update-Version':'2.0.0','X-AgentChat-Update-State':'downloading'}});}
-    if(path.endsWith('/apply')) {phase='old';return route.fulfill({status:202,headers:{'X-AgentChat-Update-Available':'true','X-AgentChat-Update-Current':'1.0.0','X-AgentChat-Update-Version':'2.0.0','X-AgentChat-Update-State':'restarting'}});}
+    if(path.endsWith('/apply')) {phase='draining';return route.fulfill({status:202,headers:{'X-AgentChat-Update-Available':'true','X-AgentChat-Update-Current':'1.0.0','X-AgentChat-Update-Version':'2.0.0','X-AgentChat-Update-State':'draining'}});}
     polls++;
     if(phase==='offline')return route.abort();
     const current=phase==='trial'||phase==='unhealthy'||phase==='healthy'?'2.0.0':'1.0.0';
-    const state=phase==='available'?'available':phase==='ready'?'ready':'idle';
+    const state=phase==='available'?'available':phase==='ready'?'ready':phase==='draining'?'draining':'idle';
     const committed=phase==='trial'?'false':'true';
     return route.fulfill({status:200,headers:{'X-AgentChat-Update-Available':'true','X-AgentChat-Update-Current':current,'X-AgentChat-Update-Version':'2.0.0','X-AgentChat-Update-State':state,'X-AgentChat-Update-Committed':committed}});
   });
@@ -27,6 +27,11 @@ test('reloads once only after the expected update is committed and healthy', asy
   expect(navigations).toBe(0);
   await page.getByRole('button',{name:'Restart to update'}).click();
   const pollOnce=async()=>{const before=polls;await expect.poll(()=>polls,{timeout:12000}).toBeGreaterThan(before);};
+  await expect(page.locator('#update-panel')).toContainText('Waiting for active work');
+  await page.evaluate(()=>{window.__realDateNow=Date.now;Date.now=()=>window.__realDateNow()+180000;});
+  await pollOnce(); await expect(page.locator('#update-panel')).toContainText('Waiting for active work'); expect(navigations).toBe(0);
+  await page.evaluate(()=>{Date.now=window.__realDateNow;});
+  phase='old';
   await pollOnce(); expect(navigations).toBe(0); // Old server remains.
   phase='offline'; await pollOnce(); expect(navigations).toBe(0);
   phase='trial'; await pollOnce(); expect(navigations).toBe(0); // New version before launcher commit.

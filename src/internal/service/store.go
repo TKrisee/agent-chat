@@ -47,24 +47,26 @@ type Options struct {
 }
 
 type Service struct {
-	setupMu         sync.RWMutex
-	setup           runtimeapi.CodexSetup
-	reviewProofMu   sync.Mutex
-	reviewProof     map[string]bool
-	startMu         sync.Mutex
-	runningJobs     int
-	activeMu        sync.Mutex
-	activeRuns      map[string]activeRun
-	usageMu         sync.RWMutex
-	usage           weeklySample
-	usageGeneration uint64
-	usageKick       chan struct{}
-	db              *sql.DB
-	lock            *os.File
-	dir             string
-	opts            Options
-	kick            chan struct{}
-	run             chan struct{}
+	setupMu          sync.RWMutex
+	setup            runtimeapi.CodexSetup
+	reviewProofMu    sync.Mutex
+	reviewProof      map[string]bool
+	startMu          sync.Mutex
+	runningJobs      int
+	updateDrain      chan struct{}
+	updateDrainReady bool
+	activeMu         sync.Mutex
+	activeRuns       map[string]activeRun
+	usageMu          sync.RWMutex
+	usage            weeklySample
+	usageGeneration  uint64
+	usageKick        chan struct{}
+	db               *sql.DB
+	lock             *os.File
+	dir              string
+	opts             Options
+	kick             chan struct{}
+	run              chan struct{}
 }
 
 func Open(opts Options) (*Service, error) {

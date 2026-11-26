@@ -141,7 +141,7 @@ func run(ctx context.Context, stop context.CancelFunc, ready func()) error {
 		})
 	}
 	handler := s.Handler(ui)
-	update := &updater.Handler{Client: updater.Client{BaseURL: releaseBaseURL}, Root: os.Getenv("AGENTCHAT_MANAGED_ROOT"), Version: os.Getenv("AGENTCHAT_MANAGED_VERSION"), Stop: stop}
+	update := &updater.Handler{Client: updater.Client{BaseURL: releaseBaseURL}, Root: os.Getenv("AGENTCHAT_MANAGED_ROOT"), Version: os.Getenv("AGENTCHAT_MANAGED_VERSION"), Stop: stop, Drain: s.BeginUpdateDrain, Lifetime: ctx}
 	server := &http.Server{
 		Addr: *listen, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second,
 		WriteTimeout: 25 * time.Second, IdleTimeout: 45 * time.Second,
