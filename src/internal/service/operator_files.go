@@ -16,8 +16,10 @@ type operatorFile struct {
 	Content   []byte `json:"content"`
 }
 
+const maxOperatorAttachmentBytes = 64 << 20
+
 func (s *Service) postMessageUpload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 33<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, 65<<20)
 	if err := r.ParseMultipartForm(1 << 20); err != nil {
 		httpFailure(w, fmt.Errorf("%w: invalid upload: %v", errInvalid, err))
 		return
@@ -39,7 +41,7 @@ func (s *Service) postMessageUpload(w http.ResponseWriter, r *http.Request) {
 	id, text, reply := r.FormValue("id"), r.FormValue("text"), r.FormValue("reply_to")
 	to, project := r.FormValue("recipient"), r.FormValue("project_id")
 	mentions := vals["mention_id"]
-	if !clientID.MatchString(id) || strings.TrimSpace(text) == "" || len(text) > 64*1024 || (to == "") == (project == "") || (to != "" && strings.HasPrefix(to, groupPrefix)) || (project != "" && !projectID.MatchString(project)) || (reply != "" && !clientID.MatchString(reply)) || len(mentions) > 32 || (project == "" && len(mentions) > 0) {
+	if !clientID.MatchString(id) || (strings.TrimSpace(text) == "" && len(r.MultipartForm.File["files"]) == 0) || len(text) > 64*1024 || (to == "") == (project == "") || (to != "" && strings.HasPrefix(to, groupPrefix)) || (project != "" && !projectID.MatchString(project)) || (reply != "" && !clientID.MatchString(reply)) || len(mentions) > 32 || (project == "" && len(mentions) > 0) {
 		httpFailure(w, fmt.Errorf("%w: invalid message", errInvalid))
 		return
 	}
@@ -97,7 +99,7 @@ func validateOperatorFiles(files []operatorFile) error {
 		if f.Name == "" || f.Name == "." || f.Name == ".." || filepath.Base(f.Name) != f.Name || strings.ContainsAny(f.Name, "/\\\x00") || len(f.Name) > 255 {
 			return fmt.Errorf("%w: invalid filename", errInvalid)
 		}
-		if len(f.Content) > maxAttachment || total > maxAttachmentBytes {
+		if len(f.Content) > maxAttachment || total > maxOperatorAttachmentBytes {
 			return fmt.Errorf("%w: attachment limit exceeded", errInvalid)
 		}
 		if len(f.MediaType) > 255 || strings.ContainsAny(f.MediaType, "\r\n") {

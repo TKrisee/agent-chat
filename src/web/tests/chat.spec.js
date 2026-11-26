@@ -127,10 +127,15 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
 });
 
 test('image gallery stays within one message and downloads the selected image', async ({page, serviceURL}) => {
-  const state = `{"projects":[],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"}],"tasks":[],"jobs":[],"messages":[{"id":"gallery-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Gallery","at":"2026-01-01T00:00:00Z","attachments":[{"id":"image-one","name":"one.png","media_type":"image/png"},{"id":"image-two","name":"two.png","media_type":"image/png"},{"id":"image-three","name":"three.png","media_type":"image/png"}]},{"id":"other-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Other","at":"2026-01-01T00:00:01Z","attachments":[{"id":"other-image","name":"other.png","media_type":"image/png"}]}]}`;
+  const state = `{"projects":[],"agents":[{"id":"root","name":"Root","role":"root","project_id":"","status":"idle","model":"test"}],"tasks":[],"jobs":[],"messages":[{"id":"gallery-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Gallery","at":"2026-01-01T00:00:00Z","attachments":[{"id":"image-one","name":"one.png","media_type":"image/png"},{"id":"image-two","name":"two.png","media_type":"image/png"},{"id":"image-three","name":"three.png","media_type":"image/png"},{"id":"notes","name":"notes.txt","media_type":"text/plain"}]},{"id":"other-message","room_id":"dm:operator:root","sender":"root","recipient":"operator","role":"root","text":"Other","at":"2026-01-01T00:00:01Z","attachments":[{"id":"other-image","name":"other.png","media_type":"image/png"}]}]}`;
   await page.route('**/api/state', route => route.fulfill({status:200,contentType:'application/json',body:state}));
   await page.route('**/api/attachments/*/preview', route => route.fulfill({status:200,contentType:'image/png',body:Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64')}));
   await page.goto(serviceURL);
+  const gallery = page.locator('[data-message-id="gallery-message"]');
+  await expect(gallery.locator('.attachment-image-grid [data-attachment-preview]')).toHaveCount(3);
+  await expect(gallery.locator('.attachment-image-grid [data-attachment-preview="notes"]')).toHaveCount(0);
+  await expect(gallery.getByRole('button',{name:'Preview notes.txt'})).toBeVisible();
+  await expect(page.locator('[data-message-id="other-message"] .attachment-image-grid')).toHaveCount(0);
   await page.locator('[data-attachment-preview="image-two"]').click();
   const dialog=page.locator('dialog.attachment-preview');
   await expect(dialog).toBeVisible();
