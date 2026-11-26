@@ -329,6 +329,7 @@ func (s *Service) state() (State, error) {
 
 func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/agents/{id}/operator-previews", s.setOperatorPreviews)
 	mux.HandleFunc("GET /api/usage", s.usageStatus)
 	mux.HandleFunc("POST /api/usage/settings", s.usageSettings)
 	mux.HandleFunc("GET /api/workflow-notices/{id}/scope-request", s.scopeRequest)

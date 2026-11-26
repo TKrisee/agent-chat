@@ -158,6 +158,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.ParentPlanning {
 		add("parent-planning")
 	}
+	if req.OperatorPreviews {
+		add("operator-previews")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -186,6 +189,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.ParentPlanning && (req.Role != "po" || req.Kind != "po_followup" || req.TaskID == "" || req.ReportOnly || req.ChildReceiptOnly) {
 		return errors.New("parent planning requires an unrestricted PO parent follow-up")
+	}
+	if req.OperatorPreviews && (req.Role != "worker" || req.Kind != "work") {
+		return errors.New("operator previews require a worker work job")
 	}
 	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
 		return errors.New("unsupported reasoning effort")
@@ -373,6 +379,9 @@ func prompt(req runtimeapi.Request) string {
 	}
 	if req.Role == "worker" && req.Kind == "work" {
 		b.WriteString("\nReturn the requested text, workspace attachments, and optional post_group actions for project coordination; do not propose orchestration actions.\n")
+		if req.OperatorPreviews {
+			b.WriteString("The operator enabled previews: to share only image attachments from this result directly with the operator, include send_operator_previews with every field empty. The PO still receives the normal delivery; no other files or earlier attachments are shared.\n")
+		}
 	} else if req.Role == "worker" {
 		b.WriteString("\nReturn only the requested text and workspace attachments; do not propose actions.\n")
 	} else {

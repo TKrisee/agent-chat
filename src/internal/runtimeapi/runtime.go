@@ -40,6 +40,7 @@ type Request struct {
 	ReportOnly       bool      `json:"report_only,omitempty"`
 	ChildReceiptOnly bool      `json:"child_receipt_only,omitempty"`
 	ParentPlanning   bool      `json:"parent_planning,omitempty"`
+	OperatorPreviews bool      `json:"operator_previews,omitempty"`
 	Model            string    `json:"model"`
 	Effort           string    `json:"effort"`
 	Instructions     string    `json:"instructions"`

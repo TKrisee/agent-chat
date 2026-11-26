@@ -33,7 +33,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 var actionTypes = map[string][]string{
 	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold"},
 	"po":     {"queue_worker", "create_worker", "create_one_shot_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
-	"worker": {"post_group"},
+	"worker": {"post_group", "send_operator_previews"},
 }
 
 func actionAllowed(role, action string) bool {
@@ -64,6 +64,8 @@ func newJobSchema(req runtimeapi.Request) string {
 			ok = false
 		case req.Role == "worker" && req.Kind != "work":
 			ok = false
+		case req.Role == "worker" && action == "send_operator_previews":
+			ok = req.OperatorPreviews
 		case req.Role == "po" && req.Kind == "operator_message":
 			ok = action == "request_approval"
 		case req.Role == "po" && req.Kind == "scope_review":
@@ -229,6 +231,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				return result, errRoleAction
 			}
 			if values[6] != "" && values[0] != "post_group" {
+				return result, errRoleAction
+			}
+			if values[0] == "send_operator_previews" && (req.Kind != "work" || !req.OperatorPreviews || values[1] != "" || values[2] != "" || values[3] != "" || values[4] != "" || values[5] != "" || values[6] != "") {
 				return result, errRoleAction
 			}
 			if values[0] == "report_progress" && (req.TaskID == "" || req.Kind == "scope_review" || req.Kind == "operator_message" || req.Kind == "project_message" || (values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {

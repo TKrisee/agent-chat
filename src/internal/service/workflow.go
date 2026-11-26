@@ -61,6 +61,10 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
 	if a.Role == "po" && kind != "operator_message" && kind != groupMessageKind {
 		guide += "\nUse explicit task-scoped Root escalation or report_progress to share task decisions and progress. You may quote task-sourced private wording when it is needed for a decision, or summarize it; omit unrelated material. Ordinary operator direct messages remain private unless intentionally shared for the task."
+		guide += " For an actual operator decision use request_approval, or a hold when the existing decision path requires it; include the exact question and options. Routine progress belongs with Root."
+		if kind == "review" || kind == "po_followup" {
+			guide += " When forwarding a pinned worker receipt attachment, use its exact managed path, name and media type shown in the receipt, never a prior worker workspace path."
+		}
 	}
 	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind {
 		var objective string
@@ -834,7 +838,15 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 	if j.Kind != "work" {
 		return fmt.Errorf("%w: unsupported worker event", errWorkflow)
 	}
+	preview := false
 	for _, action := range result.Actions {
+		if action.Type == "send_operator_previews" {
+			if preview || action.Project != "" || action.Title != "" || action.Body != "" || action.Recipient != "" || action.Task != "" || action.ReplyTo != "" {
+				return fmt.Errorf("%w: invalid operator preview action", errWorkflow)
+			}
+			preview = true
+			continue
+		}
 		if action.Type != "post_group" {
 			return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
 		}
@@ -856,6 +868,11 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 	id, err := outputMessage(tx, a, po.ID, j, result.Text, files)
 	if err != nil {
 		return err
+	}
+	if preview {
+		if err := deliverOperatorPreviews(tx, j, a, id, files); err != nil {
+			return err
+		}
 	}
 	return s.enqueue(tx, po, j.Project, j.Task, id, "review", "Check the worker result and its attachments before reporting.")
 }

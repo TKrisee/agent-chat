@@ -10,6 +10,14 @@ CREATE TABLE IF NOT EXISTS one_shot_workers (
  agent_id TEXT PRIMARY KEY REFERENCES agents(id),
  child_task_id TEXT UNIQUE REFERENCES tasks(id)
 );
+CREATE TABLE IF NOT EXISTS operator_preview_workers (
+ agent_id TEXT PRIMARY KEY REFERENCES agents(id),
+ project_id TEXT NOT NULL REFERENCES projects(id)
+);
+CREATE TABLE IF NOT EXISTS operator_preview_deliveries (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+ message_id TEXT NOT NULL UNIQUE REFERENCES messages(id)
+);
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), title TEXT NOT NULL,
   status TEXT NOT NULL CHECK(status IN ('assigned','queued','review','accepted','completed','blocked')),
