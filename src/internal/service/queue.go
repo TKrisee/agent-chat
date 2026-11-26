@@ -39,6 +39,9 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 	}
 	done := make(chan attempt, s.opts.Concurrency)
 	cleaning := make(chan struct{}, 1)
+	// Scratch cleanup may hold an open directory handle. Wait for it before
+	// Run returns so Close and relocation cannot race its final operation.
+	defer func() { cleaning <- struct{}{}; <-cleaning }()
 	defer func() {
 		for range len(active) {
 			<-done
