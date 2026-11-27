@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.7](https://github.com/TKrisee/agent-chat/compare/v0.19.6...v0.19.7) (2026-11-27)
+
+
+### Bug Fixes
+
+* stabilize agent workflows and present chat commands ([#80](https://github.com/TKrisee/agent-chat/issues/80)) ([c93e8aa](https://github.com/TKrisee/agent-chat/commit/c93e8aa5f8b8212e49f851d65b7408e297a37cea))
+
 ## [0.19.6](https://github.com/TKrisee/agent-chat/compare/v0.19.5...v0.19.6) (2026-11-27)
 
 
