@@ -71,8 +71,14 @@ func TestPOFollowThroughAssignmentAndBound(t *testing.T) {
 		if linked != 1 || leaked != 0 {
 			t.Fatalf("pinned note=%d Root leaks=%d", linked, leaked)
 		}
-		if escalation, err := s.claim(nil); err != nil || escalation != nil {
-			t.Fatalf("unexpected escalation %+v %v", escalation, err)
+		escalation, err := s.claim(nil)
+		if err != nil || escalation == nil || !escalation.Request.LocalHoldSupervisor {
+			t.Fatalf("private supervisory wake %+v %v", escalation, err)
+		}
+		for _, m := range escalation.Request.Context {
+			if strings.Contains(m.Text, "Review only; do not deploy.") {
+				t.Fatal("private continuation content reached Root")
+			}
 		}
 	})
 	t.Run("update then worker", func(t *testing.T) {

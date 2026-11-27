@@ -125,8 +125,16 @@ CREATE TABLE IF NOT EXISTS task_holds (
 CREATE TABLE IF NOT EXISTS task_local_holds (
  job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id)
 );
+CREATE TABLE IF NOT EXISTS task_local_supervision_candidates (
+ hold_job_id TEXT PRIMARY KEY REFERENCES task_local_holds(job_id)
+);
 CREATE TABLE IF NOT EXISTS task_internal_wakes (
  source_id TEXT PRIMARY KEY REFERENCES messages(id)
+);
+CREATE TABLE IF NOT EXISTS task_local_supervisions (
+ hold_job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id),
+ source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ recovery_task_id TEXT UNIQUE REFERENCES tasks(id)
 );
 
 CREATE TABLE IF NOT EXISTS project_goals (

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -120,14 +121,14 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		workspace = s.workspace(project)
 	}
 	var parent string
-	if kind == "operator_message" || kind == groupMessageKind {
+	if kind == "operator_message" || kind == groupMessageKind || kind == "scope_review" || kind == "assignment" {
 		err := tx.QueryRow("SELECT parent_id FROM message_replies WHERE message_id=?", source).Scan(&parent)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 	}
 	if parent != "" {
-		guide += "\nThe operator replied to message " + parent + ". Its exact text and attachments are included in the context."
+		guide += "\nThe source message replies to message " + parent + ". Its exact text and attachments are included in the context."
 	}
 	history, err := s.runtimeContext(tx, a, project, task, parent, kind, source)
 	if err != nil {
@@ -151,6 +152,13 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	req := runtimeapi.Request{ID: id, AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
 		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history,
 		Instructions: guide + "\n\nEvent: " + kind + "\n" + instructions}
+	if a.ID == root && kind == "task_blocked" {
+		var n int
+		if err := tx.QueryRow(`SELECT count(*) FROM task_local_supervisions WHERE source_id=?`, source).Scan(&n); err != nil {
+			return err
+		}
+		req.LocalHoldSupervisor = n == 1
+	}
 	if a.ID == root && kind == "operator_message" {
 		req.AllowOperatorResolveHold, err = s.offerOperatorHoldResolution(tx, source)
 		if err != nil {
@@ -526,13 +534,37 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 					return err
 				}
 			}
-			if j.Kind != groupMessageKind {
+			internalWake := 0
+			if j.Kind == "task_blocked" && j.Agent == root {
+				if err := tx.QueryRow(`SELECT count(*) FROM task_internal_wakes WHERE source_id=?`, j.Source).Scan(&internalWake); err != nil {
+					return err
+				}
+			}
+			if internalWake == 0 && j.Task != "" {
+				if err := tx.QueryRow(`SELECT count(*) FROM task_local_supervisions WHERE recovery_task_id=?`, j.Task).Scan(&internalWake); err != nil {
+					return err
+				}
+			}
+			if j.Kind != groupMessageKind && internalWake == 0 {
 				if err := addMessage(tx, newID(), "service", operator, "system", diagnostic, j.Project, j.Task); err != nil {
 					return err
 				}
 			}
 		}
 		_, err := tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, nullIfEmpty(diagnostic), j.ID)
+		if err != nil || j.Project == "" {
+			return err
+		}
+		if _, err = tx.Exec("SAVEPOINT local_supervision"); err != nil {
+			return err
+		}
+		if wakeErr := s.maybeSuperviseLocalHold(tx, j.Project); wakeErr != nil {
+			if _, err = tx.Exec("ROLLBACK TO local_supervision"); err != nil {
+				return err
+			}
+			log.Printf("local hold supervision deferred: %v", wakeErr)
+		}
+		_, err = tx.Exec("RELEASE local_supervision")
 		return err
 	})
 	if err == nil {
@@ -606,7 +638,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		if action.Task != "" && action.Type != "resolve_hold" {
 			return fmt.Errorf("%w: task field is reserved for resolve_hold", errWorkflow)
 		}
-		if action.ReplyTo != "" && action.Type != "post_group" {
+		if action.ReplyTo != "" && action.Type != "post_group" && !(a.Role == "root" && action.Type == "delegate") {
 			return fmt.Errorf("%w: reply_to is reserved for project group posts", errWorkflow)
 		}
 		if action.Type == "resolve_hold" && len(result.Actions) != 1 {
@@ -830,6 +862,17 @@ func attachGroupReply(tx *sql.Tx, messageID, parentID, project string) error {
 	return err
 }
 
+// Delegations quote only messages in the destination Root–PO conversation.
+// Missing or inaccessible targets leave the new message standalone.
+func attachDelegationReply(tx *sql.Tx, messageID, parentID, project, po string) error {
+	if parentID == "" {
+		return nil
+	}
+	room := directRoom(root, po)
+	_, err := tx.Exec(`INSERT INTO message_replies(message_id,parent_id) SELECT child.id,parent.id FROM messages child JOIN messages parent ON parent.id=? AND parent.room_id=? AND parent.project_id=? AND ((parent.sender=? AND parent.recipient=?) OR (parent.sender=? AND parent.recipient=?)) WHERE child.id=? AND child.room_id=? AND child.project_id=? AND child.sender=? AND child.recipient=? AND child.id<>parent.id`, parentID, room, project, root, po, po, root, messageID, room, project, root, po)
+	return err
+}
+
 func relayProjectReport(tx *sql.Tx, a agent, j job, text string, files []attachmentData) error {
 	var report string
 	err := tx.QueryRow(`SELECT m.text FROM messages m JOIN projects p ON p.id=m.project_id
@@ -970,6 +1013,9 @@ func outputMessage(tx *sql.Tx, a agent, recipient string, j job, text string, fi
 func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
 	if len(action.Title) > 250 || len(action.Body) > 64*1024 {
 		return fmt.Errorf("%w: action title or body exceeds limits", errWorkflow)
+	}
+	if a.ID == root && j.Kind == "task_blocked" && j.Request.LocalHoldSupervisor {
+		return s.delegateLocalSupervision(tx, a, j, action)
 	}
 	if action.Type == "request_approval" && (a.Role == "root" || a.Role == "po") {
 		if a.Role == "root" && j.Kind == "task_blocked" {
@@ -1242,6 +1288,9 @@ func (s *Service) rootAssignment(tx *sql.Tx, a agent, j job, action runtimeapi.A
 	if err := addMessage(tx, id, a.ID, po.ID, a.Role, action.Body, action.Project, task); err != nil {
 		return err
 	}
+	if err := attachDelegationReply(tx, id, action.ReplyTo, action.Project, po.ID); err != nil {
+		return err
+	}
 	if err := workflowNotice(tx, action.Project, "scope:"+task, "Root sent the project owner a request for scope assessment."); err != nil {
 		return err
 	}
@@ -1267,7 +1316,15 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 		if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 			return err
 		}
-		_, err := outputMessage(tx, a, operator, j, result.Text, files)
+		var internal int
+		if err := tx.QueryRow(`SELECT count(*) FROM task_local_supervisions WHERE recovery_task_id=?`, j.Task).Scan(&internal); err != nil {
+			return err
+		}
+		recipient := operator
+		if internal != 0 {
+			recipient = root
+		}
+		_, err := outputMessage(tx, a, recipient, j, result.Text, files)
 		return err
 	}
 	if len(result.Actions) != 1 {
@@ -1303,6 +1360,9 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 	}
 	id, err := outputMessage(tx, a, po.ID, j, action.Body, nil)
 	if err != nil {
+		return err
+	}
+	if err := attachDelegationReply(tx, id, action.ReplyTo, j.Project, po.ID); err != nil {
 		return err
 	}
 	if err := workflowNotice(tx, j.Project, "assignment:"+j.ID, "Root sent the finalized assignment to the project owner."); err != nil {

@@ -162,6 +162,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.ParentPlanning {
 		add("parent-planning")
 	}
+	if req.LocalHoldSupervisor {
+		add("local-hold-supervisor")
+	}
 	if req.OperatorPreviews {
 		add("operator-previews")
 	}
@@ -199,6 +202,9 @@ func validate(req runtimeapi.Request) error {
 	}
 	if req.OperatorPreviews && (req.Role != "worker" || req.Kind != "work") {
 		return errors.New("operator previews require a worker work job")
+	}
+	if req.LocalHoldSupervisor && (req.Role != "root" || req.Kind != "task_blocked" || req.TaskID == "" || req.ProjectID == "") {
+		return errors.New("local hold supervision requires a Root task-blocked project turn")
 	}
 	if req.AllowOperatorResolveHold && (req.Role != "root" || req.Kind != "operator_message") {
 		return errors.New("operator hold resolution requires a Root operator message")
@@ -366,12 +372,17 @@ func prompt(req runtimeapi.Request) string {
 		}
 	}
 	if req.Role == "root" {
+		if req.Kind == "scope_decision" || req.LocalHoldSupervisor {
+			b.WriteString("\nFor delegate, reply_to may reference an existing relevant message; the app attaches it only if the recipient can read it. Leave it empty when no reply is needed.\n")
+		}
 		b.WriteString("\nSolve ordinary coordination and technical problems within the team's authority. For a missing file, look in authorized checkouts, artifacts and receipt history or ask its owning agent through an available internal route. For documentation, use available primary vendor documentation or tool help. Use an authorized alternative or bounded retry where appropriate and continue independent work. Do not ask the operator to retrieve routine files or documentation or interpret a vague blocker. Ask them for genuine product or art choices, such as selecting concept A or B or accepting or revising a model, and for authority the team actually lacks. Respect privacy, access boundaries, stops, approvals and uncertain effects.\n")
 		if req.Kind == "operator_message" {
 			b.WriteString("\nTo forward evidence explicitly supplied by the operator to the relevant project's PO without resolving a hold, use handoff_evidence with the exact project ID and a concise body; leave other action fields empty. Do not treat historical quoted approvals as new authorizations. PO work and result acceptance remain with the PO.\n")
 		}
 		b.WriteString("\nWhen receiving project reports or escalations, summarize relevant facts for the operator and forward actual questions or choices needing their decision; do not relay routine team chatter or private PO conversations.\n")
-		if req.Kind == "task_blocked" {
+		if req.Kind == "task_blocked" && req.LocalHoldSupervisor {
+			b.WriteString("\nThe original local hold remains active. Inspect actual task and receipt records; distinguish reviewed designs from delivered work. If genuinely useful, delegate at most one distinct, nonduplicative, independently authorized same-project task to the appointed PO for scope review; otherwise take no action. Preserve the prior operator scope and every human, qualification, production, stop and uncertain-effect boundary. Do not repeat effects, launch recursive recovery, create a status-only task, repeat an exhausted lookup, resolve the original hold, or address the operator in this turn.\n")
+		} else if req.Kind == "task_blocked" {
 			b.WriteString("Escalate to the operator only a specific decision they actually own, not a technical prerequisite or a generic request for permission. If the PO's question is incomplete, seek the missing facts from the PO through an available authorized internal route; if none is available, report the missing information honestly and do not claim a clarification was sent or invent a decision. When an operator decision is genuinely needed, state the single exact question, why it requires their authority, the relevant evidence, practical options and impact, and what happens next.\n")
 			b.WriteString("For a blocked-task escalation, summarize the concrete blocker using only PO evidence explicitly shared for this task; do not assume the operator has seen it. Distinguish operational decisions explicitly assigned to Root from decisions actually requiring the operator. For an active hold explicitly marked Root-owned, use resolve_hold with its exact project and task and your scoped decision in body, within the authorized scope and respecting stops, exhausted retry limits and approval boundaries. Do not assume legacy or operator-owned holds allow autonomous resolution. Ask the operator only when a specific real decision or request is recorded: state the exact requirement in plain language and any supplied options, tradeoffs, recommendation and independent constraints. Never ask a generic question about whether they need to decide. If ownership or the decision is unknown, report the known status or clarify through authorized project paths; never invent a decision, infer private PO details, or claim clarification was requested when it was not.\n")
 		}

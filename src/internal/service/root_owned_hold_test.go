@@ -25,8 +25,15 @@ func TestRootOwnedHoldDecisionIsScopedAndBounded(t *testing.T) {
 			}
 			rootJob, err := s.claim(nil)
 			if tc.fence == "default" {
-				if err != nil || rootJob != nil {
-					t.Fatalf("local hold unexpectedly woke Root: %+v %v", rootJob, err)
+				if err != nil || rootJob == nil || !rootJob.Request.LocalHoldSupervisor {
+					t.Fatalf("local supervisor unavailable: %+v %v", rootJob, err)
+				}
+				if err := s.complete(*rootJob, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "resolve_hold", Project: "alpha", Task: task, Body: "Do not clear."}}}, nil, nil, nil); err != nil {
+					t.Fatal(err)
+				}
+				var active int
+				if err := s.db.QueryRow(`SELECT count(*) FROM task_holds WHERE task_id=? AND status='active'`, task).Scan(&active); err != nil || active != 1 {
+					t.Fatalf("local hold changed: %v", err)
 				}
 				return
 			}

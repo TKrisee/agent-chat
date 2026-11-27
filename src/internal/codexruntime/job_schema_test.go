@@ -41,6 +41,22 @@ func TestAuthorizedOperatorHoldSchema(t *testing.T) {
 	}
 }
 
+func TestDelegateOnlyReplyField(t *testing.T) {
+	for _, req := range []runtimeapi.Request{
+		{Role: "root", Kind: "scope_decision", ProjectID: "alpha", TaskID: "task"},
+		{Role: "root", Kind: "task_blocked", ProjectID: "alpha", TaskID: "task", LocalHoldSupervisor: true},
+	} {
+		cmd := exec.Command("jq", "-e", `.properties.actions.items.properties.reply_to.type == "string" and (.properties.actions.items.properties.reply_to | has("enum") | not)`)
+		cmd.Stdin = strings.NewReader(newJobSchema(req))
+		if err := cmd.Run(); err != nil {
+			t.Fatalf("delegate reply field: %v", err)
+		}
+		if !strings.Contains(prompt(req), "app attaches it only if the recipient can read it") {
+			t.Fatal("missing recipient visibility guidance")
+		}
+	}
+}
+
 func TestReportRecoverySchemaAndFingerprint(t *testing.T) {
 	request := runtimeapi.Request{Role: "po", Kind: "po_followup"}
 	ordinary := newJobSchema(request)

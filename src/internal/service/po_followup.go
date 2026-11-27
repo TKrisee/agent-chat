@@ -321,7 +321,10 @@ func (s *Service) recordLocalPOHold(tx *sql.Tx, j job, a agent, phase, reason st
 	if _, err := tx.Exec(`INSERT INTO task_holds(job_id,task_id,project_id,po_id,phase,assignment_id,note_id,review_id,root_source_id,status) VALUES(?,?,?,?,?,?,?,?,?,'active')`, j.ID, j.Task, j.Project, a.ID, phase, assignment, nullIfEmpty(note), nullIfEmpty(review), source); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO task_local_holds(job_id) VALUES(?)`, j.ID)
+	if _, err = tx.Exec(`INSERT INTO task_local_holds(job_id) VALUES(?)`, j.ID); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO task_local_supervision_candidates(hold_job_id) VALUES(?)`, j.ID)
 	return err
 }
 func (s *Service) poHoldAction(tx *sql.Tx, j job, a agent, action runtimeapi.Action) error {

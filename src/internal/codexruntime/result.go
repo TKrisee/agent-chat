@@ -54,6 +54,8 @@ func newJobSchema(req runtimeapi.Request) string {
 	for _, action := range actionTypes[req.Role] {
 		ok := true
 		switch {
+		case req.LocalHoldSupervisor:
+			ok = action == "delegate"
 		case req.ChildReceiptOnly:
 			ok = action == "accept_result" || action == "report" || action == "report_progress"
 		case req.ReportOnly:
@@ -93,7 +95,7 @@ func newJobSchema(req runtimeapi.Request) string {
 		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":0,"items":`, 1)
 		return schema
 	}
-	if req.Role == "worker" && req.Kind == "operator_message" {
+	if req.LocalHoldSupervisor || (req.Role == "worker" && req.Kind == "operator_message") {
 		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":1,"items":`, 1)
 	}
 	return strings.Replace(schema, oldEnum, `"enum":[`+strings.Join(allowed, ",")+`]`, 1)
@@ -268,6 +270,11 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				return result, errRoleAction
 			}
 			if values[6] != "" && values[0] != "post_group" {
+				if req.Role != "root" || values[0] != "delegate" {
+					return result, errRoleAction
+				}
+			}
+			if req.LocalHoldSupervisor && (values[0] != "delegate" || values[1] != req.ProjectID || strings.TrimSpace(values[2]) == "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "") {
 				return result, errRoleAction
 			}
 			if values[0] == "handoff_evidence" && (req.Role != "root" || req.Kind != "operator_message" || strings.TrimSpace(values[1]) == "" || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "" || values[6] != "") {
@@ -322,7 +329,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			return result, errors.New("unknown structured result row")
 		}
 	}
-	if req.Role == "worker" && req.Kind == "operator_message" && len(result.Actions) > 1 {
+	if (req.LocalHoldSupervisor || (req.Role == "worker" && req.Kind == "operator_message")) && len(result.Actions) > 1 {
 		return result, errRoleAction
 	}
 	return result, nil

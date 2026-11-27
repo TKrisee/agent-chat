@@ -7,7 +7,7 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
-func TestLocalHoldDoesNotPromptOperatorOrWakeRoot(t *testing.T) {
+func TestLocalHoldWakesRootPrivatelyWithoutPromptingOperator(t *testing.T) {
 	for _, protected := range []bool{false, true} {
 		t.Run(map[bool]string{false: "ordinary", true: "private task input"}[protected], func(t *testing.T) {
 			s, task, po, _ := continuationFixture(t)
@@ -49,8 +49,22 @@ func TestLocalHoldDoesNotPromptOperatorOrWakeRoot(t *testing.T) {
 			if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND recipient=? AND text=?`, task, po, reason).Scan(&ownerReason); err != nil {
 				t.Fatal(err)
 			}
-			if status != "blocked" || marker != 1 || rootJobs != 0 || operatorMessages != 0 || (!protected && rootReason != 1) || (protected && (rootReason != 0 || ownerReason != 1)) {
+			if status != "blocked" || marker != 1 || rootJobs != 1 || operatorMessages != 0 || (!protected && rootReason != 1) || (protected && (rootReason != 0 || ownerReason != 1)) {
 				t.Fatalf("status=%s marker=%d root jobs=%d operator=%d root reason=%d owner reason=%d", status, marker, rootJobs, operatorMessages, rootReason, ownerReason)
+			}
+			wake, err := s.claim(nil)
+			if err != nil || wake == nil || !wake.Request.LocalHoldSupervisor {
+				t.Fatalf("private Root wake: %v", err)
+			}
+			if protected {
+				for _, m := range wake.Request.Context {
+					if m.Text == reason {
+						t.Fatal("protected hold reason reached Root")
+					}
+				}
+			}
+			if err := s.complete(*wake, runtimeapi.Result{Text: "No independent route established."}, nil, nil, nil); err != nil {
+				t.Fatal(err)
 			}
 			id := newID()
 			if code := postOperatorHold(s, task, "alpha", "Continue within scope.", id); code != 202 {
