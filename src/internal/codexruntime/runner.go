@@ -181,6 +181,9 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.AllowOperatorResolveHold {
 		add("allow-operator-resolve-hold")
 	}
+	if req.ModelSelection {
+		add("model-selection")
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {

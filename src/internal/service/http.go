@@ -143,6 +143,8 @@ func querySlice[T any](db querier, query string, scan func(*sql.Rows) (T, error)
 
 func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/model-preferences", s.getModelPreferences)
+	mux.HandleFunc("POST /api/model-preferences", s.setModelPreferences)
 	mux.HandleFunc("POST /api/agents/{id}/operator-previews", s.setOperatorPreviews)
 	mux.HandleFunc("GET /api/usage", s.usageStatus)
 	mux.HandleFunc("POST /api/usage/settings", s.usageSettings)

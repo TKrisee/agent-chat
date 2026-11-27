@@ -9,6 +9,11 @@ import (
 
 type State string
 
+// ModelCatalog lists executable model slugs available to the selected runtime.
+type ModelCatalog interface {
+	Models(context.Context) ([]string, error)
+}
+
 const (
 	NotStarted State = "not_started"
 	Running    State = "running"
@@ -29,6 +34,7 @@ type DiagnosticReader interface {
 }
 
 type Request struct {
+	ModelSelection           bool      `json:"model_selection,omitempty"`
 	ID                       string    `json:"id"`
 	AgentID                  string    `json:"agent_id"`
 	Role                     string    `json:"role"`
@@ -77,14 +83,17 @@ type Result struct {
 }
 
 type Action struct {
-	Type      string   `json:"type"`
-	DependsOn []string `json:"depends_on,omitempty"`
-	ReplyTo   string   `json:"reply_to,omitempty"`
-	Task      string   `json:"task,omitempty"`
-	Project   string   `json:"project"`
-	Title     string   `json:"title"`
-	Body      string   `json:"body"`
-	Recipient string   `json:"recipient"`
+	Type        string   `json:"type"`
+	Model       string   `json:"model,omitempty"`
+	Category    string   `json:"category,omitempty"`
+	ModelReason string   `json:"model_reason,omitempty"`
+	DependsOn   []string `json:"depends_on,omitempty"`
+	ReplyTo     string   `json:"reply_to,omitempty"`
+	Task        string   `json:"task,omitempty"`
+	Project     string   `json:"project"`
+	Title       string   `json:"title"`
+	Body        string   `json:"body"`
+	Recipient   string   `json:"recipient"`
 }
 
 type Attachment struct {

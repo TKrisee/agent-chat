@@ -7,11 +7,17 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 func (s *Service) ConfigureRuntime(ctx context.Context, runner runtimeapi.Runner) error {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
+	s.setupMu.Lock()
+	s.modelCatalog, _ = runner.(runtimeapi.ModelCatalog)
+	s.models = nil
+	s.modelsAt = time.Time{}
+	s.setupMu.Unlock()
 	setup, ok := runner.(runtimeapi.CodexSetup)
 	if !ok {
 		return nil
