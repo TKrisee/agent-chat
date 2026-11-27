@@ -214,6 +214,8 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 	if a.Role == "po" && project != "" && project == a.Project && task != "" && kind != "operator_message" && kind != groupMessageKind {
 		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN root_evidence_handoffs h ON h.message_id=m.id JOIN projects p ON p.id=h.project_id AND p.po_id=? WHERE h.project_id=? AND m.project_id=p.id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? ORDER BY m.seq DESC LIMIT 12)`
 		args = append(args, a.ID, project, root, a.ID, directRoom(root, a.ID))
+		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN worker_po_handoffs h ON h.message_id=m.id JOIN projects p ON p.id=h.project_id AND p.po_id=? JOIN agents w ON w.id=m.sender AND w.role='worker' AND w.project_id=p.id WHERE h.project_id=? AND m.project_id=p.id AND m.recipient=? AND m.role='worker' AND m.room_id='dm:'||CASE WHEN m.sender<m.recipient THEN m.sender||':'||m.recipient ELSE m.recipient||':'||m.sender END ORDER BY m.seq DESC LIMIT 12)`
+		args = append(args, a.ID, project, a.ID)
 	}
 	if kind == "scope_review" {
 		query += ` UNION SELECT * FROM (SELECT ` + privateColumns + ` FROM messages
@@ -867,7 +869,7 @@ func shareAcceptedWorkerAttachments(tx *sql.Tx, j job, po, reportID string) erro
 }
 
 func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Result, files []attachmentData) error {
-	if (j.Kind != "work" && len(result.Actions) != 0) || (strings.TrimSpace(result.Text) == "" && len(files) == 0) {
+	if (j.Kind != "work" && j.Kind != "operator_message" && len(result.Actions) != 0) || (strings.TrimSpace(result.Text) == "" && len(files) == 0) {
 		return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
 	}
 	if j.Kind == "operator_message" && j.Task == "" {
@@ -879,6 +881,30 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 		}
 		if err != nil {
 			return err
+		}
+		if len(result.Actions) > 1 {
+			return fmt.Errorf("%w: worker conversation permits one scoped share", errWorkflow)
+		}
+		if len(result.Actions) == 1 {
+			action := result.Actions[0]
+			if action.Type != "share_with_po" || action.Project != "" || action.Title != "" || action.Recipient != "" || action.Task != "" || action.ReplyTo != "" || len(action.DependsOn) != 0 || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
+				return fmt.Errorf("%w: invalid worker evidence share", errWorkflow)
+			}
+			var po string
+			err := tx.QueryRow(`SELECT p.po_id FROM projects p JOIN agents worker ON worker.id=? AND worker.role='worker' AND worker.project_id=p.id JOIN agents owner ON owner.id=p.po_id AND owner.role='po' AND owner.project_id=p.id JOIN messages m ON m.id=? AND m.sender=? AND m.recipient=worker.id AND m.role='operator' AND m.project_id=p.id AND m.room_id=? AND m.task_id IS NULL WHERE p.id=?`, a.ID, j.Source, operator, directRoom(operator, a.ID), j.Project).Scan(&po)
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: worker evidence share unavailable", errWorkflow)
+			}
+			if err != nil {
+				return err
+			}
+			id := newID()
+			if err := addMessage(tx, id, a.ID, po, "worker", action.Body, j.Project, ""); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO worker_po_handoffs(message_id,source_id,job_id,project_id) VALUES(?,?,?,?)`, id, j.Source, j.ID, j.Project); err != nil {
+				return err
+			}
 		}
 		_, err = outputMessage(tx, a, operator, j, result.Text, files)
 		return err

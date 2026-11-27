@@ -33,7 +33,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 var actionTypes = map[string][]string{
 	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold", "handoff_evidence"},
 	"po":     {"queue_worker", "create_worker", "create_one_shot_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
-	"worker": {"post_group", "send_operator_previews"},
+	"worker": {"post_group", "send_operator_previews", "share_with_po"},
 }
 
 func actionAllowed(role, action string) bool {
@@ -62,7 +62,11 @@ func newJobSchema(req runtimeapi.Request) string {
 			ok = action != "accept_result"
 		case req.Kind == "project_message" || req.Kind == "approval_denied":
 			ok = false
+		case req.Role == "worker" && req.Kind == "operator_message":
+			ok = action == "share_with_po"
 		case req.Role == "worker" && req.Kind != "work":
+			ok = false
+		case action == "share_with_po":
 			ok = false
 		case req.Role == "worker" && action == "send_operator_previews":
 			ok = req.OperatorPreviews
@@ -88,6 +92,9 @@ func newJobSchema(req runtimeapi.Request) string {
 	if len(allowed) == 0 {
 		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":0,"items":`, 1)
 		return schema
+	}
+	if req.Role == "worker" && req.Kind == "operator_message" {
+		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":1,"items":`, 1)
 	}
 	return strings.Replace(schema, oldEnum, `"enum":[`+strings.Join(allowed, ",")+`]`, 1)
 }
@@ -269,6 +276,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if values[0] == "send_operator_previews" && (req.Kind != "work" || !req.OperatorPreviews || values[1] != "" || values[2] != "" || values[3] != "" || values[4] != "" || values[5] != "" || values[6] != "") {
 				return result, errRoleAction
 			}
+			if values[0] == "share_with_po" && (req.Role != "worker" || req.Kind != "operator_message" || values[1] != "" || values[2] != "" || strings.TrimSpace(values[3]) == "" || len(values[3]) > 4096 || values[4] != "" || values[5] != "" || values[6] != "") {
+				return result, errRoleAction
+			}
 			if values[0] == "report_progress" && (req.TaskID == "" || req.Kind == "scope_review" || req.Kind == "operator_message" || req.Kind == "project_message" || (values[1] != "" && values[1] != req.ProjectID) || values[2] != "" || strings.TrimSpace(values[3]) == "" || (values[4] != "" && values[4] != "root")) {
 				return result, errRoleAction
 			}
@@ -311,6 +321,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 		default:
 			return result, errors.New("unknown structured result row")
 		}
+	}
+	if req.Role == "worker" && req.Kind == "operator_message" && len(result.Actions) > 1 {
+		return result, errRoleAction
 	}
 	return result, nil
 }

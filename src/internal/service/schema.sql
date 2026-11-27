@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS message_replies (
   parent_id TEXT NOT NULL REFERENCES messages(id),
   CHECK(message_id<>parent_id)
 );
+CREATE TABLE IF NOT EXISTS worker_po_handoffs (
+ message_id TEXT PRIMARY KEY REFERENCES messages(id),
+ source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ job_id TEXT NOT NULL UNIQUE REFERENCES jobs(id),
+ project_id TEXT NOT NULL REFERENCES projects(id)
+);
 CREATE TABLE IF NOT EXISTS message_mentions (
   message_id TEXT NOT NULL REFERENCES messages(id),
   agent_id TEXT NOT NULL REFERENCES agents(id),
