@@ -887,7 +887,10 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 		}
 		if len(result.Actions) == 1 {
 			action := result.Actions[0]
-			if action.Type != "share_with_po" || action.Project != "" || action.Title != "" || action.Recipient != "" || action.Task != "" || action.ReplyTo != "" || len(action.DependsOn) != 0 || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
+			if action.Type != "share_with_po" {
+				return fmt.Errorf("%w: worker must submit text or attachments without orchestration actions", errWorkflow)
+			}
+			if action.Project != "" || action.Title != "" || action.Recipient != "" || action.Task != "" || action.ReplyTo != "" || len(action.DependsOn) != 0 || strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
 				return fmt.Errorf("%w: invalid worker evidence share", errWorkflow)
 			}
 			var po string

@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 
 	"agentchat/src/internal/runtimeapi"
@@ -81,7 +82,7 @@ func TestWorkerDMCanShareAssignedFindingWithAppointedPO(t *testing.T) {
 }
 
 func TestWorkerShareRejectsForeignSourceAndWrongScope(t *testing.T) {
-	for _, scenario := range []string{"foreign source", "wrong recipient"} {
+	for _, scenario := range []string{"foreign source", "wrong recipient", "orchestration action"} {
 		t.Run(scenario, func(t *testing.T) {
 			s, _, _, worker := continuationFixture(t)
 			defer s.Close()
@@ -100,12 +101,21 @@ func TestWorkerShareRejectsForeignSourceAndWrongScope(t *testing.T) {
 			if scenario == "wrong recipient" {
 				action.Recipient = root
 			}
+			if scenario == "orchestration action" {
+				action.Type = "request_approval"
+			}
 			if err := s.complete(*j, runtimeapi.Result{Text: "Done.", Actions: []runtimeapi.Action{action}}, nil, nil, nil); err != nil {
 				t.Fatal(err)
 			}
 			var count int
 			if err := s.db.QueryRow(`SELECT count(*) FROM worker_po_handoffs`).Scan(&count); err != nil || count != 0 {
 				t.Fatalf("unauthorized handoff=%d: %v", count, err)
+			}
+			if scenario == "orchestration action" {
+				var diagnostic string
+				if err := s.db.QueryRow(`SELECT COALESCE(diagnostic,'') FROM jobs WHERE id=?`, j.ID).Scan(&diagnostic); err != nil || !strings.Contains(diagnostic, "worker must submit text or attachments without orchestration actions") {
+					t.Fatalf("diagnostic %q: %v", diagnostic, err)
+				}
 			}
 		})
 	}
