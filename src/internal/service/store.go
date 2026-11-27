@@ -49,6 +49,11 @@ type Options struct {
 type Service struct {
 	setupMu          sync.RWMutex
 	setup            runtimeapi.CodexSetup
+	modelCatalog     runtimeapi.ModelCatalog
+	models           []string
+	modelsSource     string
+	modelsAt         time.Time
+	modelsGeneration uint64
 	reviewProofMu    sync.Mutex
 	reviewProof      map[string]bool
 	startMu          sync.Mutex

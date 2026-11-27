@@ -30,6 +30,7 @@ func (s *Service) Run(ctx context.Context, runner runtimeapi.Runner) error {
 		return err
 	}
 	go s.pollUsage(ctx, runner)
+	go s.pollModels(ctx)
 	tick := time.NewTicker(s.opts.Poll)
 	defer tick.Stop()
 	active := make(map[string]bool)

@@ -21,7 +21,7 @@ func (r *Runner) IsLegacyProgress(ctx context.Context, payload []byte, project, 
 	defer cancel()
 	const filter = `split("\n") | if length!=2 then false else (.[0]|@base64d|fromjson) as $result | (.[1]|@base64d) as $body |
   ($result|type)=="object" and ($result.actions|type)=="array" and
-  ([ $result.actions[] | select(type=="object" and .type=="report_progress" and .body==$body and (.project=="" or .project==$project) and (.recipient=="" or .recipient=="root") and .title=="" and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on"])==[]) and ((has("depends_on")|not) or .depends_on==[]) ) ] | length)==1 end`
+  ([ $result.actions[] | select(type=="object" and .type=="report_progress" and .body==$body and (.project=="" or .project==$project) and (.recipient=="" or .recipient=="root") and .title=="" and ((has("task")|not) or .task=="") and ((has("reply_to")|not) or .reply_to=="") and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason"])==[]) and ((.model // "")=="") and ((.category // "")=="") and ((.model_reason // "")=="") and ((has("depends_on")|not) or .depends_on==[]) ) ] | length)==1 end`
 	cmd := exec.CommandContext(ctx, r.cfg.JQPath, "-e", "-R", "-s", "--arg", "project", project, filter)
 	cmd.Stdin = bytes.NewBufferString(base64.StdEncoding.EncodeToString(payload) + "\n" + base64.StdEncoding.EncodeToString([]byte(body)))
 	cmd.Stdout = io.Discard
@@ -70,7 +70,7 @@ def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
 type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and
 (.actions|type=="array" and length>=2 and length<=12) and
 ([.actions[]|select(.type=="request_approval")]|length)==1 and
-all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on"])==[]) and ((has("depends_on")|not) or .depends_on==[]) and
+all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason"])==[]) and ((.model // "")=="") and ((.category // "")=="") and ((.model_reason // "")=="") and ((has("depends_on")|not) or .depends_on==[]) and
 ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and (.task//"")=="" and (.reply_to//"")=="" and (.project=="" or .project==$project) and
 if .type=="create_worker" then (.title|nonblank and (test("\\s")|not)) and .body=="" and .recipient==""
 elif .type=="queue_work_item" then (.title|nonblank) and (.body|nonblank) and (.recipient|nonblank)
@@ -133,7 +133,7 @@ func (r *Runner) IsLegacyChildProgress(ctx context.Context, payload []byte, proj
 def nonblank: type=="string" and (gsub("^\\s+|\\s+$";"")|length>0);
 type=="object" and keys==["actions","attachments","text"] and (.text|type=="string") and .attachments==[] and
 (.actions|type=="array" and length>=3 and length<=12) and
-all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on"])==[]) and ((has("depends_on")|not) or .depends_on==[]) and
+all(.actions[]; type=="object" and ((keys-["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason"])==[]) and ((.model // "")=="") and ((.category // "")=="") and ((.model_reason // "")=="") and ((has("depends_on")|not) or .depends_on==[]) and
 ([.type,.project,.title,.body,.recipient,(.task//""),(.reply_to//"")]|all(.[];type=="string")) and (.task//"")=="" and (.reply_to//"")=="" and (.project=="" or .project==$project) and
 if .type=="accept_result" then (.recipient=="" or .recipient==$worker)
 elif .type=="report" then (.recipient=="" or .recipient=="root" or .recipient==$worker) and (.body|nonblank)

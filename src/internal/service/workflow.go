@@ -114,6 +114,15 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 			guide += "\nRecorded child work items:\n" + strings.Join(outcomes, "\n")
 		}
 	}
+	modelSelection := false
+	if a.Role == "po" && task != "" && (kind == "assignment" || kind == "po_continue" || kind == "po_followup" || kind == "review" || kind == "approval_approved") {
+		preferenceGuide, err := s.modelPreferenceGuidance(tx, project)
+		if err != nil {
+			return err
+		}
+		guide += preferenceGuide
+		modelSelection = preferenceGuide != ""
+	}
 	if a.Role == "root" && kind != projectReportRecovery {
 		guide += "\nRoot-bound task updates and escalations may contain private operator-to-PO material intentionally shared for a decision. Before any operator-facing response, include only the information needed for that response; do not relay unrelated private conversation."
 	}
@@ -167,7 +176,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		}
 	}
 	req := runtimeapi.Request{ID: id, AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
-		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history,
+		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history, ModelSelection: modelSelection,
 		Instructions: guide + "\n\nEvent: " + kind + "\n" + instructions}
 	if a.ID == root && kind == "task_blocked" {
 		var n int
@@ -678,6 +687,12 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return err
 	}
 	for _, action := range result.Actions {
+		if action.Model != "" && (a.Role != "po" || (action.Type != "create_worker" && action.Type != "create_one_shot_worker")) {
+			return fmt.Errorf("%w: model is only available for new workers", errWorkflow)
+		}
+		if (action.Category != "" || action.ModelReason != "") && (a.Role != "po" || action.Type != "queue_work_item") {
+			return fmt.Errorf("%w: model category is only available for work items", errWorkflow)
+		}
 		if a.Role == "root" && j.Kind == "task_blocked" && action.Type == "request_approval" && len(result.Actions) != 1 {
 			return fmt.Errorf("%w: Root hold approval must be requested alone", errWorkflow)
 		}

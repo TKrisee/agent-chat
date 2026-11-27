@@ -42,7 +42,11 @@ func (s *Service) createProjectWorker(tx *sql.Tx, j job, po agent, action runtim
 		return workItemPlanning("worker name already exists; use the registered roster")
 	}
 	id := newID()
-	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, s.opts.WorkerModel, s.opts.Effort); err != nil {
+	model, err := s.preferredWorkerModel(tx, action.Model)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, model, s.opts.Effort); err != nil {
 		return err
 	}
 	if action.Type == "create_one_shot_worker" {
@@ -129,6 +133,9 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 		return err
 	}
 	if err = workflowNotice(tx, j.Project, "work-item:"+child, "The project owner queued a work item for a worker."); err != nil {
+		return err
+	}
+	if err = s.notifyModelDeparture(tx, j.Project, child, action.Category, worker.Model, action.ModelReason); err != nil {
 		return err
 	}
 	return s.enqueue(tx, worker, j.Project, child, source, "work", action.Body)
