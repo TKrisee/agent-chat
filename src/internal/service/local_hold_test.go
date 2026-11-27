@@ -102,11 +102,11 @@ func TestInternalRootWakeRejectsUnsupportedApproval(t *testing.T) {
 	s, task, po, _ := continuationFixture(t)
 	defer s.Close()
 	j := activeAssignment(t, s, task, po)
-	if err := s.complete(j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Recipient: root, Body: "Root should review this prerequisite."}}}, nil, nil, nil); err != nil {
+	if err := s.complete(j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Body: "A local technical prerequisite needs investigation."}}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	wake, err := s.claim(nil)
-	if err != nil || wake == nil || wake.Kind != "task_blocked" {
+	if err != nil || wake == nil || wake.Kind != "task_blocked" || !wake.Request.LocalHoldSupervisor {
 		t.Fatalf("Root wake: %v", err)
 	}
 	if err := s.complete(*wake, runtimeapi.Result{Text: "Internal note", Actions: []runtimeapi.Action{{Type: "request_approval", Title: "Choose", Body: "Please decide."}}}, nil, nil, nil); err != nil {

@@ -139,9 +139,18 @@ func (s *Service) initialize() error {
 		if err := migrateRooms(tx); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(reportDeliverySchema); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(stateFeedSchema); err != nil {
+			return err
+		}
 		_, err := tx.Exec("INSERT OR IGNORE INTO agents VALUES (?,?,?,?,?,?)",
 			root, "Root", "root", nil, s.opts.RootModel, s.opts.Effort)
 		if err != nil {
+			return err
+		}
+		if err := backfillProjectReportIssues(tx); err != nil {
 			return err
 		}
 		return deliverPendingApprovals(tx)
@@ -333,6 +342,24 @@ func (s *Service) userMessageWithFiles(ctx context.Context, id, to, project, tex
 		}
 		if parent != "" {
 			if _, err := tx.Exec("INSERT INTO message_replies(message_id,parent_id) VALUES(?,?)", id, parent); err != nil {
+				return err
+			}
+		}
+		if to == root && text == "/recover-report" {
+			if parent == "" || len(files) != 0 {
+				return fmt.Errorf("%w: reply to the report delivery notice without attachments", errInvalid)
+			}
+			if err := s.requestProjectReportRecovery(tx, id, parent); err != nil {
+				return err
+			}
+			created, hasJobs = true, true
+			return nil
+		}
+		if to == root && isRootBacklogIntake(text) {
+			if parent != "" || len(files) != 0 {
+				return fmt.Errorf("%w: send the backlog intake directly to Root without a reply or attachments", errInvalid)
+			}
+			if err := recordRootBacklogGrant(tx, id, text); err != nil {
 				return err
 			}
 		}

@@ -33,6 +33,12 @@ func (s *Service) poAssignmentSource(tx *sql.Tx, j job, po string) (string, erro
 		return "", err
 	}
 	if count == 0 {
+		err = tx.QueryRow(`SELECT count(DISTINCT m.id),COALESCE(min(m.id),'') FROM jobs a JOIN messages m ON m.id=a.source_id JOIN po_followups f ON f.assignment_id=m.id AND f.trigger_id=a.id JOIN po_assignment_corrections c ON c.source_id=f.source_id JOIN jobs correction ON correction.source_id=f.source_id AND correction.task_id=a.task_id AND correction.project_id=a.project_id AND correction.agent_id=a.agent_id AND correction.kind='po_followup' WHERE a.task_id=? AND a.project_id=? AND a.agent_id=? AND a.kind='assignment' AND a.status='completed' AND (correction.id=? OR (correction.status='completed' AND COALESCE(correction.diagnostic,'')='') OR EXISTS (SELECT 1 FROM po_followups next JOIN jobs current ON current.source_id=next.source_id WHERE next.trigger_id=a.id AND next.assignment_id=m.id AND next.ordinal>f.ordinal AND (current.id=? OR (current.status='completed' AND COALESCE(current.diagnostic,'')='')) AND current.task_id=a.task_id AND current.project_id=a.project_id AND current.agent_id=a.agent_id AND current.kind='po_followup')) AND m.task_id=a.task_id AND m.project_id=a.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0`, assignmentTask, j.Project, po, j.ID, j.ID, root, po, directRoom(root, po)).Scan(&count, &id)
+		if err != nil {
+			return "", err
+		}
+	}
+	if count == 0 {
 		_, recovered, ok, err := s.recoveredTitledAssignment(tx, assignmentTask, j.Project, po)
 		if err != nil {
 			return "", err
@@ -54,7 +60,7 @@ func (s *Service) poAssignmentSource(tx *sql.Tx, j job, po string) (string, erro
 	return id, nil
 }
 func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.Result, correction ...string) error {
-	if a.Role != "po" || j.Task == "" || (j.Kind != "assignment" && j.Kind != "po_continue" && j.Kind != "review" && j.Kind != "po_followup") {
+	if a.Role != "po" || j.Task == "" || (j.Kind != "assignment" && j.Kind != "po_continue" && j.Kind != "review" && j.Kind != "po_followup" && j.Kind != "approval_approved" && j.Kind != "approval_denied") {
 		return nil
 	}
 	for _, action := range result.Actions {
@@ -75,14 +81,23 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		return nil
 	}
 	var other, approvals int
-	if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain')),(SELECT count(*) FROM approvals WHERE task_id=? AND status IN ('pending','denied'))`, j.Task, j.ID, j.Task).Scan(&other, &approvals); err != nil {
+	if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain')),(SELECT count(*) FROM approvals WHERE task_id=? AND status='pending')`, j.Task, j.ID, j.Task).Scan(&other, &approvals); err != nil {
 		return err
 	}
 	if other != 0 || approvals != 0 {
 		return nil
 	}
+	if len(correction) == 0 {
+		var outcomes int
+		if err := tx.QueryRow(`SELECT count(*) FROM po_parent_outcome_events WHERE parent_task_id=? AND delivered_source_id IS NULL`, j.Task).Scan(&outcomes); err != nil {
+			return err
+		}
+		if outcomes != 0 {
+			return nil
+		}
+	}
 	var children int
-	if err := tx.QueryRow(`SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.status IN ('queued','review','accepted')`, j.Task).Scan(&children); err != nil {
+	if err := tx.QueryRow(`SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=? AND c.status IN ('queued','review','accepted') AND NOT (c.status='queued' AND EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=c.id AND prerequisite.status!='completed'))`, j.Task).Scan(&children); err != nil {
 		return err
 	}
 	if children != 0 && len(correction) == 0 {
@@ -110,7 +125,7 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		if err != nil {
 			return err
 		}
-		if j.Kind == "po_continue" {
+		if j.Kind == "po_continue" || j.Kind == "approval_approved" || j.Kind == "approval_denied" {
 			f.note = j.Source
 		}
 		if j.Kind == "review" {
@@ -121,6 +136,12 @@ func (s *Service) poFollowThrough(tx *sql.Tx, j job, a agent, result runtimeapi.
 		}
 		if j.Kind == "review" {
 			f.review = j.Source
+		}
+		if (j.Kind == "approval_approved" || j.Kind == "approval_denied") && (phase == "review" || phase == "accepted") {
+			err = tx.QueryRow(`SELECT COALESCE((SELECT r.source_id FROM jobs r WHERE r.task_id=? AND r.project_id=? AND r.agent_id=? AND r.kind='review' AND r.status='completed' AND COALESCE(r.diagnostic,'')='' ORDER BY r.rowid DESC LIMIT 1),'')`, j.Task, j.Project, a.ID).Scan(&f.review)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	if phase == "review" || phase == "accepted" {
@@ -254,18 +275,16 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 			return err
 		}
 	}
+	autoRootAvailable := rootOwned
 	if rootOwned && explicit {
 		var used int
 		if err := tx.QueryRow(`SELECT count(*) FROM root_hold_decisions WHERE task_id=?`, j.Task).Scan(&used); err != nil {
 			return err
 		}
-		if used == 0 {
-			if _, err := tx.Exec(`INSERT INTO root_owned_holds(job_id) VALUES(?)`, j.ID); err != nil {
-				return err
-			}
-		} else {
-			rootOwned = false
+		if _, err := tx.Exec(`INSERT INTO root_owned_holds(job_id) VALUES(?)`, j.ID); err != nil {
+			return err
 		}
+		autoRootAvailable = used == 0
 	}
 	manager, err := getAgent(tx, root)
 	if err != nil {
@@ -275,8 +294,10 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 	if protected && !rootOwned {
 		instruction = "The project owner recorded a task blocker with operator-private details. The operator has the exact details. Ask only whether an operator decision is needed; do not infer, reconstruct, or disclose private content."
 	}
-	if rootOwned {
+	if rootOwned && autoRootAvailable {
 		instruction = "The project owner explicitly requests a Root-owned decision. If within existing scope and all stops and safeguards, use resolve_hold with this exact task and project and your decision as body; work resumes only through the appointed PO. Otherwise ask the operator a specific question with any supplied options and risks. Do not invent authorization."
+	} else if rootOwned {
+		instruction = "The project owner requests a decision, but Root's autonomous resolution for this task was already used. Preserve the hold. If a specific new decision genuinely requires operator authority, request a standalone approval with the exact question and context; otherwise take no action. Do not repeat the earlier decision or invent authorization."
 	}
 	return s.enqueue(tx, manager, j.Project, j.Task, source, "task_blocked", instruction)
 }

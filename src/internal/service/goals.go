@@ -25,24 +25,27 @@ func setProjectGoal(tx *sql.Tx, action runtimeapi.Action) error {
 		if strings.TrimSpace(action.Body) == "" || len(action.Body) > 4096 {
 			return fmt.Errorf("%w: goal objective must be 1 to 4096 bytes", errWorkflow)
 		}
-		_, err := tx.Exec(`INSERT INTO project_goals(project_id,objective,status) VALUES (?,?,'active') ON CONFLICT(project_id) DO UPDATE SET objective=excluded.objective,status='active'`, action.Project, action.Body)
-		return err
+		if _, err := tx.Exec(`INSERT INTO project_goals(project_id,objective,status) VALUES (?,?,'active') ON CONFLICT(project_id) DO UPDATE SET objective=excluded.objective,status='active'`, action.Project, action.Body); err != nil {
+			return err
+		}
 	case "set_project_goal_status":
 		if action.Body != "active" && action.Body != "paused" && action.Body != "complete" {
 			return fmt.Errorf("%w: goal status must be active, paused, or complete", errWorkflow)
 		}
-		result, err := tx.Exec(`UPDATE project_goals SET status=? WHERE project_id=?`, action.Body, action.Project)
-		if err != nil {
-			return err
-		}
-		count, err := result.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if count != 1 {
+		var status string
+		err := tx.QueryRow(`SELECT status FROM project_goals WHERE project_id=?`, action.Project).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: project has no goal", errWorkflow)
 		}
-		return nil
+		if err != nil || status == action.Body {
+			return err
+		}
+		if _, err := tx.Exec(`UPDATE project_goals SET status=? WHERE project_id=?`, action.Body, action.Project); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("%w: invalid goal action", errWorkflow)
 	}
-	return fmt.Errorf("%w: invalid goal action", errWorkflow)
+	_, err := tx.Exec(`INSERT INTO project_goal_revisions(project_id,revision) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET revision=excluded.revision`, action.Project, newID())
+	return err
 }

@@ -11,7 +11,7 @@ import (
 
 // handoffEvidence shares only the Root-authored summary. It does not change a
 // held task or implicitly copy the operator's private message or attachments.
-func handoffEvidence(tx *sql.Tx, j job, action runtimeapi.Action) error {
+func (s *Service) handoffEvidence(tx *sql.Tx, j job, action runtimeapi.Action) error {
 	if j.Agent != root || j.Kind != "operator_message" || !projectID.MatchString(action.Project) || strings.TrimSpace(action.Body) == "" || action.Title != "" || action.Recipient != "" || action.Task != "" || action.ReplyTo != "" {
 		return fmt.Errorf("%w: evidence handoff requires an exact project and summary", errWorkflow)
 	}
@@ -27,8 +27,10 @@ func handoffEvidence(tx *sql.Tx, j job, action runtimeapi.Action) error {
 	if err := addMessage(tx, id, root, po, "root", action.Body, action.Project, ""); err != nil {
 		return err
 	}
-	_, err = tx.Exec(`INSERT INTO root_evidence_handoffs(message_id,source_id,project_id) VALUES(?,?,?)`, id, j.Source, action.Project)
-	return err
+	if _, err = tx.Exec(`INSERT INTO root_evidence_handoffs(message_id,source_id,project_id) VALUES(?,?,?)`, id, j.Source, action.Project); err != nil {
+		return err
+	}
+	return s.queuePOEvidence(tx, action.Project)
 }
 
 // offerOperatorHoldResolution mirrors the existing narrow hold authorization

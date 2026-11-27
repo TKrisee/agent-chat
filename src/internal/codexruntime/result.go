@@ -31,7 +31,7 @@ var errValidationUnavailable = errors.New("native output validator was unavailab
 
 // actionTypes is the single role allowlist used for new schemas and decoding.
 var actionTypes = map[string][]string{
-	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold", "handoff_evidence"},
+	"root":   {"create_project", "delegate", "stop_project", "resume_project", "set_project_goal", "set_project_goal_status", "request_approval", "resolve_hold", "handoff_evidence", "investigate_hold"},
 	"po":     {"queue_worker", "create_worker", "create_one_shot_worker", "queue_work_item", "accept_result", "report", "report_progress", "request_approval", "post_group", "hold_task"},
 	"worker": {"post_group", "send_operator_previews", "share_with_po"},
 }
@@ -55,14 +55,16 @@ func newJobSchema(req runtimeapi.Request) string {
 		ok := true
 		switch {
 		case req.LocalHoldSupervisor:
-			ok = action == "delegate"
+			ok = action == "delegate" || action == "investigate_hold"
+		case action == "investigate_hold":
+			ok = false
 		case req.ChildReceiptOnly:
 			ok = action == "accept_result" || action == "report" || action == "report_progress"
 		case req.ReportOnly:
 			ok = action == "report"
 		case req.ParentPlanning:
 			ok = action != "accept_result"
-		case req.Kind == "project_message" || req.Kind == "approval_denied":
+		case req.Kind == "project_message" || req.Kind == "approval_denied" || req.Kind == "po_evidence" || req.Kind == "po_hold_investigation" || req.Kind == "project_report_recovery":
 			ok = false
 		case req.Role == "worker" && req.Kind == "operator_message":
 			ok = action == "share_with_po"
@@ -78,6 +80,8 @@ func newJobSchema(req runtimeapi.Request) string {
 			ok = action == "post_group"
 		case req.Role == "root" && req.Kind == "scope_decision":
 			ok = action == "delegate"
+		case req.Role == "root" && req.Kind == "root_backlog":
+			ok = action == "delegate"
 		case req.Role == "root" && req.Kind == "task_blocked":
 			ok = action == "resolve_hold" || action == "request_approval"
 		case req.Role == "root" && req.Kind == "operator_message":
@@ -91,11 +95,14 @@ func newJobSchema(req runtimeapi.Request) string {
 			allowed = append(allowed, `"`+action+`"`)
 		}
 	}
+	if req.Kind == "root_backlog" || req.Kind == "po_hold_investigation" {
+		schema = strings.Replace(schema, `"attachments":{"type":"array","items":`, `"attachments":{"type":"array","maxItems":0,"items":`, 1)
+	}
 	if len(allowed) == 0 {
 		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":0,"items":`, 1)
 		return schema
 	}
-	if req.LocalHoldSupervisor || (req.Role == "worker" && req.Kind == "operator_message") {
+	if (req.Role == "root" && (req.Kind == "task_blocked" || req.Kind == "root_backlog")) || (req.Role == "worker" && req.Kind == "operator_message") {
 		schema = strings.Replace(schema, `"actions":{"type":"array","items":`, `"actions":{"type":"array","maxItems":1,"items":`, 1)
 	}
 	return strings.Replace(schema, oldEnum, `"enum":[`+strings.Join(allowed, ",")+`]`, 1)
@@ -120,8 +127,11 @@ type limitedBuffer struct {
 func (r *Runner) resultDigest(dir string) (string, error) {
 	path := filepath.Join(dir, "result.json")
 	info, err := os.Lstat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > r.cfg.MaxOutputBytes {
-		return "", errors.New("native final result is not a bounded regular file")
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 1 || info.Size() > r.cfg.MaxOutputBytes {
+		return "", errResultShape
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -257,6 +267,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			}
 			result.Text = values[0]
 		case "action":
+			if req.Kind == "project_report_recovery" || req.Kind == "po_hold_investigation" {
+				return result, errRoleAction
+			}
 			if len(values) != 8 {
 				return result, errors.New("malformed action")
 			}
@@ -266,7 +279,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 				}
 				return result, errRoleAction
 			}
-			if values[5] != "" && values[0] != "resolve_hold" {
+			if values[5] != "" && values[0] != "resolve_hold" && values[0] != "investigate_hold" {
 				return result, errRoleAction
 			}
 			if values[6] != "" && values[0] != "post_group" {
@@ -274,7 +287,16 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 					return result, errRoleAction
 				}
 			}
-			if req.LocalHoldSupervisor && (values[0] != "delegate" || values[1] != req.ProjectID || strings.TrimSpace(values[2]) == "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "") {
+			if req.LocalHoldSupervisor && values[0] != "delegate" && values[0] != "investigate_hold" {
+				return result, errRoleAction
+			}
+			if req.LocalHoldSupervisor && values[0] == "delegate" && (values[1] != req.ProjectID || strings.TrimSpace(values[2]) == "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "") {
+				return result, errRoleAction
+			}
+			if values[0] == "investigate_hold" && (!req.LocalHoldSupervisor || req.Role != "root" || req.Kind != "task_blocked" || values[1] != req.ProjectID || values[5] != req.TaskID || values[2] != "" || strings.TrimSpace(values[3]) == "" || len(values[3]) > 4096 || values[4] != "" || values[6] != "") {
+				return result, errRoleAction
+			}
+			if req.Kind == "root_backlog" && (req.Role != "root" || values[0] != "delegate" || values[1] != req.ProjectID || strings.TrimSpace(values[2]) == "" || strings.TrimSpace(values[3]) == "" || values[5] != "") {
 				return result, errRoleAction
 			}
 			if values[0] == "handoff_evidence" && (req.Role != "root" || req.Kind != "operator_message" || strings.TrimSpace(values[1]) == "" || values[2] != "" || strings.TrimSpace(values[3]) == "" || values[4] != "" || values[5] != "" || values[6] != "") {
@@ -310,6 +332,9 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			}
 			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6], DependsOn: dependencies})
 		case "attachment":
+			if req.Kind == "po_hold_investigation" {
+				return result, errRoleAction
+			}
 			if len(values) != 3 {
 				return result, errors.New("malformed attachment")
 			}
@@ -329,7 +354,10 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			return result, errors.New("unknown structured result row")
 		}
 	}
-	if (req.LocalHoldSupervisor || (req.Role == "worker" && req.Kind == "operator_message")) && len(result.Actions) > 1 {
+	if (req.LocalHoldSupervisor || req.Kind == "root_backlog" || (req.Role == "worker" && req.Kind == "operator_message")) && len(result.Actions) > 1 {
+		return result, errRoleAction
+	}
+	if req.Kind == "root_backlog" && len(result.Attachments) != 0 {
 		return result, errRoleAction
 	}
 	return result, nil

@@ -109,6 +109,18 @@ func (s *Service) claim(active map[string]bool) (*job, error) {
 	defer s.startMu.Unlock()
 	return s.claimLocked(active)
 }
+
+// pendingClaimPredicate uses job alias j and one paused boolean parameter.
+const pendingClaimPredicate = `j.status='pending' AND ?=0 AND NOT EXISTS
+			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1) AND
+			        (j.kind!='po_evidence' OR EXISTS (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.po_id=j.agent_id)) AND
+			        (j.kind!='po_hold_investigation' OR EXISTS (SELECT 1 FROM local_hold_investigations i JOIN task_holds h ON h.job_id=i.hold_job_id AND h.status='active' JOIN tasks t ON t.id=h.task_id AND t.status='blocked' AND t.owner_id=h.po_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id WHERE i.source_id=j.source_id AND h.task_id=j.task_id AND h.project_id=j.project_id AND h.po_id=j.agent_id AND i.assessment_id IS NULL AND NOT EXISTS (SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending') AND NOT EXISTS (SELECT 1 FROM jobs other WHERE other.task_id=h.task_id AND other.id<>j.id AND other.status IN ('pending','submitted','running','uncertain')))) AND
+			        (j.kind!='root_backlog' OR EXISTS (SELECT 1 FROM eligible_root_backlog_wakes w WHERE w.source_id=j.source_id AND w.project_id=j.project_id AND w.parent_task_id=j.task_id)) AND
+				        (j.kind!='work' OR NOT EXISTS (SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=j.task_id AND prerequisite.status!='completed')) AND
+				        (j.kind!='work' OR NOT EXISTS (SELECT 1 FROM jobs lane WHERE lane.agent_id=j.agent_id AND lane.kind='work' AND lane.id!=j.id AND (lane.status IN ('submitted','running','uncertain') OR (lane.status='pending' AND lane.rowid<j.rowid AND NOT EXISTS (SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=lane.task_id AND prerequisite.status!='completed'))))) AND
+			        (j.kind!='work' OR EXISTS(SELECT 1 FROM project_workspace_roots r WHERE r.project_id=j.project_id) OR NOT EXISTS
+			         (SELECT 1 FROM jobs w WHERE w.id!=j.id AND w.project_id=j.project_id AND w.kind='work' AND w.status IN ('submitted','running','uncertain')))`
+
 func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 	if s.updateDrain != nil {
 		return nil, nil
@@ -128,12 +140,7 @@ func (s *Service) claimLocked(active map[string]bool) (*job, error) {
 			SELECT ` + jobColumns + ` FROM jobs j
 			WHERE j.next_at<=? AND
 			  (j.status IN ('submitted','running') OR
-			    (j.status='pending' AND ?=0 AND NOT EXISTS
-			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1) AND
-				        (j.kind!='work' OR NOT EXISTS (SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=j.task_id AND prerequisite.status!='completed')) AND
-				        (j.kind!='work' OR NOT EXISTS (SELECT 1 FROM jobs lane WHERE lane.agent_id=j.agent_id AND lane.kind='work' AND lane.id!=j.id AND (lane.status IN ('submitted','running','uncertain') OR (lane.status='pending' AND lane.rowid<j.rowid AND NOT EXISTS (SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=lane.task_id AND prerequisite.status!='completed'))))) AND
-			        (j.kind!='work' OR EXISTS(SELECT 1 FROM project_workspace_roots r WHERE r.project_id=j.project_id) OR NOT EXISTS
-			         (SELECT 1 FROM jobs w WHERE w.id!=j.id AND w.project_id=j.project_id AND w.kind='work' AND w.status IN ('submitted','running','uncertain')))))`
+			    (` + pendingClaimPredicate + `))`
 		args := []any{now(), paused}
 		if len(active) != 0 {
 			query += " AND j.agent_id NOT IN (" + strings.Repeat("?,", len(active)-1) + "?)"
@@ -268,6 +275,47 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 			return s.disposition(j.ID, "pending", "", 0)
 		}
 		if j.Kind == "work" {
+			var planned string
+			err := s.db.QueryRow(`SELECT path FROM project_workspace_jobs WHERE job_id=?`, j.ID).Scan(&planned)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if err == nil && planned != j.Request.Workspace {
+				result, state, recoverErr := runner.Recover(ctx, j.Request)
+				if recoverErr != nil {
+					var permanent interface{ PermanentRecovery() bool }
+					if errors.As(recoverErr, &permanent) && permanent.PermanentRecovery() {
+						return s.disposition(j.ID, "uncertain", recoverErr.Error(), 0)
+					}
+					return s.disposition(j.ID, "pending", "Workspace change awaits recovery evidence; retry when storage is available.", s.opts.Poll)
+				}
+				switch state {
+				case runtimeapi.Completed:
+					return s.finish(j, result)
+				case runtimeapi.NotStarted:
+					proof, ok := runner.(interface {
+						CanRebindWorkspace(context.Context, runtimeapi.Request) (bool, error)
+					})
+					if !ok {
+						return s.complete(j, runtimeapi.Result{}, nil, nil, errors.New("Workspace change requires a fresh work item; no execution started and the original receipt was preserved."))
+					}
+					allowed, proofErr := proof.CanRebindWorkspace(ctx, j.Request)
+					if proofErr != nil {
+						return s.disposition(j.ID, "pending", "Workspace change awaits recovery evidence; retry when storage is available.", s.opts.Poll)
+					}
+					if !allowed {
+						return s.complete(j, runtimeapi.Result{}, nil, nil, errors.New("Workspace change requires a fresh work item; no execution started and the original receipt was preserved."))
+					}
+				default:
+					return s.disposition(j.ID, "uncertain", "Workspace change withheld: prior execution outcome is uncertain.", 0)
+				}
+				old := j.Request.Workspace
+				j.Request.Workspace = planned
+				j.Request.Instructions = strings.Replace(j.Request.Instructions, "Operator-authorized fresh job workspace: "+old+".", "Operator-authorized fresh job workspace: "+planned+".", 1)
+			}
+			if _, err := s.prepareWorkWorkspace(j.Project, j.ID, j.Request.Workspace); err != nil {
+				return s.disposition(j.ID, "pending", workspacePrepareDiagnostic, s.opts.Poll)
+			}
 			j.Request.Scratch = ""
 			if err := s.prepareScratch(j.ID); err != nil {
 				log.Printf("optional scratch unavailable for work job: %v", err)
@@ -317,6 +365,10 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 		if errors.Is(err, runtimeapi.ErrStartWithheld) {
 			return s.disposition(j.ID, "pending", "execution withheld before launch", 0)
 		}
+		var rejected interface{ PermanentNoLaunch() bool }
+		if errors.As(err, &rejected) && rejected.PermanentNoLaunch() {
+			return s.complete(j, runtimeapi.Result{}, nil, nil, err)
+		}
 		if ctx.Err() != nil {
 			reason := unknownDiagnostic(runner, j.Request)
 			if reason == defaultUnknownDiagnostic {
@@ -335,6 +387,10 @@ func (s *Service) runJob(ctx context.Context, runner runtimeapi.Runner, j job) e
 
 	result, state, err := runner.Recover(ctx, j.Request)
 	if err != nil {
+		var permanent interface{ PermanentRecovery() bool }
+		if errors.As(err, &permanent) && permanent.PermanentRecovery() {
+			return s.disposition(j.ID, "uncertain", err.Error(), 0)
+		}
 		return s.disposition(j.ID, j.Status, err.Error(), s.opts.Poll)
 	}
 	switch state {
@@ -390,20 +446,29 @@ func (s *Service) disposition(id, status, diagnostic string, delay time.Duration
 		if err != nil || status != "uncertain" {
 			return err
 		}
-		_, err = tx.Exec("UPDATE tasks SET status='blocked' WHERE id=(SELECT task_id FROM jobs WHERE id=?) AND status!='completed'", id)
-		if err != nil {
-			return err
-		}
 		var project sql.NullString
 		var task sql.NullString
-		if err = tx.QueryRow("SELECT project_id,task_id FROM jobs WHERE id=?", id).Scan(&project, &task); err != nil {
+		var kind string
+		if err = tx.QueryRow("SELECT project_id,task_id,kind FROM jobs WHERE id=?", id).Scan(&project, &task, &kind); err != nil {
 			return err
 		}
-		if project.Valid && task.Valid {
+		if kind == "project_report" {
+			if err := recordProjectReportIssue(tx, id); err != nil {
+				return err
+			}
+		} else if kind != projectReportRecovery && project.Valid && task.Valid {
+			if _, err := tx.Exec("UPDATE tasks SET status='blocked' WHERE id=? AND status!='completed'", task.String); err != nil {
+				return err
+			}
 			if err := workflowNotice(tx, project.String, "blocked:"+id, "A task could not continue and needs attention."); err != nil {
 				return err
 			}
-			return s.maybeFollowParent(tx, job{ID: id, Task: task.String, Project: project.String})
+			if err := s.maybeFollowParent(tx, job{ID: id, Task: task.String, Project: project.String}); err != nil {
+				return err
+			}
+		}
+		if project.Valid {
+			return s.reconcileProjectWakes(tx, project.String)
 		}
 		return nil
 	})

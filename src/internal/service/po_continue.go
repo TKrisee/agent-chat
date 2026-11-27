@@ -28,7 +28,7 @@ func poContinuation(tx *sql.Tx, task string) (project, po, assignment string, el
 	err = tx.QueryRow(`SELECT
  (SELECT count(*) FROM jobs j JOIN messages m ON m.id=j.source_id WHERE j.task_id=? AND j.project_id=? AND j.agent_id=? AND j.kind='assignment' AND j.status='completed' AND COALESCE(j.diagnostic,'')='' AND m.task_id=j.task_id AND m.project_id=j.project_id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND length(trim(m.text))>0),
  (SELECT count(*) FROM jobs WHERE task_id=? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain')),
- (SELECT count(*) FROM approvals WHERE task_id=?),
+ (SELECT count(*) FROM approvals WHERE task_id=? AND status='pending'),
  (SELECT count(*) FROM jobs WHERE task_id=? AND kind='work'),
  (SELECT count(*) FROM messages m JOIN agents a ON a.id=m.recipient AND a.role='worker' WHERE m.task_id=? AND m.sender=? AND m.project_id=?)`, task, project, po, root, po, directRoom(root, po), task, task, task, task, po, project).Scan(&assignments, &active, &approvals, &workers, &messages)
 	if err != nil || assignments != 1 || active != 0 || approvals != 0 || workers != 0 || messages != 0 {

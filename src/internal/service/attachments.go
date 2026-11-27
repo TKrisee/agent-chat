@@ -35,6 +35,11 @@ type attachmentQuerier interface {
 }
 
 func (s *Service) uploadAttachments(db attachmentQuerier, j job, result runtimeapi.Result) ([]runtimeapi.Attachment, error) {
+	// Recovery may nominate stored report attachments only. Its delivery
+	// transaction verifies exact paths and shares the stored blobs.
+	if j.Request.Role == "root" && j.Kind == projectReportRecovery {
+		return nil, nil
+	}
 	refs := result.Attachments
 	if len(refs) == 0 {
 		return refs, nil
@@ -271,4 +276,32 @@ func writeAttachment(path string, content []byte) error {
 		return err
 	}
 	return os.Rename(tmp.Name(), path)
+}
+
+func (s *Service) shareNominatedReportAttachments(tx *sql.Tx, source, delivery string, refs []runtimeapi.Attachment) error {
+	if len(refs) == 0 {
+		return nil
+	}
+	known, err := querySlice(tx, `SELECT a.id,a.name,a.media_type FROM message_attachments m JOIN attachments a ON a.id=m.attachment_id WHERE m.message_id=?`, func(rows *sql.Rows) (attachmentData, error) {
+		var a attachmentData
+		err := rows.Scan(&a.ID, &a.Name, &a.MediaType)
+		return a, err
+	}, source)
+	if err != nil {
+		return err
+	}
+	allowed := make(map[runtimeapi.Attachment]string, len(known))
+	for _, a := range known {
+		allowed[runtimeapi.Attachment{Path: filepath.Join(s.dir, "attachments", a.ID), Name: a.Name, MediaType: a.MediaType}] = a.ID
+	}
+	for _, ref := range refs {
+		id := allowed[ref]
+		if id == "" {
+			return fmt.Errorf("%w: recovery attachment is outside the exact accepted report", errWorkflow)
+		}
+		if _, err := tx.Exec(`INSERT INTO attachment_shares(message_id,attachment_id) VALUES(?,?) ON CONFLICT DO NOTHING`, delivery, id); err != nil {
+			return err
+		}
+	}
+	return nil
 }

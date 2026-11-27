@@ -16,6 +16,7 @@ func TestNewJobActionSchema(t *testing.T) {
 		{"po", "operator_message", `.properties.actions.items.properties.type.enum == ["request_approval"]`},
 		{"po", "project_message", `.properties.actions.maxItems == 0`},
 		{"po", "approval_denied", `.properties.actions.maxItems == 0`},
+		{"po", "po_evidence", `.properties.actions.maxItems == 0`},
 		{"root", "approval_denied", `.properties.actions.maxItems == 0`},
 		{"worker", "project_message", `.properties.actions.maxItems == 0`},
 		{"root", "task_blocked", `.properties.actions.items.properties.type.enum == ["request_approval","resolve_hold"]`},

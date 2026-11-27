@@ -29,6 +29,32 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+// effectiveListen follows the standard Go flag parser: both dash forms are
+// accepted, later values win, and parsing stops at a positional argument or --.
+func effectiveListen(args []string) string {
+	listen := "127.0.0.1:8877"
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" || !strings.HasPrefix(arg, "-") || arg == "-" {
+			break
+		}
+		name := strings.TrimPrefix(arg, "-")
+		name = strings.TrimPrefix(name, "-")
+		key, value, hasValue := strings.Cut(name, "=")
+		if !hasValue {
+			if i+1 >= len(args) {
+				break
+			}
+			i++
+			value = args[i]
+		}
+		if key == "listen" {
+			listen = value
+		}
+	}
+	return listen
+}
 func run() error {
 	exe, err := os.Executable()
 	if err != nil {
@@ -149,15 +175,7 @@ func run() error {
 		}
 		done := make(chan error, 1)
 		go func() { done <- trial.Wait() }()
-		listen := "127.0.0.1:8877"
-		for i := 0; i < len(args); i++ {
-			if args[i] == "-listen" && i+1 < len(args) {
-				i++
-				listen = args[i]
-			} else if strings.HasPrefix(args[i], "-listen=") {
-				listen = strings.TrimPrefix(args[i], "-listen=")
-			}
-		}
+		listen := effectiveListen(args)
 		ready := false
 		client := &http.Client{Timeout: time.Second}
 		deadline := time.After(30 * time.Second)

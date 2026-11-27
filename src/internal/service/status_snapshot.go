@@ -124,15 +124,9 @@ func (s *Service) statusSnapshot(tx *sql.Tx) (string, error) {
 			if e == nil {
 				holdJobs[t.id] = latestHold
 			}
-			_, _, _, continuation, err := poContinuation(tx, t.id)
+			continuation, err := s.continuationEligible(tx, t.id, t.status)
 			if err != nil {
 				return "", err
-			}
-			if t.status == "blocked" {
-				_, continuation, err = s.legacyReviewRecovery(tx, t.id)
-				if err != nil {
-					return "", err
-				}
 			}
 			if t.status == "blocked" {
 				h, active, err := s.activeTaskHold(tx, t.id)

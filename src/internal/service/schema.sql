@@ -114,6 +114,17 @@ CREATE TABLE IF NOT EXISTS po_followups (
  UNIQUE(trigger_id,phase,ordinal)
 );
 
+CREATE TABLE IF NOT EXISTS po_assignment_corrections (
+ source_id TEXT PRIMARY KEY REFERENCES po_followups(source_id)
+);
+
+CREATE TABLE IF NOT EXISTS po_parent_outcome_events (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id),
+ parent_task_id TEXT NOT NULL REFERENCES tasks(id),
+ child_task_id TEXT NOT NULL REFERENCES tasks(id),
+ delivered_source_id TEXT REFERENCES messages(id)
+);
+
 CREATE TABLE IF NOT EXISTS task_holds (
  job_id TEXT PRIMARY KEY REFERENCES jobs(id), task_id TEXT NOT NULL REFERENCES tasks(id),
  project_id TEXT NOT NULL REFERENCES projects(id), po_id TEXT NOT NULL REFERENCES agents(id),
@@ -136,12 +147,56 @@ CREATE TABLE IF NOT EXISTS task_local_supervisions (
  source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
  recovery_task_id TEXT UNIQUE REFERENCES tasks(id)
 );
+CREATE TABLE IF NOT EXISTS local_hold_investigations (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id),
+ hold_job_id TEXT NOT NULL UNIQUE REFERENCES task_holds(job_id),
+ supervisor_source_id TEXT NOT NULL UNIQUE REFERENCES task_local_supervisions(source_id),
+ assessment_id TEXT UNIQUE REFERENCES messages(id)
+);
 
 CREATE TABLE IF NOT EXISTS project_goals (
  project_id TEXT PRIMARY KEY REFERENCES projects(id),
  objective TEXT NOT NULL,
  status TEXT NOT NULL CHECK(status IN ('active','paused','complete'))
 );
+CREATE TABLE IF NOT EXISTS project_goal_revisions (
+ project_id TEXT PRIMARY KEY REFERENCES project_goals(project_id), revision TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS root_backlog_grants (
+ origin_id TEXT PRIMARY KEY REFERENCES messages(id), project_id TEXT NOT NULL REFERENCES projects(id),
+ po_id TEXT NOT NULL REFERENCES agents(id), goal_revision TEXT NOT NULL, scope TEXT NOT NULL,
+ UNIQUE(project_id,goal_revision)
+);
+CREATE TABLE IF NOT EXISTS root_backlog_wakes (
+ parent_task_id TEXT PRIMARY KEY REFERENCES tasks(id), source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ origin_id TEXT NOT NULL REFERENCES messages(id), project_id TEXT NOT NULL REFERENCES projects(id),
+ po_id TEXT NOT NULL REFERENCES agents(id), objective TEXT NOT NULL, next_task_id TEXT UNIQUE REFERENCES tasks(id)
+);
+CREATE TABLE IF NOT EXISTS root_backlog_candidates (
+ parent_task_id TEXT PRIMARY KEY REFERENCES tasks(id), report_message_id TEXT NOT NULL REFERENCES messages(id),
+ objective TEXT NOT NULL
+);
+CREATE VIEW IF NOT EXISTS authorized_root_backlog_intakes AS
+ SELECT grant.origin_id,grant.project_id,grant.po_id,grant.scope,g.objective
+ FROM root_backlog_grants grant
+ JOIN project_goal_revisions rev ON rev.project_id=grant.project_id AND rev.revision=grant.goal_revision
+ JOIN project_goals g ON g.project_id=rev.project_id AND g.status='active'
+ JOIN projects p ON p.id=grant.project_id AND p.po_id=grant.po_id
+ JOIN agents po ON po.id=p.po_id AND po.project_id=p.id AND po.role='po'
+ JOIN messages m ON m.id=grant.origin_id AND m.sender='operator' AND m.recipient='root'
+  AND m.role='operator' AND m.room_id='dm:operator:root' AND m.project_id IS NULL AND m.task_id IS NULL;
+CREATE VIEW IF NOT EXISTS eligible_root_backlog_wakes AS
+ SELECT w.source_id,w.parent_task_id,w.project_id,w.po_id,w.origin_id
+ FROM root_backlog_wakes w
+ JOIN authorized_root_backlog_intakes a ON a.origin_id=w.origin_id AND a.project_id=w.project_id
+  AND a.po_id=w.po_id AND a.objective=w.objective
+ JOIN projects p ON p.id=w.project_id AND p.stopped=0
+ JOIN tasks t ON t.id=w.parent_task_id AND t.project_id=w.project_id AND t.owner_id=w.po_id AND t.status='completed'
+ JOIN task_origins o ON o.task_id=t.id AND o.message_id=a.origin_id
+ WHERE w.next_task_id IS NULL
+  AND NOT EXISTS(SELECT 1 FROM approvals ap WHERE ap.task_id=t.id AND ap.status='pending')
+  AND NOT EXISTS(SELECT 1 FROM task_holds h WHERE h.task_id=t.id AND h.status='active')
+  AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.task_id=t.id AND x.status='uncertain');
 
 CREATE TABLE IF NOT EXISTS usage_settings (
  id INTEGER PRIMARY KEY CHECK(id=1), enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
@@ -203,12 +258,31 @@ CREATE TABLE IF NOT EXISTS root_evidence_handoffs (
  source_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
  project_id TEXT NOT NULL REFERENCES projects(id)
 );
+CREATE TABLE IF NOT EXISTS po_evidence_wakes (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id), project_id TEXT NOT NULL REFERENCES projects(id),
+ po_id TEXT NOT NULL REFERENCES agents(id)
+);
+CREATE TABLE IF NOT EXISTS po_evidence_wake_items (
+ source_id TEXT NOT NULL REFERENCES po_evidence_wakes(source_id),
+ message_id TEXT NOT NULL UNIQUE REFERENCES messages(id),
+ consumed_job_id TEXT REFERENCES jobs(id), PRIMARY KEY(source_id,message_id)
+);
+CREATE TABLE IF NOT EXISTS po_evidence_assessments (
+ job_id TEXT PRIMARY KEY REFERENCES jobs(id), message_id TEXT NOT NULL UNIQUE REFERENCES messages(id)
+);
+CREATE TABLE IF NOT EXISTS po_evidence_rejections (
+ message_id TEXT PRIMARY KEY REFERENCES messages(id), job_id TEXT NOT NULL REFERENCES jobs(id)
+);
 CREATE TABLE IF NOT EXISTS po_explicit_progress (
  message_id TEXT PRIMARY KEY REFERENCES po_progress_notes(message_id)
 );
 
 CREATE TABLE IF NOT EXISTS root_owned_holds (
  job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id)
+);
+CREATE TABLE IF NOT EXISTS root_hold_approvals (
+ approval_id TEXT PRIMARY KEY REFERENCES approvals(id),
+ hold_job_id TEXT NOT NULL UNIQUE REFERENCES root_owned_holds(job_id)
 );
 CREATE TABLE IF NOT EXISTS root_hold_decisions (
  task_id TEXT PRIMARY KEY REFERENCES tasks(id),

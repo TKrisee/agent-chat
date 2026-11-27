@@ -52,6 +52,50 @@ func TestMixedApprovalCorrectsWithoutApplyingBatch(t *testing.T) {
 	}
 }
 
+func TestInitialPlanningCorrectionDispatchesWorkItem(t *testing.T) {
+	s, task, po, _ := continuationFixture(t)
+	defer s.Close()
+	j := activeAssignment(t, s, task, po)
+	bad := runtimeapi.Result{Actions: []runtimeapi.Action{
+		{Type: "queue_work_item", Project: "alpha", Title: "Bad", Body: "Work", Recipient: "missing"},
+	}}
+	if err := s.complete(j, bad, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	follow := followupClaim(t, s)
+	good := runtimeapi.Result{Actions: []runtimeapi.Action{
+		{Type: "create_worker", Project: "alpha", Title: "CorrectedWorker"},
+		{Type: "queue_work_item", Project: "alpha", Title: "Corrected", Body: "Work", Recipient: "CorrectedWorker"},
+	}}
+	if err := s.complete(follow, good, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM po_work_items WHERE parent_task_id=?`, task).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("corrected work items=%d: %v", n, err)
+	}
+}
+
+func TestSecondPlanningCorrectionDispatchesWorkItem(t *testing.T) {
+	s, task, po, _ := continuationFixture(t)
+	defer s.Close()
+	bad := runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Project: "alpha", Title: "Bad", Body: "Work", Recipient: "missing"}}}
+	if err := s.complete(activeAssignment(t, s, task, po), bad, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.complete(followupClaim(t, s), bad, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	good := runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "queue_work_item", Project: "alpha", Title: "Corrected", Body: "Work", Recipient: "Worker"}}}
+	if err := s.complete(followupClaim(t, s), good, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM po_work_items WHERE parent_task_id=?`, task).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("corrected work items=%d: %v", n, err)
+	}
+}
+
 func TestMixedApprovalCorrectionIsBounded(t *testing.T) {
 	s, task, po, _ := continuationFixture(t)
 	defer s.Close()
