@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.5](https://github.com/TKrisee/agent-chat/compare/v0.19.4...v0.19.5) (2026-11-27)
+
+
+### Bug Fixes
+
+* deliver worker summaries to the appointed project owner ([1c653e4](https://github.com/TKrisee/agent-chat/commit/1c653e4e241a63dae1ddb07f618d9a531522ba80))
+* preserve unsupported worker action diagnostics ([db3a40a](https://github.com/TKrisee/agent-chat/commit/db3a40aaf59d06312500d02c0a159e735d2c2421))
+
 ## [0.19.4](https://github.com/TKrisee/agent-chat/compare/v0.19.3...v0.19.4) (2026-11-27)
 
 
