@@ -17,8 +17,14 @@ func TestModelCatalogFilter(t *testing.T) {
 		cmd := exec.Command("jq", "-r", modelListFilter)
 		cmd.Stdin = strings.NewReader(tc.input)
 		out, err := cmd.Output()
-		if err != nil || strings.TrimSpace(string(out)) != tc.want {
+		if err != nil || normalizeModelListLines(out) != tc.want {
 			t.Errorf("%s: got %q err %v want %q", tc.input, out, err, tc.want)
 		}
+	}
+}
+
+func TestNormalizeModelListLinesWindows(t *testing.T) {
+	if got := normalizeModelListLines([]byte("model\tgpt-6.1-terra\r\ncursor\tbmV4dA==\r\n")); got != "model\tgpt-6.1-terra\ncursor\tbmV4dA==" {
+		t.Fatalf("unexpected normalized lines %q", got)
 	}
 }
