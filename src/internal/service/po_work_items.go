@@ -142,9 +142,23 @@ func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	if err != nil {
 		return err
 	}
+	var childStatus string
+	if err = tx.QueryRow(`SELECT status FROM tasks WHERE id=? AND project_id=?`, j.Task, j.Project).Scan(&childStatus); err != nil {
+		return err
+	}
+	if childStatus != "completed" && childStatus != "blocked" {
+		return nil
+	}
+	if _, err = tx.Exec(`INSERT INTO po_parent_outcome_events(job_id,parent_task_id,child_task_id) VALUES(?,?,?) ON CONFLICT(job_id) DO NOTHING`, j.ID, parent, j.Task); err != nil {
+		return err
+	}
+	var pending int
+	if err = tx.QueryRow(`SELECT count(*) FROM po_parent_outcome_events WHERE parent_task_id=? AND delivered_source_id IS NULL`, parent).Scan(&pending); err != nil || pending == 0 {
+		return err
+	}
 	var parentStatus, poID string
 	var stopped, open, busy int
-	err = tx.QueryRow(`SELECT t.status,t.owner_id,p.stopped,(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=t.id AND c.status IN ('queued','review','accepted') AND NOT (c.status='queued' AND EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=c.id AND prerequisite.status!='completed'))),(SELECT count(*) FROM jobs q WHERE q.task_id=t.id AND q.kind='po_followup' AND q.status IN ('pending','submitted','running')) FROM tasks t JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id WHERE t.id=? AND t.project_id=?`, parent, j.Project).Scan(&parentStatus, &poID, &stopped, &open, &busy)
+	err = tx.QueryRow(`SELECT t.status,t.owner_id,p.stopped,(SELECT count(*) FROM po_work_items i JOIN tasks c ON c.id=i.child_task_id WHERE i.parent_task_id=t.id AND c.status IN ('queued','review','accepted') AND NOT (c.status='queued' AND EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks prerequisite ON prerequisite.id=d.prerequisite_task_id WHERE d.child_task_id=c.id AND prerequisite.status!='completed'))),(SELECT count(*) FROM jobs q WHERE q.task_id=t.id AND q.status IN ('pending','submitted','running','uncertain'))+(SELECT count(*) FROM approvals ap WHERE ap.task_id=t.id AND ap.status='pending')+(SELECT count(*) FROM task_holds h WHERE h.task_id=t.id AND h.status='active') FROM tasks t JOIN projects p ON p.id=t.project_id AND p.po_id=t.owner_id WHERE t.id=? AND t.project_id=?`, parent, j.Project).Scan(&parentStatus, &poID, &stopped, &open, &busy)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -219,7 +233,11 @@ func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	if err != nil {
 		return err
 	}
-	return s.enqueue(tx, po, j.Project, parent, source, "po_followup", "Review the recorded child work item outcomes. Continue independent authorized work via new work items, or report the completed full scope only after all required child work is complete. Preserve stops and uncertain effects; do not repeat prior work.")
+	if err := s.enqueue(tx, po, j.Project, parent, source, "po_followup", "Review the recorded child work item outcomes. Continue independent authorized work via new work items, or report the completed full scope only after all required child work is complete. Preserve stops and uncertain effects; do not repeat prior work."); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`UPDATE po_parent_outcome_events SET delivered_source_id=? WHERE parent_task_id=? AND delivered_source_id IS NULL`, source, parent)
+	return err
 }
 
 // A successful dispatch is progress and warrants one coalesced planning turn.

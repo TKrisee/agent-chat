@@ -22,9 +22,17 @@ type AttachmentRef struct {
 	URL       string `json:"url"`
 }
 
+type MessageCommand struct {
+	Kind    string `json:"kind"`
+	Project string `json:"project_id,omitempty"`
+	Task    string `json:"task_id,omitempty"`
+}
+
 type Message struct {
+	Position       int64           `json:"position"`
 	ApprovalID     string          `json:"approval_id,omitempty"`
 	NoticeDetail   string          `json:"notice_detail,omitempty"`
+	Command        *MessageCommand `json:"command,omitempty"`
 	RoomID         string          `json:"room_id"`
 	ID             string          `json:"id"`
 	Sender         string          `json:"sender"`
@@ -52,6 +60,7 @@ type Project struct {
 }
 
 type Task struct {
+	Position              int64  `json:"position"`
 	ID                    string `json:"id"`
 	Project               string `json:"project_id"`
 	Title                 string `json:"title"`
@@ -64,6 +73,7 @@ type Task struct {
 }
 
 type Agent struct {
+	Position       int64  `json:"position"`
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	Role           string `json:"role"`
@@ -76,6 +86,7 @@ type Agent struct {
 }
 
 type Approval struct {
+	Position     int64  `json:"position"`
 	DecisionNote string `json:"decision_note,omitempty"`
 	ID           string `json:"id"`
 	Project      string `json:"project_id"`
@@ -87,6 +98,7 @@ type Approval struct {
 }
 
 type Job struct {
+	Position   int64  `json:"position"`
 	ID         string `json:"id"`
 	Agent      string `json:"agent_id"`
 	Project    string `json:"project_id"`
@@ -99,6 +111,7 @@ type Job struct {
 }
 
 type State struct {
+	Cursor    string     `json:"cursor"`
 	Messages  []Message  `json:"messages"`
 	Projects  []Project  `json:"projects"`
 	Tasks     []Task     `json:"tasks"`
@@ -128,206 +141,6 @@ func querySlice[T any](db querier, query string, scan func(*sql.Rows) (T, error)
 	return items, rows.Err()
 }
 
-func (s *Service) state() (State, error) {
-	var view State
-	err := s.write(func(tx *sql.Tx) error {
-		var err error
-		view.Messages, err = querySlice(tx, `SELECT m.id,m.sender,m.recipient,m.role,m.text,m.at,
-			COALESCE(m.task_id,''),COALESCE(m.project_id,''),COALESCE(reply.parent_id,''),receipt.read_at,m.room_id,COALESCE(delivery.approval_id,'')
-			FROM messages m
-			LEFT JOIN approval_deliveries delivery ON delivery.message_id=m.id
-			LEFT JOIN message_replies reply ON reply.message_id=m.id
-			LEFT JOIN operator_message_reads receipt ON receipt.message_id=m.id
-            WHERE m.room_id IS NOT NULL AND ((m.room_id LIKE 'dm:%' AND (m.sender='operator' OR m.recipient='operator'))
-              OR (m.room_id='group:'||m.project_id AND EXISTS (SELECT 1 FROM projects p WHERE p.id=m.project_id))) ORDER BY m.seq`, func(rows *sql.Rows) (Message, error) {
-			var m Message
-			var millis int64
-			var readMillis sql.NullInt64
-			err := rows.Scan(&m.ID, &m.Sender, &m.Recipient, &m.Role, &m.Text, &millis,
-				&m.Task, &m.Project, &m.ReplyTo, &readMillis, &m.RoomID, &m.ApprovalID)
-			m.At = time.UnixMilli(millis).UTC()
-			if readMillis.Valid {
-				at := time.UnixMilli(readMillis.Int64).UTC()
-				m.OperatorReadAt = &at
-			}
-			m.Attachments = []AttachmentRef{}
-			return m, err
-		})
-		if err != nil {
-			return err
-		}
-		type mention struct{ message, agent string }
-		mentions, err := querySlice(tx, "SELECT message_id,agent_id FROM message_mentions ORDER BY message_id,agent_id", func(rows *sql.Rows) (mention, error) {
-			var m mention
-			err := rows.Scan(&m.message, &m.agent)
-			return m, err
-		})
-		if err != nil {
-			return err
-		}
-		scopeDetails, err := querySlice(tx, "SELECT message_id FROM ("+scopeDetailsSQL+")", func(rows *sql.Rows) (string, error) { var id string; err := rows.Scan(&id); return id, err })
-		if err != nil {
-			return err
-		}
-		scopeEligible := make(map[string]bool, len(scopeDetails))
-		for _, d := range scopeDetails {
-			scopeEligible[d] = true
-		}
-		byMentionedMessage := make(map[string][]string)
-		for _, m := range mentions {
-			byMentionedMessage[m.message] = append(byMentionedMessage[m.message], m.agent)
-		}
-		type ref struct {
-			AttachmentRef
-			Message string
-		}
-		refs, err := querySlice(tx, `SELECT a.id,m.message_id,a.name,a.media_type
-			FROM message_attachments m JOIN attachments a ON a.id=m.attachment_id ORDER BY a.id`, func(rows *sql.Rows) (ref, error) {
-			var a ref
-			err := rows.Scan(&a.ID, &a.Message, &a.Name, &a.MediaType)
-			a.URL = "/api/attachments/" + a.ID
-			return a, err
-		})
-		if err != nil {
-			return err
-		}
-		byMessage := make(map[string][]AttachmentRef)
-		for _, a := range refs {
-			byMessage[a.Message] = append(byMessage[a.Message], a.AttachmentRef)
-		}
-		for i := range view.Messages {
-			if scopeEligible[view.Messages[i].ID] {
-				view.Messages[i].NoticeDetail = "scope_request"
-			}
-			view.Messages[i].MentionIDs = byMentionedMessage[view.Messages[i].ID]
-			if refs := byMessage[view.Messages[i].ID]; len(refs) > 0 {
-				view.Messages[i].Attachments = refs
-			}
-		}
-		view.Projects, err = querySlice(tx, `SELECT p.id,p.name,p.po_id,p.stopped,COALESCE(g.objective,''),COALESCE(g.status,''),COALESCE((SELECT path FROM project_workspace_roots w WHERE w.project_id=p.id),''),(SELECT COUNT(*) FROM jobs j
-			WHERE j.project_id=p.id AND j.status IN ('submitted','running','uncertain'))
-			FROM projects p LEFT JOIN project_goals g ON g.project_id=p.id ORDER BY p.id`, func(rows *sql.Rows) (Project, error) {
-			var p Project
-			var stopped bool
-			err := rows.Scan(&p.ID, &p.Name, &p.PO, &stopped, &p.GoalObjective, &p.GoalStatus, &p.WorkspaceRoot, &p.UnsettledEffects)
-			p.Status = "running"
-			if stopped {
-				p.Status = "stopped"
-				if p.UnsettledEffects != 0 {
-					p.Status = "stopping"
-				}
-			}
-			return p, err
-		})
-		if err != nil {
-			return err
-		}
-		view.Tasks, err = querySlice(tx, `SELECT t.id,t.project_id,t.title,t.status,t.owner_id,EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks p ON p.id=d.prerequisite_task_id WHERE d.child_task_id=t.id AND p.status!='completed') AND t.status='queued' FROM tasks t ORDER BY t.rowid`, func(rows *sql.Rows) (Task, error) {
-			var t Task
-			err := rows.Scan(&t.ID, &t.Project, &t.Title, &t.Status, &t.Owner, &t.WaitingOnDependencies)
-			return t, err
-		})
-		if err != nil {
-			return err
-		}
-		for i := range view.Tasks {
-			if view.Tasks[i].Status == "blocked" {
-				h, found, holdErr := s.activeTaskHold(tx, view.Tasks[i].ID)
-				if holdErr != nil {
-					return holdErr
-				}
-				if found {
-					view.Tasks[i].ResolveHoldEligible, holdErr = s.holdCanResolve(tx, h)
-					if holdErr != nil {
-						return holdErr
-					}
-				}
-				view.Tasks[i].RetryHandoffEligible, err = handoffEligible(tx, view.Tasks[i].ID, "blocked", "", true)
-				if err != nil {
-					return err
-				}
-				_, view.Tasks[i].ContinuePOEligible, err = s.legacyReviewRecovery(tx, view.Tasks[i].ID)
-				if err != nil {
-					return err
-				}
-				if !view.Tasks[i].ContinuePOEligible {
-					_, view.Tasks[i].ContinuePOEligible, err = s.legacyTitledPlanning(tx, view.Tasks[i].ID)
-					if err != nil {
-						return err
-					}
-				}
-				if !view.Tasks[i].ContinuePOEligible {
-					_, view.Tasks[i].ContinuePOEligible, err = s.parentReportRecoveryEligible(tx, view.Tasks[i].ID)
-					if err != nil {
-						return err
-					}
-				}
-				if !view.Tasks[i].ContinuePOEligible {
-					_, view.Tasks[i].ContinuePOEligible, err = s.legacyMixedApprovalRecovery(tx, view.Tasks[i].ID)
-					if err != nil {
-						return err
-					}
-				}
-				if !view.Tasks[i].ContinuePOEligible {
-					_, view.Tasks[i].ContinuePOEligible, err = s.approvalPlanningRecoveryEligible(tx, view.Tasks[i].ID)
-					if err != nil {
-						return err
-					}
-				}
-				if !view.Tasks[i].ContinuePOEligible {
-					_, view.Tasks[i].ContinuePOEligible, err = s.parentAmbiguityRecoveryEligible(tx, view.Tasks[i].ID)
-					if err != nil {
-						return err
-					}
-				}
-			}
-			if view.Tasks[i].Status == "assigned" {
-				_, _, _, view.Tasks[i].ContinuePOEligible, err = poContinuation(tx, view.Tasks[i].ID)
-				if err != nil {
-					return err
-				}
-			}
-		}
-		view.Agents, err = querySlice(tx, `SELECT a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,
-			CASE WHEN p.stopped=1 THEN 'stopped' WHEN EXISTS(SELECT 1 FROM jobs j
-			WHERE j.agent_id=a.id AND j.status IN ('submitted','running')) THEN 'busy' ELSE 'idle' END,
-			CASE WHEN a.role='po' AND a.id=po.id THEN ? WHEN a.role='worker' THEN COALESCE(po.id,'') ELSE '' END,
-			EXISTS(SELECT 1 FROM one_shot_workers o WHERE o.agent_id=a.id),
-			EXISTS(SELECT 1 FROM one_shot_workers o JOIN tasks t ON t.id=o.child_task_id AND t.status='completed' WHERE o.agent_id=a.id
-			 AND NOT EXISTS(SELECT 1 FROM jobs j WHERE (j.agent_id=a.id OR j.task_id=t.id) AND j.status IN ('pending','submitted','running','uncertain'))
-			 AND NOT EXISTS(SELECT 1 FROM approvals x WHERE x.task_id=t.id AND x.status='pending')
-			 AND NOT EXISTS(SELECT 1 FROM task_holds h WHERE h.task_id=t.id AND h.status='active'))
-			FROM agents a LEFT JOIN projects p ON p.id=a.project_id
-			LEFT JOIN agents po ON po.id=p.po_id AND po.role='po' AND po.project_id=p.id
-			ORDER BY a.rowid`, func(rows *sql.Rows) (Agent, error) {
-			var a Agent
-			err := rows.Scan(&a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Status, &a.Parent, &a.OneShot, &a.OneShotRetired)
-			return a, err
-		}, root)
-		if err != nil {
-			return err
-		}
-		view.Approvals, err = querySlice(tx, `SELECT a.id,COALESCE(a.project_id,''),COALESCE(a.task_id,''),
-			a.requested_by,a.title,a.body,a.status,COALESCE(n.note,'') FROM approvals a LEFT JOIN approval_decision_notes n ON n.approval_id=a.id ORDER BY a.rowid`, func(rows *sql.Rows) (Approval, error) {
-			var a Approval
-			err := rows.Scan(&a.ID, &a.Project, &a.Task, &a.RequestedBy, &a.Title, &a.Body, &a.Status, &a.DecisionNote)
-			return a, err
-		})
-		if err != nil {
-			return err
-		}
-		view.Jobs, err = querySlice(tx, `SELECT j.id,j.agent_id,COALESCE(j.project_id,''),COALESCE(j.task_id,''),
-			j.kind,j.source_id,j.status,COALESCE(j.diagnostic,''),
-			EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.review_job_id=j.id AND c.task_id=j.task_id AND c.confirmed_by='operator' AND c.effects_unknown_ack=1 AND j.kind='scope_review' AND j.status='uncertain') FROM jobs j ORDER BY j.rowid`, func(rows *sql.Rows) (Job, error) {
-			var j Job
-			err := rows.Scan(&j.ID, &j.Agent, &j.Project, &j.Task, &j.Kind, &j.Source, &j.Status, &j.Diagnostic, &j.Superseded)
-			return j, err
-		})
-		return err
-	})
-	return view, err
-}
-
 func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/agents/{id}/operator-previews", s.setOperatorPreviews)
@@ -337,6 +150,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	mux.HandleFunc("GET /api/codex-setup", s.codexSetupStatus)
 	mux.HandleFunc("POST /api/codex-setup/retry", s.codexSetupRetry)
 	mux.HandleFunc("POST /api/codex-setup/source", s.codexSetupSource)
+	mux.HandleFunc("GET /api/state/changes", s.stateChanges)
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, r *http.Request) {
 		view, err := s.state()
 		if err != nil {
@@ -531,6 +345,9 @@ func (s *Service) setStop(w http.ResponseWriter, id string, stopped bool) {
 	err := s.write(func(tx *sql.Tx) error {
 		var err error
 		unsettled, err = updateStop(tx, id, stopped)
+		if err == nil && !stopped {
+			return s.reconcileProjectWakes(tx, id)
+		}
 		return err
 	})
 	if err != nil {
@@ -629,6 +446,9 @@ func (s *Service) decideApproval(w http.ResponseWriter, r *http.Request) {
 			if _, err := tx.Exec("INSERT INTO approval_decision_notes(approval_id,note) VALUES(?,?)", id, body.Note); err != nil {
 				return err
 			}
+		}
+		if handled, err := s.resolveRootHoldApproval(tx, id, body.Decision, body.Note); handled || err != nil {
+			return err
 		}
 		a, err := getAgent(tx, who)
 		if err != nil {

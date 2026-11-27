@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 )
 
+const workspacePrepareDiagnostic = "Workspace preparation failed before launch; choose a valid project workspace."
+
 func (s *Service) setProjectWorkspace(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil || len(r.PostForm) != 1 || len(r.PostForm["path"]) != 1 {
 		httpFailure(w, fmt.Errorf("%w: one workspace path is required", errInvalid))
@@ -49,13 +51,49 @@ func (s *Service) setProjectWorkspace(w http.ResponseWriter, r *http.Request) {
 		if count != 1 {
 			return errAbsent
 		}
-		if err := tx.QueryRow("SELECT count(*) FROM jobs WHERE project_id=? AND kind='work' AND status IN ('pending','submitted','running')", r.PathValue("id")).Scan(&count); err != nil {
+		if err := tx.QueryRow(`SELECT count(*) FROM jobs j LEFT JOIN project_workspace_jobs w ON w.job_id=j.id WHERE j.project_id=? AND (j.status IN ('submitted','running','uncertain') OR (j.kind='work' AND j.status='pending' AND (COALESCE(j.diagnostic,'')<>? OR w.job_id IS NULL)))`, r.PathValue("id"), workspacePrepareDiagnostic).Scan(&count); err != nil {
 			return err
 		}
 		if count != 0 {
-			return fmt.Errorf("%w: project work is active or queued", errConflict)
+			return fmt.Errorf("%w: project work is active, uncertain, or has a workspace that cannot safely be rebound", errConflict)
 		}
-		_, err := tx.Exec("INSERT INTO project_workspace_roots(project_id,path) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET path=excluded.path", r.PathValue("id"), path)
+		rows, err := tx.Query(`SELECT j.id,w.path,w.created FROM jobs j JOIN project_workspace_jobs w ON w.job_id=j.id WHERE j.project_id=? AND j.kind='work' AND j.status='pending' AND j.diagnostic=?`, r.PathValue("id"), workspacePrepareDiagnostic)
+		if err != nil {
+			return err
+		}
+		type pendingWorkspace struct {
+			id, previous string
+			created      bool
+		}
+		var pending []pendingWorkspace
+		for rows.Next() {
+			var item pendingWorkspace
+			if err = rows.Scan(&item.id, &item.previous, &item.created); err != nil {
+				rows.Close()
+				return err
+			}
+			pending = append(pending, item)
+		}
+		if err = rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, item := range pending {
+			if filepath.Base(item.previous) != item.id {
+				return fmt.Errorf("%w: job workspace identity is invalid", errConflict)
+			}
+			next := filepath.Join(path, item.id)
+			if next == item.previous && item.created {
+				return fmt.Errorf("%w: choose a different workspace root to repair the missing job directory", errConflict)
+			}
+			if next != item.previous {
+				if _, err = tx.Exec(`UPDATE project_workspace_jobs SET path=?,created=0 WHERE job_id=?`, next, item.id); err != nil {
+					return err
+				}
+			}
+		}
+		_, err = tx.Exec("INSERT INTO project_workspace_roots(project_id,path) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET path=excluded.path", r.PathValue("id"), path)
 		return err
 	})
 	if err != nil {

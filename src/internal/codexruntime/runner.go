@@ -48,6 +48,16 @@ type Runner struct {
 	setupGeneration    uint64
 }
 
+type permanentRecoveryError struct{ reason string }
+
+func (e permanentRecoveryError) Error() string         { return e.reason }
+func (permanentRecoveryError) PermanentRecovery() bool { return true }
+
+type noLaunchError struct{ reason string }
+
+func (e noLaunchError) Error() string         { return e.reason }
+func (noLaunchError) PermanentNoLaunch() bool { return true }
+
 var _ runtimeapi.Runner = (*Runner)(nil)
 
 func New(cfg Config) (*Runner, error) {
@@ -206,6 +216,9 @@ func validate(req runtimeapi.Request) error {
 	if req.LocalHoldSupervisor && (req.Role != "root" || req.Kind != "task_blocked" || req.TaskID == "" || req.ProjectID == "") {
 		return errors.New("local hold supervision requires a Root task-blocked project turn")
 	}
+	if req.Kind == "root_backlog" && (req.Role != "root" || req.TaskID == "" || req.ProjectID == "" || req.LocalHoldSupervisor) {
+		return errors.New("backlog review requires a Root project task")
+	}
 	if req.AllowOperatorResolveHold && (req.Role != "root" || req.Kind != "operator_message") {
 		return errors.New("operator hold resolution requires a Root operator message")
 	}
@@ -281,21 +294,27 @@ func retryable(dir string) (bool, error) {
 	name := string(b)
 	if name == "prestart-STOP" {
 		proof, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
 		if err != nil || string(proof) != "STOP" {
-			return false, errors.New("invalid prestart stop receipt")
+			return false, permanentRecoveryError{"Native prestart receipt is invalid; execution outcome remains uncertain."}
 		}
 		return true, nil
 	}
 	if name != "capacity-EMFILE" && name != "capacity-ENFILE" {
-		return false, errors.New("invalid capacity receipt")
+		return false, permanentRecoveryError{"Native retry receipt is invalid; execution outcome remains uncertain."}
 	}
 	suffix := strings.TrimPrefix(name, "capacity-")
 	code, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
 	if err != nil || (string(code) != "EMFILE" && string(code) != "ENFILE") {
-		return false, errors.New("missing exact capacity receipt")
+		return false, permanentRecoveryError{"Native capacity receipt is invalid; execution outcome remains uncertain."}
 	}
 	if string(code) != suffix {
-		return false, errors.New("capacity proof code mismatch")
+		return false, permanentRecoveryError{"Native capacity receipt does not match; execution outcome remains uncertain."}
 	}
 	return true, nil
 }
@@ -362,6 +381,10 @@ func prompt(req runtimeapi.Request) string {
 	}
 	b.WriteString("Task instructions:\n")
 	b.WriteString(req.Instructions)
+	if req.Kind == "project_report_recovery" {
+		b.WriteString("\nReturn the operator-facing summary in text, an empty actions array, and any authorized stored report nominations in attachments. Preserve each nominated attachment's exact path, name, and media type.")
+		return b.String()
+	}
 	if req.ParentPlanning {
 		b.WriteString("\nThis is parent planning, not a child review. Completed child receipts are already recorded; do not accept them again. Continue authorized planning or report the parent outcome when ready.\n")
 	}
@@ -372,6 +395,9 @@ func prompt(req runtimeapi.Request) string {
 		}
 	}
 	if req.Role == "root" {
+		if req.Kind == "root_backlog" {
+			b.WriteString("\nReview the active authorized goal and original scope. Delegate at most one genuinely distinct, already-authorized same-project task to the appointed PO or take no action. Do not broaden authority or bypass stops, approvals or uncertain effects; do not attach files.\n")
+		}
 		if req.Kind == "scope_decision" || req.LocalHoldSupervisor {
 			b.WriteString("\nFor delegate, reply_to may reference an existing relevant message; the app attaches it only if the recipient can read it. Leave it empty when no reply is needed.\n")
 		}
@@ -381,8 +407,10 @@ func prompt(req runtimeapi.Request) string {
 		}
 		b.WriteString("\nWhen receiving project reports or escalations, summarize relevant facts for the operator and forward actual questions or choices needing their decision; do not relay routine team chatter or private PO conversations.\n")
 		if req.Kind == "task_blocked" && req.LocalHoldSupervisor {
+			b.WriteString("For a same-task technical assessment without resolving the hold, use investigate_hold with this exact project and task and a bounded instruction in body; leave other fields empty. This requests only a PO assessment under existing authority, never replay or a new assignment.\n")
 			b.WriteString("\nThe original local hold remains active. Inspect actual task and receipt records; distinguish reviewed designs from delivered work. If genuinely useful, delegate at most one distinct, nonduplicative, independently authorized same-project task to the appointed PO for scope review; otherwise take no action. Preserve the prior operator scope and every human, qualification, production, stop and uncertain-effect boundary. Do not repeat effects, launch recursive recovery, create a status-only task, repeat an exhausted lookup, resolve the original hold, or address the operator in this turn.\n")
 		} else if req.Kind == "task_blocked" {
+			b.WriteString("For an explicitly Root-owned active hold, if a specific decision genuinely requires the operator, use one standalone request_approval with the exact question, relevant options and impact. Approval is tied to this hold; denial leaves it held. Never use this for a local supervisor or a routine technical blocker.\n")
 			b.WriteString("Escalate to the operator only a specific decision they actually own, not a technical prerequisite or a generic request for permission. If the PO's question is incomplete, seek the missing facts from the PO through an available authorized internal route; if none is available, report the missing information honestly and do not claim a clarification was sent or invent a decision. When an operator decision is genuinely needed, state the single exact question, why it requires their authority, the relevant evidence, practical options and impact, and what happens next.\n")
 			b.WriteString("For a blocked-task escalation, summarize the concrete blocker using only PO evidence explicitly shared for this task; do not assume the operator has seen it. Distinguish operational decisions explicitly assigned to Root from decisions actually requiring the operator. For an active hold explicitly marked Root-owned, use resolve_hold with its exact project and task and your scoped decision in body, within the authorized scope and respecting stops, exhausted retry limits and approval boundaries. Do not assume legacy or operator-owned holds allow autonomous resolution. Ask the operator only when a specific real decision or request is recorded: state the exact requirement in plain language and any supplied options, tradeoffs, recommendation and independent constraints. Never ask a generic question about whether they need to decide. If ownership or the decision is unknown, report the known status or clarify through authorized project paths; never invent a decision, infer private PO details, or claim clarification was requested when it was not.\n")
 		}
@@ -390,7 +418,13 @@ func prompt(req runtimeapi.Request) string {
 	if req.Role == "po" && req.Kind == "scope_review" {
 		b.WriteString("\nReturn the scope assessment in text; the app delivers it to Root. Do not use report_progress or dispatch actions during scope review.\n")
 	}
-	if req.Role == "po" && req.Kind != "operator_message" && req.Kind != "scope_review" && req.Kind != "project_message" && req.Kind != "approval_denied" {
+	if req.Role == "po" && req.Kind == "po_evidence" {
+		b.WriteString("\nThis private evidence turn is for a substantive assessment of the pinned project summaries only. Return text without actions, task changes, hold resolution, replay, or operator output. Existing authorized task turns govern any subsequent work.\n")
+	}
+	if req.Role == "po" && req.Kind == "po_hold_investigation" {
+		b.WriteString("\nAssess the exact existing held task and pinned evidence. Return a private factual text assessment only; do not perform new effects, dispatch, replay, change a hold, or treat this request as additional authority. Preserve all stops, approvals, privacy and uncertainty boundaries.\n")
+	}
+	if req.Role == "po" && req.Kind != "operator_message" && req.Kind != "scope_review" && req.Kind != "project_message" && req.Kind != "approval_denied" && req.Kind != "po_evidence" && req.Kind != "po_hold_investigation" {
 		b.WriteString("\nResolve routine workspace, access and environment troubleshooting within your existing authority and have workers continue independent authorized work. Find missing inputs in authorized checkouts, artifacts or receipt history, or ask the owning agent through an available internal route. Consult available primary vendor documentation or tool help; use a permitted alternative or bounded retry where appropriate. Do not ask the operator to retrieve routine files or documentation or interpret a vague blocker. A technical prerequisite is not itself an operator decision. Ask the operator for genuine product or art choices, such as selecting concept A or B or accepting or revising a model, and for authority the team actually lacks. When a genuine decision exceeds your authority, isolate one precise question rather than bundling unrelated issues; provide the evidence, why the operator must decide, the viable options and their impact, and the next action for each outcome. Preserve stops, denials, approval boundaries, privacy and uncertain-effect fences; do not claim access or authorization you lack.\n")
 		b.WriteString("\nSend routine project progress privately to Root using report_progress: set body to the update, project to empty or this project, recipient to empty or root, and title, task and reply_to empty. Do not send generic status or recaps to the operator or group. Use the project group for worker coordination and focused collaboration; answer a directly addressed operator question once in that room. Route actual operator decisions through the existing hold or approval workflow, and send the completed parent report to Root.\n")
 		b.WriteString("For hold_task, leave recipient empty for a task-local technical hold; set recipient to root only when the needed scoped decision is delegated to Root. Use a standalone request_approval for an actual operator decision, with the exact question and context. Never use a Root-owned hold to bypass stops, retry limits or approval requirements.\n")
@@ -398,7 +432,7 @@ func prompt(req runtimeapi.Request) string {
 	if req.Role == "po" || req.Role == "worker" {
 		b.WriteString("\nFor a post_group reply, set reply_to to the exact message id of the prior message in this project group shown in the live context. Leave reply_to empty for standalone posts and every other action. Archived or external references belong in the message body as citations; do not use their identifiers as reply_to.\n")
 	}
-	if req.Role == "po" && req.TaskID != "" && req.Kind != "scope_review" {
+	if req.Role == "po" && req.TaskID != "" && req.Kind != "scope_review" && req.Kind != "po_hold_investigation" {
 		b.WriteString("\nWhen the operator requests a one-shot worker, use create_one_shot_worker with the exact worker name in title; project may be empty or the current project, and body, recipient, task and reply_to must be empty. Bind that worker to one appropriate child using queue_work_item. Review its result normally; do not reuse it for another child or bypass recovery safeguards.\n")
 		b.WriteString("\nAn approval request must be the only action in its response: never combine request_approval with progress, worker creation, dispatch, posts or any other action. Nothing in a rejected mixed response was applied. Continue independent work that does not need approval in separate turns; a denial never authorizes dispatch of the denied work.\n")
 		b.WriteString("\nYou are the PO, not Root: never emit resolve_hold. If a continuation says a hold is already resolved, follow its recorded decision and use only PO actions for the current task.\n")
@@ -438,9 +472,6 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		return zero, err
 	}
 	body := prompt(req)
-	if len(body) > 2<<20 {
-		return zero, errors.New("run prompt exceeds bounded input size")
-	}
 	info, err := os.Stat(req.Workspace)
 	if err != nil || !info.IsDir() {
 		return zero, errors.New("workspace is unavailable")
@@ -468,6 +499,9 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 			return zero, ErrUnknown
 		}
 		created = false
+	}
+	if created && len(body) > 2<<20 {
+		return zero, noLaunchError{"Native run was not started: prompt exceeds the allowed size."}
 	}
 	lock, err := lockRun(dir, false)
 	if platformlock.IsContended(err) {
@@ -499,6 +533,9 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 		canRetry, e := retryable(dir)
 		if e != nil || !canRetry {
 			return zero, fmt.Errorf("%w: retry proof changed", ErrUnknown)
+		}
+		if len(body) > 2<<20 {
+			return zero, noLaunchError{"Native run was not started: prompt exceeds the allowed size."}
 		}
 		if e = runCtx.Err(); e != nil {
 			return zero, runtimeapi.StartCancellation(runCtx)
@@ -653,7 +690,7 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 func (r *Runner) Recover(ctx context.Context, req runtimeapi.Request) (runtimeapi.Result, runtimeapi.State, error) {
 	var zero runtimeapi.Result
 	if err := validate(req); err != nil {
-		return zero, runtimeapi.Unknown, err
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native recovery request is invalid; execution outcome remains uncertain."}
 	}
 	dir := r.dir(req.ID)
 	info, err := os.Lstat(dir)
@@ -663,12 +700,12 @@ func (r *Runner) Recover(ctx context.Context, req runtimeapi.Request) (runtimeap
 		return zero, runtimeapi.Unknown, err
 	}
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return zero, runtimeapi.Unknown, errors.New("invalid run journal directory")
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native journal identity is invalid; execution outcome remains uncertain."}
 	}
 	lock, err := lockRun(dir, false)
 	if platformlock.IsContended(err) {
 		if b, e := os.ReadFile(filepath.Join(dir, "intent")); e == nil && string(b) != fingerprint(req) {
-			return zero, runtimeapi.Unknown, errors.New("run ID was reused with a different request")
+			return zero, runtimeapi.Unknown, permanentRecoveryError{"Native journal request does not match; execution outcome remains uncertain."}
 		}
 		return zero, runtimeapi.Running, nil
 	}
@@ -681,7 +718,7 @@ func (r *Runner) Recover(ctx context.Context, req runtimeapi.Request) (runtimeap
 		return zero, runtimeapi.Unknown, nil
 	}
 	if string(b) != fingerprint(req) {
-		return zero, runtimeapi.Unknown, errors.New("run ID was reused with a different request")
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native journal request does not match; execution outcome remains uncertain."}
 	}
 	receipt, err := os.ReadFile(filepath.Join(dir, "complete"))
 	if os.IsNotExist(err) {
@@ -696,21 +733,37 @@ func (r *Runner) Recover(ctx context.Context, req runtimeapi.Request) (runtimeap
 	} else if err != nil {
 		return zero, runtimeapi.Unknown, err
 	}
-	if canRetry, e := retryable(dir); e != nil || canRetry {
-		return zero, runtimeapi.Unknown, errors.New("conflicting completion and capacity receipts")
+	if canRetry, e := retryable(dir); e != nil {
+		return zero, runtimeapi.Unknown, e
+	} else if canRetry {
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native journal has conflicting receipts; execution outcome remains uncertain."}
 	}
 	digest, err := r.resultDigest(dir)
-	if err != nil || digest != string(receipt) {
-		return zero, runtimeapi.Unknown, errors.New("completed native result does not match its receipt")
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, errResultShape) {
+			return zero, runtimeapi.Unknown, permanentRecoveryError{"Native completed result is invalid; execution outcome remains uncertain."}
+		}
+		return zero, runtimeapi.Unknown, err
+	}
+	if digest != string(receipt) {
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native completed result does not match its receipt; execution outcome remains uncertain."}
 	}
 	readCtx, cancel := context.WithTimeout(ctx, r.cfg.MaxDuration)
 	defer cancel()
 	result, err := r.readResult(readCtx, dir, req)
 	if err != nil {
+		if errors.Is(err, errResultShape) || errors.Is(err, errRoleAction) || errors.Is(err, errWorkerAction) {
+			return zero, runtimeapi.Unknown, permanentRecoveryError{"Native completed result failed validation; execution outcome remains uncertain."}
+		}
 		return zero, runtimeapi.Unknown, err
 	}
-	if after, e := r.resultDigest(dir); e != nil || after != digest {
-		return zero, runtimeapi.Unknown, errors.New("completed native result changed during recovery")
+	if after, e := r.resultDigest(dir); e != nil {
+		if errors.Is(e, os.ErrNotExist) || errors.Is(e, errResultShape) {
+			return zero, runtimeapi.Unknown, permanentRecoveryError{"Native completed result changed during recovery; execution outcome remains uncertain."}
+		}
+		return zero, runtimeapi.Unknown, e
+	} else if after != digest {
+		return zero, runtimeapi.Unknown, permanentRecoveryError{"Native completed result changed during recovery; execution outcome remains uncertain."}
 	}
 	return result, runtimeapi.Completed, nil
 }

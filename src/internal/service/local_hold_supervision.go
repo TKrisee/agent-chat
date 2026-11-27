@@ -16,12 +16,20 @@ func (s *Service) maybeSuperviseLocalHold(tx *sql.Tx, project string) error {
 		return nil
 	}
 	var busy int
-	err := tx.QueryRow(`SELECT count(*) FROM jobs j WHERE j.project_id=? AND (j.status IN ('submitted','running') OR (j.status='pending' AND (j.kind!='work' OR (NOT EXISTS(SELECT 1 FROM po_work_dependencies d JOIN tasks p ON p.id=d.prerequisite_task_id WHERE d.child_task_id=j.task_id AND p.status!='completed') AND NOT EXISTS(SELECT 1 FROM jobs lane WHERE lane.agent_id=j.agent_id AND lane.kind='work' AND lane.status='uncertain')))))`, project).Scan(&busy)
+	var enabled bool
+	var reserve int
+	if err := tx.QueryRow(`SELECT enabled,reserve FROM usage_settings WHERE id=1`).Scan(&enabled, &reserve); err != nil {
+		return err
+	}
+	if enabled && s.usageBlocked(reserve) {
+		return nil
+	}
+	err := tx.QueryRow(`SELECT count(*) FROM jobs j WHERE j.project_id=? AND (j.status IN ('submitted','running') OR (j.next_at<=? AND (`+pendingClaimPredicate+`)))`, project, now(), false).Scan(&busy)
 	if err != nil || busy != 0 {
 		return err
 	}
 	var hold, source, task, po string
-	err = tx.QueryRow(`SELECT h.job_id,h.root_source_id,h.task_id,h.po_id FROM task_holds h JOIN task_local_holds l ON l.job_id=h.job_id JOIN task_local_supervision_candidates c ON c.hold_job_id=h.job_id JOIN tasks t ON t.id=h.task_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id JOIN agents a ON a.id=h.po_id AND a.role='po' AND a.project_id=p.id WHERE h.project_id=? AND h.status='active' AND t.status='blocked' AND t.owner_id=h.po_id AND p.stopped=0 AND NOT EXISTS(SELECT 1 FROM task_local_supervisions x WHERE x.hold_job_id=h.job_id OR x.recovery_task_id=h.task_id OR x.recovery_task_id=(SELECT parent_task_id FROM po_work_items WHERE child_task_id=h.task_id)) AND NOT EXISTS(SELECT 1 FROM jobs x WHERE x.task_id=h.task_id AND x.status IN ('pending','submitted','running','uncertain')) AND NOT EXISTS(SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending') ORDER BY h.rowid LIMIT 1`, project).Scan(&hold, &source, &task, &po)
+	err = tx.QueryRow(`SELECT h.job_id,h.root_source_id,h.task_id,h.po_id FROM task_holds h JOIN task_local_holds l ON l.job_id=h.job_id JOIN task_local_supervision_candidates c ON c.hold_job_id=h.job_id JOIN tasks t ON t.id=h.task_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id JOIN agents a ON a.id=h.po_id AND a.role='po' AND a.project_id=p.id WHERE h.project_id=? AND h.status='active' AND t.status='blocked' AND t.owner_id=h.po_id AND p.stopped=0 AND NOT EXISTS(SELECT 1 FROM task_local_supervisions x WHERE x.hold_job_id=h.job_id OR x.recovery_task_id=h.task_id OR x.recovery_task_id=(SELECT parent_task_id FROM po_work_items WHERE child_task_id=h.task_id)) AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.task_id=h.task_id AND (j.status IN ('submitted','running','uncertain') OR (j.next_at<=? AND (`+pendingClaimPredicate+`)))) AND NOT EXISTS(SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending') ORDER BY h.rowid LIMIT 1`, project, now(), false).Scan(&hold, &source, &task, &po)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -46,7 +54,7 @@ func (s *Service) delegateLocalSupervision(tx *sql.Tx, a agent, j job, action ru
 		return fmt.Errorf("%w: supervisor requires a distinct same-project delegation", errWorkflow)
 	}
 	var origin, po string
-	err := tx.QueryRow(`SELECT origin.id,h.po_id FROM task_local_supervisions x JOIN task_holds h ON h.job_id=x.hold_job_id JOIN task_local_holds l ON l.job_id=h.job_id JOIN tasks t ON t.id=h.task_id AND t.status='blocked' AND t.owner_id=h.po_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id AND p.stopped=0 JOIN task_origins o ON o.task_id=COALESCE((SELECT parent_task_id FROM po_work_items WHERE child_task_id=h.task_id),h.task_id) JOIN messages origin ON origin.id=o.message_id AND origin.sender=? AND origin.recipient=? AND origin.role='operator' AND origin.room_id=? WHERE x.source_id=? AND x.recovery_task_id IS NULL AND h.status='active' AND h.task_id=? AND h.project_id=? AND NOT EXISTS(SELECT 1 FROM jobs other WHERE other.task_id=h.task_id AND other.id<>? AND other.status IN ('pending','submitted','running','uncertain')) AND NOT EXISTS(SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending')`, operator, root, directRoom(operator, root), j.Source, j.Task, j.Project, j.ID).Scan(&origin, &po)
+	err := tx.QueryRow(`SELECT origin.id,h.po_id FROM task_local_supervisions x JOIN task_holds h ON h.job_id=x.hold_job_id JOIN task_local_holds l ON l.job_id=h.job_id JOIN tasks t ON t.id=h.task_id AND t.status='blocked' AND t.owner_id=h.po_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id AND p.stopped=0 JOIN task_origins o ON o.task_id=COALESCE((SELECT parent_task_id FROM po_work_items WHERE child_task_id=h.task_id),h.task_id) JOIN messages origin ON origin.id=o.message_id AND origin.sender=? AND origin.recipient=? AND origin.role='operator' AND origin.room_id=? WHERE x.source_id=? AND x.recovery_task_id IS NULL AND h.status='active' AND h.task_id=? AND h.project_id=? AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.task_id=h.task_id AND j.id<>? AND (j.status IN ('submitted','running','uncertain') OR (j.next_at<=? AND (`+pendingClaimPredicate+`)))) AND NOT EXISTS(SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending')`, operator, root, directRoom(operator, root), j.Source, j.Task, j.Project, j.ID, now(), false).Scan(&origin, &po)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: local hold supervision unavailable", errWorkflow)
 	}

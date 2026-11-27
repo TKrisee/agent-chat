@@ -10,7 +10,7 @@ import (
 
 func TestLocalHoldSupervisorContract(t *testing.T) {
 	req := runtimeapi.Request{Role: "root", Kind: "task_blocked", ProjectID: "alpha", TaskID: "task", LocalHoldSupervisor: true}
-	cmd := exec.Command("jq", "-e", `.properties.actions.maxItems == 1 and .properties.actions.items.properties.type.enum == ["delegate"]`)
+	cmd := exec.Command("jq", "-e", `.properties.actions.maxItems == 1 and .properties.actions.items.properties.type.enum == ["delegate","investigate_hold"]`)
 	cmd.Stdin = strings.NewReader(newJobSchema(req))
 	if err := cmd.Run(); err != nil {
 		t.Fatal("supervisor schema")

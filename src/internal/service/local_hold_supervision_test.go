@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"database/sql"
+	"net/http/httptest"
 	"testing"
 
 	"agentchat/src/internal/runtimeapi"
@@ -95,5 +96,115 @@ func TestLocalHoldSupervisionWaitsForIdleAndPreservesHold(t *testing.T) {
 				t.Fatalf("recursive wake=%d: %v", wake, err)
 			}
 		})
+	}
+}
+
+func TestLocalHoldSupervisionAfterLastJobUncertain(t *testing.T) {
+	s, task, po, worker := continuationFixture(t)
+	defer s.Close()
+	origin := newID()
+	if err := s.write(func(tx *sql.Tx) error {
+		if err := addMessage(tx, origin, operator, root, "operator", "Original scope", "", ""); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO task_origins(task_id,message_id) VALUES(?,?)`, task, origin)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.userMessage(context.Background(), newID(), worker, "", "Independent question", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.complete(activeAssignment(t, s, task, po), runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Body: "Technical input unavailable."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	work, err := s.claim(nil)
+	if err != nil || work == nil || work.Agent != worker {
+		t.Fatalf("work: %+v %v", work, err)
+	}
+	if err := s.write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`UPDATE jobs SET kind='work' WHERE id=?`, work.ID); err != nil {
+			return err
+		}
+		stale := newID()
+		if err := addMessage(tx, stale, "service", root, "system", "stale internal wake", "alpha", task); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO jobs(id,agent_id,project_id,task_id,source_id,kind,status,request,next_at) VALUES(?,?,'alpha',?,?,'root_backlog','pending',?,0)`, newID(), root, task, stale, []byte("{}")); err != nil {
+			return err
+		}
+		pending, otherTask := newID(), newID()
+		if _, err := tx.Exec(`INSERT INTO tasks VALUES(?,'alpha','Other work','queued',?)`, otherTask, worker); err != nil {
+			return err
+		}
+		if err := addMessage(tx, pending, po, worker, "po", "dependent work", "alpha", otherTask); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO jobs(id,agent_id,project_id,task_id,source_id,kind,status,request,next_at) VALUES(?,?,'alpha',?,?,'work','pending',?,0)`, newID(), worker, otherTask, pending, []byte("{}"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.disposition(work.ID, "uncertain", "unknown", 0); err != nil {
+		t.Fatal(err)
+	}
+	wake, err := s.claim(nil)
+	if err != nil || wake == nil || wake.Kind != "task_blocked" || !wake.Request.LocalHoldSupervisor {
+		t.Fatalf("supervisor: %+v %v", wake, err)
+	}
+	var status string
+	if err := s.db.QueryRow(`SELECT status FROM jobs WHERE id=?`, work.ID).Scan(&status); err != nil || status != "uncertain" {
+		t.Fatalf("job=%s %v", status, err)
+	}
+	if err := s.complete(*wake, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "delegate", Project: "alpha", Title: "Independent investigation", Body: "Inspect an independent authorized route."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var linked int
+	if err := s.db.QueryRow(`SELECT count(*) FROM task_local_supervisions WHERE source_id=? AND recovery_task_id IS NOT NULL`, wake.Source).Scan(&linked); err != nil || linked != 1 {
+		t.Fatalf("supervisor action blocked by fenced pending jobs: %d %v", linked, err)
+	}
+}
+
+func TestLocalHoldSupervisionAfterProjectResume(t *testing.T) {
+	s, task, po, worker := continuationFixture(t)
+	defer s.Close()
+	origin := newID()
+	if err := s.write(func(tx *sql.Tx) error {
+		if err := addMessage(tx, origin, operator, root, "operator", "Original scope", "", ""); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO task_origins(task_id,message_id) VALUES(?,?)`, task, origin)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.userMessage(context.Background(), newID(), worker, "", "Independent question", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.complete(activeAssignment(t, s, task, po), runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Body: "Technical input unavailable."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	work, err := s.claim(nil)
+	if err != nil || work == nil || work.Agent != worker {
+		t.Fatalf("work: %+v %v", work, err)
+	}
+	if _, err := s.db.Exec(`UPDATE projects SET stopped=1 WHERE id='alpha'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.disposition(work.ID, "uncertain", "unknown", 0); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM task_local_supervisions`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("stopped wake=%d %v", n, err)
+	}
+	w := httptest.NewRecorder()
+	s.setStop(w, "alpha", false)
+	if w.Code != 200 {
+		t.Fatalf("resume status=%d", w.Code)
+	}
+	wake, err := s.claim(nil)
+	if err != nil || wake == nil || wake.Kind != "task_blocked" || !wake.Request.LocalHoldSupervisor {
+		t.Fatalf("supervisor: %+v %v", wake, err)
 	}
 }

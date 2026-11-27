@@ -46,6 +46,8 @@ Start in the Root conversation to describe your project. Select a project to ope
 
 Set a project workspace from its group chat with `/workspace <absolute-directory>`.
 
+For continuing work, ask Root to set an active project goal. In the Root conversation, enter `/backlog <project-id>`, then use Shift+Enter and write the authorized scope and its limits on the following lines. This one-time intake lets Root select the first assignment and, after each completed assignment, consider one distinct next assignment through the usual project owner scope review. An ordinary request remains scoped to that request. Replacing, pausing, or completing the goal ends automatic continuation under that authorization. The app checks the recorded intake, goal revision, project and owner. Root interprets the written scope when selecting work.
+
 For an eligible task, send `/continue <instruction>` in its project group chat to continue with the project owner, or `/retry-handoff` to retry an eligible handoff. If more than one task is eligible, specify its full task UUID: `/continue <task-UUID> <instruction>` or `/retry-handoff <task-UUID>`.
 
 The right panel shows the team, work and project activity. Open Settings from the cog in the sidebar to check for app updates and configure the optional weekly allowance guard. When enabled, the guard holds new work at the configured reserve or while allowance information is unavailable; it does not interrupt work already running.

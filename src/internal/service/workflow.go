@@ -42,6 +42,12 @@ func agentGuide(role, kind string, shared bool) string {
 		if kind == "operator_message" {
 			guide = poChatGuide
 		}
+		if kind == "po_evidence" {
+			guide = "You are the project owner. Review only the explicitly shared evidence in this event and provide a substantive private text assessment. Return no actions or attachments. Do not change tasks, approvals, holds, or repeat work."
+		}
+		if kind == "po_hold_investigation" {
+			guide = "Assess the exact held task and its pinned evidence privately. Return a substantive text assessment only; take no actions, attach no files, and do not clear the hold or repeat uncertain effects. Respect existing scope, stops, approvals, and privacy."
+		}
 	case "worker":
 		if kind == "operator_message" {
 			guide = workerChatGuide
@@ -60,14 +66,21 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		return fmt.Errorf("%w: Codex setup is not ready", errConflict)
 	}
 	guide := agentGuide(a.Role, kind, project != "" && project == a.Project)
-	if a.Role == "po" && kind != "operator_message" && kind != groupMessageKind {
+	if a.ID == root && kind == "operator_message" && isRootBacklogIntake(instructions) {
+		guide += "\nThis dedicated operator intake explicitly authorizes a continuing scope for the named existing project. Choose at most one initial assignment within the stated scope. Use one delegate for that exact project, or leave actions empty when no work is ready. The active project goal provides context and does not expand the text of the intake."
+	}
+	if kind == projectReportRecovery {
+		guide = ""
+	}
+	if a.Role == "po" && kind != "operator_message" && kind != groupMessageKind && kind != "po_evidence" && kind != "po_hold_investigation" {
 		guide += "\nUse explicit task-scoped Root escalation or report_progress to share task decisions and progress. You may quote task-sourced private wording when it is needed for a decision, or summarize it; omit unrelated material. Ordinary operator direct messages remain private unless intentionally shared for the task."
 		guide += " For an actual operator decision use request_approval, or a hold when the existing decision path requires it; include the exact question and options. Routine progress belongs with Root."
 		if kind == "review" || kind == "po_followup" {
 			guide += " When forwarding a pinned worker receipt attachment, use its exact managed path, name and media type shown in the receipt, never a prior worker workspace path."
+			guide += " Attach only authorized deliverables when emitting report. These files become part of the accepted report."
 		}
 	}
-	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind {
+	if a.Role == "po" && project != "" && task != "" && kind != "operator_message" && kind != groupMessageKind && kind != "po_hold_investigation" {
 		var objective string
 		err := tx.QueryRow(`SELECT g.objective FROM project_goals g JOIN projects p ON p.id=g.project_id WHERE g.project_id=? AND p.po_id=? AND g.status='active'`, project, a.ID).Scan(&objective)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -101,7 +114,7 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 			guide += "\nRecorded child work items:\n" + strings.Join(outcomes, "\n")
 		}
 	}
-	if a.Role == "root" {
+	if a.Role == "root" && kind != projectReportRecovery {
 		guide += "\nRoot-bound task updates and escalations may contain private operator-to-PO material intentionally shared for a decision. Before any operator-facing response, include only the information needed for that response; do not relay unrelated private conversation."
 	}
 	if a.Role == "root" && (kind == "operator_message" || kind == "approval_approved") {
@@ -185,6 +198,12 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 }
 
 func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kind string, source ...string) ([]runtimeapi.Message, error) {
+	if kind == "po_evidence" {
+		if len(source) != 1 {
+			return nil, fmt.Errorf("%w: evidence context unavailable", errWorkflow)
+		}
+		return poEvidenceContext(tx, a, project, task, source[0])
+	}
 	const privateColumns = "id,sender,role,text,seq,'' AS group_recipient,recipient,room_id"
 	const shared = `SELECT m.id,m.sender,m.role,m.text,m.seq,m.recipient AS group_recipient,m.recipient,m.room_id FROM messages m
 		WHERE m.project_id=? AND m.recipient=? AND m.room_id=m.recipient AND m.task_id IS NULL
@@ -195,7 +214,15 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 	sharedArgs := []any{project, groupRecipient, operator}
 	query := "SELECT " + privateColumns + " FROM messages WHERE task_id=? ORDER BY seq DESC LIMIT 24"
 	args := []any{task}
-	if kind == groupMessageKind {
+	if kind == projectReportRecovery {
+		if len(source) != 1 {
+			return nil, fmt.Errorf("%w: report recovery request unavailable", errWorkflow)
+		}
+		query = "SELECT " + privateColumns + ` FROM messages m WHERE m.id=? OR m.id=(
+			SELECT j.source_id FROM project_report_review_attempts r JOIN jobs j ON j.id=r.relay_job_id
+			WHERE r.request_message_id=? AND j.project_id=? AND j.task_id=? AND j.agent_id=? AND j.kind='project_report')`
+		args = []any{source[0], source[0], project, task, root}
+	} else if kind == groupMessageKind {
 		query = shared + "24"
 		args = sharedArgs
 	} else if task == "" {
@@ -217,13 +244,15 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		query += " UNION SELECT * FROM (" + notice + ")"
 		args = append(args, project, groupRecipient)
 	}
-	if kind != groupMessageKind && kind != "operator_message" && project != "" && (project == a.Project || a.Role == "root") {
+	if kind != groupMessageKind && kind != "operator_message" && kind != projectReportRecovery && project != "" && (project == a.Project || a.Role == "root") {
 		query += " UNION SELECT * FROM (" + shared + "12)"
 		args = append(args, sharedArgs...)
 		query += " UNION SELECT * FROM (" + notice + ")"
 		args = append(args, project, groupRecipient)
 	}
 	if a.Role == "po" && project != "" && project == a.Project && task != "" && kind != "operator_message" && kind != groupMessageKind {
+		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM po_evidence_assessments x JOIN jobs j ON j.id=x.job_id AND j.kind='po_evidence' AND j.status='completed' AND COALESCE(j.diagnostic,'')='' JOIN messages m ON m.id=x.message_id JOIN projects p ON p.id=j.project_id AND p.po_id=j.agent_id WHERE j.project_id=? AND j.agent_id=? AND m.project_id=j.project_id AND m.sender=j.agent_id AND m.recipient=j.agent_id AND m.role='po' ORDER BY m.seq DESC LIMIT 12)`
+		args = append(args, project, a.ID)
 		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN root_evidence_handoffs h ON h.message_id=m.id JOIN projects p ON p.id=h.project_id AND p.po_id=? WHERE h.project_id=? AND m.project_id=p.id AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? ORDER BY m.seq DESC LIMIT 12)`
 		args = append(args, a.ID, project, root, a.ID, directRoom(root, a.ID))
 		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN worker_po_handoffs h ON h.message_id=m.id JOIN projects p ON p.id=h.project_id AND p.po_id=? JOIN agents w ON w.id=m.sender AND w.role='worker' AND w.project_id=p.id WHERE h.project_id=? AND m.project_id=p.id AND m.recipient=? AND m.role='worker' AND m.room_id='dm:'||CASE WHEN m.sender<m.recipient THEN m.sender||':'||m.recipient ELSE m.recipient||':'||m.sender END ORDER BY m.seq DESC LIMIT 12)`
@@ -250,6 +279,10 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 			query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id=?`
 			args = append(args, assessment)
 		}
+	}
+	if kind == "root_backlog" && a.ID == root && len(source) != 0 {
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages m WHERE m.id=(SELECT origin_id FROM root_backlog_wakes WHERE source_id=? AND parent_task_id=? AND project_id=?) AND m.sender=? AND m.recipient=? AND m.role='operator' AND m.room_id=?`
+		args = append(args, source[0], task, project, operator, root, directRoom(operator, root))
 	}
 	if kind == "operator_message" && a.ID == root {
 		holds, _, err := s.activeHolds(tx)
@@ -281,6 +314,34 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		}
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?)`
 		args = append(args, assignment, note)
+	}
+	if kind == "po_hold_investigation" {
+		if len(source) != 1 || a.Role != "po" {
+			return nil, fmt.Errorf("%w: held investigation context unavailable", errWorkflow)
+		}
+		var assignment, note, review string
+		err := tx.QueryRow(`SELECT h.assignment_id,COALESCE(h.note_id,''),COALESCE(h.review_id,'') FROM local_hold_investigations i JOIN task_holds h ON h.job_id=i.hold_job_id JOIN tasks t ON t.id=h.task_id AND t.owner_id=h.po_id AND t.status='blocked' JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id WHERE i.source_id=? AND h.task_id=? AND h.project_id=? AND h.po_id=? AND h.status='active' AND i.assessment_id IS NULL`, source[0], task, project, a.ID).Scan(&assignment, &note, &review)
+		if err != nil {
+			return nil, fmt.Errorf("%w: held investigation context unavailable", errWorkflow)
+		}
+		var valid int
+		err = tx.QueryRow(`SELECT count(*) FROM messages m WHERE m.id=? AND m.project_id=? AND m.sender=? AND m.recipient=? AND m.role='root' AND m.room_id=? AND (m.task_id=? OR EXISTS(SELECT 1 FROM po_work_items i WHERE i.child_task_id=? AND i.parent_task_id=m.task_id))`, assignment, project, root, a.ID, directRoom(root, a.ID), task, task).Scan(&valid)
+		if err != nil || valid != 1 {
+			return nil, fmt.Errorf("%w: held assignment unavailable", errWorkflow)
+		}
+		if note != "" {
+			err = tx.QueryRow(`SELECT count(*) FROM messages WHERE id=? AND task_id=? AND project_id=? AND sender=? AND recipient=? AND role='operator' AND room_id=?`, note, task, project, operator, a.ID, directRoom(operator, a.ID)).Scan(&valid)
+			if err != nil || valid != 1 {
+				return nil, fmt.Errorf("%w: held instruction unavailable", errWorkflow)
+			}
+		}
+		if review != "" {
+			if _, err = activeReviewWorker(tx, job{Task: task, Project: project, Kind: "review", Source: review}, a.ID); err != nil {
+				return nil, err
+			}
+		}
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
+		args = append(args, assignment, note, review)
 	}
 	if kind == "po_followup" {
 		if len(source) != 1 {
@@ -358,6 +419,10 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		args = append(args, task, root, a.ID, directRoom(root, a.ID))
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
 		args = append(args, f.assignment, f.note, f.review)
+	}
+	if a.Role == "po" && task != "" && project == a.Project && kind != "po_hold_investigation" {
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (SELECT i.assessment_id FROM local_hold_investigations i JOIN task_holds h ON h.job_id=i.hold_job_id WHERE h.task_id=? AND h.project_id=? AND h.po_id=? AND i.assessment_id IS NOT NULL) AND project_id=? AND task_id=? AND sender=? AND recipient=? AND role='po'`
+		args = append(args, task, project, a.ID, project, task, a.ID, a.ID)
 	}
 	if pinLatestReceipt && a.Role == "po" && task != "" && project == a.Project {
 		// Only the latest successful worker receipt addressed to this PO on the
@@ -471,6 +536,14 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 			}
 		}
 		if invalid != nil {
+			diagnostic = invalid.Error()
+			if j.Kind == "po_evidence" {
+				if err := rejectPOEvidence(tx, j); err != nil {
+					return err
+				}
+			}
+		}
+		if invalid != nil && j.Kind != "project_report" && j.Kind != projectReportRecovery {
 			var reviewErr *reviewConflictError
 			var childPlanningErr *childPlanningConflictError
 			if (errors.As(invalid, &reviewErr) || errors.As(invalid, &childPlanningErr)) && len(files) == 0 && len(uploads) == 0 {
@@ -498,12 +571,17 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 				}
 				if a.Role == "po" && (j.Kind == "assignment" || j.Kind == "po_continue" || j.Kind == "po_followup") && parentTaskOwned(tx, j, a) == nil {
 					var other int
-					if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=? AND status IN ('pending','denied'))`, j.Task, j.ID, j.Task).Scan(&other); err != nil {
+					if err = tx.QueryRow(`SELECT (SELECT count(*) FROM jobs WHERE task_id=? AND id<>? AND status IN ('pending','submitted','running','uncertain') AND NOT EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.task_id=jobs.task_id AND c.review_job_id=jobs.id AND jobs.status='uncertain'))+(SELECT count(*) FROM approvals WHERE task_id=? AND status='pending')`, j.Task, j.ID, j.Task).Scan(&other); err != nil {
 						return err
 					}
 					if other == 0 {
 						if err = s.poFollowThrough(tx, j, a, runtimeapi.Result{}, planning.Error()); err != nil {
 							return err
+						}
+						if j.Kind == "assignment" {
+							if _, err = tx.Exec(`INSERT INTO po_assignment_corrections(source_id) SELECT source_id FROM po_followups WHERE trigger_id=? AND assignment_id=? ON CONFLICT DO NOTHING`, j.ID, j.Source); err != nil {
+								return err
+							}
 						}
 						_, err = tx.Exec("UPDATE jobs SET status='completed',result=?,diagnostic=? WHERE id=?", payload, invalid.Error(), j.ID)
 						return err
@@ -524,13 +602,12 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 					return err
 				}
 			}
-			if j.Task != "" {
+			if j.Task != "" && j.Kind != "po_hold_investigation" {
 				if err := workflowNotice(tx, j.Project, "blocked:"+j.ID, "A task could not continue and needs attention."); err != nil {
 					return err
 				}
 			}
-			diagnostic = invalid.Error()
-			if j.Task != "" {
+			if j.Task != "" && j.Kind != "po_hold_investigation" {
 				if _, err := tx.Exec("UPDATE tasks SET status='blocked' WHERE id=? AND status!='completed'", j.Task); err != nil {
 					return err
 				}
@@ -539,6 +616,9 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 				}
 			}
 			internalWake := 0
+			if j.Kind == "root_backlog" || j.Kind == "po_hold_investigation" {
+				internalWake = 1
+			}
 			if j.Kind == "task_blocked" && j.Agent == root {
 				if err := tx.QueryRow(`SELECT count(*) FROM task_internal_wakes WHERE source_id=?`, j.Source).Scan(&internalWake); err != nil {
 					return err
@@ -559,10 +639,15 @@ func (s *Service) complete(j job, result runtimeapi.Result, uploads []runtimeapi
 		if err != nil || j.Project == "" {
 			return err
 		}
+		if invalid != nil && j.Kind == "project_report" {
+			if err := recordProjectReportIssue(tx, j.ID); err != nil {
+				return err
+			}
+		}
 		if _, err = tx.Exec("SAVEPOINT local_supervision"); err != nil {
 			return err
 		}
-		if wakeErr := s.maybeSuperviseLocalHold(tx, j.Project); wakeErr != nil {
+		if wakeErr := s.reconcileProjectWakes(tx, j.Project); wakeErr != nil {
 			if _, err = tx.Exec("ROLLBACK TO local_supervision"); err != nil {
 				return err
 			}
@@ -589,10 +674,22 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	if len(result.Text) > 128*1024 || len(result.Actions) > 12 {
 		return fmt.Errorf("%w: result exceeds limits", errWorkflow)
 	}
+	if err := validateBacklogIntakeResult(tx, j, result.Actions); err != nil {
+		return err
+	}
 	for _, action := range result.Actions {
+		if a.Role == "root" && j.Kind == "task_blocked" && action.Type == "request_approval" && len(result.Actions) != 1 {
+			return fmt.Errorf("%w: Root hold approval must be requested alone", errWorkflow)
+		}
 		if len(action.DependsOn) != 0 && action.Type != "queue_work_item" {
 			return fmt.Errorf("%w: dependencies require a work item", errWorkflow)
 		}
+	}
+	if j.Kind == projectReportRecovery {
+		if a.ID != root || len(result.Actions) != 0 || len(files) != 0 {
+			return fmt.Errorf("%w: report recovery permits only a summary and exact attachment nominations", errWorkflow)
+		}
+		return s.relayRecoveredProjectReport(tx, a, j, result.Text, result.Attachments)
 	}
 	if j.Kind == "po_followup" {
 		var approvalPlanning int
@@ -639,7 +736,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		}
 	}
 	for _, action := range result.Actions {
-		if action.Task != "" && action.Type != "resolve_hold" {
+		if action.Task != "" && action.Type != "resolve_hold" && !(a.ID == root && j.Request.LocalHoldSupervisor && action.Type == "investigate_hold") {
 			return fmt.Errorf("%w: task field is reserved for resolve_hold", errWorkflow)
 		}
 		if action.ReplyTo != "" && action.Type != "post_group" && !(a.Role == "root" && action.Type == "delegate") {
@@ -665,6 +762,15 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	}
 	if j.Kind == groupMessageKind {
 		return groupMessageResult(tx, a, j, result, files)
+	}
+	if j.Kind == "po_evidence" {
+		return s.consumePOEvidence(tx, j, a, result, files)
+	}
+	if j.Kind == "po_hold_investigation" {
+		return s.consumeLocalHoldInvestigation(tx, a, j, result, files)
+	}
+	if j.Kind == "root_backlog" || j.Kind == "po_evidence" {
+		return s.applyRootBacklog(tx, a, j, result, files)
 	}
 	if a.Role == "worker" {
 		return s.workerResult(tx, j, a, result, files)
@@ -695,6 +801,17 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return s.finishScope(tx, a, j, result, files)
 	}
 
+	// Only an explicit PO report authorizes moving its declared files from
+	// commentary to the accepted deliverable.
+	var reportFiles []attachmentData
+	if a.Role == "po" {
+		for _, action := range result.Actions {
+			if action.Type == "report" {
+				reportFiles, files = files, nil
+				break
+			}
+		}
+	}
 	recipient := operator
 	internalTaskWake := false
 	if a.ID == root && j.Kind == "task_blocked" {
@@ -711,7 +828,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		recipient = root
 	}
 	if a.Role == "root" && j.Kind == "project_report" {
-		if err := relayProjectReport(tx, a, j, result.Text, files); err != nil {
+		if err := s.relayProjectReport(tx, a, j, result.Text, files); err != nil {
 			return err
 		}
 	} else if a.ID == root && j.Kind == "task_blocked" && len(result.Actions) == 1 && result.Actions[0].Type == "resolve_hold" {
@@ -783,8 +900,17 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 			if (pass == 0 && planning) || (pass == 1 && !planning) {
 				continue
 			}
-			if j.Kind == "approval_denied" {
+			if j.Kind == "approval_denied" && (action.Type == "queue_work_item" || action.Type == "queue_worker" || action.Type == "create_worker" || action.Type == "create_one_shot_worker") {
 				return fmt.Errorf("%w: operator approval must be requested separately and a denial cannot dispatch work", errWorkflow)
+			}
+			if action.Type == "queue_work_item" || action.Type == "queue_worker" || action.Type == "create_worker" || action.Type == "create_one_shot_worker" {
+				var pending int
+				if err := tx.QueryRow(`SELECT count(*) FROM approvals WHERE task_id=? AND status='pending'`, planningJob.Task).Scan(&pending); err != nil {
+					return err
+				}
+				if pending != 0 {
+					return fmt.Errorf("%w: task has a pending operator approval", errWorkflow)
+				}
 			}
 			if action.Type == "request_approval" && len(result.Actions) != 1 {
 				if a.Role == "po" && (j.Kind == "assignment" || j.Kind == "po_continue" || j.Kind == "po_followup") {
@@ -808,7 +934,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 					if err := s.reportPOProgress(tx, j, a, action, true); err != nil {
 						return err
 					}
-				} else if err := s.applyAction(tx, a, j, action); err != nil {
+				} else if err := s.applyAction(tx, a, j, action, reportFiles...); err != nil {
 					return err
 				}
 				if childParent != "" && action.Type == "report" {
@@ -877,28 +1003,6 @@ func attachDelegationReply(tx *sql.Tx, messageID, parentID, project, po string) 
 	return err
 }
 
-func relayProjectReport(tx *sql.Tx, a agent, j job, text string, files []attachmentData) error {
-	var report string
-	err := tx.QueryRow(`SELECT m.text FROM messages m JOIN projects p ON p.id=m.project_id
-		JOIN tasks t ON t.id=m.task_id AND t.project_id=p.id AND t.status='completed'
-		WHERE m.id=? AND m.task_id=? AND p.id=? AND m.sender=p.po_id AND m.recipient=? AND m.role='po'`,
-		j.Source, j.Task, j.Project, root).Scan(&report)
-	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("%w: exact PO report unavailable", errWorkflow)
-	}
-	if err != nil {
-		return err
-	}
-	if strings.TrimSpace(text) == "" {
-		text = report
-	}
-	id, err := outputMessage(tx, a, operator, j, text, files)
-	if err != nil {
-		return err
-	}
-	return shareTaskAttachments(tx, j.Source, id)
-}
-
 func shareAcceptedWorkerAttachments(tx *sql.Tx, j job, po, reportID string) error {
 	var workerResultID string
 	err := tx.QueryRow(`SELECT m.id FROM messages m JOIN agents w ON w.id=m.sender AND w.project_id=m.project_id
@@ -953,6 +1057,9 @@ func (s *Service) workerResult(tx *sql.Tx, j job, a agent, result runtimeapi.Res
 				return err
 			}
 			if _, err := tx.Exec(`INSERT INTO worker_po_handoffs(message_id,source_id,job_id,project_id) VALUES(?,?,?,?)`, id, j.Source, j.ID, j.Project); err != nil {
+				return err
+			}
+			if err := s.queuePOEvidence(tx, j.Project); err != nil {
 				return err
 			}
 		}
@@ -1014,11 +1121,14 @@ func outputMessage(tx *sql.Tx, a agent, recipient string, j job, text string, fi
 	return id, nil
 }
 
-func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action) error {
+func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Action, reportFiles ...attachmentData) error {
 	if len(action.Title) > 250 || len(action.Body) > 64*1024 {
 		return fmt.Errorf("%w: action title or body exceeds limits", errWorkflow)
 	}
 	if a.ID == root && j.Kind == "task_blocked" && j.Request.LocalHoldSupervisor {
+		if action.Type == "investigate_hold" {
+			return s.investigateLocalHold(tx, a, j, action)
+		}
 		return s.delegateLocalSupervision(tx, a, j, action)
 	}
 	if action.Type == "request_approval" && (a.Role == "root" || a.Role == "po") {
@@ -1028,7 +1138,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 				return err
 			}
 			if internal != 0 {
-				return fmt.Errorf("%w: operator approval must be requested by the project owner", errWorkflow)
+				return s.requestRootHoldApproval(tx, j, action)
 			}
 		}
 		if action.Project != "" && action.Project != j.Project || action.Recipient != "" && action.Recipient != operator ||
@@ -1051,7 +1161,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 	if a.Role == "root" && (j.Kind == "operator_message" || j.Kind == "approval_approved") {
 		switch action.Type {
 		case "handoff_evidence":
-			return handoffEvidence(tx, j, action)
+			return s.handoffEvidence(tx, j, action)
 		case "resolve_hold":
 			return s.resolveHold(tx, j, action)
 		case "set_project_goal", "set_project_goal_status":
@@ -1065,6 +1175,9 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			_, err := updateStop(tx, action.Project, action.Type == "stop_project")
 			if errors.Is(err, errAbsent) {
 				err = fmt.Errorf("%w: project does not exist", errWorkflow)
+			}
+			if err == nil && action.Type == "resume_project" {
+				err = s.reconcileProjectWakes(tx, action.Project)
 			}
 			return err
 		}
@@ -1127,6 +1240,13 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		if strings.TrimSpace(action.Body) == "" {
 			return fmt.Errorf("%w: report requires Root and a body", errWorkflow)
 		}
+		var pendingApproval int
+		if err := tx.QueryRow(`SELECT count(*) FROM approvals WHERE task_id=? AND status='pending'`, j.Task).Scan(&pendingApproval); err != nil {
+			return err
+		}
+		if pendingApproval != 0 {
+			return fmt.Errorf("%w: task has a pending operator approval", errWorkflow)
+		}
 		var parent string
 		err := tx.QueryRow("SELECT parent_task_id FROM po_work_items WHERE child_task_id=?", j.Task).Scan(&parent)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1143,7 +1263,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			if err := moveTask(tx, j, "accepted", "completed", a.ID, a.ID); err != nil {
 				return err
 			}
-			_, err = outputMessage(tx, a, a.ID, j, action.Body, nil)
+			_, err = recordAcceptedTaskReport(tx, a, j, a.ID, action.Body, reportFiles)
 			return err
 		}
 		if action.Recipient != "" && action.Recipient != root {
@@ -1166,7 +1286,7 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		if err := workflowNotice(tx, j.Project, "complete:"+j.ID, "The project owner completed the task and sent the report to Root."); err != nil {
 			return err
 		}
-		id, err := outputMessage(tx, a, root, j, action.Body, nil)
+		id, err := recordAcceptedTaskReport(tx, a, j, root, action.Body, reportFiles)
 		if err != nil {
 			return err
 		}
@@ -1181,6 +1301,9 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 			if err != nil {
 				return err
 			}
+			if err := shareAcceptedChildReportAttachments(tx, j, a.ID, id); err != nil {
+				return err
+			}
 		} else if err := shareAcceptedWorkerAttachments(tx, j, a.ID, id); err != nil {
 			return err
 		}
@@ -1188,7 +1311,10 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		if err != nil {
 			return err
 		}
-		return s.enqueue(tx, manager, j.Project, j.Task, id, "project_report", action.Body)
+		if err := s.enqueue(tx, manager, j.Project, j.Task, id, "project_report", action.Body); err != nil {
+			return err
+		}
+		return recordRootBacklogCandidate(tx, j, id)
 	default:
 		return fmt.Errorf("%w: unsupported action %q", errWorkflow, action.Type)
 	}
@@ -1337,6 +1463,9 @@ func (s *Service) finishScope(tx *sql.Tx, a agent, j job, result runtimeapi.Resu
 	action := result.Actions[0]
 	if action.Type != "delegate" {
 		return fmt.Errorf("%w: final assignment action must be delegate", errWorkflow)
+	}
+	if err := validateBacklogScopeDecision(tx, j, action.Title); err != nil {
+		return err
 	}
 	if action.Project != j.Project {
 		return &scopeFieldError{"project must equal the current project ID"}

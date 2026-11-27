@@ -135,7 +135,7 @@ func TestContinuePOSameTaskAndFences(t *testing.T) {
 					_, err := tx.Exec("UPDATE projects SET stopped=1 WHERE id='alpha'")
 					return err
 				case "approval":
-					_, err := tx.Exec(`INSERT INTO approvals VALUES(?,'alpha',?,?,'approval','body','denied')`, newID(), task, po)
+					_, err := tx.Exec(`INSERT INTO approvals VALUES(?,'alpha',?,?,'approval','body','pending')`, newID(), task, po)
 					return err
 				case "worker":
 					id := newID()

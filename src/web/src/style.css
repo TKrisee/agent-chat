@@ -134,10 +134,17 @@ button.reply-quote:focus-visible{outline:2px solid #5149bc;outline-offset:2px}
 #guard-settings input[type=number] { width:65px; padding:6px; border:1px solid #ccd9cd; border-radius:7px; background:#fff; color:#29382f; }
 #guard-settings button { justify-self:start; border:0; border-radius:9px; padding:9px 14px; background:#285a48; color:white; font-weight:700; }
 #guard-settings button:focus-visible { outline:2px solid #769e7d; outline-offset:2px; }
-.workflow-notice { margin:13px 0 0 37px; padding:9px 12px; border-left:2px solid #a9c5a4; border-radius:0 8px 8px 0; background:#f0f5ed; color:#53675b; }
+.workflow-notice,.command-message { margin:13px 0 0 37px; padding:9px 12px; border-left:2px solid #a9c5a4; border-radius:0 8px 8px 0; background:#f0f5ed; color:#53675b; }
 .workflow-notice div { display:flex; align-items:baseline; gap:10px; font-size:12px; }
 .workflow-notice div span { color:#8b9a8f; font-size:11px; }
 .workflow-notice p { margin:4px 0 0; font-size:13px; line-height:1.45; overflow-wrap:anywhere; white-space:pre-wrap; }
+.command-heading { display:flex; flex-wrap:wrap; align-items:baseline; gap:3px 8px; font-size:13px; overflow-wrap:anywhere; }
+.command-heading strong { color:#34483c; }
+.command-target,.command-meta { color:#53675b; font-size:12px; }
+.command-meta { margin-inline-start:auto; font-size:11px; }
+.command-meta time { margin-inline-start:4px; }
+.command-message .message-text { margin:4px 0 0; }
+@media(max-width:500px) { .command-message { margin-inline-start:0; } .command-meta { margin-inline-start:0; } }
 
 .po-goal { padding: 12px; border-bottom: 1px solid #e4eae1; overflow-wrap: anywhere; }
 .po-goal p { white-space: pre-wrap; margin: 6px 0 0; }
