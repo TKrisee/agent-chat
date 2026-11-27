@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.3](https://github.com/TKrisee/agent-chat/compare/v0.19.2...v0.19.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* keep technical blockers within the project team ([a8340cf](https://github.com/TKrisee/agent-chat/commit/a8340cfb3872afb6e162cf68173120e2b1900c24))
+
 ## [0.19.2](https://github.com/TKrisee/agent-chat/compare/v0.19.1...v0.19.2) (2026-11-26)
 
 
