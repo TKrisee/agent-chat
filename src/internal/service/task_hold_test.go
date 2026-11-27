@@ -62,12 +62,34 @@ func heldTaskFixture(t *testing.T) (*Service, string, string, string) {
 	if err != nil || j == nil || j.Kind != "po_continue" {
 		t.Fatalf("PO claim %+v %v", j, err)
 	}
-	if err := s.complete(*j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Body: "A private decision is needed."}}}, nil, nil, nil); err != nil {
+	if err := s.complete(*j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Recipient: root, Body: "A private decision is needed."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Reconstruct a pre-change operator-owned hold, including its redacted
+	// escalation; new Root-addressed holds are explicitly Root-owned.
+	if err := s.write(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM root_owned_holds WHERE job_id=?`, j.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM task_internal_wakes WHERE source_id=(SELECT root_source_id FROM task_holds WHERE job_id=?)`, j.ID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`UPDATE messages SET text='A task is blocked and needs a decision. The operator has the private details; do not infer or disclose them.' WHERE id=(SELECT root_source_id FROM task_holds WHERE job_id=?)`, j.ID)
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 	rootJob, err := s.claim(nil)
 	if err != nil || rootJob == nil || rootJob.Kind != "task_blocked" {
 		t.Fatalf("Root escalation %+v %v", rootJob, err)
+	}
+	// The old protected hold enqueued a redacted Root request. The new
+	// Root-owned path intentionally shares its reason; reconstruct the old
+	// request context along with the persisted legacy rows above.
+	for i := range rootJob.Request.Context {
+		if rootJob.Request.Context[i].Text == "A private decision is needed." {
+			rootJob.Request.Context[i].Text = "A task is blocked and needs a decision. The operator has the private details; do not infer or disclose them."
+		}
 	}
 	for _, m := range rootJob.Request.Context {
 		if m.Text == "A private decision is needed." || m.Text == "Private operator-to-PO context." {
@@ -293,7 +315,13 @@ func TestLegacyReviewHoldPreservesWorkerAndPriorNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	po := followupClaim(t, s)
-	if err := s.complete(po, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Body: "Waiting for the operator decision."}}}, nil, nil, nil); err != nil {
+	if err := s.complete(po, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Recipient: root, Body: "Waiting for the operator decision."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM root_owned_holds WHERE job_id=?`, po.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`DELETE FROM task_internal_wakes WHERE source_id=(SELECT root_source_id FROM task_holds WHERE job_id=?)`, po.ID); err != nil {
 		t.Fatal(err)
 	}
 	rootJob, err := s.claim(nil)

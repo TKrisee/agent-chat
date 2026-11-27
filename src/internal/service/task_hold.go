@@ -121,7 +121,11 @@ func (s *Service) activeTaskHold(tx *sql.Tx, task string) (h activeHold, ok bool
 	return h, true, nil
 }
 func (s *Service) holdCanResolve(tx *sql.Tx, h activeHold) (bool, error) {
-	return s.holdCanResolveExcluding(tx, h, "", true)
+	var local int
+	if err := tx.QueryRow(`SELECT count(*) FROM task_local_holds WHERE job_id=?`, h.job).Scan(&local); err != nil {
+		return false, err
+	}
+	return s.holdCanResolveExcluding(tx, h, "", local == 0)
 }
 func (s *Service) holdCanResolveExcluding(tx *sql.Tx, h activeHold, excludeJob string, requireRootMessage bool) (bool, error) {
 	var valid, other, approvals int
@@ -196,6 +200,19 @@ func (s *Service) resolveHold(tx *sql.Tx, j job, action runtimeapi.Action) error
 	}
 	if !clearHoldAuthorization(text, h.task) {
 		return fmt.Errorf("%w: operator authorization must be an unambiguous affirmative", errWorkflow)
+	}
+	var local int
+	if err = tx.QueryRow(`SELECT count(*) FROM task_local_holds WHERE job_id=?`, h.job).Scan(&local); err != nil {
+		return err
+	}
+	if local != 0 {
+		if !strings.Contains(text, h.task) {
+			return fmt.Errorf("%w: specify the exact held task", errWorkflow)
+		}
+		if err = tx.QueryRow(`SELECT seq FROM messages WHERE id=? AND task_id=?`, h.rootSource, h.task).Scan(&rootSeq); err != nil || userSeq <= rootSeq {
+			return fmt.Errorf("%w: operator instruction predates hold", errWorkflow)
+		}
+		return s.applyHoldResolution(tx, h, text, newID(), "")
 	}
 	if err = tx.QueryRow("SELECT seq FROM messages WHERE id=? AND sender=? AND recipient=? AND task_id=?", h.rootMessage, root, operator, h.task).Scan(&rootSeq); err != nil {
 		return fmt.Errorf("%w: linked Root escalation unavailable", errWorkflow)

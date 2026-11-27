@@ -197,6 +197,9 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 		if err := addMessage(tx, source, a.ID, root, a.Role, shared, j.Project, j.Task); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`INSERT INTO task_internal_wakes(source_id) VALUES(?)`, source); err != nil {
+			return err
+		}
 		manager, err := getAgent(tx, root)
 		if err != nil {
 			return err
@@ -206,6 +209,9 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 	protected, err := poHasPrivateOperatorInput(tx, j, a)
 	if err != nil {
 		return err
+	}
+	if !rootOwned {
+		return s.recordLocalPOHold(tx, j, a, phase, reason, protected)
 	}
 	rootReason := reason
 	if protected && !rootOwned {
@@ -217,6 +223,11 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 	source := newID()
 	if err := addMessage(tx, source, a.ID, root, a.Role, rootReason, j.Project, j.Task); err != nil {
 		return err
+	}
+	if rootOwned {
+		if _, err := tx.Exec(`INSERT INTO task_internal_wakes(source_id) VALUES(?)`, source); err != nil {
+			return err
+		}
 	}
 	if explicit {
 		assignment, err := s.poAssignmentSource(tx, j, a.ID)
@@ -268,6 +279,50 @@ func (s *Service) escalatePOHold(tx *sql.Tx, j job, a agent, phase, reason strin
 		instruction = "The project owner explicitly requests a Root-owned decision. If within existing scope and all stops and safeguards, use resolve_hold with this exact task and project and your decision as body; work resumes only through the appointed PO. Otherwise ask the operator a specific question with any supplied options and risks. Do not invent authorization."
 	}
 	return s.enqueue(tx, manager, j.Project, j.Task, source, "task_blocked", instruction)
+}
+
+// A local hold records the PO's task decision without asking Root or the
+// operator to decide. Protected input stays in the PO's own task context.
+func (s *Service) recordLocalPOHold(tx *sql.Tx, j job, a agent, phase, reason string, protected bool) error {
+	assignment, err := s.poAssignmentSource(tx, j, a.ID)
+	if err != nil {
+		return err
+	}
+	var note, review string
+	switch j.Kind {
+	case "po_continue":
+		note = j.Source
+	case "review":
+		review = j.Source
+	case "po_followup":
+		f, err := readPOFollowup(tx, j.Source)
+		if err != nil {
+			return err
+		}
+		note, review = f.note, f.review
+	}
+	if (phase == "review" || phase == "accepted") && review == "" {
+		return fmt.Errorf("%w: held review receipt unavailable", errWorkflow)
+	}
+	shared := reason
+	if protected {
+		if err := addMessage(tx, newID(), a.ID, a.ID, a.Role, reason, j.Project, j.Task); err != nil {
+			return err
+		}
+		shared = "The project owner recorded a task-local hold; details remain in the task owner's private context."
+	}
+	source := newID()
+	if err := addMessage(tx, source, a.ID, root, a.Role, shared, j.Project, j.Task); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO po_progress_notes(message_id) VALUES(?)`, source); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO task_holds(job_id,task_id,project_id,po_id,phase,assignment_id,note_id,review_id,root_source_id,status) VALUES(?,?,?,?,?,?,?,?,?,'active')`, j.ID, j.Task, j.Project, a.ID, phase, assignment, nullIfEmpty(note), nullIfEmpty(review), source); err != nil {
+		return err
+	}
+	_, err = tx.Exec(`INSERT INTO task_local_holds(job_id) VALUES(?)`, j.ID)
+	return err
 }
 func (s *Service) poHoldAction(tx *sql.Tx, j job, a agent, action runtimeapi.Action) error {
 	if j.Kind != "assignment" && j.Kind != "po_continue" && j.Kind != "review" && j.Kind != "po_followup" {

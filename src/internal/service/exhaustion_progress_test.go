@@ -68,6 +68,19 @@ func TestExhaustionSharesOnlyExplicitPOProgress(t *testing.T) {
 			if !shared && strings.Contains(all, "Ask only whether an operator decision is needed") {
 				t.Fatal("vague decision prompt")
 			}
+			if err := s.complete(*rootJob, runtimeapi.Result{Text: "Internal technical update"}, nil, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			var internal, operator int
+			if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND sender=? AND recipient=? AND text='Internal technical update'`, task, root, root).Scan(&internal); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND sender=? AND recipient=? AND text='Internal technical update'`, task, root, "operator").Scan(&operator); err != nil {
+				t.Fatal(err)
+			}
+			if internal != 1 || operator != 0 {
+				t.Fatalf("internal=%d operator=%d", internal, operator)
+			}
 		})
 	}
 }

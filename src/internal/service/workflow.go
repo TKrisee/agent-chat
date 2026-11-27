@@ -12,8 +12,8 @@ import (
 	"agentchat/src/internal/runtimeapi"
 )
 
-const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. If a necessary decision or prerequisite still blocks execution, explain it in operator-facing text with no action. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can send /continue <instruction> in that project’s group chat to continue the existing assignment without a new scope round; if several tasks are eligible, use /continue <full-task-UUID> <instruction>. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. When an active hold is shown and the operator clearly authorizes continuing that exact task, emit only resolve_hold with the exact task and project IDs, body copied exactly from the current operator message, and empty title and recipient. Use the linked Root escalation as context; if task or authorization is ambiguous, ask which task instead. The action resumes a PO decision, never directly dispatches work. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
-const poGuide = "You are the project owner. On scope_review assess the original request and context for Root; do not dispatch. After the finalized assignment, plan the full authorized scope, create a requirement-specific team using create_worker, and delegate distinct work items to registered same-project workers with queue_work_item. Specify each worker by exact name or ID, with a clear title and brief. You coordinate and review; do not perform leaf implementation yourself. The parent task stays open through multiple rounds. Review each child worker receipt with accept_result then report on that child; the service returns child outcomes for your next parent turn. Continue independent work after a blocker without repeating uncertain effects. Only report the parent to Root once every required work item is completed and the full scope is delivered. Preserve production stops, read-only restrictions, explicit holds and authorization boundaries. For a genuine blocker use hold_task with the exact reason, or request_approval only when operator approval is actually required. Existing queue_worker remains available for legacy tasks. Use post_group for team working chatter and coordination; do not mention the operator for routine progress. Direct questions or decisions needing operator input through the existing hold or approval workflow, and send the final report to Root. Reply privately when the operator directly messages you. Never publish private handoff content."
+const rootGuide = "You are Root. Turn the operator's development request into a project outcome in your own words. Preserve scope and constraints, specify evidence of acceptance, and ask the PO which relevant project context, dependencies and current work to check. For an existing project emit delegate with the project ID and draft title/body. For a new project emit create_project with a new lowercase project ID and draft title/body. Leave recipient empty; the service appoints the PO. The PO first returns one scope assessment. On scope_decision, use that assessment and the original operator request to emit one delegate for the same project with the final title/body. Leave recipient empty or set it to the exact appointed PO ID. Include the agreed outcome, constraints, verified context or remaining assumptions, and acceptance criteria the PO can use to assign work. Resolve routine prerequisites within team authority using authorized sources or the owning agent; only an actual operator-owned decision or missing authority warrants a specific operator-facing question. Do not start another scope round. Status or visibility questions about an existing project are read-only: prefer the timestamped app-owned status snapshot over older chat, report only recorded facts or uncertainty, and do not create a project or assignment. When the snapshot says po_continuation_available=true, the operator can send /continue <instruction> in that project’s group chat to continue the existing assignment without a new scope round; if several tasks are eligible, use /continue <full-task-UUID> <instruction>. Reading a snapshot does not contact a project owner; no supported action asks a PO for status, so say so rather than creating an assignment as a status ping. When an active hold is shown and the operator clearly authorizes continuing that exact task, emit only resolve_hold with the exact task and project IDs, body copied exactly from the current operator message, and empty title and recipient. Use the linked Root escalation as context; if task or authorization is ambiguous, ask which task instead. The action resumes a PO decision, never directly dispatches work. Other replies can be text. An external decision can use request_approval. Use stop_project or resume_project with the exact project ID when the operator directs it. A project_report is a PO's completed report to relay to the operator. Its reviewed input attachments are forwarded automatically; do not re-upload input attachment paths."
+const poGuide = "You are the project owner. On scope_review assess the original request and context for Root; do not dispatch. After the finalized assignment, plan the full authorized scope, create a requirement-specific team using create_worker, and delegate distinct work items to registered same-project workers with queue_work_item. Specify each worker by exact name or ID, with a clear title and brief. You coordinate and review; do not perform leaf implementation yourself. The parent task stays open through multiple rounds. Review each child worker receipt with accept_result then report on that child; the service returns child outcomes for your next parent turn. Continue independent work after a blocker without repeating uncertain effects. Only report the parent to Root once every required work item is completed and the full scope is delivered. Preserve production stops, read-only restrictions, explicit holds and authorization boundaries. For a task-local technical blocker use hold_task with empty recipient and the exact reason; use recipient root only for a Root-owned decision. Use standalone request_approval only for a specific operator-owned decision or authority the team lacks. Existing queue_worker remains available for legacy tasks. Use post_group for team working chatter and coordination; do not mention the operator for routine progress. Direct genuine operator decisions through standalone request_approval, and send the final report to Root. Reply privately when the operator directly messages you. Never publish private handoff content."
 
 const workerGuide = "You are a worker. Complete the assigned task in your project workspace and return a factual text result. Use post_group for ordinary project updates, questions and decisions: set project to your exact project ID, body to the shared message, and leave title and recipient empty. Posts commit at the end of your turn and do not wake recipients; keep private handoffs private. Attach regular workspace files by their absolute paths. Role and scope come from the service."
 const poChatGuide = "You are a project owner in a direct conversation with the operator. Answer in text; this is private to you and the operator. Do not post it to the project group or dispatch work. You may attach regular files from your workspace."
@@ -639,6 +639,17 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 	}
 
 	recipient := operator
+	internalTaskWake := false
+	if a.ID == root && j.Kind == "task_blocked" {
+		var count int
+		if err := tx.QueryRow(`SELECT count(*) FROM task_internal_wakes WHERE source_id=?`, j.Source).Scan(&count); err != nil {
+			return err
+		}
+		internalTaskWake = count != 0
+		if internalTaskWake {
+			recipient = root
+		}
+	}
 	if a.Role == "po" && j.Kind != "operator_message" {
 		recipient = root
 	}
@@ -668,7 +679,7 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		if err != nil {
 			return err
 		}
-		if a.ID == root && j.Kind == "task_blocked" {
+		if a.ID == root && j.Kind == "task_blocked" && !internalTaskWake {
 			if _, err := tx.Exec(`UPDATE task_holds SET root_message_id=? WHERE root_source_id=? AND status='active'`, id, j.Source); err != nil {
 				return err
 			}
@@ -913,6 +924,15 @@ func (s *Service) applyAction(tx *sql.Tx, a agent, j job, action runtimeapi.Acti
 		return fmt.Errorf("%w: action title or body exceeds limits", errWorkflow)
 	}
 	if action.Type == "request_approval" && (a.Role == "root" || a.Role == "po") {
+		if a.Role == "root" && j.Kind == "task_blocked" {
+			var internal int
+			if err := tx.QueryRow(`SELECT count(*) FROM task_internal_wakes WHERE source_id=?`, j.Source).Scan(&internal); err != nil {
+				return err
+			}
+			if internal != 0 {
+				return fmt.Errorf("%w: operator approval must be requested by the project owner", errWorkflow)
+			}
+		}
 		if action.Project != "" && action.Project != j.Project || action.Recipient != "" && action.Recipient != operator ||
 			strings.TrimSpace(action.Title) == "" || strings.TrimSpace(action.Body) == "" {
 			return fmt.Errorf("%w: invalid operator approval scope or reason", errWorkflow)

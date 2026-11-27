@@ -24,6 +24,12 @@ func TestRootOwnedHoldDecisionIsScopedAndBounded(t *testing.T) {
 				t.Fatal(err)
 			}
 			rootJob, err := s.claim(nil)
+			if tc.fence == "default" {
+				if err != nil || rootJob != nil {
+					t.Fatalf("local hold unexpectedly woke Root: %+v %v", rootJob, err)
+				}
+				return
+			}
 			if err != nil || rootJob == nil || rootJob.Kind != "task_blocked" {
 				t.Fatalf("root job %+v: %v", rootJob, err)
 			}
@@ -70,5 +76,31 @@ func TestRootOwnedHoldDecisionIsScopedAndBounded(t *testing.T) {
 				t.Fatalf("fence %s queued followup", tc.fence)
 			}
 		})
+	}
+}
+
+func TestRootOwnedUnresolvedTextStaysInternal(t *testing.T) {
+	s, task, po, _ := continuationFixture(t)
+	defer s.Close()
+	j := activeAssignment(t, s, task, po)
+	if err := s.complete(j, runtimeapi.Result{Actions: []runtimeapi.Action{{Type: "hold_task", Project: "alpha", Recipient: root, Body: "Assess the technical prerequisite."}}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	r, err := s.claim(nil)
+	if err != nil || r == nil || r.Kind != "task_blocked" {
+		t.Fatalf("Root wake %+v: %v", r, err)
+	}
+	if err := s.complete(*r, runtimeapi.Result{Text: "Internal unresolved prerequisite"}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var internal, outward int
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND sender=? AND recipient=? AND text='Internal unresolved prerequisite'`, task, root, root).Scan(&internal); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND sender=? AND recipient=? AND text='Internal unresolved prerequisite'`, task, root, operator).Scan(&outward); err != nil {
+		t.Fatal(err)
+	}
+	if internal != 1 || outward != 0 {
+		t.Fatalf("internal=%d operator=%d", internal, outward)
 	}
 }

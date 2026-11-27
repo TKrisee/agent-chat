@@ -116,6 +116,12 @@ CREATE TABLE IF NOT EXISTS task_holds (
  root_source_id TEXT NOT NULL REFERENCES messages(id), root_message_id TEXT REFERENCES messages(id),
  status TEXT NOT NULL CHECK(status IN ('active','resolved'))
 );
+CREATE TABLE IF NOT EXISTS task_local_holds (
+ job_id TEXT PRIMARY KEY REFERENCES task_holds(job_id)
+);
+CREATE TABLE IF NOT EXISTS task_internal_wakes (
+ source_id TEXT PRIMARY KEY REFERENCES messages(id)
+);
 
 CREATE TABLE IF NOT EXISTS project_goals (
  project_id TEXT PRIMARY KEY REFERENCES projects(id),

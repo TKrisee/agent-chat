@@ -56,6 +56,18 @@ func TestPOMultiWorkerActionContract(t *testing.T) {
 	}
 }
 
+func TestEscalationGuidanceByRole(t *testing.T) {
+	_, req, _ := setup(t)
+	req.Role, req.Kind = "po", "assignment"
+	if guide := prompt(req); !strings.Contains(guide, "technical prerequisite is not itself an operator decision") || !strings.Contains(guide, "isolate one precise question") || !strings.Contains(guide, "authorized checkouts, artifacts or receipt history") || !strings.Contains(guide, "selecting concept A or B") {
+		t.Fatal("PO decision guidance missing")
+	}
+	req.Role, req.Kind = "root", "task_blocked"
+	if guide := prompt(req); !strings.Contains(guide, "do not claim a clarification was sent") || !strings.Contains(guide, "single exact question") || !strings.Contains(guide, "primary vendor documentation") || !strings.Contains(guide, "accepting or revising a model") {
+		t.Fatal("Root escalation guidance missing")
+	}
+}
+
 func TestWorkItemDependenciesDecode(t *testing.T) {
 	r, req, _ := setup(t)
 	req.Role, req.Kind, req.ProjectID = "po", "assignment", "alpha"
