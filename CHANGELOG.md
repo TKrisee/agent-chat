@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.20.0](https://github.com/TKrisee/agent-chat/compare/v0.19.7...v0.20.0) (2026-11-27)
+
+
+### Features
+
+* add advisory model preferences for project owners ([#82](https://github.com/TKrisee/agent-chat/issues/82)) ([09c533d](https://github.com/TKrisee/agent-chat/commit/09c533d23b7772f0d325192d57cb14219aeead3d))
+
 ## [0.19.7](https://github.com/TKrisee/agent-chat/compare/v0.19.6...v0.19.7) (2026-11-27)
 
 
