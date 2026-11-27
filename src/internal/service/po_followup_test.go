@@ -61,14 +61,18 @@ func TestPOFollowThroughAssignmentAndBound(t *testing.T) {
 		if err := s.db.QueryRow("SELECT count(*) FROM jobs WHERE task_id=? AND kind='work'", task).Scan(&n); err != nil || n != 0 {
 			t.Fatalf("unexpected work %d %v", n, err)
 		}
-		escalation, err := s.claim(nil)
-		if err != nil || escalation == nil || escalation.Kind != "task_blocked" {
-			t.Fatalf("escalation %+v %v", escalation, err)
+		var linked, leaked int
+		if err := s.db.QueryRow(`SELECT count(*) FROM task_holds h JOIN messages m ON m.id=h.note_id JOIN task_local_holds l ON l.job_id=h.job_id WHERE h.task_id=? AND h.status='active' AND m.sender=? AND m.recipient=? AND m.text=?`, task, operator, j.Agent, "Review only; do not deploy.").Scan(&linked); err != nil {
+			t.Fatal(err)
 		}
-		for _, m := range escalation.Request.Context {
-			if strings.Contains(m.Text, "Review only; do not deploy.") {
-				t.Fatal("private continuation content reached Root")
-			}
+		if err := s.db.QueryRow(`SELECT count(*) FROM messages WHERE task_id=? AND recipient=? AND instr(text,?)>0`, task, root, "Review only; do not deploy.").Scan(&leaked); err != nil {
+			t.Fatal(err)
+		}
+		if linked != 1 || leaked != 0 {
+			t.Fatalf("pinned note=%d Root leaks=%d", linked, leaked)
+		}
+		if escalation, err := s.claim(nil); err != nil || escalation != nil {
+			t.Fatalf("unexpected escalation %+v %v", escalation, err)
 		}
 	})
 	t.Run("update then worker", func(t *testing.T) {
