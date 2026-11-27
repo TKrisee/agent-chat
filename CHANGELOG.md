@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.19.6](https://github.com/TKrisee/agent-chat/compare/v0.19.5...v0.19.6) (2026-11-27)
+
+
+### Bug Fixes
+
+* preserve existing reply context instructions ([84a8d83](https://github.com/TKrisee/agent-chat/commit/84a8d839d2b3cec258c9a3490d2aeb8690d691ae))
+* supervise stalled work and attach visible delegation replies ([55063a7](https://github.com/TKrisee/agent-chat/commit/55063a7d5f49053c9c0ee2f522a36de7007be726))
+
 ## [0.19.5](https://github.com/TKrisee/agent-chat/compare/v0.19.4...v0.19.5) (2026-11-27)
 
 
