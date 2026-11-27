@@ -251,6 +251,7 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 			args = append(args, source[0], operator, root, directRoom(operator, root))
 		}
 	}
+	pinLatestReceipt := false
 	if kind == "po_continue" {
 		p, po, assignment, eligible, err := poContinuation(tx, task)
 		if err != nil {
@@ -275,6 +276,7 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		if err != nil {
 			return nil, err
 		}
+		pinLatestReceipt = f.review == ""
 		var approvedDecision string
 		err = tx.QueryRow(`SELECT decision_id FROM approval_planning_recoveries WHERE source_id=? AND task_id=?`, source[0], task).Scan(&approvedDecision)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -342,6 +344,23 @@ func (s *Service) runtimeContext(tx *sql.Tx, a agent, project, task, parent, kin
 		args = append(args, task, root, a.ID, directRoom(root, a.ID))
 		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (?,?,?)`
 		args = append(args, f.assignment, f.note, f.review)
+	}
+	if pinLatestReceipt && a.Role == "po" && task != "" && project == a.Project {
+		// Only the latest successful worker receipt addressed to this PO on the
+		// exact task. Explicitly pinned review inputs always take precedence.
+		query += ` UNION SELECT * FROM (SELECT m.id,m.sender,m.role,m.text,m.seq,'' AS group_recipient,m.recipient,m.room_id FROM messages m JOIN agents w ON w.id=m.sender AND w.role='worker' AND w.project_id=m.project_id WHERE m.task_id=? AND m.project_id=? AND m.recipient=? AND m.role='worker' AND m.room_id='dm:'||CASE WHEN m.sender<m.recipient THEN m.sender||':'||m.recipient ELSE m.recipient||':'||m.sender END AND EXISTS(SELECT 1 FROM jobs review JOIN jobs work ON work.id=(SELECT latest.id FROM jobs latest WHERE latest.task_id=m.task_id AND latest.project_id=m.project_id AND latest.kind='work' ORDER BY latest.rowid DESC LIMIT 1) WHERE review.source_id=m.id AND review.task_id=m.task_id AND review.project_id=m.project_id AND review.agent_id=m.recipient AND review.kind='review' AND review.rowid>work.rowid AND work.agent_id=m.sender AND work.status='completed' AND COALESCE(work.diagnostic,'')='') ORDER BY m.seq DESC LIMIT 1)`
+		args = append(args, task, project, a.ID)
+	}
+	if kind == "operator_message" && len(source) == 1 && parent != "" {
+		// Root's operator DM can contain project-linked escalations alongside
+		// general messages. Worker and PO threads retain exact project scope.
+		query += ` UNION SELECT ` + privateColumns + ` FROM messages WHERE id IN (WITH RECURSIVE thread(id,depth) AS (SELECT m.id,1 FROM message_replies r JOIN messages child ON child.id=r.message_id JOIN messages m ON m.id=r.parent_id WHERE r.message_id=? AND child.room_id=? AND m.room_id=? AND (?=1 OR (COALESCE(child.project_id,'')=? AND COALESCE(m.project_id,'')=?)) UNION ALL SELECT m.id,thread.depth+1 FROM thread JOIN message_replies r ON r.message_id=thread.id JOIN messages m ON m.id=r.parent_id WHERE thread.depth<8 AND m.room_id=? AND (?=1 OR COALESCE(m.project_id,'')=?)) SELECT id FROM thread)`
+		room := directRoom(operator, a.ID)
+		rootDM := 0
+		if a.ID == root {
+			rootDM = 1
+		}
+		args = append(args, source[0], room, room, rootDM, project, project, room, rootDM, project)
 	}
 	if parent != "" {
 		query += ` UNION SELECT id,sender,role,text,seq,CASE WHEN recipient=? AND project_id=? THEN recipient ELSE '' END,recipient,room_id

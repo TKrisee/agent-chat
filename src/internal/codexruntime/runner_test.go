@@ -100,6 +100,17 @@ func TestWorkerScratchIsWritableAndBoundToReceipt(t *testing.T) {
 	}
 }
 
+func TestWorkerExecutionHandoffGuidance(t *testing.T) {
+	_, req, _ := setup(t)
+	req.Role, req.Kind = "worker", "work"
+	guide := prompt(req)
+	for _, phrase := range []string{"cold or warm", "otherwise say unknown", "imports or compilation in progress", "next turn should observe", "do not infer readiness", "registry fallback can be informational", "Never put credentials in chat"} {
+		if !strings.Contains(guide, phrase) {
+			t.Fatalf("missing handoff guidance %q", phrase)
+		}
+	}
+}
+
 func TestManagedPOSubagentOptIn(t *testing.T) {
 	for _, tc := range []struct {
 		source, role, kind string
