@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.4](https://github.com/TKrisee/agent-chat/compare/v0.19.3...v0.19.4) (2026-11-27)
+
+
+### Bug Fixes
+
+* retain relevant execution context across turns ([899477e](https://github.com/TKrisee/agent-chat/commit/899477e4fbf817e311a66efa08feef62509cb978))
+
 ## [0.19.3](https://github.com/TKrisee/agent-chat/compare/v0.19.2...v0.19.3) (2026-11-27)
 
 
