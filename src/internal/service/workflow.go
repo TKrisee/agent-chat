@@ -128,7 +128,11 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 		}
 	}
 	if parent != "" {
-		guide += "\nThe source message replies to message " + parent + ". Its exact text and attachments are included in the context."
+		if kind == "operator_message" || kind == groupMessageKind {
+			guide += "\nThe operator replied to message " + parent + ". Its exact text and attachments are included in the context."
+		} else {
+			guide += "\nThe source message replied to message " + parent + ". Its exact text and attachments are included in the context."
+		}
 	}
 	history, err := s.runtimeContext(tx, a, project, task, parent, kind, source)
 	if err != nil {
