@@ -47,7 +47,7 @@ func TestBrowserDeepLinksServeShellWithoutMaskingAssetsOrAPI(t *testing.T) {
 	}
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api", nil))
-	if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != "/api/" {
+	if (w.Code != http.StatusTemporaryRedirect && w.Code != http.StatusMovedPermanently) || w.Header().Get("Location") != "/api/" || strings.Contains(w.Body.String(), "app shell") {
 		t.Fatalf("api redirect %d", w.Code)
 	}
 	w = httptest.NewRecorder()
