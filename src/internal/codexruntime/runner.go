@@ -230,6 +230,13 @@ func (r *Runner) dir(id string) string {
 	sum := sha256.Sum256([]byte(id))
 	return filepath.Join(r.cfg.StateDir, hex.EncodeToString(sum[:]))
 }
+func validEffort(e string) bool {
+	switch e {
+	case "minimal", "low", "medium", "high", "xhigh", "max", "ultra":
+		return true
+	}
+	return false
+}
 func validate(req runtimeapi.Request) error {
 	if (req.Provider == "" && (req.ProviderPort != 0 || req.ProviderID != "")) || (req.Provider != "" && (req.Provider != "agentchat-local" || !validLocalProviderID(req.ProviderID) || req.Role != "worker" || req.ProviderPort < 1 || req.ProviderPort > 65535 || req.Model == "")) {
 		return errors.New("unsupported provider binding")
@@ -268,7 +275,7 @@ func validate(req runtimeapi.Request) error {
 	if req.AllowOperatorResolveHold && (req.Role != "root" || req.Kind != "operator_message") {
 		return errors.New("operator hold resolution requires a Root operator message")
 	}
-	if req.Effort != "" && req.Effort != "minimal" && req.Effort != "low" && req.Effort != "medium" && req.Effort != "high" && req.Effort != "xhigh" {
+	if req.Effort != "" && !validEffort(req.Effort) {
 		return errors.New("unsupported reasoning effort")
 	}
 	return nil

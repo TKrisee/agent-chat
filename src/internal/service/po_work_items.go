@@ -79,8 +79,29 @@ func (s *Service) createProjectWorker(tx *sql.Tx, j job, po agent, action runtim
 	if action.Provider != "" {
 		model = action.Model
 	}
-	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, model, s.opts.Effort); err != nil {
+	effort := s.opts.Effort
+	if action.Model != "" || action.Provider != "" {
+		effort = ""
+	}
+	if action.Effort != "" {
+		effort = ""
+	}
+	if action.Effort != "" && (action.Model == "" || model == action.Model) {
+		modelID := model
+		if action.Provider != "" {
+			modelID = qualifiedModelID(action.Provider, model)
+		}
+		if modelEffortAllowed(s.cachedModelDetails(), modelID, action.Effort) {
+			effort = action.Effort
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, model, effort); err != nil {
 		return err
+	}
+	if action.Effort != "" && effort == "" {
+		if _, err := tx.Exec(`INSERT INTO worker_effort_fallbacks(agent_id,requested_effort) VALUES(?,?)`, id, action.Effort); err != nil {
+			return err
+		}
 	}
 	if action.Provider != "" {
 		if _, err := tx.Exec(`INSERT INTO agent_model_providers(agent_id,provider,port) VALUES(?,?,?)`, id, action.Provider, providerPort); err != nil {
@@ -177,10 +198,23 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 	if worker.Provider != "" {
 		chosen = qualifiedModelID(worker.Provider, worker.Model)
 	}
-	if err = s.notifyModelDeparture(tx, j.Project, child, action.Category, chosen, action.ModelReason); err != nil {
+	var omittedEffort string
+	if err = tx.QueryRow(`SELECT COALESCE((SELECT requested_effort FROM worker_effort_fallbacks WHERE agent_id=?),'')`, worker.ID).Scan(&omittedEffort); err != nil {
 		return err
 	}
-	return s.enqueue(tx, worker, j.Project, child, source, "work", action.Body)
+	if err = s.notifyModelDeparture(tx, j.Project, child, action.Category, chosen, worker.Effort, omittedEffort, action.ModelReason); err != nil {
+		return err
+	}
+	if err = s.enqueue(tx, worker, j.Project, child, source, "work", action.Body); err != nil {
+		return err
+	}
+	if omittedEffort != "" {
+		_, err = tx.Exec(`DELETE FROM worker_effort_fallbacks WHERE agent_id=?`, worker.ID)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (s *Service) maybeFollowParent(tx *sql.Tx, j job) error {
 	var parent string

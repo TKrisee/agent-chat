@@ -4,7 +4,8 @@ import {isPreviewableImage, previewAttachment} from './attachment-preview';
 import {renderProjectActivity} from './project-activity';
 import './project-activity.css';
 import {renderMessageMarkdown, mentionsOperator} from './message-markdown';
-import {modelPreferencesDirty, modelPreferencesFocus, mountModelPreferences} from './model-preferences';
+import {modelPreferencesDirty, mountModelPreferences} from './model-preferences';
+import {closeSettingsSelect} from './settings-select';
 type Attachment = {id:string; name:string; media_type:string; url:string};
 type MessageCommand = {kind:'backlog'|'recover_report'; project_id?:string; task_id?:string};
 type Message = {id:string; position?:number; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]; approval_id?:string; command?:MessageCommand};
@@ -56,7 +57,7 @@ async function updateRequest(action=''):Promise<void>{
  } finally {updateBusy=false;renderUpdate();}
 }
 function hasUnsentWork():boolean {
- if(sending || stopSending || settingsDirty || modelPreferencesDirty() || commandSending || [...filesByChannel.values()].some(files=>files.length>0) || [...drafts.values()].some(text=>text.trim().length>0))return true;
+ if(sending || stopSending || settingsDirty || savingGuard || modelPreferencesDirty() || commandSending || [...filesByChannel.values()].some(files=>files.length>0) || [...drafts.values()].some(text=>text.trim().length>0))return true;
  try {for(let i=0;i<sessionStorage.length;i++){const key=sessionStorage.key(i);if(key && (key.startsWith('draft-text:') || key.startsWith('pending-id:') || key.startsWith('draft-reply:')) && sessionStorage.getItem(key)?.trim())return true;}}
  catch{return true;}
  return false;
@@ -66,9 +67,26 @@ function expireUpdate():boolean {
  expectedUpdate=null;updateRestarting=false;updateDeferred=false;updateUnconfirmed=true;
  updateInfo={available:true,current:updateInfo?.current||'',version:'',state:'error',error:'Update could not be confirmed. Check the running version.'};return true;
 }
-function renderUpdate():void{const el=app.querySelector<HTMLElement>('#update-panel');if(!el)return;const u=updateInfo;if(!u?.available){el.hidden=true;return;}el.hidden=false;const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';el.innerHTML=`<strong>App updates</strong><small>${esc(u.state==='deferred'?'Update ready. Finish or clear drafts to reload.':u.state==='draining'?'Waiting for active work…':u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;el.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',e=>{const action=(e.currentTarget as HTMLButtonElement).dataset.updateAction!;void updateRequest(action);});}
+function renderUpdate():void {
+ const panel=app.querySelector<HTMLElement>('#update-panel');
+ const unavailable=app.querySelector<HTMLElement>('#update-unavailable');
+ if(!panel || !unavailable)return;
+ const u=updateInfo;
+ panel.hidden=!u?.available;
+ unavailable.hidden=!!u?.available;
+ if(!u?.available){
+  unavailable.textContent=updateBusy?'Checking for updates…':'App updates are unavailable.';
+  return;
+ }
+ const action=u.state==='available'?'download':u.state==='ready'?'apply':u.state==='idle'||u.state==='current'||u.state==='error'?'check':'';
+ panel.innerHTML=`<small>${esc(u.state==='deferred'?'Update ready. Finish or clear drafts to reload.':u.state==='draining'?'Waiting for active work…':u.state==='restarting'?'Restarting…':u.state==='downloading'?'Downloading…':u.state==='checking'?'Checking…':u.state==='ready'?`Version ${u.version} is ready`:u.state==='available'?`Version ${u.version} available`:u.state==='current'?'Up to date':u.state==='error'?(u.error||'Update failed'):`Current: ${u.current}`)}</small>${action?`<button type="button" data-update-action="${action}">${action==='download'?'Download':action==='apply'?'Restart to update':'Check for updates'}</button>`:''}`;
+ panel.querySelector<HTMLButtonElement>('[data-update-action]')?.addEventListener('click',()=>void updateRequest(action));
+}
 type WeeklyUsage={known:boolean;remaining:number|null;reset:number|null;observed:number|null;enabled:boolean;warn:number;reserve:number;paused:boolean};
 let weeklyUsage:WeeklyUsage|null=null;let weeklyError='';let settingsOpen=true;let guardEnabled=false;let guardWarn='40';let guardReserve='30';let settingsDirty=false;let savingGuard=false;
+const settingsSections=[['models','Models'],['providers','Local providers'],['usage','Usage limits'],['codex','Codex setup'],['updates','Updates']] as const;
+type SettingsSection=typeof settingsSections[number][0];
+let selectedSettingsSection:SettingsSection='models';
 function numberHeader(r:Response,key:string):number|null {const raw=r.headers.get(key);if(raw===null || raw.trim()==='')return null;const n=Number(raw);return Number.isFinite(n)?n:null;}
 async function loadWeeklyUsage(body?:URLSearchParams):Promise<void> {
  try {
@@ -105,12 +123,78 @@ async function checkSetup(retry=false, source?:'managed'|'override'):Promise<voi
   else if(pendingSourceReload && setupSource!==pendingSourceReload)pendingSourceReload=null;
   setupCanRetry=next==='error';setupError=next==='error'?(await r.text()):'';
   setupReady=next==='ready'||next==='not_required';
-  if(!setupReady){setupBlocked=true;settingsOpen=true;}
+  if(!setupReady){setupBlocked=true;settingsOpen=true;selectedSettingsSection='codex';}
   else {if(!setupBlocked && !source && !pendingSourceReload)settingsOpen=false;if(!dataStarted){dataStarted=true;void refresh();void updateRequest();void loadWeeklyUsage();}}
- } catch {if(source)setupSwitchError='Could not confirm the CLI selection. Check setup before trying again.';else {setupState='error';setupError='Waiting for the Agent Chat service.';setupCanRetry=false;setupReady=false;setupBlocked=true;settingsOpen=true;}}
+ } catch {if(source)setupSwitchError='Could not confirm the CLI selection. Check setup before trying again.';else {setupState='error';setupError='Waiting for the Agent Chat service.';setupCanRetry=false;setupReady=false;setupBlocked=true;settingsOpen=true;selectedSettingsSection='codex';}}
  finally{setupBusy=false;const current=[setupState,setupSource,setupVersion,setupError,setupReady,setupCanRetry,setupCanManaged,setupCanOverride].join('|');if(source || retry || previous!==current)render();if(pendingSourceReload && setupState==='ready' && setupSource===pendingSourceReload && !hasUnsentWork() && !expectedUpdate && !updateRestarting && !updateBusy && !reloadTriggered){reloadTriggered=true;pendingSourceReload=null;window.location.reload();}}
 }
-function settingsMarkup():string {const u=weeklyUsage;return `<section class="settings-page" aria-label="Settings" ${settingsOpen?'':'hidden'}><div class="settings-content">${setupMarkup()}${setupReady?`<div id="update-panel" class="update-panel" hidden></div><section id="model-preferences" aria-labelledby="model-preferences-title"></section><h2>Weekly allowance</h2><p>${esc(weeklyLabel())}${u?.paused?' · New work held':''}</p>${u?.reset?`<p class="settings-muted">Resets ${esc(new Date(u.reset*1000).toLocaleString())}</p>`:''}${weeklyError?`<p role="alert" class="settings-error">${esc(weeklyError)}</p>`:''}${!u?'<p class="settings-muted">Allowance settings are unavailable right now.</p>':`<form id="guard-settings"><label class="guard-switch"><input type="checkbox" name="enabled" ${guardEnabled?'checked':''}> Pause new work when the weekly reserve is reached</label><label>Warn when remaining allowance is at or below <span><input name="warn" type="number" min="0" max="100" step="1" value="${esc(guardWarn)}" required> %</span></label><label>Pause new work when remaining allowance is at or below <span><input name="reserve" type="number" min="0" max="100" step="1" value="${esc(guardReserve)}" required> %</span></label><p class="settings-muted">When enabled, queued work waits if allowance information is unavailable or reaches the reserve. It resumes when enough allowance is available; work already running can finish.</p><button type="submit" ${savingGuard?'disabled':''}>${savingGuard?'Saving…':'Save settings'}</button></form>`}`:''}</div></section>`;}
+function usageSettingsMarkup():string {
+ const u=weeklyUsage;
+ return `<h2>Weekly allowance</h2><p>${esc(weeklyLabel())}${u?.paused?' · New work held':''}</p>
+  ${u?.reset?`<p class="settings-muted">Resets ${esc(new Date(u.reset*1000).toLocaleString())}</p>`:''}
+  ${weeklyError?`<p role="alert" class="settings-error">${esc(weeklyError)}</p>`:''}
+  ${!u?'<p class="settings-muted">Allowance settings are unavailable right now.</p>':`<form id="guard-settings">
+   <label class="guard-switch"><input id="guard-enabled" type="checkbox" name="enabled" ${guardEnabled?'checked':''} ${savingGuard?'disabled':''}> Pause new work when the weekly reserve is reached</label>
+   <label>Warn when remaining allowance is at or below <span><input id="guard-warn" name="warn" type="number" min="0" max="100" step="1" value="${esc(guardWarn)}" ${savingGuard?'disabled':''} required> %</span></label>
+   <label>Pause new work when remaining allowance is at or below <span><input id="guard-reserve" name="reserve" type="number" min="0" max="100" step="1" value="${esc(guardReserve)}" ${savingGuard?'disabled':''} required> %</span></label>
+   <p class="settings-muted">When enabled, queued work waits if allowance information is unavailable or reaches the reserve. It resumes when enough allowance is available; work already running can finish.</p>
+   <button type="submit" ${savingGuard?'disabled':''}>${savingGuard?'Saving…':'Save settings'}</button>
+  </form>`}`;
+}
+function settingsMarkup():string {
+ let content=setupMarkup();
+ if(setupReady){
+  const bodies:Record<SettingsSection,string>={
+   models:'<section id="model-preferences" aria-labelledby="model-preferences-title"></section>',
+   providers:'<div id="local-model-provider-settings"></div>',
+   usage:usageSettingsMarkup(),
+   codex:content,
+   updates:'<h2>App updates</h2><div id="update-panel" class="update-panel" hidden></div><p id="update-unavailable" class="settings-muted" hidden>App updates are unavailable.</p>',
+  };
+  const tabs=settingsSections.map(([id,label])=>{
+   const selected=id===selectedSettingsSection;
+   return `<button id="settings-tab-${id}" type="button" role="tab" data-settings-tab="${id}" aria-controls="settings-section-${id}" aria-selected="${selected}" tabindex="${selected?0:-1}">${label}</button>`;
+  }).join('');
+  const panels=settingsSections.map(([id])=>`<div id="settings-section-${id}" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-${id}" tabindex="0" ${id===selectedSettingsSection?'':'hidden'}>${bodies[id]}</div>`).join('');
+  content=`<div class="settings-tabs" role="tablist" aria-label="Settings sections">${tabs}</div>${panels}`;
+ }
+ return `<section class="settings-page" aria-label="Settings" ${settingsOpen?'':'hidden'}><div class="settings-content">${content}</div></section>`;
+}
+function bindSettingsSections(page:HTMLElement):void {
+ const list=page.querySelector<HTMLElement>('.settings-tabs');
+ if(!list)return;
+ const tabs=Array.from(list.querySelectorAll<HTMLButtonElement>('[data-settings-tab]'));
+ function activate(tab:HTMLButtonElement) {
+  const section=tab.dataset.settingsTab as SettingsSection;
+  if(section!==selectedSettingsSection){
+   closeSettingsSelect();
+   selectedSettingsSection=section;
+   for(const choice of tabs){
+    const selected=choice===tab;
+    choice.tabIndex=selected?0:-1;
+    choice.setAttribute('aria-selected',String(selected));
+    page.querySelector<HTMLElement>(`#settings-section-${choice.dataset.settingsTab}`)!.hidden=!selected;
+   }
+   page.scrollTop=0;
+  }
+  tab.focus({preventScroll:true});
+ }
+ for(const tab of tabs)tab.onclick=()=>activate(tab);
+ list.addEventListener('keydown',event=>{
+  const index=tabs.findIndex(tab=>tab===event.target);
+  if(index<0 || event.altKey || event.ctrlKey || event.metaKey)return;
+  let next:number;
+  switch(event.key){
+   case 'ArrowLeft': next=(index+tabs.length-1)%tabs.length; break;
+   case 'ArrowRight': next=(index+1)%tabs.length; break;
+   case 'Home': next=0; break;
+   case 'End': next=tabs.length-1; break;
+   default:return;
+  }
+  event.preventDefault();
+  activate(tabs[next]);
+ });
+}
 const workPanelKey = 'agent-chat.work-panel';
 let workPanelVisible = true;
 try { workPanelVisible = localStorage.getItem(workPanelKey) !== 'hidden'; } catch { /* Storage may be unavailable. */ }
@@ -373,10 +457,11 @@ function renderCommandMessage(m:Message, command:NonNullable<ReturnType<typeof c
 }
 
 function render() {
- const modelFocus = modelPreferencesFocus();
  if(attachmentMenuTarget && (attachmentMenuTarget!==recipient || settingsOpen || !setupReady))attachmentMenuTarget='';
  const attachmentOpen=attachmentMenuTarget===recipient;
  const activeAction = document.activeElement instanceof HTMLElement && app.contains(document.activeElement) ? document.activeElement : null;
+ const settingsFocus=activeAction?.closest('.settings-page') ? activeAction.id : '';
+ const settingsScroll=app.querySelector<HTMLElement>('.settings-page:not([hidden])')?.scrollTop || 0;
  const actionFocus = activeAction ? (['reply','copy','attachmentPreview','download','scope'] as const).map(key=>({key,value:activeAction.dataset[key]})).find(x=>x.value) : undefined;
  const attachmentFocus=activeAction?.id==='upload-file'?'upload':activeAction?.id==='attach-files'?'toggle':'';
  const actionMessage = activeAction?.closest<HTMLElement>('[data-message-id]')?.dataset.messageId;
@@ -411,10 +496,29 @@ function render() {
  const tasks=state.tasks.filter(t=>!p||t.project_id===p.id).slice(-5).reverse();
  app.innerHTML=`<div class="shell"><aside id="conversation-panel" class="sidebar ${mobileNav?'open':''} ${railCollapsed?'rail-collapsed':''}" aria-label="Conversations" ${narrowLayout.matches && !mobileNav?'inert':''}><div class="brand"><span class="brandmark">✳</span><div><b>Agent Chat</b><small>YOUR WORKSPACE</small></div></div><div class="conversation-navigation" ${setupReady?'':'hidden'}><div class="side-heading">CONVERSATIONS</div><button class="conversation ${recipient==='root'?'selected':''}" data-recipient="root" aria-label="Root conversation, ${unread('root')} unread"><span class="avatar root-avatar">✳</span><span><b>Root</b><small>General conversation</small></span>${unreadBadge('root')}<span class="chevron">›</span></button><div class="side-heading projects-heading">PROJECTS <span>${state.projects.length}</span></div><div class="project-list">${state.projects.length ? state.projects.map(x=>`<button class="conversation ${selectedProjectId===x.id?'selected':''}" data-project="${esc(x.id)}" aria-label="${esc(x.name)} project, ${projectUnread(x.id)} unread"><span class="avatar project-avatar">${esc(x.name.slice(0,1).toUpperCase())}</span><span><b>${esc(x.name)}</b><small>${esc(x.status || 'Project')}</small></span>${projectBadge(x.id)}<span class="chevron">›</span></button>${selectedProjectId===x.id?`<div class="project-agents"><div class="agent-count">${projectAgents(x.id).length} agents · ${projectAgents(x.id).filter(a=>!!a.parent_id && projectAgents(x.id).some(parent=>parent.id===a.parent_id)).length} subagents</div>${agentChoices(x.id)}</div>`:''}`).join('') : '<p class="side-empty">Projects will appear here.</p>'}</div></div><div class="sidebar-tools"><button type="button" id="weekly-control" ${setupReady?'':'hidden'} aria-label="${esc(weeklyLabel())}, open settings" aria-describedby="weekly-tooltip"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 3.5v8.5h8.5" stroke-linejoin="round"></path><path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5H12z" fill="currentColor" stroke="none" opacity=".45"></path></svg></span></button><button type="button" id="open-settings" aria-label="Settings"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="5.5"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1m7.8 7.8L18 18M18 6l-2.1 2.1m-7.8 7.8L6 18"></path></svg></span></button></div></aside><main class="main"><div class="content"><section class="chat" aria-label="Conversation with ${esc(group?p?.name || 'project':name(recipient))}"><header class="channel-header"><button type="button" class="rail-toggle" id="rail-toggle" aria-label="${(narrowLayout.matches ? mobileNav : !railCollapsed)?'Collapse':'Expand'} conversations" aria-expanded="${narrowLayout.matches ? mobileNav : !railCollapsed}" aria-controls="conversation-panel">${panelToggleIcon}</button><h1 tabindex="-1">${settingsOpen?'Settings':esc(group?p?.name || 'Project':name(recipient))}</h1><button id="work-toggle" class="work-toggle" type="button" aria-controls="work-panel-content" aria-expanded="${workPanelVisible}" aria-label="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" title="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" ${settingsOpen?'hidden':''}>${panelToggleIcon}</button></header>${settingsMarkup()}${!settingsOpen && firstUnread ? `<div class="group-unread-banner" role="status"><button type="button" id="jump-group-read" aria-label="${latestRead ? 'Jump to latest read message' : 'Jump to first unread message'}">${groupUnread.length} unread · since ${esc(date(firstUnread.at))}</button><button type="button" id="mark-group-read">Mark as read</button></div>` : ''}<div class="chat-scroll" id="chat-scroll" ${settingsOpen?'hidden':''}>${recipient==='root' && stopReceipt?`<p class="notice" role="status">${esc(stopReceipt)}</p>`:''}${loading?'<p class="notice" role="status">Loading conversation…</p>':''}${error?`<div class="notice error" role="alert">${esc(error)} <button id="retry">Try again</button></div>`:''}${!loading&&!error&&!msgs.length?'<div class="empty">No messages yet. Start the conversation below.</div>':''}<div class="messages">${msgs.map(m=>{const command=commandPresentation(m);return (m.id===firstUnread?.id ? `<div class="unread-divider" role="separator" aria-label="First unread message"><span>Unread messages</span></div>` : '') + (command ? renderCommandMessage(m,command,msgs) : m.sender==='service' && m.role==='system' && m.room_id.startsWith('group:') ? `<article class="workflow-notice" data-message-id="${esc(m.id)}" aria-label="Agent Chat workflow notice"><div><strong>Agent Chat</strong><span>${esc(date(m.at))}</span></div><p>${esc(m.text)}</p>${m.notice_detail==='scope_request'?`<button type="button" class="scope-toggle" data-scope="${esc(m.id)}" aria-expanded="${openScopes.has(m.id)}" aria-controls="scope-${esc(m.id)}">${openScopes.has(m.id)?'Hide scope request':'View scope request'}</button><div id="scope-${esc(m.id)}" class="scope-detail" ${openScopes.has(m.id)?'':'hidden'}>${scopeDetails.get(m.id)?.loading?'<span role="status">Loading scope request…</span>':scopeDetails.get(m.id)?.error?`<span role="alert">${esc(scopeDetails.get(m.id)?.error)}</span>`:`<pre>${esc(scopeDetails.get(m.id)?.text || '')}</pre>`}</div>`:''}</article>` : `<article class="message ${linkedApproval(m)?.status==='pending' ? 'pending-approval ' : ''}${group && m.sender!=='operator' && m.sender!=='service' && m.role!=='system' && ((m.mention_ids||[]).includes('operator') || mentionsOperator(m.text) || (!!m.reply_to && state.messages.some(parent=>parent.id===m.reply_to && parent.room_id===m.room_id && parent.sender==='operator')))?'operator-mention':''}" data-message-id="${esc(m.id)}"><div class="message-avatar ${m.sender==='root'?'root-avatar':''}">${esc(name(m.sender).slice(0,1).toUpperCase())}</div><div class="message-body"><div class="message-meta"><strong>${esc(name(m.sender))}</strong>${group?`<span>→ ${esc(name(m.recipient))}</span>`:''}<span>${esc(date(m.at))}</span></div>${m.reply_to?replyQuote(m.reply_to,msgs):''}<div class="message-text" data-markdown-id="${esc(m.id)}">${esc(m.text)}</div>${messageActions(m)}${approvalMarkup(m)}${m.attachments?.length?`<div class="attachments">${attachments(m.attachments)}</div>`:''}</div></article>`);}).join('')}</div></div>${commandReceipts.get(recipient)?`<p class="notice command-receipt ${commandReceipts.get(recipient)?.fading?'fading':''}" role="status">${esc(commandReceipts.get(recipient)?.text)}</p>`:''}<form class="composer" id="composer" ${settingsOpen?'hidden':''} aria-busy="${(sending&&recipient===sendTarget)||(stopSending&&recipient==='root')}"><div class="composer-heading"><label for="message">${group?`Message ${esc(p?.name || 'project')} chat`:`Message ${esc(p?name(recipient):'Root')}`}</label>${activity.label?`<div class="agent-activity" role="status" aria-live="polite"><span class="activity-dot ${activity.active?'busy':''}" aria-hidden="true"></span>${esc(activity.label)}</div>`:''}</div>${group&&selectedMentions.length?`<div class="mention-selected" aria-label="Selected mentions">${selectedMentions.map(m=>`<button type="button" data-unmention="${esc(m.id)}" aria-label="Remove mention ${esc(m.label)}" ${pendingId(recipient)?'disabled':''}>@${esc(m.label)} ×</button>`).join('')}</div>`:''}${slashOptions.length?`<div class="mention-options" role="listbox" aria-label="Slash commands">${slashOptions.map((c,i)=>`<button type="button" role="option" aria-selected="${i===slashIndex}" data-slash-choice="${esc(c.name)}"><strong>${esc(c.usage)}</strong><small>${esc(c.description)}</small></button>`).join('')}</div>`:''}${mentionOpen?`<div id="mention-options" class="mention-options" role="group" aria-label="Choose a project agent">${mentionOptions.length?mentionOptions.map(a=>`<button type="button" data-mention-choice="${esc(a.id)}" aria-label="Mention ${esc(a.name)}, ${esc(a.role)}, ${esc(a.id)}"><strong>${esc(a.name)}</strong><small>${esc(a.role)} · ${esc(a.id)}</small></button>`).join(''):selectedMentions.length>=32?'<span>Up to 32 agents per message.</span>':'<span>No matching agents.</span>'}</div>`:''}${activity.guidance?`<div class="status-guidance"><span>${esc(activity.guidance)}</span>${activity.detail?`<details id="status-details" data-diagnostic="status:${esc(activity.key || '')}" ${activity.key && openDetails.has('status:'+activity.key)?'open':''}><summary id="status-details-summary">Details</summary><p>${esc(activity.detail)}</p></details>`:''}</div>`:''}${(pendingId(recipient)?pendingReply(recipient):draftReply(recipient))?`<div class="compose-reply"><div><small>Replying to</small>${quote(pendingId(recipient)?pendingReply(recipient):draftReply(recipient),msgs)}</div><button type="button" id="cancel-reply" aria-label="Cancel reply" ${pendingId(recipient)?'disabled':''}>×</button></div>`:''}<div role="status" aria-live="polite" class="copy-feedback">${esc(copyFeedback)}</div><div class="compose-box">${fileErrors.has(recipient)?`<p class="notice" role="alert">${esc(fileErrors.get(recipient)!)}</p>`:''}${draftFiles(recipient).length?`<div class="file-list" role="region" aria-label="Attachments" tabindex="0">${draftFiles(recipient).map((f,i)=>draftFileCard(f,i,!!pendingId(recipient))).join('')}</div>`:''}<div class="compose-entry"><div class="attachment-control"><button type="button" id="attach-files" class="attach-button" aria-label="Add attachment" aria-expanded="${attachmentOpen}" aria-controls="attachment-menu" title="Add attachment" ${pendingId(recipient)&&!missingPendingFiles(recipient)?'disabled':''}>＋</button><div id="attachment-menu" class="attachment-menu" ${attachmentOpen?'':'hidden'}><button type="button" id="upload-file">Upload a file</button></div></div><span class="sr-only" id="composer-help">Press Enter to send or retry delivery. Press Shift and Enter for a new line.</span><textarea id="message" aria-describedby="composer-help" enterkeyhint="send" rows="1" placeholder="${group?'Write a shared message…':'Write a message…'}" ${group&&pendingId(recipient)?'readonly':''}>${esc(group&&pendingId(recipient)?pendingText(recipient):pendingId(recipient) && !draft() ? pendingText(recipient) : draft())}</textarea></div><span class="sr-only" role="status" aria-live="polite">${composeNotice || (pendingId(recipient)?conflicts.has(recipient)?'The message could not be retried because its ID conflicts with another request.':retryReady.has(recipient)?'Press Enter to retry the saved message.':'Checking the saved message.':'')}</span></div></form></section><aside id="work-panel" class="context ${workPanelVisible ? '' : 'collapsed'}" aria-label="Work context" ${settingsOpen?'hidden':''} ${workPanelVisible ? '' : 'inert'}><div id="work-panel-content" class="context-body">${p?activityMarkup(p.id):`<div class="context-top"><span class="eyebrow">AT A GLANCE</span><h2>Your work</h2><p>Recent work across your workspace.</p></div><div class="context-heading"><h3>Recent work</h3><span>${tasks.length}</span></div>${tasks.length?tasks.map(t=>`<div class="task"><span class="task-dot"></span><div><strong>${esc(t.title)}</strong><small>${esc(t.status)} · ${esc(name(t.owner_id))}</small>${taskDiagnostics(t)}</div></div>`).join(''):'<p class="context-empty">No recent work to show yet.</p>'}`}</div></aside></div></main></div><div id="weekly-tooltip" class="weekly-tooltip" role="tooltip" hidden>${esc(weeklyLabel())}</div>`;
  renderUpdate();
- mountModelPreferences(app.querySelector<HTMLElement>('#model-preferences'), setupReady && settingsOpen, modelFocus);
+ mountModelPreferences(app.querySelector<HTMLElement>('#model-preferences'), app.querySelector<HTMLElement>('#local-model-provider-settings'), setupReady && settingsOpen);
+ const settingsPage=app.querySelector<HTMLElement>('.settings-page')!;
+ bindSettingsSections(settingsPage);
+ if(settingsOpen){
+  settingsPage.scrollTop=settingsScroll;
+  if(settingsFocus)document.getElementById(settingsFocus)?.focus({preventScroll:true});
+ }
  app.querySelector<HTMLButtonElement>('#setup-retry')?.addEventListener('click',()=>void checkSetup(true));
  app.querySelector<HTMLButtonElement>('#setup-source')?.addEventListener('click',e=>void checkSetup(false,(e.currentTarget as HTMLButtonElement).dataset.source as 'managed'|'override'));
- const openSettings=()=>{selectionEpoch++;const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll)scrollByRecipient.set(recipient,scroll.scrollTop);settingsOpen=true;mobileNav=false;settingsDirty=false;if(weeklyUsage){guardEnabled=weeklyUsage.enabled;guardWarn=String(weeklyUsage.warn);guardReserve=String(weeklyUsage.reserve);}readReceipts.contextChanged();render();app.querySelector<HTMLElement>('.channel-header h1')?.focus();};
+ const openSettings=(section?:SettingsSection)=>{
+  selectionEpoch++;
+  const scroll=app.querySelector<HTMLElement>('#chat-scroll');
+  if(scroll && !settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);
+  if(section && section!==selectedSettingsSection){
+   selectedSettingsSection=section;
+   settingsPage.scrollTop=0;
+  }
+  settingsOpen=true;
+  mobileNav=false;
+  readReceipts.contextChanged();
+  render();
+  app.querySelector<HTMLElement>('.channel-header h1')?.focus();
+ };
  app.querySelector<HTMLButtonElement>('#mark-group-read')?.addEventListener('click', event => { (event.currentTarget as HTMLButtonElement).disabled=true; void readReceipts.markCurrentRoomRead(); });
  app.querySelector<HTMLButtonElement>('#jump-group-read')?.addEventListener('click', () => {
   const scroll=app.querySelector<HTMLElement>('#chat-scroll');
@@ -437,20 +541,24 @@ function render() {
   scroll.scrollTop+=element.getBoundingClientRect().top-scroll.getBoundingClientRect().top;
   scrollByRecipient.set(recipient,scroll.scrollTop);rememberScroll(scroll);
  }));
- app.querySelector<HTMLButtonElement>('#open-settings')!.onclick=openSettings;
+ app.querySelector<HTMLButtonElement>('#open-settings')!.onclick=()=>openSettings();
  const weeklyButton=app.querySelector<HTMLButtonElement>('#weekly-control')!;
- weeklyButton.onclick=openSettings;
+ weeklyButton.onclick=()=>openSettings('usage');
  const tooltip=app.querySelector<HTMLElement>('#weekly-tooltip')!;
  const showWeekly=()=>{const rect=weeklyButton.getBoundingClientRect();tooltip.style.left=`${Math.min(rect.right+8,window.innerWidth-180)}px`;tooltip.style.top=`${Math.max(8,rect.top)}px`;tooltip.hidden=false;};
  const hideWeekly=()=>{tooltip.hidden=true;};
  weeklyButton.addEventListener('mouseenter',showWeekly);weeklyButton.addEventListener('mouseleave',hideWeekly);weeklyButton.addEventListener('focus',showWeekly);weeklyButton.addEventListener('blur',hideWeekly);
  const guardForm=app.querySelector<HTMLFormElement>('#guard-settings');
- guardForm?.addEventListener('input',()=>{const form=new FormData(guardForm);guardEnabled=form.has('enabled');guardWarn=String(form.get('warn')||'');guardReserve=String(form.get('reserve')||'');settingsDirty=true;});
+ guardForm?.addEventListener('input',()=>{
+  const form=new FormData(guardForm);
+  guardEnabled=form.has('enabled');guardWarn=String(form.get('warn')||'');guardReserve=String(form.get('reserve')||'');
+  settingsDirty=guardEnabled!==weeklyUsage?.enabled || guardWarn!==String(weeklyUsage?.warn) || guardReserve!==String(weeklyUsage?.reserve);
+ });
  guardForm?.addEventListener('submit',e=>{e.preventDefault();if(savingGuard)return;savingGuard=true;const body=new URLSearchParams({enabled:String(guardEnabled),warn_percent:guardWarn,reserve_percent:guardReserve});void loadWeeklyUsage(body).finally(()=>{savingGuard=false;render();});render();});
  app.querySelectorAll<HTMLElement>('[data-markdown-id]').forEach(el=>{const message=msgs.find(m=>m.id===el.dataset.markdownId);if(message)renderMessageMarkdown(el,message.text,['operator','Root',...state.agents.filter(a=>!message.project_id || a.project_id===message.project_id).map(a=>a.name)]);});
- app.querySelectorAll<HTMLButtonElement>('[data-recipient]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;settingsDirty=false;recipient=b.dataset.recipient!;selectedProjectId='';rememberSelection();mobileNav=false;readReceipts.contextChanged();const content=app.querySelector<HTMLElement>('.content');if(content)content.scrollTop=0;render();});
- app.querySelectorAll<HTMLButtonElement>('[data-project]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;settingsDirty=false;selectedProjectId=b.dataset.project!;recipient='group:'+selectedProjectId;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
- app.querySelectorAll<HTMLButtonElement>('[data-agent]').forEach(b=>b.onclick=()=>{const a=state.agents.find(x=>x.id===b.dataset.agent && x.project_id===selectedProjectId);if(!a)return;const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';settingsOpen=false;settingsDirty=false;recipient=a.id;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
+ app.querySelectorAll<HTMLButtonElement>('[data-recipient]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;recipient=b.dataset.recipient!;selectedProjectId='';rememberSelection();mobileNav=false;readReceipts.contextChanged();const content=app.querySelector<HTMLElement>('.content');if(content)content.scrollTop=0;render();});
+ app.querySelectorAll<HTMLButtonElement>('[data-project]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;selectedProjectId=b.dataset.project!;recipient='group:'+selectedProjectId;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
+ app.querySelectorAll<HTMLButtonElement>('[data-agent]').forEach(b=>b.onclick=()=>{const a=state.agents.find(x=>x.id===b.dataset.agent && x.project_id===selectedProjectId);if(!a)return;const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';settingsOpen=false;recipient=a.id;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
  const rail=app.querySelector<HTMLButtonElement>('#rail-toggle')!;
  rail.onclick=()=>{const panel=app.querySelector<HTMLElement>('#conversation-panel')!;let expanded:boolean;if(narrowLayout.matches){mobileNav=!mobileNav;panel.classList.toggle('open',mobileNav);panel.inert=!mobileNav;expanded=mobileNav;readReceipts.contextChanged();}else{railCollapsed=!railCollapsed;panel.classList.toggle('rail-collapsed',railCollapsed);expanded=!railCollapsed;try{localStorage.setItem(railKey,String(railCollapsed));}catch{}}rail.setAttribute('aria-expanded',String(expanded));rail.setAttribute('aria-label',`${expanded?'Collapse':'Expand'} conversations`);};
  const toggle = app.querySelector<HTMLButtonElement>('#work-toggle')!;

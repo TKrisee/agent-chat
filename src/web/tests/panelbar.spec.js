@@ -59,9 +59,15 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await weekly.click();
   await expect(page.getByRole('heading', {name:'Settings'})).toBeVisible();
   await expect(page.getByRole('button', {name:'Back to chat'})).toHaveCount(0);
-  await expect(page.locator('.settings-page #update-panel').getByRole('button', {name:'Check for updates'})).toBeVisible();
+  await expect(page.getByRole('tab', {name:'Usage limits'})).toHaveAttribute('aria-selected','true');
+  await expect(page.getByRole('heading', {name:'Weekly allowance'})).toBeVisible();
+  await expect(page.locator('.settings-page #update-panel')).toBeHidden();
   await expect(page.locator('#work-panel #update-panel')).toHaveCount(0);
   await page.getByLabel('Pause new work when the weekly reserve is reached').check();
+  await page.getByRole('tab',{name:'Updates'}).click();
+  await expect(page.locator('.settings-page #update-panel').getByRole('button', {name:'Check for updates'})).toBeVisible();
+  await weekly.click();
+  await expect(page.getByLabel('Pause new work when the weekly reserve is reached')).toBeChecked();
   await page.getByRole('button', {name:'Save settings'}).click();
   await expect.poll(() => saved).toContain('enabled=true');
   await expect.poll(() => saved).toContain('warn_percent=40');
@@ -127,6 +133,7 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   await page.getByRole('button',{name:'Use external CLI'}).click();
   await expect.poll(()=>navigations).toBe(2);
   await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('tab',{name:'Codex setup'}).click();
   await expect(page.getByText('External CLI selected')).toBeVisible();
   await page.getByRole('button',{name:'Use managed CLI'}).click();
   await expect(page.getByRole('status').filter({hasText:'Downloading Codex…'})).toBeVisible();
@@ -134,6 +141,7 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   phase='ready';
   await expect.poll(()=>navigations,{timeout:10000}).toBe(3);
   await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('tab',{name:'Codex setup'}).click();
   await expect(page.getByText('Managed CLI selected')).toBeVisible();
   expect(switches).toBe(2);
   await page.getByRole('button',{name:/Root conversation/}).click();

@@ -692,6 +692,9 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return err
 	}
 	for _, action := range result.Actions {
+		if action.Effort != "" && (a.Role != "po" || (action.Type != "create_worker" && action.Type != "create_one_shot_worker")) {
+			return fmt.Errorf("%w: reasoning effort is only available for new workers", errWorkflow)
+		}
 		if action.Provider != "" && (a.Role != "po" || (action.Type != "create_worker" && action.Type != "create_one_shot_worker")) {
 			return fmt.Errorf("%w: provider is only available for new workers", errWorkflow)
 		}
