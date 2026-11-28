@@ -23,7 +23,7 @@ jobs:
           go-version-file: src/go.mod
           cache-dependency-path: src/go.sum
       - run: go test -tags codexruntime ./...
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: npm
