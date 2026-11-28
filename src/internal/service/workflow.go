@@ -178,6 +178,11 @@ func (s *Service) enqueue(tx *sql.Tx, a agent, project, task, source, kind, inst
 	req := runtimeapi.Request{ID: id, AgentID: a.ID, Role: a.Role, ProjectID: project, TaskID: task, Kind: kind,
 		Workspace: workspace, Model: a.Model, Effort: a.Effort, Context: history, ModelSelection: modelSelection,
 		Instructions: guide + "\n\nEvent: " + kind + "\n" + instructions}
+	if a.Provider != "" {
+		req.Provider = "agentchat-local"
+		req.ProviderID = a.Provider
+		req.ProviderPort = a.ProviderPort
+	}
 	if a.ID == root && kind == "task_blocked" {
 		var n int
 		if err := tx.QueryRow(`SELECT count(*) FROM task_local_supervisions WHERE source_id=?`, source).Scan(&n); err != nil {
@@ -687,6 +692,9 @@ func (s *Service) applyResult(tx *sql.Tx, j job, result runtimeapi.Result, files
 		return err
 	}
 	for _, action := range result.Actions {
+		if action.Provider != "" && (a.Role != "po" || (action.Type != "create_worker" && action.Type != "create_one_shot_worker")) {
+			return fmt.Errorf("%w: provider is only available for new workers", errWorkflow)
+		}
 		if action.Model != "" && (a.Role != "po" || (action.Type != "create_worker" && action.Type != "create_one_shot_worker")) {
 			return fmt.Errorf("%w: model is only available for new workers", errWorkflow)
 		}

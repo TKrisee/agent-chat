@@ -42,12 +42,50 @@ func (s *Service) createProjectWorker(tx *sql.Tx, j job, po agent, action runtim
 		return workItemPlanning("worker name already exists; use the registered roster")
 	}
 	id := newID()
+	providerPort := 0
+	if action.Provider != "" {
+		if !strings.HasPrefix(action.Provider, "local:") || !clientID.MatchString(strings.TrimPrefix(action.Provider, "local:")) || !validLocalModel(action.Model) {
+			return workItemPlanning("requested provider or model is unavailable")
+		}
+		var enabled bool
+		var port int
+		e := tx.QueryRow(`SELECT enabled,port FROM local_model_providers WHERE id=?`, action.Provider).Scan(&enabled, &port)
+		if errors.Is(e, sql.ErrNoRows) {
+			return workItemPlanning("local provider unavailable")
+		}
+		if e != nil {
+			return e
+		}
+		if !enabled {
+			return workItemPlanning("local provider is disabled")
+		}
+		models, ok := s.cachedModels()
+		found := false
+		for _, m := range models {
+			if m == qualifiedModelID(action.Provider, action.Model) {
+				found = true
+				break
+			}
+		}
+		if !ok || !found {
+			return workItemPlanning("requested provider or model is unavailable")
+		}
+		providerPort = port
+	}
 	model, err := s.preferredWorkerModel(tx, action.Model)
 	if err != nil {
 		return err
 	}
+	if action.Provider != "" {
+		model = action.Model
+	}
 	if _, err := tx.Exec("INSERT INTO agents VALUES(?,?,'worker',?,?,?)", id, action.Title, j.Project, model, s.opts.Effort); err != nil {
 		return err
+	}
+	if action.Provider != "" {
+		if _, err := tx.Exec(`INSERT INTO agent_model_providers(agent_id,provider,port) VALUES(?,?,?)`, id, action.Provider, providerPort); err != nil {
+			return err
+		}
 	}
 	if action.Type == "create_one_shot_worker" {
 		_, err := tx.Exec("INSERT INTO one_shot_workers(agent_id) VALUES(?)", id)
@@ -135,7 +173,11 @@ func (s *Service) queuePOWorkItem(tx *sql.Tx, j job, po agent, action runtimeapi
 	if err = workflowNotice(tx, j.Project, "work-item:"+child, "The project owner queued a work item for a worker."); err != nil {
 		return err
 	}
-	if err = s.notifyModelDeparture(tx, j.Project, child, action.Category, worker.Model, action.ModelReason); err != nil {
+	chosen := worker.Model
+	if worker.Provider != "" {
+		chosen = qualifiedModelID(worker.Provider, worker.Model)
+	}
+	if err = s.notifyModelDeparture(tx, j.Project, child, action.Category, chosen, action.ModelReason); err != nil {
 		return err
 	}
 	return s.enqueue(tx, worker, j.Project, child, source, "work", action.Body)

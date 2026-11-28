@@ -10,8 +10,8 @@ type MessageCommand = {kind:'backlog'|'recover_report'; project_id?:string; task
 type Message = {id:string; position?:number; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]; approval_id?:string; command?:MessageCommand};
 type Project = {id:string; name:string; status:string; po_id:string; goal_objective?:string; goal_status?:string};
 type Task = {id:string; position?:number; project_id:string; title:string; status:string; owner_id:string; waiting_on_dependencies?:boolean; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean; resolve_hold_eligible?:boolean};
-type Job = {id:string; position?:number; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string; superseded?:boolean};
-type Agent = {id:string; position?:number; name:string; role:string; project_id:string; status:string; model:string; parent_id?:string; one_shot_retired?:boolean};
+type Job = {id:string; position?:number; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; kind?:string; source_id?:string; superseded?:boolean; provider_unavailable?:boolean};
+type Agent = {id:string; position?:number; name:string; role:string; project_id:string; status:string; model:string; model_provider?:string; model_provider_label?:string; parent_id?:string; one_shot_retired?:boolean};
 type Approval = {id:string; position?:number;status:string;decision_note?:string};
 type State = {messages:Message[]; projects:Project[]; tasks:Task[]; agents:Agent[]; jobs:Job[]; approvals:Approval[]};
 const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -328,7 +328,8 @@ function memberActivity(agent:Agent):{label:string;active:boolean} {
  const jobs=state.jobs.filter(j=>j.agent_id===agent.id && !(j.status==='pending' && state.tasks.some(t=>t.id===j.task_id && t.waiting_on_dependencies)));
  if(jobs.some(j=>j.status==='running'))return {label:'Working',active:true};
  if(jobs.some(j=>j.status==='submitted'))return {label:'Starting',active:false};
- if(jobs.some(j=>j.status==='pending'))return {label:'Queued',active:false};
+ if(jobs.some(j=>j.status==='pending' && !j.provider_unavailable))return {label:'Queued',active:false};
+ if(jobs.some(j=>j.status==='pending'))return {label:'Provider unavailable',active:false};
  if(jobs.at(-1)?.status==='uncertain' || state.tasks.some(t=>t.owner_id===agent.id && t.status==='blocked'))return {label:'Needs attention',active:false};
  if(jobs.at(-1)?.status==='completed' && jobs.at(-1)?.diagnostic?.trim())return {label:'Failed',active:false};
  return {label:'Idle',active:false};
@@ -341,6 +342,7 @@ function agentActivity(target:string): {label:string; detail?:string; guidance?:
  const newest=(status:string)=>[...jobs].reverse().find(j=>j.status===status);
  const current=newest('running') || newest('submitted') || newest('pending') || (jobs.at(-1)?.status==='uncertain' ? jobs.at(-1) : undefined);
  if(current){const reason=current.diagnostic?.trim();
+  if(current.status==='pending' && current.provider_unavailable)return {label:'Provider unavailable',guidance:'Work is queued for its configured model provider.',key:current.id,busy:false};
   const label=current.status==='running'?'Working':current.status==='submitted'?(reason?'Starting · retrying':'Starting'):current.status==='pending'?(reason?'Queued · retrying':'Queued'):'Blocked · uncertain';
   const guidance=current.status==='uncertain'?'The outcome is unknown. Ask Root to check the outcome before trying again.':reason?'Waiting to retry automatically. No action needed now.':undefined;
   return {label,detail:reason,guidance,key:current.id,busy:current.status!=='uncertain'};

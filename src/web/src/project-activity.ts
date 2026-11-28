@@ -1,7 +1,7 @@
 /** Compact project overview; messages remain scoped to the selected room. */
 export type ActivityProject = {id:string; name:string; po_id:string; goal_objective?:string; goal_status?:string};
-export type ActivityAgent = {id:string; name:string; role:string; project_id:string; status:string; model?:string; parent_id?:string; one_shot_retired?:boolean};
-export type ActivityJob = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; source_id?:string; kind?:string; superseded?:boolean};
+export type ActivityAgent = {id:string; name:string; role:string; project_id:string; status:string; model?:string; model_provider?:string; model_provider_label?:string; parent_id?:string; one_shot_retired?:boolean};
+export type ActivityJob = {id:string; agent_id:string; project_id:string; task_id:string; status:string; diagnostic?:string; source_id?:string; kind?:string; superseded?:boolean; provider_unavailable?:boolean};
 export type ActivityMessage = {id:string; room_id:string; sender:string; recipient:string; text:string; at:string; project_id?:string};
 export type ActivityTask = {id:string; project_id:string; title:string; status:string; owner_id:string; waiting_on_dependencies?:boolean; retry_handoff_eligible?:boolean; continue_po_eligible?:boolean};
 export type ActivityState = {projects:ActivityProject[]; agents:ActivityAgent[]; jobs:ActivityJob[]; messages:ActivityMessage[]; tasks:ActivityTask[]};
@@ -19,11 +19,11 @@ export function renderProjectActivity(state:ActivityState, projectId:string, roo
  const tasks=state.tasks.filter(t=>t.project_id===projectId).slice(-5).reverse();
  const jobs=state.jobs.filter(j=>j.project_id===projectId);
  const isOpen=(key:string)=>open.has(key)?'open':'';
- const teamRow=(a:ActivityAgent)=>{const status=statusFor(a.id);return `<li><span class="activity-dot ${status.active?'busy':''}" aria-hidden="true"></span><strong>${escape(a.name)}</strong><small>${escape(a.role)} · ${escape(status.label)}${a.model?`<span class="pa-model">${escape(a.model)}</span>`:''}</small></li>`;};
+ const teamRow=(a:ActivityAgent)=>{const status=statusFor(a.id);const model=a.model?[a.model,a.model_provider_label || a.model_provider].filter(Boolean).join(' · '):'';return `<li><span class="activity-dot ${status.active?'busy':''}" aria-hidden="true"></span><strong>${escape(a.name)}</strong><small>${escape(a.role)} · ${escape(status.label)}${model?`<span class="pa-model">${escape(model)}</span>`:''}</small></li>`;};
  const team=members.filter(a=>!a.one_shot_retired).map(teamRow).join('');
  const past=members.filter(a=>a.one_shot_retired);
  const pastTeam=past.length?`<details data-diagnostic="panel:past-team:${escape(projectId)}" ${isOpen('panel:past-team:'+projectId)}><summary>Past one-shot workers (${past.length})</summary><ul class="pa-team">${past.map(teamRow).join('')}</ul></details>`:'';
- const work=tasks.map(t=>{const attempts=jobs.filter(j=>j.task_id===t.id && !j.superseded);const latest=attempts.at(-1);const status=t.waiting_on_dependencies?'Waiting on dependencies':latest && ['pending','submitted','running'].includes(latest.status)?({pending:'Queued',submitted:'Starting',running:'Working'} as Record<string,string>)[latest.status]:latest?.status==='uncertain'?'Needs attention':latest?.status==='completed' && latest.diagnostic?.trim()?'Failed':t.status;return `<li><strong>${escape(t.title)}</strong><small>${escape(status)} · ${escape(who(t.owner_id))}</small>${diagnostics(t)}</li>`;}).join('');
+ const work=tasks.map(t=>{const attempts=jobs.filter(j=>j.task_id===t.id && !j.superseded);const latest=attempts.at(-1);const status=t.waiting_on_dependencies?'Waiting on dependencies':latest?.status==='pending' && latest.provider_unavailable?'Provider unavailable':latest && ['pending','submitted','running'].includes(latest.status)?({pending:'Queued',submitted:'Starting',running:'Working'} as Record<string,string>)[latest.status]:latest?.status==='uncertain'?'Needs attention':latest?.status==='completed' && latest.diagnostic?.trim()?'Failed':t.status;return `<li><strong>${escape(t.title)}</strong><small>${escape(status)} · ${escape(who(t.owner_id))}</small>${diagnostics(t)}</li>`;}).join('');
  const messages=state.messages.filter(m=>m.room_id===roomId).slice(-8).reverse();
  const exchanges=messages.map(m=>`<li><small>${escape(who(m.sender))} · ${escape(time(m.at))}</small><p>${escape(short(m.text,180))}</p></li>`).join('');
  const goal=project.goal_objective?`<details data-diagnostic="panel:goal:${escape(projectId)}" ${isOpen('panel:goal:'+projectId)}><summary>PO goal <small>${escape(project.goal_status || '')}</small></summary><p class="pa-goal">${escape(project.goal_objective)}</p></details>`:'';

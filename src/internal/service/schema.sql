@@ -6,6 +6,10 @@ CREATE TABLE IF NOT EXISTS agents (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('root','po','worker')),
   project_id TEXT REFERENCES projects(id), model TEXT NOT NULL, effort TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS agent_model_providers (
+ agent_id TEXT PRIMARY KEY REFERENCES agents(id), provider TEXT NOT NULL CHECK(provider!=''), port INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS local_model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535));
 CREATE TABLE IF NOT EXISTS one_shot_workers (
  agent_id TEXT PRIMARY KEY REFERENCES agents(id),
  child_task_id TEXT UNIQUE REFERENCES tasks(id)

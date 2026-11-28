@@ -3,6 +3,7 @@ package codexruntime
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -24,6 +25,39 @@ import (
 
 var ErrUnknown = errors.New("native run outcome is unknown; automatic replay is withheld")
 var ErrRunning = errors.New("native run is already running")
+
+// A fresh unpredictable internal alias prevents workspace configuration from
+// predefining auth or headers for the explicitly selected loopback endpoint.
+func localProviderArgs(port int) ([]string, error) {
+	if port < 1 || port > 65535 {
+		return nil, errors.New("invalid local provider port")
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	alias := "agentchat_" + hex.EncodeToString(nonce[:])
+	table := fmt.Sprintf(`model_providers.%s={name="Agent Chat local",base_url="http://127.0.0.1:%d/v1",wire_api="responses",requires_openai_auth=false}`, alias, port)
+	return []string{"-c", "model_provider=" + strconv.Quote(alias), "-c", table}, nil
+}
+
+func validLocalProviderID(id string) bool {
+	if !strings.HasPrefix(id, "local:") || len(id) != len("local:")+36 {
+		return false
+	}
+	for i, c := range id[len("local:"):] {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 // Config selects executable paths and a private persistent journal. Defaults do
 // not change Codex sandbox, approval, provider, credentials or user config.
@@ -184,6 +218,12 @@ func fingerprint(req runtimeapi.Request) string {
 	if req.ModelSelection {
 		add("model-selection")
 	}
+	if req.Provider != "" {
+		add("provider")
+		add(req.Provider)
+		add(req.ProviderID)
+		add(strconv.Itoa(req.ProviderPort))
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 func (r *Runner) dir(id string) string {
@@ -191,6 +231,9 @@ func (r *Runner) dir(id string) string {
 	return filepath.Join(r.cfg.StateDir, hex.EncodeToString(sum[:]))
 }
 func validate(req runtimeapi.Request) error {
+	if (req.Provider == "" && (req.ProviderPort != 0 || req.ProviderID != "")) || (req.Provider != "" && (req.Provider != "agentchat-local" || !validLocalProviderID(req.ProviderID) || req.Role != "worker" || req.ProviderPort < 1 || req.ProviderPort > 65535 || req.Model == "")) {
+		return errors.New("unsupported provider binding")
+	}
 	if req.Role != "root" && req.Role != "po" && req.Role != "worker" {
 		return errors.New("unsupported agent role")
 	}
@@ -568,6 +611,13 @@ func (r *Runner) Execute(ctx context.Context, req runtimeapi.Request) (runtimeap
 	}
 	if req.Model != "" {
 		args = append(args, "--model", req.Model)
+	}
+	if req.Provider == "agentchat-local" {
+		providerArgs, e := localProviderArgs(req.ProviderPort)
+		if e != nil {
+			return zero, e
+		}
+		args = append(args, providerArgs...)
 	}
 	if req.Effort != "" {
 		args = append(args, "-c", "model_reasoning_effort="+strconv.Quote(req.Effort))

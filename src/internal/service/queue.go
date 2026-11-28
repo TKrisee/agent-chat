@@ -114,6 +114,7 @@ func (s *Service) claim(active map[string]bool) (*job, error) {
 // pendingClaimPredicate uses job alias j and one paused boolean parameter.
 const pendingClaimPredicate = `j.status='pending' AND ?=0 AND NOT EXISTS
 			        (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.stopped=1) AND
+			        NOT EXISTS (SELECT 1 FROM agent_model_providers b WHERE b.agent_id=j.agent_id AND NOT EXISTS (SELECT 1 FROM local_model_providers lp WHERE lp.id=b.provider AND lp.enabled=1 AND lp.port=b.port)) AND
 			        (j.kind!='po_evidence' OR EXISTS (SELECT 1 FROM projects p WHERE p.id=j.project_id AND p.po_id=j.agent_id)) AND
 			        (j.kind!='po_hold_investigation' OR EXISTS (SELECT 1 FROM local_hold_investigations i JOIN task_holds h ON h.job_id=i.hold_job_id AND h.status='active' JOIN tasks t ON t.id=h.task_id AND t.status='blocked' AND t.owner_id=h.po_id JOIN projects p ON p.id=h.project_id AND p.po_id=h.po_id WHERE i.source_id=j.source_id AND h.task_id=j.task_id AND h.project_id=j.project_id AND h.po_id=j.agent_id AND i.assessment_id IS NULL AND NOT EXISTS (SELECT 1 FROM approvals ap WHERE ap.task_id=h.task_id AND ap.status='pending') AND NOT EXISTS (SELECT 1 FROM jobs other WHERE other.task_id=h.task_id AND other.id<>j.id AND other.status IN ('pending','submitted','running','uncertain')))) AND
 			        (j.kind!='root_backlog' OR EXISTS (SELECT 1 FROM eligible_root_backlog_wakes w WHERE w.source_id=j.source_id AND w.project_id=j.project_id AND w.parent_task_id=j.task_id)) AND
