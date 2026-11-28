@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.22.0](https://github.com/TKrisee/agent-chat/compare/v0.21.0...v0.22.0) (2026-11-28)
+
+
+### Features
+
+* add model reasoning preferences and organize settings ([#86](https://github.com/TKrisee/agent-chat/issues/86)) ([f18bafa](https://github.com/TKrisee/agent-chat/commit/f18bafa65950057d99da5bca7303a32a69dde7c0))
+
 ## [0.21.0](https://github.com/TKrisee/agent-chat/compare/v0.20.0...v0.21.0) (2026-11-28)
 
 
