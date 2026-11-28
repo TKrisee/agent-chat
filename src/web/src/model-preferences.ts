@@ -1,3 +1,7 @@
+import './settings-select.css';
+import {closeSettingsSelect, settingsSelect, type SelectGroup} from './settings-select';
+import {localModelProvidersDirty, localModelProvidersSaving, renderLocalModelProviders, syncLocalModelProviders, type LocalModelProvider} from './local-model-providers';
+
 const categories = [
   ['reasoning', 'Hard reasoning'],
   ['implementation', 'Implementation'],
@@ -8,11 +12,21 @@ const categories = [
 
 type Category = typeof categories[number][0];
 type Preferences = Record<Category, string>;
-type Model = {id:string; label?:string};
+type Model = {
+  id: string;
+  model?: string;
+  label?: string;
+  provider_id?: string;
+  provider_label?: string;
+  available?: boolean;
+};
+type Provider = {id:string; label:string; available:boolean};
 type ModelPreferencesResponse = {
   preferences: Partial<Preferences>;
   models: Model[];
   catalog_available: boolean;
+  providers?: Provider[];
+  local_providers?: LocalModelProvider[];
 };
 
 const emptyPreferences: Preferences = {
@@ -28,6 +42,7 @@ let visible = false;
 let saved = {...emptyPreferences};
 let draft = {...saved};
 let models: Model[] = [];
+let providers: Provider[] = [];
 let catalogAvailable = false;
 let loaded = false;
 let loading = false;
@@ -35,8 +50,11 @@ let saving = false;
 let loadError = '';
 let saveError = '';
 let savedNotice = '';
-
 export function modelPreferencesDirty(): boolean {
+  return choicesDirty() || localModelProvidersDirty();
+}
+
+function choicesDirty(): boolean {
   return categories.some(([key]) => draft[key] !== saved[key]);
 }
 
@@ -49,28 +67,70 @@ export function mountModelPreferences(section: HTMLElement | null, show: boolean
   const opened = show && !visible;
   panel = section;
   visible = show;
-  if (!visible || !panel) return;
+  if (!visible || !panel) {
+    closeSettingsSelect();
+    return;
+  }
   renderModelPreferences(focus);
   if (opened) void loadModelPreferences();
 }
 
 function canSave(): boolean {
-  return modelPreferencesDirty() && categories.every(([key]) =>
+  return choicesDirty() && categories.every(([key]) =>
     !draft[key] || draft[key] === saved[key] ||
-    (catalogAvailable && models.some(model => model.id === draft[key])),
+    (catalogAvailable && models.some(model => model.id === draft[key] && model.available !== false)),
   );
 }
 
-function option(value: string, label: string): HTMLOptionElement {
-  const item = document.createElement('option');
-  item.value = value;
-  item.textContent = label;
-  return item;
+function modelLabel(model: Model): string {
+  return model.label || model.model || model.id;
+}
+
+function providerLabel(model: Model): string {
+  return model.provider_label || providers.find(provider => provider.id === model.provider_id)?.label ||
+    model.provider_id || 'Default provider';
+}
+
+function modelGroups(value: string): SelectGroup[] {
+  const selectable = catalogAvailable ? models.filter(model => model.available !== false) : [];
+  const grouped = selectable.some(model => !!(model.provider_id || model.provider_label)) || providers.length > 0;
+  const all: SelectGroup[] = [{choices:[{value:'',label:'Let PO choose'}]}];
+  const byProvider = new Map<string, SelectGroup>();
+  const counts = new Map<string, number>();
+  const providerKeys = new Map<string, Set<string>>();
+  for (const model of selectable) {
+    const slug = model.model || modelLabel(model);
+    counts.set(slug, (counts.get(slug) || 0) + 1);
+    const label = providerLabel(model);
+    const ids = providerKeys.get(label) || new Set<string>();
+    ids.add(model.provider_id || '');
+    providerKeys.set(label, ids);
+  }
+  for (const model of selectable) {
+    const key = model.provider_id || '';
+    const title = providerLabel(model);
+    const groupLabel = (providerKeys.get(title)?.size || 0) > 1 ? `${title} (${key || 'default'})` : title;
+    let group = byProvider.get(key);
+    if (!group) {
+      group = grouped ? {label:groupLabel,choices:[]} : all[0];
+      byProvider.set(key, group);
+      if (grouped) all.push(group);
+    }
+    const duplicate = (counts.get(model.model || modelLabel(model)) || 0) > 1;
+    group.choices.push({value:model.id, label:duplicate ? `${modelLabel(model)} · ${groupLabel}` : modelLabel(model)});
+  }
+  if (value && !selectable.some(model => model.id === value)) {
+    const old = models.find(model => model.id === value);
+    const label = old ? `${modelLabel(old)} · ${providerLabel(old)}` : value;
+    all[0].choices.push({value, label:`${label} (unavailable)`,disabled:true});
+  }
+  return all;
 }
 
 function renderModelPreferences(focus = modelPreferencesFocus()): void {
   if (!visible || !panel) return;
-  panel.setAttribute('aria-busy', String(loading || saving));
+  closeSettingsSelect();
+  panel.setAttribute('aria-busy', String(loading || saving || localModelProvidersSaving()));
   panel.innerHTML = '<h2 id="model-preferences-title">Model preferences</h2><p>These preferences guide new assignments. The project owner can choose another eligible model and will notify you when it does.</p>';
   if (loadError) {
     const alert = document.createElement('p');
@@ -91,7 +151,7 @@ function renderModelPreferences(focus = modelPreferencesFocus()): void {
     panel.append(status);
   }
   if (loaded) {
-    if (!catalogAvailable || !models.length) {
+    if (!catalogAvailable || !models.some(model => model.available !== false)) {
       const warning = document.createElement('p');
       warning.className = 'settings-muted';
       warning.textContent = 'Model choices are unavailable. You can keep or clear your saved preferences.';
@@ -103,7 +163,7 @@ function renderModelPreferences(focus = modelPreferencesFocus()): void {
     save.type = 'submit';
     save.id = 'save-model-preferences';
     save.textContent = saving ? 'Saving…' : 'Save model preferences';
-    save.disabled = saving || loading || !canSave();
+    save.disabled = saving || loading || localModelProvidersSaving() || !canSave();
     const feedback = document.createElement('p');
     feedback.className = saveError ? 'settings-error' : 'settings-muted';
     feedback.setAttribute('role', saveError ? 'alert' : 'status');
@@ -113,27 +173,21 @@ function renderModelPreferences(focus = modelPreferencesFocus()): void {
       const label = document.createElement('label');
       const caption = document.createElement('span');
       caption.textContent = title;
-      const select = document.createElement('select');
-      select.name = key;
-      select.id = `model-preference-${key}`;
-      select.disabled = saving;
-      select.append(option('', 'Let PO choose'));
-      if (catalogAvailable) {
-        select.append(...models.map(model => option(model.id, model.label || model.id)));
-      }
-      if (draft[key] && !Array.from(select.options).some(item => item.value === draft[key])) {
-        const unavailable = option(draft[key], `${draft[key]} (unavailable)`);
-        unavailable.disabled = true;
-        select.append(unavailable);
-      }
-      select.value = draft[key];
-      select.onchange = () => {
-        draft[key] = select.value;
-        saveError = '';
-        savedNotice = '';
-        feedback.textContent = '';
-        save.disabled = loading || !canSave();
-      };
+      caption.id = `model-preference-${key}-label`;
+      const select = settingsSelect({
+        id:`model-preference-${key}`,
+        labelId:caption.id,
+        value:draft[key],
+        groups:modelGroups(draft[key]),
+        disabled:saving || localModelProvidersSaving(),
+        onChange(value) {
+          draft[key] = value;
+          saveError = '';
+          savedNotice = '';
+          feedback.textContent = '';
+          save.disabled = loading || !canSave();
+        },
+      });
       label.append(caption, select);
       form.append(label);
     }
@@ -143,12 +197,14 @@ function renderModelPreferences(focus = modelPreferencesFocus()): void {
     };
     form.append(save, feedback);
     panel.append(form);
+    const local = renderLocalModelProviders(loading || saving, renderModelPreferences, loadModelPreferences);
+    if (local) panel.append(local);
   }
   if (focus) document.getElementById(focus)?.focus({preventScroll:true});
 }
 
 async function loadModelPreferences(): Promise<void> {
-  if (loading || saving) return;
+  if (loading || saving || localModelProvidersSaving()) return;
   loading = true;
   loadError = '';
   renderModelPreferences();
@@ -163,7 +219,9 @@ async function loadModelPreferences(): Promise<void> {
       saved[key] = value;
     }
     models = data.models;
+    providers = data.providers || [];
     catalogAvailable = data.catalog_available;
+    syncLocalModelProviders(data.local_providers);
     loaded = true;
   } catch {
     loadError = 'Could not load model preferences.';
@@ -174,7 +232,7 @@ async function loadModelPreferences(): Promise<void> {
 }
 
 async function saveModelPreferences(): Promise<void> {
-  if (loading || saving || !canSave()) return;
+  if (loading || saving || localModelProvidersSaving() || !canSave()) return;
   saving = true;
   saveError = '';
   savedNotice = '';

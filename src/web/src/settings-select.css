@@ -1,0 +1,124 @@
+#model-preferences .settings-select-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-width: 0;
+  height: 36px;
+  margin: 0;
+  padding: 0 11px;
+  gap: 8px;
+  border: 1px solid #ccd9cd;
+  border-radius: 6px;
+  background: #fff;
+  color: #29382f;
+  font: inherit;
+  text-align: start;
+}
+
+#model-preferences .settings-select-trigger:hover:not(:disabled),
+#model-preferences .settings-select-trigger[aria-expanded="true"] {
+  background: #f0f5ed;
+  border-color: #a9c5a4;
+}
+
+.settings-select-value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-select-chevron {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin: -3px 2px 0;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(45deg);
+}
+
+.settings-select-popup {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+  border: 1px solid #ccd9cd;
+  border-radius: 6px;
+  background: #fbfcf8;
+  color: #29382f;
+  box-shadow: 0 6px 18px #1b342426;
+  font-size: 13px;
+}
+
+.settings-select-viewport {
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 4px;
+}
+
+.settings-select-group-label {
+  margin: 5px 7px 2px;
+  color: #53675b;
+  font-size: 11px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.settings-select-option {
+  position: relative;
+  box-sizing: border-box;
+  min-height: 31px;
+  padding: 7px 29px 7px 8px;
+  border-radius: 4px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.settings-select-option[data-highlighted] {
+  background: #e8f0e2;
+  color: #24493b;
+}
+
+.settings-select-option[aria-selected="true"]::after {
+  position: absolute;
+  top: 9px;
+  right: 11px;
+  width: 5px;
+  height: 9px;
+  border: solid #285a48;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+  content: '';
+}
+
+.settings-select-option[aria-disabled="true"] {
+  color: #627169;
+  cursor: default;
+}
+
+.settings-select-scroll {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 23px;
+  padding: 0;
+  border: 0;
+  background: #fbfcf8;
+  color: #285a48;
+}
+
+.settings-select-scroll[hidden] { display: none; }
+.settings-select-scroll:disabled { opacity: .45; cursor: default; }
+.settings-select-scroll:not(:disabled):hover { background: #e8f0e2; }
+.settings-select-scroll-up .settings-select-chevron { margin-top: 3px; transform: rotate(225deg); }
+
+@media (hover: none) {
+  .settings-select-option { min-height: 40px; padding-block: 10px; }
+  .settings-select-scroll { min-height: 32px; }
+}

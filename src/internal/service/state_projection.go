@@ -157,7 +157,7 @@ func (s *Service) projectState(tx *sql.Tx, selected stateSelection, view *State)
 			return err
 		}
 	}
-	view.Agents, err = queryStateRows(tx, selected, "agent", " WHERE a.id", "a.rowid", `SELECT a.rowid,a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,
+	view.Agents, err = queryStateRows(tx, selected, "agent", " WHERE a.id", "a.rowid", `SELECT a.rowid,a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,COALESCE((SELECT provider FROM agent_model_providers WHERE agent_id=a.id),''),COALESCE((SELECT lp.name FROM agent_model_providers b JOIN local_model_providers lp ON lp.id=b.provider WHERE b.agent_id=a.id),''),
 		CASE WHEN p.stopped=1 THEN 'stopped' WHEN EXISTS(SELECT 1 FROM jobs j
 		WHERE j.agent_id=a.id AND j.status IN ('submitted','running')) THEN 'busy' ELSE 'idle' END,
 		CASE WHEN a.role='po' AND a.id=po.id THEN ? WHEN a.role='worker' THEN COALESCE(po.id,'') ELSE '' END,
@@ -169,7 +169,7 @@ func (s *Service) projectState(tx *sql.Tx, selected stateSelection, view *State)
 		FROM agents a LEFT JOIN projects p ON p.id=a.project_id
 		LEFT JOIN agents po ON po.id=p.po_id AND po.role='po' AND po.project_id=p.id`, func(rows *sql.Rows) (Agent, error) {
 		var a Agent
-		err := rows.Scan(&a.Position, &a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Status, &a.Parent, &a.OneShot, &a.OneShotRetired)
+		err := rows.Scan(&a.Position, &a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.ModelProvider, &a.ModelProviderLabel, &a.Status, &a.Parent, &a.OneShot, &a.OneShotRetired)
 		return a, err
 	}, root)
 	if err != nil {
@@ -186,9 +186,10 @@ func (s *Service) projectState(tx *sql.Tx, selected stateSelection, view *State)
 	}
 	view.Jobs, err = queryStateRows(tx, selected, "job", " WHERE j.id", "j.rowid", `SELECT j.rowid,j.id,j.agent_id,COALESCE(j.project_id,''),COALESCE(j.task_id,''),
 		j.kind,j.source_id,j.status,COALESCE(j.diagnostic,''),
-		EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.review_job_id=j.id AND c.task_id=j.task_id AND c.confirmed_by='operator' AND c.effects_unknown_ack=1 AND j.kind='scope_review' AND j.status='uncertain') FROM jobs j`, func(rows *sql.Rows) (Job, error) {
+		EXISTS(SELECT 1 FROM scope_draft_confirmations c WHERE c.review_job_id=j.id AND c.task_id=j.task_id AND c.confirmed_by='operator' AND c.effects_unknown_ack=1 AND j.kind='scope_review' AND j.status='uncertain'),
+		(j.status='pending' AND EXISTS(SELECT 1 FROM agent_model_providers b WHERE b.agent_id=j.agent_id AND NOT EXISTS(SELECT 1 FROM local_model_providers lp WHERE lp.id=b.provider AND lp.enabled=1 AND lp.port=b.port))) FROM jobs j`, func(rows *sql.Rows) (Job, error) {
 		var j Job
-		err := rows.Scan(&j.Position, &j.ID, &j.Agent, &j.Project, &j.Task, &j.Kind, &j.Source, &j.Status, &j.Diagnostic, &j.Superseded)
+		err := rows.Scan(&j.Position, &j.ID, &j.Agent, &j.Project, &j.Task, &j.Kind, &j.Source, &j.Status, &j.Diagnostic, &j.Superseded, &j.ProviderUnavailable)
 		return j, err
 	})
 	return err

@@ -73,16 +73,18 @@ type Task struct {
 }
 
 type Agent struct {
-	Position       int64  `json:"position"`
-	ID             string `json:"id"`
-	Name           string `json:"name"`
-	Role           string `json:"role"`
-	Project        string `json:"project_id"`
-	Parent         string `json:"parent_id,omitempty"`
-	Status         string `json:"status"`
-	Model          string `json:"model"`
-	OneShot        bool   `json:"one_shot,omitempty"`
-	OneShotRetired bool   `json:"one_shot_retired,omitempty"`
+	Position           int64  `json:"position"`
+	ID                 string `json:"id"`
+	Name               string `json:"name"`
+	Role               string `json:"role"`
+	Project            string `json:"project_id"`
+	Parent             string `json:"parent_id,omitempty"`
+	Status             string `json:"status"`
+	Model              string `json:"model"`
+	ModelProvider      string `json:"model_provider,omitempty"`
+	ModelProviderLabel string `json:"model_provider_label,omitempty"`
+	OneShot            bool   `json:"one_shot,omitempty"`
+	OneShotRetired     bool   `json:"one_shot_retired,omitempty"`
 }
 
 type Approval struct {
@@ -98,16 +100,17 @@ type Approval struct {
 }
 
 type Job struct {
-	Position   int64  `json:"position"`
-	ID         string `json:"id"`
-	Agent      string `json:"agent_id"`
-	Project    string `json:"project_id"`
-	Task       string `json:"task_id"`
-	Kind       string `json:"kind"`
-	Source     string `json:"source_id"`
-	Status     string `json:"status"`
-	Diagnostic string `json:"diagnostic,omitempty"`
-	Superseded bool   `json:"superseded,omitempty"`
+	Position            int64  `json:"position"`
+	ID                  string `json:"id"`
+	Agent               string `json:"agent_id"`
+	Project             string `json:"project_id"`
+	Task                string `json:"task_id"`
+	Kind                string `json:"kind"`
+	Source              string `json:"source_id"`
+	Status              string `json:"status"`
+	Diagnostic          string `json:"diagnostic,omitempty"`
+	Superseded          bool   `json:"superseded,omitempty"`
+	ProviderUnavailable bool   `json:"provider_unavailable,omitempty"`
 }
 
 type State struct {
@@ -145,6 +148,7 @@ func (s *Service) Handler(static http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/model-preferences", s.getModelPreferences)
 	mux.HandleFunc("POST /api/model-preferences", s.setModelPreferences)
+	mux.HandleFunc("POST /api/model-providers/local", s.setLocalModelProvider)
 	mux.HandleFunc("POST /api/agents/{id}/operator-previews", s.setOperatorPreviews)
 	mux.HandleFunc("GET /api/usage", s.usageStatus)
 	mux.HandleFunc("POST /api/usage/settings", s.usageSettings)

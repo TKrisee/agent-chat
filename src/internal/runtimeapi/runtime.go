@@ -14,6 +14,14 @@ type ModelCatalog interface {
 	Models(context.Context) ([]string, error)
 }
 
+type ProviderModelCatalog interface {
+	ModelsForProvider(context.Context, string) ([]string, error)
+}
+
+type LocalModelCatalog interface {
+	LocalModels(context.Context, int) ([]string, error)
+}
+
 const (
 	NotStarted State = "not_started"
 	Running    State = "running"
@@ -34,6 +42,9 @@ type DiagnosticReader interface {
 }
 
 type Request struct {
+	Provider                 string    `json:"provider,omitempty"`
+	ProviderID               string    `json:"provider_id,omitempty"`
+	ProviderPort             int       `json:"provider_port,omitempty"`
 	ModelSelection           bool      `json:"model_selection,omitempty"`
 	ID                       string    `json:"id"`
 	AgentID                  string    `json:"agent_id"`
@@ -83,6 +94,7 @@ type Result struct {
 }
 
 type Action struct {
+	Provider    string   `json:"provider,omitempty"`
 	Type        string   `json:"type"`
 	Model       string   `json:"model,omitempty"`
 	Category    string   `json:"category,omitempty"`

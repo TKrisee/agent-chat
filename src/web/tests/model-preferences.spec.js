@@ -2,6 +2,19 @@ import { test, expect } from './fixture.js';
 
 const empty = {reasoning:'',implementation:'',precise_edits:'',research:'',routine_checks:''};
 
+async function openSettings(page) {
+  await expect(page.getByLabel('Message Root')).toBeVisible();
+  await page.getByRole('button', {name:'Settings',exact:true}).click();
+  const section = page.getByRole('region', {name:'Model preferences',exact:true});
+  await expect(section.getByRole('combobox')).toHaveCount(5);
+  return section;
+}
+
+async function choose(page, trigger, name) {
+  await trigger.click();
+  await page.getByRole('listbox').getByRole('option', {name,exact:true}).click();
+}
+
 test('settings uses available model choices and saves category preferences', async ({page, serviceURL}) => {
   const initial = {...empty, precise_edits:'retired-model'};
   const attempted = {...initial, reasoning:'deep-model', implementation:'build-model', precise_edits:''};
@@ -24,37 +37,32 @@ test('settings uses available model choices and saves category preferences', asy
     return route.fulfill({json:{preferences:saved,models,catalog_available:true}});
   });
   await page.goto(serviceURL);
-  const settings = page.getByRole('button', {name:'Settings',exact:true});
   await expect(page.getByLabel('Message Root')).toBeVisible();
   expect(reads).toBe(0);
-  await settings.click();
-
-  const section = page.getByRole('region', {name:'Model preferences'});
-  await expect(section.getByRole('combobox')).toHaveCount(5);
+  const section = await openSettings(page);
   await expect(section).toContainText('can choose another eligible model and will notify you');
   const reasoning = section.getByRole('combobox', {name:'Hard reasoning'});
   const implementation = section.getByRole('combobox', {name:'Implementation'});
   const precise = section.getByRole('combobox', {name:'Precise edits'});
-  await expect(section.getByRole('combobox', {name:'Research'})).toHaveValue('');
-  await expect(section.getByRole('combobox', {name:'Routine checks'})).toHaveValue('');
-  await expect(reasoning.locator('option')).toHaveText(['Let PO choose','Deep Model','build-model']);
-  await expect(precise).toHaveValue('retired-model');
-  await expect(precise.locator('option:checked')).toHaveText('retired-model (unavailable)');
-  await expect(precise.locator('option:checked')).toBeDisabled();
+  await expect(section.getByRole('combobox', {name:'Research'})).toHaveText('Let PO choose');
+  await expect(section.getByRole('combobox', {name:'Routine checks'})).toHaveText('Let PO choose');
+  await expect(precise).toHaveText('retired-model (unavailable)');
+  await precise.click();
+  await expect(page.getByRole('option', {name:'retired-model (unavailable)'})).toBeDisabled();
+  await precise.press('Escape');
 
   const save = section.getByRole('button', {name:'Save model preferences'});
   await expect(save).toBeDisabled();
-  await reasoning.selectOption('deep-model');
-  await implementation.selectOption('build-model');
-  await precise.selectOption('');
+  await choose(page, reasoning, 'Deep Model');
+  await choose(page, implementation, 'build-model');
+  await choose(page, precise, 'Let PO choose');
   await save.click();
   await expect(section.getByRole('alert')).toContainText('A selected model is no longer available.');
-  await expect(reasoning).toHaveValue('deep-model');
-  await expect(reasoning.locator('option:checked')).toHaveText('deep-model (unavailable)');
-  await expect(implementation).toHaveValue('build-model');
-  await expect(precise).toHaveValue('');
+  await expect(reasoning).toHaveText('deep-model (unavailable)');
+  await expect(implementation).toHaveText('build-model');
+  await expect(precise).toHaveText('Let PO choose');
   await expect(save).toBeDisabled();
-  await reasoning.selectOption('replacement-model');
+  await choose(page, reasoning, 'Replacement Model');
   await save.click();
   await expect(section.getByRole('status')).toHaveText('Model preferences saved.');
   await expect.poll(() => reads).toBeGreaterThanOrEqual(3);
@@ -65,10 +73,9 @@ test('settings uses available model choices and saves category preferences', asy
   await expect(save).toBeDisabled();
 
   await page.reload();
-  await expect(page.getByLabel('Message Root')).toBeVisible();
-  await settings.click();
-  await expect(reasoning).toHaveValue('replacement-model');
-  await expect(implementation).toHaveValue('build-model');
+  await openSettings(page);
+  await expect(reasoning).toHaveText('Replacement Model');
+  await expect(implementation).toHaveText('build-model');
 });
 
 test('an unavailable catalog preserves saved choices and lets the operator clear them', async ({page, serviceURL}) => {
@@ -83,19 +90,100 @@ test('an unavailable catalog preserves saved choices and lets the operator clear
     return route.fulfill({json:{preferences:saved,models:[],catalog_available:false}});
   });
   await page.goto(serviceURL);
-  await expect(page.getByLabel('Message Root')).toBeVisible();
-  await page.getByRole('button', {name:'Settings',exact:true}).click();
-  const section = page.getByRole('region', {name:'Model preferences'});
+  const section = await openSettings(page);
   await expect(section).toContainText('Model choices are unavailable.');
   const checks = section.getByRole('combobox', {name:'Routine checks'});
-  await expect(checks).toHaveValue('previous-model');
-  await expect(checks.locator('option')).toHaveText(['Let PO choose','previous-model (unavailable)']);
-  await checks.selectOption('');
+  await expect(checks).toHaveText('previous-model (unavailable)');
+  await checks.click();
+  await expect(page.getByRole('option')).toHaveText(['Let PO choose','previous-model (unavailable)']);
+  await page.getByRole('option', {name:'Let PO choose'}).click();
   await section.getByRole('button', {name:'Save model preferences'}).click();
   await expect(section.getByRole('status')).toHaveText('Model preferences saved.');
   expect(posted).toBe(JSON.stringify({preferences:empty}));
+});
 
+test('local providers preserve draft model choices and duplicate slugs stay distinct', async ({page, serviceURL}) => {
+  const stale = {id:'opaque-stale',model:'older-qwen',provider_id:'archived',provider_label:'Archived runner',available:false};
+  const codex = [
+    {id:'qwen',model:'qwen',provider_id:'',provider_label:'Codex'},
+    {id:'cloud-reasoning',model:'cloud-reasoning',provider_id:'',provider_label:'Codex'},
+  ];
+  const local = {id:'opaque-live',model:'qwen',provider_id:'local-studio',provider_label:'Studio runner'};
+  const many = Array.from({length:22}, (_, i) => ({
+    ...local,id:`opaque-local-${i}`,model:`local-model-${String(i).padStart(2,'0')}`,
+  }));
+  let models = [...codex, stale];
+  let preferences = {...empty, research:'opaque-stale'};
+  let localProviders = [{id:'existing',name:'Disabled runner',port:8000,enabled:false,available:false}];
+  let submittedProvider;
+  let submittedPreferences;
+  await page.route('**/api/model-providers/local', route => {
+    submittedProvider = route.request().postData();
+    localProviders = [...localProviders, {id:'local-studio',name:'Studio runner',port:9000,enabled:true,available:true}];
+    models = [...codex, local, ...many, stale];
+    return route.fulfill({status:201,json:{id:'local-studio'}});
+  });
+  await page.route('**/api/model-preferences', route => {
+    if (route.request().method() === 'POST') {
+      submittedPreferences = route.request().postData();
+      preferences = {...preferences,reasoning:'cloud-reasoning',implementation:'opaque-live'};
+      return route.fulfill({status:204});
+    }
+    return route.fulfill({json:{preferences,models,catalog_available:true,local_providers:localProviders}});
+  });
+  await page.goto(serviceURL);
+  const section = await openSettings(page);
+  const reasoning = section.getByRole('combobox',{name:'Hard reasoning'});
+  const implementation = section.getByRole('combobox',{name:'Implementation'});
+  await choose(page, reasoning, 'cloud-reasoning');
+  await expect(section.getByRole('combobox', {name:'Research'})).toHaveText('older-qwen · Archived runner (unavailable)');
+
+  const localSettings = page.getByRole('region',{name:'Local model providers'});
+  await expect(localSettings).toContainText('Codex requires an API that supports Responses.');
+  await expect(localSettings).toContainText('http://127.0.0.1:8000/v1');
+  await expect(localSettings).toContainText('Disabled runner');
+  await localSettings.getByText('Add local provider',{exact:true}).click();
+  const add = localSettings.getByRole('form',{name:'Add local provider'});
+  await expect(add.getByLabel('Loopback port')).toHaveValue('8000');
+  await add.getByLabel('Name',{exact:true}).fill('Studio runner');
+  await add.getByLabel('Loopback port').fill('9000');
+  await add.getByRole('button',{name:'Add provider'}).click();
+  await expect(localSettings).toContainText('Studio runner');
+  await expect(localSettings).toContainText('Catalog reachable');
+  expect(submittedProvider).toBe(JSON.stringify({id:'',name:'Studio runner',port:9000,enabled:true}));
+  await expect(reasoning).toHaveText('cloud-reasoning');
+
+  await implementation.focus();
+  await implementation.press('ArrowDown');
+  const list = page.getByRole('listbox',{name:'Implementation'});
+  await expect(list.getByRole('group',{name:'Codex'}).getByRole('option',{name:'qwen · Codex'})).toBeAttached();
+  const qwen = list.getByRole('group',{name:'Studio runner'}).getByRole('option',{name:'qwen · Studio runner'});
+  await expect(qwen).toBeAttached();
+  await expect(page.getByRole('button',{name:'Scroll models down'})).toBeVisible();
+  await implementation.press('End');
+  const last = list.getByRole('option',{name:'local-model-21'});
+  await expect(implementation).toHaveAttribute('aria-activedescendant', await last.getAttribute('id'));
+  expect(await list.evaluate(el => el.scrollTop)).toBeGreaterThan(0);
+  await implementation.press('Escape');
+  await expect(list).toHaveCount(0);
+  await expect(implementation).toBeFocused();
+  await expect(implementation).toHaveText('Let PO choose');
+
+  await implementation.click();
+  await section.getByRole('heading',{name:'Model preferences'}).click();
+  await expect(list).toHaveCount(0);
+  await choose(page, implementation, 'qwen · Studio runner');
+  await expect(implementation).toHaveText('qwen · Studio runner');
   await page.setViewportSize({width:390,height:750});
-  await expect(checks).toBeVisible();
-  expect(await section.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await implementation.click();
+  await expect(list).toBeVisible();
+  const popup = await list.boundingBox();
+  expect(popup.x).toBeGreaterThanOrEqual(0);
+  expect(popup.x + popup.width).toBeLessThanOrEqual(390);
+  expect(popup.y).toBeGreaterThanOrEqual(0);
+  expect(popup.y + popup.height).toBeLessThanOrEqual(750);
+  await implementation.press('Escape');
+  await section.getByRole('button',{name:'Save model preferences'}).click();
+  await expect(section.getByText('Model preferences saved.',{exact:true})).toBeVisible();
+  expect(submittedPreferences).toBe(JSON.stringify({preferences:{...empty,reasoning:'cloud-reasoning',implementation:'opaque-live',research:'opaque-stale'}}));
 });

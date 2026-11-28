@@ -47,31 +47,33 @@ type Options struct {
 }
 
 type Service struct {
-	setupMu          sync.RWMutex
-	setup            runtimeapi.CodexSetup
-	modelCatalog     runtimeapi.ModelCatalog
-	models           []string
-	modelsSource     string
-	modelsAt         time.Time
-	modelsGeneration uint64
-	reviewProofMu    sync.Mutex
-	reviewProof      map[string]bool
-	startMu          sync.Mutex
-	runningJobs      int
-	updateDrain      chan struct{}
-	updateDrainReady bool
-	activeMu         sync.Mutex
-	activeRuns       map[string]activeRun
-	usageMu          sync.RWMutex
-	usage            weeklySample
-	usageGeneration  uint64
-	usageKick        chan struct{}
-	db               *sql.DB
-	lock             *os.File
-	dir              string
-	opts             Options
-	kick             chan struct{}
-	run              chan struct{}
+	setupMu                      sync.RWMutex
+	setup                        runtimeapi.CodexSetup
+	modelCatalog                 runtimeapi.ModelCatalog
+	models                       []string
+	modelsSource                 string
+	modelsAt                     time.Time
+	modelsGeneration             uint64
+	modelsConfigGeneration       uint64
+	modelsLoadedConfigGeneration uint64
+	reviewProofMu                sync.Mutex
+	reviewProof                  map[string]bool
+	startMu                      sync.Mutex
+	runningJobs                  int
+	updateDrain                  chan struct{}
+	updateDrainReady             bool
+	activeMu                     sync.Mutex
+	activeRuns                   map[string]activeRun
+	usageMu                      sync.RWMutex
+	usage                        weeklySample
+	usageGeneration              uint64
+	usageKick                    chan struct{}
+	db                           *sql.DB
+	lock                         *os.File
+	dir                          string
+	opts                         Options
+	kick                         chan struct{}
+	run                          chan struct{}
 }
 
 func Open(opts Options) (*Service, error) {
@@ -205,13 +207,14 @@ func nullIfEmpty(v string) any {
 }
 
 type agent struct {
-	ID, Name, Role, Project, Model, Effort string
+	ID, Name, Role, Project, Model, Effort, Provider string
+	ProviderPort                                     int
 }
 
 func getAgent(tx *sql.Tx, id string) (agent, error) {
 	var a agent
-	err := tx.QueryRow("SELECT id,name,role,COALESCE(project_id,''),model,effort FROM agents WHERE id=?", id).
-		Scan(&a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Effort)
+	err := tx.QueryRow("SELECT a.id,a.name,a.role,COALESCE(a.project_id,''),a.model,a.effort,COALESCE(p.provider,''),COALESCE(p.port,0) FROM agents a LEFT JOIN agent_model_providers p ON p.agent_id=a.id WHERE a.id=?", id).
+		Scan(&a.ID, &a.Name, &a.Role, &a.Project, &a.Model, &a.Effort, &a.Provider, &a.ProviderPort)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = fmt.Errorf("%w: agent %q", errAbsent, id)
 	}

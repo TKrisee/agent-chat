@@ -51,8 +51,8 @@ func newJobSchema(req runtimeapi.Request) string {
 		schema, oldEnum = workerOutputSchema, `"enum":["post_group"]`
 	}
 	if req.Role == "po" && req.ModelSelection {
-		schema = strings.Replace(schema, `"required":["type","project","title","body","recipient","task","reply_to","depends_on"]`, `"required":["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason"]`, 1)
-		schema = strings.Replace(schema, `"depends_on":{"type":"array"`, `"model":{"type":"string"},"category":{"type":"string","enum":["","reasoning","implementation","precise_edits","research","routine_checks"]},"model_reason":{"type":"string"},"depends_on":{"type":"array"`, 1)
+		schema = strings.Replace(schema, `"required":["type","project","title","body","recipient","task","reply_to","depends_on"]`, `"required":["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason","provider"]`, 1)
+		schema = strings.Replace(schema, `"depends_on":{"type":"array"`, `"provider":{"type":"string"},"model":{"type":"string"},"category":{"type":"string","enum":["","reasoning","implementation","precise_edits","research","routine_checks"]},"model_reason":{"type":"string"},"depends_on":{"type":"array"`, 1)
 	}
 	allowed := make([]string, 0)
 	for _, action := range actionTypes[req.Role] {
@@ -116,10 +116,10 @@ const extractFilter = `
  def exact($keys): type == "object" and (keys | sort) == ($keys | sort);
  def strings_for($keys): . as $v | all($keys[]; ($v[.] | type) == "string");
  if ((exact(["text","actions","attachments"]) or ($worker=="yes" and exact(["text","attachments"]))) and (.text|type)=="string" and ((has("actions") and (.actions|type)=="array") or ($worker=="yes" and (has("actions")|not))) and (.attachments|type)=="array" and
-     all((.actions // [])[]; ((keys - ["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason"]) == []) and strings_for(["type","project","title","body","recipient"]) and ((has("task")|not) or (.task|type)=="string") and ((has("reply_to")|not) or (.reply_to|type)=="string") and ((has("model")|not) or (.model|type)=="string") and ((has("category")|not) or (.category|type)=="string") and ((has("model_reason")|not) or (.model_reason|type)=="string") and ((has("depends_on")|not) or ((.depends_on|type)=="array" and all(.depends_on[]; type=="string" and length>0)))) and
+     all((.actions // [])[]; ((keys - ["type","project","title","body","recipient","task","reply_to","depends_on","model","category","model_reason","provider"]) == []) and strings_for(["type","project","title","body","recipient"]) and ((has("task")|not) or (.task|type)=="string") and ((has("reply_to")|not) or (.reply_to|type)=="string") and ((has("provider")|not) or (.provider|type)=="string") and ((has("model")|not) or (.model|type)=="string") and ((has("category")|not) or (.category|type)=="string") and ((has("model_reason")|not) or (.model_reason|type)=="string") and ((has("depends_on")|not) or ((.depends_on|type)=="array" and all(.depends_on[]; type=="string" and length>0)))) and
      all(.attachments[]; exact(["path","name","media_type"]) and strings_for(["path","name","media_type"])))
  then (["text",(.text|@base64)]|@tsv),
-      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64),((.task // "")|@base64),((.reply_to // "")|@base64),(((.depends_on // [])|map(@base64)|join(","))|@base64),((.model // "")|@base64),((.category // "")|@base64),((.model_reason // "")|@base64)]|@tsv),
+      ((.actions // [])[] | ["action",(.type|@base64),(.project|@base64),(.title|@base64),(.body|@base64),(.recipient|@base64),((.task // "")|@base64),((.reply_to // "")|@base64),(((.depends_on // [])|map(@base64)|join(","))|@base64),((.model // "")|@base64),((.category // "")|@base64),((.model_reason // "")|@base64),((.provider // "")|@base64)]|@tsv),
       (.attachments[] | ["attachment",(.path|@base64),(.name|@base64),(.media_type|@base64)]|@tsv)
  else error("invalid structured result") end`
 
@@ -274,7 +274,7 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if req.Kind == "project_report_recovery" || req.Kind == "po_hold_investigation" {
 				return result, errRoleAction
 			}
-			if len(values) != 11 {
+			if len(values) != 12 {
 				return result, errors.New("malformed action")
 			}
 			if !actionAllowed(req.Role, values[0]) {
@@ -340,7 +340,10 @@ func (r *Runner) readResult(ctx context.Context, dir string, req runtimeapi.Requ
 			if (values[9] != "" || values[10] != "") && (req.Role != "po" || values[0] != "queue_work_item") {
 				return result, errRoleAction
 			}
-			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6], DependsOn: dependencies, Model: values[8], Category: values[9], ModelReason: values[10]})
+			if values[11] != "" && (!req.ModelSelection || req.Role != "po" || (values[0] != "create_worker" && values[0] != "create_one_shot_worker")) {
+				return result, errRoleAction
+			}
+			result.Actions = append(result.Actions, runtimeapi.Action{Type: values[0], Project: values[1], Title: values[2], Body: values[3], Recipient: values[4], Task: values[5], ReplyTo: values[6], DependsOn: dependencies, Model: values[8], Category: values[9], ModelReason: values[10], Provider: values[11]})
 		case "attachment":
 			if req.Kind == "po_hold_investigation" {
 				return result, errRoleAction
