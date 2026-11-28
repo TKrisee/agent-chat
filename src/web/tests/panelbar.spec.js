@@ -19,9 +19,9 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
     'X-AgentChat-Update-Available':'true', 'X-AgentChat-Update-Current':'0.5.0', 'X-AgentChat-Update-State':'idle',
   }}));
   await page.goto(serviceURL);
-  const weekly=page.getByRole('button', {name:'Weekly · 53% left, open settings'});
+  const weekly=page.getByRole('link', {name:'Weekly · 53% left, open settings'});
   await expect(weekly).toBeVisible();
-  for (const button of [weekly, page.getByRole('button', {name:'Settings', exact:true})]) {
+  for (const button of [weekly, page.getByRole('link', {name:'Settings', exact:true})]) {
     await expect.poll(() => button.evaluateAll(elements => {
       const target = elements[0]?.getBoundingClientRect();
       const glyph = elements[0]?.querySelector('span')?.getBoundingClientRect();
@@ -50,7 +50,7 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   };
   await page.mouse.move(0,0);
   const pie = await paintedBounds(weekly.locator('span'));
-  const cog = await paintedBounds(page.getByRole('button', {name:'Settings', exact:true}).locator('span'));
+  const cog = await paintedBounds(page.getByRole('link', {name:'Settings', exact:true}).locator('span'));
   console.log('Painted icon bounds', {pie, cog});
   expect(pie.right).toBeGreaterThan(pie.left);
   for(const edge of ['left','top','right','bottom']) expect(Math.abs(pie[edge]-cog[edge])).toBeLessThanOrEqual(1);
@@ -72,7 +72,7 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await expect.poll(() => saved).toContain('enabled=true');
   await expect.poll(() => saved).toContain('warn_percent=40');
   await expect.poll(() => saved).toContain('reserve_percent=30');
-  await page.getByRole('button', {name:/Root conversation/}).click();
+  await page.getByRole('link', {name:/Root conversation/}).click();
   const header = page.locator('.channel-header');
   const left = header.locator('#rail-toggle');
   const right = header.locator('#work-toggle');
@@ -105,16 +105,16 @@ test('channel header retains panel controls on desktop and mobile', async ({ pag
   await right.click();
   await expect(page.locator('#work-panel')).toBeVisible();
   await left.click();
-  await page.getByRole('button', {name:'Settings', exact:true}).click();
+  await page.getByRole('link', {name:'Settings', exact:true}).click();
   await expect(header.getByRole('heading', {name:'Settings'})).toBeVisible();
   await left.click();
-  await page.getByRole('button', {name:/Root conversation/}).click();
+  await page.getByRole('link', {name:/Root conversation/}).click();
   await expect(header.getByRole('heading', {name:'Root'})).toBeVisible();
 });
 
 test('setup keeps chat unavailable until a retry is ready', async ({page, serviceURL}) => {
   let phase='downloading', source='managed', retries=0, switches=0, navigations=0;
-  page.on('framenavigated', frame=>{if(frame===page.mainFrame())navigations++;});
+  page.on('domcontentloaded',()=>navigations++);
   const headers=()=>({'X-AgentChat-Codex-State':phase,'X-AgentChat-Codex-Source':source,'X-AgentChat-Codex-Managed-Version':'0.172.0','X-AgentChat-Codex-Can-Select-Managed':'true','X-AgentChat-Codex-Can-Select-Override':'true'});
   await page.route('**/api/codex-setup**', route => {
     if(route.request().url().endsWith('/source')){switches++;source=route.request().postData()==='source=override'?'override':'managed';if(source==='managed')phase='downloading';return route.fulfill({status:202,headers:headers()});}
@@ -123,7 +123,7 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   });
   await page.goto(serviceURL);
   await expect(page.getByRole('status').filter({hasText:'Downloading Codex…'})).toContainText('Managed version 0.172.0');
-  await expect(page.getByRole('button',{name:/Root conversation/})).toBeHidden();
+  await expect(page.getByRole('link',{name:/Root conversation/})).toBeHidden();
   await expect(page.getByLabel('Message Root')).toBeHidden();
   phase='error';
   await expect(page.getByRole('status').filter({hasText:'Codex setup could not finish'})).toContainText('Managed version 0.172.0', {timeout:10000});
@@ -132,7 +132,7 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   await expect(page.getByRole('status').filter({hasText:'Codex is ready'})).toContainText('Managed version 0.172.0', {timeout:10000});
   await page.getByRole('button',{name:'Use external CLI'}).click();
   await expect.poll(()=>navigations).toBe(2);
-  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('link',{name:'Settings',exact:true}).click();
   await page.getByRole('tab',{name:'Codex setup'}).click();
   await expect(page.getByText('External CLI selected')).toBeVisible();
   await page.getByRole('button',{name:'Use managed CLI'}).click();
@@ -140,10 +140,10 @@ test('setup keeps chat unavailable until a retry is ready', async ({page, servic
   expect(navigations).toBe(2);
   phase='ready';
   await expect.poll(()=>navigations,{timeout:10000}).toBe(3);
-  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await page.getByRole('link',{name:'Settings',exact:true}).click();
   await page.getByRole('tab',{name:'Codex setup'}).click();
   await expect(page.getByText('Managed CLI selected')).toBeVisible();
   expect(switches).toBe(2);
-  await page.getByRole('button',{name:/Root conversation/}).click();
+  await page.getByRole('link',{name:/Root conversation/}).click();
   await expect(page.getByLabel('Message Root')).toBeVisible();
 });

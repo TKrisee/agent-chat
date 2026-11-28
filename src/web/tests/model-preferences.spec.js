@@ -3,8 +3,10 @@ import { test, expect } from './fixture.js';
 const empty = {reasoning:'',implementation:'',precise_edits:'',research:'',routine_checks:''};
 
 async function openSettings(page, expectedChoices = 5) {
-  await expect(page.getByLabel('Message Root')).toBeVisible();
-  await page.getByRole('button', {name:'Settings',exact:true}).click();
+  if (new URL(page.url()).pathname !== '/settings') {
+    await expect(page.getByLabel('Message Root')).toBeVisible();
+    await page.getByRole('link', {name:'Settings',exact:true}).click();
+  }
   const section = page.getByRole('region', {name:'Model preferences',exact:true});
   await expect(section.getByRole('combobox')).toHaveCount(expectedChoices);
   return section;

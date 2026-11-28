@@ -5,7 +5,7 @@ import {renderProjectActivity} from './project-activity';
 import './project-activity.css';
 import {renderMessageMarkdown, mentionsOperator} from './message-markdown';
 import {modelPreferencesDirty, mountModelPreferences} from './model-preferences';
-import {closeSettingsSelect} from './settings-select';
+import {agentPath, groupPath, routeAt, settingsPath, settingsSections, type AppRoute, type SettingsSection} from './routes';
 type Attachment = {id:string; name:string; media_type:string; url:string};
 type MessageCommand = {kind:'backlog'|'recover_report'; project_id?:string; task_id?:string};
 type Message = {id:string; position?:number; room_id:string; notice_detail?:'scope_request'; sender:string; recipient:string; role:string; text:string; at:string; task_id?:string; project_id?:string; attachments?:Attachment[]; reply_to?:string; operator_read_at?:string; mention_ids?:string[]; approval_id?:string; command?:MessageCommand};
@@ -84,8 +84,6 @@ function renderUpdate():void {
 }
 type WeeklyUsage={known:boolean;remaining:number|null;reset:number|null;observed:number|null;enabled:boolean;warn:number;reserve:number;paused:boolean};
 let weeklyUsage:WeeklyUsage|null=null;let weeklyError='';let settingsOpen=true;let guardEnabled=false;let guardWarn='40';let guardReserve='30';let settingsDirty=false;let savingGuard=false;
-const settingsSections=[['models','Models'],['providers','Local providers'],['usage','Usage limits'],['codex','Codex setup'],['updates','Updates']] as const;
-type SettingsSection=typeof settingsSections[number][0];
 let selectedSettingsSection:SettingsSection='models';
 function numberHeader(r:Response,key:string):number|null {const raw=r.headers.get(key);if(raw===null || raw.trim()==='')return null;const n=Number(raw);return Number.isFinite(n)?n:null;}
 async function loadWeeklyUsage(body?:URLSearchParams):Promise<void> {
@@ -124,7 +122,11 @@ async function checkSetup(retry=false, source?:'managed'|'override'):Promise<voi
   setupCanRetry=next==='error';setupError=next==='error'?(await r.text()):'';
   setupReady=next==='ready'||next==='not_required';
   if(!setupReady){setupBlocked=true;settingsOpen=true;selectedSettingsSection='codex';}
-  else {if(!setupBlocked && !source && !pendingSourceReload)settingsOpen=false;if(!dataStarted){dataStarted=true;void refresh();void updateRequest();void loadWeeklyUsage();}}
+  else {
+   if(!dataStarted && setupBlocked && location.pathname==='/')history.replaceState(null,'',settingsPath('codex'));
+   applyLocation();
+   if(!dataStarted){dataStarted=true;void refresh();void updateRequest();void loadWeeklyUsage();}
+  }
  } catch {if(source)setupSwitchError='Could not confirm the CLI selection. Check setup before trying again.';else {setupState='error';setupError='Waiting for the Agent Chat service.';setupCanRetry=false;setupReady=false;setupBlocked=true;settingsOpen=true;selectedSettingsSection='codex';}}
  finally{setupBusy=false;const current=[setupState,setupSource,setupVersion,setupError,setupReady,setupCanRetry,setupCanManaged,setupCanOverride].join('|');if(source || retry || previous!==current)render();if(pendingSourceReload && setupState==='ready' && setupSource===pendingSourceReload && !hasUnsentWork() && !expectedUpdate && !updateRestarting && !updateBusy && !reloadTriggered){reloadTriggered=true;pendingSourceReload=null;window.location.reload();}}
 }
@@ -153,7 +155,7 @@ function settingsMarkup():string {
   };
   const tabs=settingsSections.map(([id,label])=>{
    const selected=id===selectedSettingsSection;
-   return `<button id="settings-tab-${id}" type="button" role="tab" data-settings-tab="${id}" aria-controls="settings-section-${id}" aria-selected="${selected}" tabindex="${selected?0:-1}">${label}</button>`;
+   return `<a id="settings-tab-${id}" href="${settingsPath(id)}" role="tab" data-route data-settings-tab aria-controls="settings-section-${id}" aria-selected="${selected}" tabindex="${selected?0:-1}">${label}</a>`;
   }).join('');
   const panels=settingsSections.map(([id])=>`<div id="settings-section-${id}" class="settings-section" role="tabpanel" aria-labelledby="settings-tab-${id}" tabindex="0" ${id===selectedSettingsSection?'':'hidden'}>${bodies[id]}</div>`).join('');
   content=`<div class="settings-tabs" role="tablist" aria-label="Settings sections">${tabs}</div>${panels}`;
@@ -163,23 +165,7 @@ function settingsMarkup():string {
 function bindSettingsSections(page:HTMLElement):void {
  const list=page.querySelector<HTMLElement>('.settings-tabs');
  if(!list)return;
- const tabs=Array.from(list.querySelectorAll<HTMLButtonElement>('[data-settings-tab]'));
- function activate(tab:HTMLButtonElement) {
-  const section=tab.dataset.settingsTab as SettingsSection;
-  if(section!==selectedSettingsSection){
-   closeSettingsSelect();
-   selectedSettingsSection=section;
-   for(const choice of tabs){
-    const selected=choice===tab;
-    choice.tabIndex=selected?0:-1;
-    choice.setAttribute('aria-selected',String(selected));
-    page.querySelector<HTMLElement>(`#settings-section-${choice.dataset.settingsTab}`)!.hidden=!selected;
-   }
-   page.scrollTop=0;
-  }
-  tab.focus({preventScroll:true});
- }
- for(const tab of tabs)tab.onclick=()=>activate(tab);
+ const tabs=Array.from(list.querySelectorAll<HTMLAnchorElement>('[data-settings-tab]'));
  list.addEventListener('keydown',event=>{
   const index=tabs.findIndex(tab=>tab===event.target);
   if(index<0 || event.altKey || event.ctrlKey || event.metaKey)return;
@@ -189,10 +175,12 @@ function bindSettingsSections(page:HTMLElement):void {
    case 'ArrowRight': next=(index+1)%tabs.length; break;
    case 'Home': next=0; break;
    case 'End': next=tabs.length-1; break;
+   case ' ': next=index; break;
    default:return;
   }
   event.preventDefault();
-  activate(tabs[next]);
+  const tab=tabs[next];
+  navigate(tab.pathname,tab.id);
  });
 }
 const workPanelKey = 'agent-chat.work-panel';
@@ -208,16 +196,89 @@ const selectionRecipientKey = 'agent-chat.selection.recipient';
 const selectionProjectKey = 'agent-chat.selection.project';
 let selectionReady = false;
 let selectionEpoch=0;
-function rememberSelection() { selectionEpoch++;try { sessionStorage.setItem(selectionRecipientKey,recipient);sessionStorage.setItem(selectionProjectKey,selectedProjectId); } catch { /* Storage may be unavailable. */ } }
-function restoreSelection() {
+let routePending=false;
+let routeNotice='';
+type ChatSelection={recipient:string;projectId:string};
+const rootSelection:ChatSelection={recipient:'root',projectId:''};
+function storedChat():ChatSelection {
  let savedRecipient = 'root', savedProject = '';
  try { savedRecipient=sessionStorage.getItem(selectionRecipientKey) || 'root';savedProject=sessionStorage.getItem(selectionProjectKey) || ''; } catch { /* Use the default. */ }
  const validProject=!!savedProject && state.projects.some(p=>p.id===savedProject);
- if(savedRecipient==='root' && !savedProject){recipient='root';selectedProjectId='';}
- else if(validProject && savedRecipient==='group:'+savedProject){recipient=savedRecipient;selectedProjectId=savedProject;}
- else if(validProject && state.agents.some(a=>a.id===savedRecipient && a.project_id===savedProject)){recipient=savedRecipient;selectedProjectId=savedProject;}
- else {recipient='root';selectedProjectId='';}
- selectionReady=true;rememberSelection();
+ if(validProject && (savedRecipient==='group:'+savedProject || state.agents.some(a=>a.id===savedRecipient && a.project_id===savedProject))){
+  return {recipient:savedRecipient,projectId:savedProject};
+ }
+ return rootSelection;
+}
+function pathForChat(target:ChatSelection):string {
+ if(!target.projectId)return '/root';
+ if(target.recipient==='group:'+target.projectId){
+  const group=state.projects.find(p=>p.id===target.projectId);
+  if(group)return groupPath(group);
+ }
+ return agentPath(target.recipient);
+}
+function chatForRoute(route:AppRoute):ChatSelection|undefined {
+ if(route.kind==='root')return rootSelection;
+ if(route.kind==='group' && state.projects.some(p=>p.id===route.id))return {recipient:'group:'+route.id,projectId:route.id};
+ if(route.kind==='agent'){
+  const agent=state.agents.find(a=>a.id===route.id && !!a.project_id);
+  if(agent && state.projects.some(p=>p.id===agent.project_id))return {recipient:agent.id,projectId:agent.project_id};
+ }
+}
+function applyLocation(restoreStoredChat=false):void {
+ if(!setupReady)return;
+ const route=routeAt(location.pathname);
+ const nextSettings=route.kind==='settings';
+ const pending=!selectionReady && (route.kind==='legacy' || route.kind==='group' || route.kind==='agent');
+ let target:ChatSelection|undefined;
+ if(route.kind==='settings'){
+  if(restoreStoredChat)target=storedChat();
+  if(selectedSettingsSection!==route.section){
+   selectedSettingsSection=route.section;
+   const page=app.querySelector<HTMLElement>('.settings-page');
+   if(page)page.scrollTop=0;
+  }
+ } else if(!pending){
+  target=route.kind==='legacy'?storedChat():chatForRoute(route);
+  if(!target){
+   target=rootSelection;
+   routeNotice='This conversation link is unavailable. Open a conversation from the sidebar.';
+   history.replaceState(null,'','/root');
+  }else if(route.kind==='legacy'){
+   history.replaceState(null,'',pathForChat(target));
+  }
+ }
+ const chatChanged=!!target && (target.recipient!==recipient || target.projectId!==selectedProjectId);
+ const contextChanged=chatChanged || nextSettings!==settingsOpen || pending!==routePending;
+ if(contextChanged){
+  if(!settingsOpen && !routePending && renderedRecipient===recipient){
+   const scroll=app.querySelector<HTMLElement>('#chat-scroll');
+   if(scroll)scrollByRecipient.set(recipient,scroll.scrollTop);
+  }
+  if(settingsOpen || pending)renderedRecipient='';
+  mentionPickerTarget='';mentionQuery='';
+  selectionEpoch++;
+ }
+ settingsOpen=nextSettings;
+ routePending=pending;
+ if(target){
+  recipient=target.recipient;
+  selectedProjectId=target.projectId;
+  try { sessionStorage.setItem(selectionRecipientKey,recipient);sessionStorage.setItem(selectionProjectKey,selectedProjectId); } catch { /* Storage may be unavailable. */ }
+ }
+ if(contextChanged)readReceipts.contextChanged();
+}
+function showLocation(focus?:string):void {
+ routeNotice='';
+ mobileNav=false;
+ applyLocation();
+ render();
+ const target=focus?document.getElementById(focus):app.querySelector<HTMLElement>('.channel-header h1');
+ target?.focus({preventScroll:true});
+}
+function navigate(path:string, focus?:string):void {
+ if(location.pathname!==path)history.pushState(null,'',path);
+ showLocation(focus);
 }
 const railKey='agent-chat.sidebar-collapsed';
 const narrowLayout=window.matchMedia('(max-width: 760px)');
@@ -336,7 +397,7 @@ function rememberScroll(scroll:HTMLElement):void {
 }
 function restoreResizeAnchor():void {
  const saved=resizeAnchor, scroll=app.querySelector<HTMLElement>('#chat-scroll');
- if(!saved || !scroll || saved.target!==recipient || saved.epoch!==selectionEpoch || settingsOpen)return;
+ if(!saved || !scroll || saved.target!==recipient || saved.epoch!==selectionEpoch || settingsOpen || routePending)return;
  if(saved.bottom)scroll.scrollTop=scroll.scrollHeight;
  else if(saved.id){const item=Array.from(scroll.querySelectorAll<HTMLElement>('[data-message-id]')).find(el=>el.dataset.messageId===saved.id);if(item)scroll.scrollTop+=item.getBoundingClientRect().top-scroll.getBoundingClientRect().top-saved.offset;}
  scrollByRecipient.set(recipient,scroll.scrollTop);rememberScroll(scroll);
@@ -393,8 +454,8 @@ const inGroup = () => !!selectedProjectId && recipient==='group:'+selectedProjec
 const projectAgents = (id:string) => state.agents.filter(a=>a.project_id===id);
 const agentChoices = (id:string) => {
  const agents=projectAgents(id), past=agents.filter(a=>a.one_shot_retired), current=agents.filter(a=>!a.one_shot_retired);
- const button=(a:Agent)=>`<button type="button" class="agent-choice ${recipient===a.id?'selected':''}" data-agent="${esc(a.id)}" aria-label="Chat with ${esc(a.name)}, ${esc(memberActivity(a).label)}, ${unread(a.id)} unread"><span>${esc(a.name)}</span><span class="activity-dot ${memberActivity(a).active?'busy':''}" aria-hidden="true" title="${esc(memberActivity(a).label)}"></span>${unreadBadge(a.id)}</button>`;
- const key='past-agents:'+id;return current.map(button).join('')+(past.length?`<details data-diagnostic="${esc(key)}" ${openDetails.has(key)?'open':''}><summary>Past one-shot workers (${past.length}) · ${past.reduce((n,a)=>n+unread(a.id),0)} unread</summary>${past.map(button).join('')}</details>`:'');
+ const link=(a:Agent)=>`<a href="${esc(agentPath(a.id))}" class="agent-choice ${recipient===a.id?'selected':''}" data-route data-agent="${esc(a.id)}" ${!settingsOpen && recipient===a.id?'aria-current="page"':''} aria-label="Chat with ${esc(a.name)}, ${esc(memberActivity(a).label)}, ${unread(a.id)} unread"><span>${esc(a.name)}</span><span class="activity-dot ${memberActivity(a).active?'busy':''}" aria-hidden="true" title="${esc(memberActivity(a).label)}"></span>${unreadBadge(a.id)}</a>`;
+ const key='past-agents:'+id;return current.map(link).join('')+(past.length?`<details data-diagnostic="${esc(key)}" ${openDetails.has(key)?'open':''}><summary>Past one-shot workers (${past.length}) · ${past.reduce((n,a)=>n+unread(a.id),0)} unread</summary>${past.map(link).join('')}</details>`:'');
 };
 const projectUnread = (id:string) => unread('group:'+id)+projectAgents(id).reduce((count,a)=>count+unread(a.id),0);
 const projectBadge = (id:string) => projectUnread(id) ? `<span class="unread" aria-label="${projectUnread(id)} unread messages">${projectUnread(id)}</span>` : '';
@@ -479,7 +540,7 @@ function render() {
  const toggleFocused = document.activeElement?.id === 'work-toggle';
  const oldInput = app.querySelector<HTMLTextAreaElement>('#message');
  const selection = focused ? [oldInput?.selectionStart || 0, oldInput?.selectionEnd || 0] : null;
- const p=project(); const group=inGroup(); const msgs=state.messages.filter(m => m.room_id===roomFor(recipient)); const agents=p?projectAgents(p.id):[]; const subagents=agents.filter(a=>!!a.parent_id && agents.some(parent=>parent.id===a.parent_id));
+ const p=project(); const group=inGroup(); const msgs=routePending ? [] : state.messages.filter(m => m.room_id===roomFor(recipient)); const agents=p?projectAgents(p.id):[]; const subagents=agents.filter(a=>!!a.parent_id && agents.some(parent=>parent.id===a.parent_id));
  const groupUnread = group ? msgs.filter(m=>readable(m) && !m.operator_read_at) : [];
  const firstUnread = groupUnread[0];
  const latestRead = group ? msgs.filter(m=>readable(m) && !!m.operator_read_at).at(-1) : undefined;
@@ -494,7 +555,7 @@ function render() {
  const slashOptions=slashPrefix && slashDismissed!==recipient+':'+slashPrefix && !pendingId(recipient)?slashCommands.filter(c=>c.name.startsWith(slashPrefix)):[];
  slashIndex=Math.max(0,Math.min(slashIndex,slashOptions.length-1));
  const tasks=state.tasks.filter(t=>!p||t.project_id===p.id).slice(-5).reverse();
- app.innerHTML=`<div class="shell"><aside id="conversation-panel" class="sidebar ${mobileNav?'open':''} ${railCollapsed?'rail-collapsed':''}" aria-label="Conversations" ${narrowLayout.matches && !mobileNav?'inert':''}><div class="brand"><span class="brandmark">✳</span><div><b>Agent Chat</b><small>YOUR WORKSPACE</small></div></div><div class="conversation-navigation" ${setupReady?'':'hidden'}><div class="side-heading">CONVERSATIONS</div><button class="conversation ${recipient==='root'?'selected':''}" data-recipient="root" aria-label="Root conversation, ${unread('root')} unread"><span class="avatar root-avatar">✳</span><span><b>Root</b><small>General conversation</small></span>${unreadBadge('root')}<span class="chevron">›</span></button><div class="side-heading projects-heading">PROJECTS <span>${state.projects.length}</span></div><div class="project-list">${state.projects.length ? state.projects.map(x=>`<button class="conversation ${selectedProjectId===x.id?'selected':''}" data-project="${esc(x.id)}" aria-label="${esc(x.name)} project, ${projectUnread(x.id)} unread"><span class="avatar project-avatar">${esc(x.name.slice(0,1).toUpperCase())}</span><span><b>${esc(x.name)}</b><small>${esc(x.status || 'Project')}</small></span>${projectBadge(x.id)}<span class="chevron">›</span></button>${selectedProjectId===x.id?`<div class="project-agents"><div class="agent-count">${projectAgents(x.id).length} agents · ${projectAgents(x.id).filter(a=>!!a.parent_id && projectAgents(x.id).some(parent=>parent.id===a.parent_id)).length} subagents</div>${agentChoices(x.id)}</div>`:''}`).join('') : '<p class="side-empty">Projects will appear here.</p>'}</div></div><div class="sidebar-tools"><button type="button" id="weekly-control" ${setupReady?'':'hidden'} aria-label="${esc(weeklyLabel())}, open settings" aria-describedby="weekly-tooltip"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 3.5v8.5h8.5" stroke-linejoin="round"></path><path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5H12z" fill="currentColor" stroke="none" opacity=".45"></path></svg></span></button><button type="button" id="open-settings" aria-label="Settings"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="5.5"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1m7.8 7.8L18 18M18 6l-2.1 2.1m-7.8 7.8L6 18"></path></svg></span></button></div></aside><main class="main"><div class="content"><section class="chat" aria-label="Conversation with ${esc(group?p?.name || 'project':name(recipient))}"><header class="channel-header"><button type="button" class="rail-toggle" id="rail-toggle" aria-label="${(narrowLayout.matches ? mobileNav : !railCollapsed)?'Collapse':'Expand'} conversations" aria-expanded="${narrowLayout.matches ? mobileNav : !railCollapsed}" aria-controls="conversation-panel">${panelToggleIcon}</button><h1 tabindex="-1">${settingsOpen?'Settings':esc(group?p?.name || 'Project':name(recipient))}</h1><button id="work-toggle" class="work-toggle" type="button" aria-controls="work-panel-content" aria-expanded="${workPanelVisible}" aria-label="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" title="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" ${settingsOpen?'hidden':''}>${panelToggleIcon}</button></header>${settingsMarkup()}${!settingsOpen && firstUnread ? `<div class="group-unread-banner" role="status"><button type="button" id="jump-group-read" aria-label="${latestRead ? 'Jump to latest read message' : 'Jump to first unread message'}">${groupUnread.length} unread · since ${esc(date(firstUnread.at))}</button><button type="button" id="mark-group-read">Mark as read</button></div>` : ''}<div class="chat-scroll" id="chat-scroll" ${settingsOpen?'hidden':''}>${recipient==='root' && stopReceipt?`<p class="notice" role="status">${esc(stopReceipt)}</p>`:''}${loading?'<p class="notice" role="status">Loading conversation…</p>':''}${error?`<div class="notice error" role="alert">${esc(error)} <button id="retry">Try again</button></div>`:''}${!loading&&!error&&!msgs.length?'<div class="empty">No messages yet. Start the conversation below.</div>':''}<div class="messages">${msgs.map(m=>{const command=commandPresentation(m);return (m.id===firstUnread?.id ? `<div class="unread-divider" role="separator" aria-label="First unread message"><span>Unread messages</span></div>` : '') + (command ? renderCommandMessage(m,command,msgs) : m.sender==='service' && m.role==='system' && m.room_id.startsWith('group:') ? `<article class="workflow-notice" data-message-id="${esc(m.id)}" aria-label="Agent Chat workflow notice"><div><strong>Agent Chat</strong><span>${esc(date(m.at))}</span></div><p>${esc(m.text)}</p>${m.notice_detail==='scope_request'?`<button type="button" class="scope-toggle" data-scope="${esc(m.id)}" aria-expanded="${openScopes.has(m.id)}" aria-controls="scope-${esc(m.id)}">${openScopes.has(m.id)?'Hide scope request':'View scope request'}</button><div id="scope-${esc(m.id)}" class="scope-detail" ${openScopes.has(m.id)?'':'hidden'}>${scopeDetails.get(m.id)?.loading?'<span role="status">Loading scope request…</span>':scopeDetails.get(m.id)?.error?`<span role="alert">${esc(scopeDetails.get(m.id)?.error)}</span>`:`<pre>${esc(scopeDetails.get(m.id)?.text || '')}</pre>`}</div>`:''}</article>` : `<article class="message ${linkedApproval(m)?.status==='pending' ? 'pending-approval ' : ''}${group && m.sender!=='operator' && m.sender!=='service' && m.role!=='system' && ((m.mention_ids||[]).includes('operator') || mentionsOperator(m.text) || (!!m.reply_to && state.messages.some(parent=>parent.id===m.reply_to && parent.room_id===m.room_id && parent.sender==='operator')))?'operator-mention':''}" data-message-id="${esc(m.id)}"><div class="message-avatar ${m.sender==='root'?'root-avatar':''}">${esc(name(m.sender).slice(0,1).toUpperCase())}</div><div class="message-body"><div class="message-meta"><strong>${esc(name(m.sender))}</strong>${group?`<span>→ ${esc(name(m.recipient))}</span>`:''}<span>${esc(date(m.at))}</span></div>${m.reply_to?replyQuote(m.reply_to,msgs):''}<div class="message-text" data-markdown-id="${esc(m.id)}">${esc(m.text)}</div>${messageActions(m)}${approvalMarkup(m)}${m.attachments?.length?`<div class="attachments">${attachments(m.attachments)}</div>`:''}</div></article>`);}).join('')}</div></div>${commandReceipts.get(recipient)?`<p class="notice command-receipt ${commandReceipts.get(recipient)?.fading?'fading':''}" role="status">${esc(commandReceipts.get(recipient)?.text)}</p>`:''}<form class="composer" id="composer" ${settingsOpen?'hidden':''} aria-busy="${(sending&&recipient===sendTarget)||(stopSending&&recipient==='root')}"><div class="composer-heading"><label for="message">${group?`Message ${esc(p?.name || 'project')} chat`:`Message ${esc(p?name(recipient):'Root')}`}</label>${activity.label?`<div class="agent-activity" role="status" aria-live="polite"><span class="activity-dot ${activity.active?'busy':''}" aria-hidden="true"></span>${esc(activity.label)}</div>`:''}</div>${group&&selectedMentions.length?`<div class="mention-selected" aria-label="Selected mentions">${selectedMentions.map(m=>`<button type="button" data-unmention="${esc(m.id)}" aria-label="Remove mention ${esc(m.label)}" ${pendingId(recipient)?'disabled':''}>@${esc(m.label)} ×</button>`).join('')}</div>`:''}${slashOptions.length?`<div class="mention-options" role="listbox" aria-label="Slash commands">${slashOptions.map((c,i)=>`<button type="button" role="option" aria-selected="${i===slashIndex}" data-slash-choice="${esc(c.name)}"><strong>${esc(c.usage)}</strong><small>${esc(c.description)}</small></button>`).join('')}</div>`:''}${mentionOpen?`<div id="mention-options" class="mention-options" role="group" aria-label="Choose a project agent">${mentionOptions.length?mentionOptions.map(a=>`<button type="button" data-mention-choice="${esc(a.id)}" aria-label="Mention ${esc(a.name)}, ${esc(a.role)}, ${esc(a.id)}"><strong>${esc(a.name)}</strong><small>${esc(a.role)} · ${esc(a.id)}</small></button>`).join(''):selectedMentions.length>=32?'<span>Up to 32 agents per message.</span>':'<span>No matching agents.</span>'}</div>`:''}${activity.guidance?`<div class="status-guidance"><span>${esc(activity.guidance)}</span>${activity.detail?`<details id="status-details" data-diagnostic="status:${esc(activity.key || '')}" ${activity.key && openDetails.has('status:'+activity.key)?'open':''}><summary id="status-details-summary">Details</summary><p>${esc(activity.detail)}</p></details>`:''}</div>`:''}${(pendingId(recipient)?pendingReply(recipient):draftReply(recipient))?`<div class="compose-reply"><div><small>Replying to</small>${quote(pendingId(recipient)?pendingReply(recipient):draftReply(recipient),msgs)}</div><button type="button" id="cancel-reply" aria-label="Cancel reply" ${pendingId(recipient)?'disabled':''}>×</button></div>`:''}<div role="status" aria-live="polite" class="copy-feedback">${esc(copyFeedback)}</div><div class="compose-box">${fileErrors.has(recipient)?`<p class="notice" role="alert">${esc(fileErrors.get(recipient)!)}</p>`:''}${draftFiles(recipient).length?`<div class="file-list" role="region" aria-label="Attachments" tabindex="0">${draftFiles(recipient).map((f,i)=>draftFileCard(f,i,!!pendingId(recipient))).join('')}</div>`:''}<div class="compose-entry"><div class="attachment-control"><button type="button" id="attach-files" class="attach-button" aria-label="Add attachment" aria-expanded="${attachmentOpen}" aria-controls="attachment-menu" title="Add attachment" ${pendingId(recipient)&&!missingPendingFiles(recipient)?'disabled':''}>＋</button><div id="attachment-menu" class="attachment-menu" ${attachmentOpen?'':'hidden'}><button type="button" id="upload-file">Upload a file</button></div></div><span class="sr-only" id="composer-help">Press Enter to send or retry delivery. Press Shift and Enter for a new line.</span><textarea id="message" aria-describedby="composer-help" enterkeyhint="send" rows="1" placeholder="${group?'Write a shared message…':'Write a message…'}" ${group&&pendingId(recipient)?'readonly':''}>${esc(group&&pendingId(recipient)?pendingText(recipient):pendingId(recipient) && !draft() ? pendingText(recipient) : draft())}</textarea></div><span class="sr-only" role="status" aria-live="polite">${composeNotice || (pendingId(recipient)?conflicts.has(recipient)?'The message could not be retried because its ID conflicts with another request.':retryReady.has(recipient)?'Press Enter to retry the saved message.':'Checking the saved message.':'')}</span></div></form></section><aside id="work-panel" class="context ${workPanelVisible ? '' : 'collapsed'}" aria-label="Work context" ${settingsOpen?'hidden':''} ${workPanelVisible ? '' : 'inert'}><div id="work-panel-content" class="context-body">${p?activityMarkup(p.id):`<div class="context-top"><span class="eyebrow">AT A GLANCE</span><h2>Your work</h2><p>Recent work across your workspace.</p></div><div class="context-heading"><h3>Recent work</h3><span>${tasks.length}</span></div>${tasks.length?tasks.map(t=>`<div class="task"><span class="task-dot"></span><div><strong>${esc(t.title)}</strong><small>${esc(t.status)} · ${esc(name(t.owner_id))}</small>${taskDiagnostics(t)}</div></div>`).join(''):'<p class="context-empty">No recent work to show yet.</p>'}`}</div></aside></div></main></div><div id="weekly-tooltip" class="weekly-tooltip" role="tooltip" hidden>${esc(weeklyLabel())}</div>`;
+ app.innerHTML=`<div class="shell"><aside id="conversation-panel" class="sidebar ${mobileNav?'open':''} ${railCollapsed?'rail-collapsed':''}" aria-label="Conversations" ${narrowLayout.matches && !mobileNav?'inert':''}><div class="brand"><span class="brandmark">✳</span><div><b>Agent Chat</b><small>YOUR WORKSPACE</small></div></div><div class="conversation-navigation" ${setupReady?'':'hidden'}><div class="side-heading">CONVERSATIONS</div><a class="conversation ${!settingsOpen && !routePending && recipient==='root'?'selected':''}" href="/root" data-route data-recipient="root" ${!settingsOpen && !routePending && recipient==='root'?'aria-current="page"':''} aria-label="Root conversation, ${unread('root')} unread"><span class="avatar root-avatar">✳</span><span><b>Root</b><small>General conversation</small></span>${unreadBadge('root')}<span class="chevron">›</span></a><div class="side-heading projects-heading">PROJECTS <span>${state.projects.length}</span></div><div class="project-list">${state.projects.length ? state.projects.map(x=>`<a class="conversation ${selectedProjectId===x.id?'selected':''}" href="${esc(groupPath(x))}" data-route data-project="${esc(x.id)}" ${!settingsOpen && inGroup() && selectedProjectId===x.id?'aria-current="page"':''} aria-label="${esc(x.name)} project, ${projectUnread(x.id)} unread"><span class="avatar project-avatar">${esc(x.name.slice(0,1).toUpperCase())}</span><span><b>${esc(x.name)}</b><small>${esc(x.status || 'Project')}</small></span>${projectBadge(x.id)}<span class="chevron">›</span></a>${selectedProjectId===x.id?`<div class="project-agents"><div class="agent-count">${projectAgents(x.id).length} agents · ${projectAgents(x.id).filter(a=>!!a.parent_id && projectAgents(x.id).some(parent=>parent.id===a.parent_id)).length} subagents</div>${agentChoices(x.id)}</div>`:''}`).join('') : '<p class="side-empty">Projects will appear here.</p>'}</div></div><div class="sidebar-tools"><a href="/settings/usage" data-route id="weekly-control" ${setupReady?'':'hidden'} aria-label="${esc(weeklyLabel())}, open settings" aria-describedby="weekly-tooltip"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5"></circle><path d="M12 3.5v8.5h8.5" stroke-linejoin="round"></path><path d="M12 3.5a8.5 8.5 0 0 1 8.5 8.5H12z" fill="currentColor" stroke="none" opacity=".45"></path></svg></span></a><a href="/settings" data-route id="open-settings" aria-label="Settings"><span aria-hidden="true"><svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="12" r="5.5"></circle><circle cx="12" cy="12" r="2"></circle><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1m7.8 7.8L18 18M18 6l-2.1 2.1m-7.8 7.8L6 18"></path></svg></span></a></div></aside><main class="main"><div class="content"><section class="chat" aria-label="Conversation with ${esc(group?p?.name || 'project':name(recipient))}"><header class="channel-header"><button type="button" class="rail-toggle" id="rail-toggle" aria-label="${(narrowLayout.matches ? mobileNav : !railCollapsed)?'Collapse':'Expand'} conversations" aria-expanded="${narrowLayout.matches ? mobileNav : !railCollapsed}" aria-controls="conversation-panel">${panelToggleIcon}</button><h1 tabindex="-1">${settingsOpen?'Settings':routePending?'Conversation':esc(group?p?.name || 'Project':name(recipient))}</h1><button id="work-toggle" class="work-toggle" type="button" aria-controls="work-panel-content" aria-expanded="${workPanelVisible}" aria-label="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" title="${workPanelVisible ? 'Collapse work panel' : 'Expand work panel'}" ${settingsOpen || routePending?'hidden':''}>${panelToggleIcon}</button></header>${settingsMarkup()}${routeNotice && !settingsOpen?`<p class="notice route-notice" role="status">${esc(routeNotice)}</p>` : ''}${!settingsOpen && firstUnread ? `<div class="group-unread-banner" role="status"><button type="button" id="jump-group-read" aria-label="${latestRead ? 'Jump to latest read message' : 'Jump to first unread message'}">${groupUnread.length} unread · since ${esc(date(firstUnread.at))}</button><button type="button" id="mark-group-read">Mark as read</button></div>` : ''}<div class="chat-scroll" id="chat-scroll" ${settingsOpen?'hidden':''}>${!routePending && recipient==='root' && stopReceipt?`<p class="notice" role="status">${esc(stopReceipt)}</p>`:''}${(loading || routePending) && !error?'<p class="notice" role="status">Loading conversation…</p>':''}${error?`<div class="notice error" role="alert">${esc(error)} <button id="retry">Try again</button></div>`:''}${!routePending&&!loading&&!error&&!msgs.length?'<div class="empty">No messages yet. Start the conversation below.</div>':''}<div class="messages">${msgs.map(m=>{const command=commandPresentation(m);return (m.id===firstUnread?.id ? `<div class="unread-divider" role="separator" aria-label="First unread message"><span>Unread messages</span></div>` : '') + (command ? renderCommandMessage(m,command,msgs) : m.sender==='service' && m.role==='system' && m.room_id.startsWith('group:') ? `<article class="workflow-notice" data-message-id="${esc(m.id)}" aria-label="Agent Chat workflow notice"><div><strong>Agent Chat</strong><span>${esc(date(m.at))}</span></div><p>${esc(m.text)}</p>${m.notice_detail==='scope_request'?`<button type="button" class="scope-toggle" data-scope="${esc(m.id)}" aria-expanded="${openScopes.has(m.id)}" aria-controls="scope-${esc(m.id)}">${openScopes.has(m.id)?'Hide scope request':'View scope request'}</button><div id="scope-${esc(m.id)}" class="scope-detail" ${openScopes.has(m.id)?'':'hidden'}>${scopeDetails.get(m.id)?.loading?'<span role="status">Loading scope request…</span>':scopeDetails.get(m.id)?.error?`<span role="alert">${esc(scopeDetails.get(m.id)?.error)}</span>`:`<pre>${esc(scopeDetails.get(m.id)?.text || '')}</pre>`}</div>`:''}</article>` : `<article class="message ${linkedApproval(m)?.status==='pending' ? 'pending-approval ' : ''}${group && m.sender!=='operator' && m.sender!=='service' && m.role!=='system' && ((m.mention_ids||[]).includes('operator') || mentionsOperator(m.text) || (!!m.reply_to && state.messages.some(parent=>parent.id===m.reply_to && parent.room_id===m.room_id && parent.sender==='operator')))?'operator-mention':''}" data-message-id="${esc(m.id)}"><div class="message-avatar ${m.sender==='root'?'root-avatar':''}">${esc(name(m.sender).slice(0,1).toUpperCase())}</div><div class="message-body"><div class="message-meta"><strong>${esc(name(m.sender))}</strong>${group?`<span>→ ${esc(name(m.recipient))}</span>`:''}<span>${esc(date(m.at))}</span></div>${m.reply_to?replyQuote(m.reply_to,msgs):''}<div class="message-text" data-markdown-id="${esc(m.id)}">${esc(m.text)}</div>${messageActions(m)}${approvalMarkup(m)}${m.attachments?.length?`<div class="attachments">${attachments(m.attachments)}</div>`:''}</div></article>`);}).join('')}</div></div>${commandReceipts.get(recipient)?`<p class="notice command-receipt ${commandReceipts.get(recipient)?.fading?'fading':''}" role="status">${esc(commandReceipts.get(recipient)?.text)}</p>`:''}<form class="composer" id="composer" ${settingsOpen || routePending?'hidden':''} aria-busy="${(sending&&recipient===sendTarget)||(stopSending&&recipient==='root')}"><div class="composer-heading"><label for="message">${group?`Message ${esc(p?.name || 'project')} chat`:`Message ${esc(p?name(recipient):'Root')}`}</label>${activity.label?`<div class="agent-activity" role="status" aria-live="polite"><span class="activity-dot ${activity.active?'busy':''}" aria-hidden="true"></span>${esc(activity.label)}</div>`:''}</div>${group&&selectedMentions.length?`<div class="mention-selected" aria-label="Selected mentions">${selectedMentions.map(m=>`<button type="button" data-unmention="${esc(m.id)}" aria-label="Remove mention ${esc(m.label)}" ${pendingId(recipient)?'disabled':''}>@${esc(m.label)} ×</button>`).join('')}</div>`:''}${slashOptions.length?`<div class="mention-options" role="listbox" aria-label="Slash commands">${slashOptions.map((c,i)=>`<button type="button" role="option" aria-selected="${i===slashIndex}" data-slash-choice="${esc(c.name)}"><strong>${esc(c.usage)}</strong><small>${esc(c.description)}</small></button>`).join('')}</div>`:''}${mentionOpen?`<div id="mention-options" class="mention-options" role="group" aria-label="Choose a project agent">${mentionOptions.length?mentionOptions.map(a=>`<button type="button" data-mention-choice="${esc(a.id)}" aria-label="Mention ${esc(a.name)}, ${esc(a.role)}, ${esc(a.id)}"><strong>${esc(a.name)}</strong><small>${esc(a.role)} · ${esc(a.id)}</small></button>`).join(''):selectedMentions.length>=32?'<span>Up to 32 agents per message.</span>':'<span>No matching agents.</span>'}</div>`:''}${activity.guidance?`<div class="status-guidance"><span>${esc(activity.guidance)}</span>${activity.detail?`<details id="status-details" data-diagnostic="status:${esc(activity.key || '')}" ${activity.key && openDetails.has('status:'+activity.key)?'open':''}><summary id="status-details-summary">Details</summary><p>${esc(activity.detail)}</p></details>`:''}</div>`:''}${(pendingId(recipient)?pendingReply(recipient):draftReply(recipient))?`<div class="compose-reply"><div><small>Replying to</small>${quote(pendingId(recipient)?pendingReply(recipient):draftReply(recipient),msgs)}</div><button type="button" id="cancel-reply" aria-label="Cancel reply" ${pendingId(recipient)?'disabled':''}>×</button></div>`:''}<div role="status" aria-live="polite" class="copy-feedback">${esc(copyFeedback)}</div><div class="compose-box">${fileErrors.has(recipient)?`<p class="notice" role="alert">${esc(fileErrors.get(recipient)!)}</p>`:''}${draftFiles(recipient).length?`<div class="file-list" role="region" aria-label="Attachments" tabindex="0">${draftFiles(recipient).map((f,i)=>draftFileCard(f,i,!!pendingId(recipient))).join('')}</div>`:''}<div class="compose-entry"><div class="attachment-control"><button type="button" id="attach-files" class="attach-button" aria-label="Add attachment" aria-expanded="${attachmentOpen}" aria-controls="attachment-menu" title="Add attachment" ${pendingId(recipient)&&!missingPendingFiles(recipient)?'disabled':''}>＋</button><div id="attachment-menu" class="attachment-menu" ${attachmentOpen?'':'hidden'}><button type="button" id="upload-file">Upload a file</button></div></div><span class="sr-only" id="composer-help">Press Enter to send or retry delivery. Press Shift and Enter for a new line.</span><textarea id="message" aria-describedby="composer-help" enterkeyhint="send" rows="1" placeholder="${group?'Write a shared message…':'Write a message…'}" ${group&&pendingId(recipient)?'readonly':''}>${esc(group&&pendingId(recipient)?pendingText(recipient):pendingId(recipient) && !draft() ? pendingText(recipient) : draft())}</textarea></div><span class="sr-only" role="status" aria-live="polite">${composeNotice || (pendingId(recipient)?conflicts.has(recipient)?'The message could not be retried because its ID conflicts with another request.':retryReady.has(recipient)?'Press Enter to retry the saved message.':'Checking the saved message.':'')}</span></div></form></section><aside id="work-panel" class="context ${workPanelVisible ? '' : 'collapsed'}" aria-label="Work context" ${settingsOpen || routePending?'hidden':''} ${workPanelVisible ? '' : 'inert'}><div id="work-panel-content" class="context-body">${p?activityMarkup(p.id):`<div class="context-top"><span class="eyebrow">AT A GLANCE</span><h2>Your work</h2><p>Recent work across your workspace.</p></div><div class="context-heading"><h3>Recent work</h3><span>${tasks.length}</span></div>${tasks.length?tasks.map(t=>`<div class="task"><span class="task-dot"></span><div><strong>${esc(t.title)}</strong><small>${esc(t.status)} · ${esc(name(t.owner_id))}</small>${taskDiagnostics(t)}</div></div>`).join(''):'<p class="context-empty">No recent work to show yet.</p>'}`}</div></aside></div></main></div><div id="weekly-tooltip" class="weekly-tooltip" role="tooltip" hidden>${esc(weeklyLabel())}</div>`;
  renderUpdate();
  mountModelPreferences(app.querySelector<HTMLElement>('#model-preferences'), app.querySelector<HTMLElement>('#local-model-provider-settings'), setupReady && settingsOpen);
  const settingsPage=app.querySelector<HTMLElement>('.settings-page')!;
@@ -505,20 +566,11 @@ function render() {
  }
  app.querySelector<HTMLButtonElement>('#setup-retry')?.addEventListener('click',()=>void checkSetup(true));
  app.querySelector<HTMLButtonElement>('#setup-source')?.addEventListener('click',e=>void checkSetup(false,(e.currentTarget as HTMLButtonElement).dataset.source as 'managed'|'override'));
- const openSettings=(section?:SettingsSection)=>{
-  selectionEpoch++;
-  const scroll=app.querySelector<HTMLElement>('#chat-scroll');
-  if(scroll && !settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);
-  if(section && section!==selectedSettingsSection){
-   selectedSettingsSection=section;
-   settingsPage.scrollTop=0;
-  }
-  settingsOpen=true;
-  mobileNav=false;
-  readReceipts.contextChanged();
-  render();
-  app.querySelector<HTMLElement>('.channel-header h1')?.focus();
- };
+ app.querySelectorAll<HTMLAnchorElement>('a[data-route]').forEach(link=>link.addEventListener('click',event=>{
+  if(event.defaultPrevented || event.button!==0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey)return;
+  event.preventDefault();
+  navigate(link.pathname,link.hasAttribute('data-settings-tab')?link.id:undefined);
+ }));
  app.querySelector<HTMLButtonElement>('#mark-group-read')?.addEventListener('click', event => { (event.currentTarget as HTMLButtonElement).disabled=true; void readReceipts.markCurrentRoomRead(); });
  app.querySelector<HTMLButtonElement>('#jump-group-read')?.addEventListener('click', () => {
   const scroll=app.querySelector<HTMLElement>('#chat-scroll');
@@ -541,9 +593,7 @@ function render() {
   scroll.scrollTop+=element.getBoundingClientRect().top-scroll.getBoundingClientRect().top;
   scrollByRecipient.set(recipient,scroll.scrollTop);rememberScroll(scroll);
  }));
- app.querySelector<HTMLButtonElement>('#open-settings')!.onclick=()=>openSettings();
- const weeklyButton=app.querySelector<HTMLButtonElement>('#weekly-control')!;
- weeklyButton.onclick=()=>openSettings('usage');
+ const weeklyButton=app.querySelector<HTMLAnchorElement>('#weekly-control')!;
  const tooltip=app.querySelector<HTMLElement>('#weekly-tooltip')!;
  const showWeekly=()=>{const rect=weeklyButton.getBoundingClientRect();tooltip.style.left=`${Math.min(rect.right+8,window.innerWidth-180)}px`;tooltip.style.top=`${Math.max(8,rect.top)}px`;tooltip.hidden=false;};
  const hideWeekly=()=>{tooltip.hidden=true;};
@@ -556,9 +606,6 @@ function render() {
  });
  guardForm?.addEventListener('submit',e=>{e.preventDefault();if(savingGuard)return;savingGuard=true;const body=new URLSearchParams({enabled:String(guardEnabled),warn_percent:guardWarn,reserve_percent:guardReserve});void loadWeeklyUsage(body).finally(()=>{savingGuard=false;render();});render();});
  app.querySelectorAll<HTMLElement>('[data-markdown-id]').forEach(el=>{const message=msgs.find(m=>m.id===el.dataset.markdownId);if(message)renderMessageMarkdown(el,message.text,['operator','Root',...state.agents.filter(a=>!message.project_id || a.project_id===message.project_id).map(a=>a.name)]);});
- app.querySelectorAll<HTMLButtonElement>('[data-recipient]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;recipient=b.dataset.recipient!;selectedProjectId='';rememberSelection();mobileNav=false;readReceipts.contextChanged();const content=app.querySelector<HTMLElement>('.content');if(content)content.scrollTop=0;render();});
- app.querySelectorAll<HTMLButtonElement>('[data-project]').forEach(b=>b.onclick=()=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';mentionPickerTarget='';mentionQuery='';settingsOpen=false;selectedProjectId=b.dataset.project!;recipient='group:'+selectedProjectId;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
- app.querySelectorAll<HTMLButtonElement>('[data-agent]').forEach(b=>b.onclick=()=>{const a=state.agents.find(x=>x.id===b.dataset.agent && x.project_id===selectedProjectId);if(!a)return;const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(scroll&&!settingsOpen)scrollByRecipient.set(recipient,scroll.scrollTop);if(settingsOpen)renderedRecipient='';settingsOpen=false;recipient=a.id;rememberSelection();mobileNav=false;readReceipts.contextChanged();render();});
  const rail=app.querySelector<HTMLButtonElement>('#rail-toggle')!;
  rail.onclick=()=>{const panel=app.querySelector<HTMLElement>('#conversation-panel')!;let expanded:boolean;if(narrowLayout.matches){mobileNav=!mobileNav;panel.classList.toggle('open',mobileNav);panel.inert=!mobileNav;expanded=mobileNav;readReceipts.contextChanged();}else{railCollapsed=!railCollapsed;panel.classList.toggle('rail-collapsed',railCollapsed);expanded=!railCollapsed;try{localStorage.setItem(railKey,String(railCollapsed));}catch{}}rail.setAttribute('aria-expanded',String(expanded));rail.setAttribute('aria-label',`${expanded?'Collapse':'Expand'} conversations`);};
  const toggle = app.querySelector<HTMLButtonElement>('#work-toggle')!;
@@ -681,10 +728,10 @@ function render() {
   if (divider) newScroll.scrollTop += divider.getBoundingClientRect().top - newScroll.getBoundingClientRect().top;
  }
  if(scrollToSent){scrollByRecipient.set(recipient,newScroll.scrollTop);sendScrollIntent=null;rememberScroll(newScroll);}
- if(!resizeAnchor || resizeAnchor.target!==recipient || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight))rememberScroll(newScroll);
+ if(!routePending && (!resizeAnchor || resizeAnchor.target!==recipient || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight)))rememberScroll(newScroll);
  app.querySelector<HTMLElement>('.content')!.scrollTop=same ? oldContentTop : 0;
  app.querySelector<HTMLElement>('#work-panel-content')!.scrollTop=same ? oldPanelTop : 0;
- renderedRecipient=recipient;
+ renderedRecipient=routePending?'':recipient;
  if(selection){input.focus({preventScroll:true});input.setSelectionRange(selection[0],selection[1]);}
  else if(same && attachmentFocus && (attachmentFocus==='toggle' || attachmentOpen))app.querySelector<HTMLButtonElement>(attachmentFocus==='upload'?'#upload-file':'#attach-files')?.focus({preventScroll:true});
  else if(same && actionFocus) {const replacement=Array.from(app.querySelectorAll<HTMLElement>('[data-reply],[data-copy],[data-attachment-preview],[data-download],[data-scope]')).find(el=>el.dataset[actionFocus.key]===actionFocus.value && el.closest<HTMLElement>('[data-message-id]')?.dataset.messageId===actionMessage);replacement?.focus({preventScroll:true});}
@@ -764,9 +811,18 @@ function refresh():Promise<void> {
  lastPoll=Date.now();
  refreshInFlight=(async()=>{
   let needsRender=loading || stateStale || !!error;
+  let initialSelection=false;
   try {
    needsRender = await fetchState() || needsRender;
-   if(!selectionReady){restoreSelection();needsRender=true;}
+   if(stateCaughtUp){
+    initialSelection=!selectionReady;
+    selectionReady=true;
+    const route=routeAt(location.pathname);
+    if(initialSelection || (needsRender && (route.kind==='group' || route.kind==='agent') && !chatForRoute(route))){
+     applyLocation(initialSelection);
+     needsRender=true;
+    }
+   }
    for(const target of ['root',...state.agents.map(a=>a.id),...state.projects.map(p=>'group:'+p.id)]) {
     const id=pendingId(target);
     if(id && target.startsWith('group:') && pendingMentions(target)===null){if(retryReady.delete(target))needsRender=true;continue;}
@@ -790,7 +846,7 @@ function refresh():Promise<void> {
    stateStale=true;error=nextError;
   } finally {
    loading=false;
-   if(!settingsOpen && needsRender)render();
+   if(needsRender && (!settingsOpen || initialSelection))render();
   }
  })();
  return refreshInFlight.finally(()=>{refreshInFlight=null;});
@@ -892,7 +948,7 @@ function resizeComposer(input:HTMLTextAreaElement):void {
  input.style.height=`${input.scrollHeight}px`;
 }
 narrowLayout.addEventListener('change',()=>{mobileNav=false;readReceipts.contextChanged();render();});
-document.addEventListener('scroll',event=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(event.target===scroll && scroll && (!resizeAnchor || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight)))rememberScroll(scroll);},{capture:true,passive:true});
+document.addEventListener('scroll',event=>{const scroll=app.querySelector<HTMLElement>('#chat-scroll');if(!routePending && event.target===scroll && scroll && (!resizeAnchor || (resizeAnchor.width===window.innerWidth && resizeAnchor.height===window.innerHeight)))rememberScroll(scroll);},{capture:true,passive:true});
 window.addEventListener('resize',()=>{const input=app.querySelector<HTMLTextAreaElement>('#message');if(input)resizeComposer(input);requestAnimationFrame(restoreResizeAnchor);});
 function closeAttachmentMenu(restoreFocus=false):void {
  attachmentMenuTarget='';
@@ -903,6 +959,7 @@ function closeAttachmentMenu(restoreFocus=false):void {
 document.addEventListener('pointerdown',e=>{if(!(e.target instanceof Node) || !app.querySelector('.attachment-control')?.contains(e.target))closeAttachmentMenu();});
 document.addEventListener('keydown',e=>{const menu=app.querySelector<HTMLElement>('#attachment-menu');if(e.key==='Escape' && menu && !menu.hidden){e.preventDefault();e.stopPropagation();closeAttachmentMenu(true);}},true);
 const readReceipts = new ReadReceipts({messages:()=>state.messages,recipient:()=>recipient,obstructed:()=>!setupReady || settingsOpen || !selectionReady || mobileNav || !!document.querySelector('dialog.attachment-preview[open]'),eligible:m=>readable(m as Message),refresh});
+window.addEventListener('popstate',()=>showLocation());
 render(); void checkSetup();
 window.setInterval(()=>{if(!document.hidden && (!setupReady || pendingSourceReload))void checkSetup();},2000);
 window.setInterval(()=>{if(setupReady && !document.hidden && !settingsOpen && !settingsDirty && !savingGuard)void loadWeeklyUsage();},60000);
