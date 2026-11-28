@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.21.0](https://github.com/TKrisee/agent-chat/compare/v0.20.0...v0.21.0) (2026-11-28)
+
+
+### Features
+
+* support local model providers for project workers ([#84](https://github.com/TKrisee/agent-chat/issues/84)) ([41a2799](https://github.com/TKrisee/agent-chat/commit/41a279927dd62b31fd732f51cf99973e0875ad8c))
+
 ## [0.20.0](https://github.com/TKrisee/agent-chat/compare/v0.19.7...v0.20.0) (2026-11-27)
 
 
