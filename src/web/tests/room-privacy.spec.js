@@ -70,7 +70,7 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   await project.click();
   await expect(page.locator('.chat p').getByText('Shared untagged message', {exact:true})).toBeVisible();
   await expect(page.getByText('Private direct message', {exact:true})).toHaveCount(0);
-  await page.getByRole('button', {name:/Root conversation/}).click();
+  await page.getByRole('link', {name:/Root conversation/}).click();
   const rootComposer=page.getByLabel('Message Root');
   await rootComposer.fill('/stop missing');
   await rootComposer.press('Enter');
@@ -190,7 +190,7 @@ test('project panel shows current work once and preserves earlier uncertainty', 
   expect(hold.get('id')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   await expect(page.getByRole('status').filter({hasText:'Hold decision queued privately'})).toBeVisible();
 
-  await page.getByRole('button',{name:/Root conversation/}).click();
+  await page.getByRole('link',{name:/Root conversation/}).click();
   await expect(page.locator('[data-message-id="m5"]')).not.toHaveClass(/operator-mention/);
 });
 

@@ -32,7 +32,7 @@ test('drop and send an attachment; preserve it for retry after a failed send', a
   await composer.press('Shift+Enter');
   await expect(composer).toHaveValue('First line\n');
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBeGreaterThan(initialHeight);
-  await page.getByRole('button', { name: /Root conversation/ }).click();
+  await page.getByRole('link', { name: /Root conversation/ }).click();
   await expect(composer).toHaveValue('First line\n');
   await expect.poll(async () => ((await composer.boundingBox())?.height ?? -1)).toBeGreaterThan(initialHeight);
   await composer.fill(Array(50).fill('Long draft').join('\n'));

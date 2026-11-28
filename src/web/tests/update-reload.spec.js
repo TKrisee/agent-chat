@@ -24,8 +24,8 @@ test('reloads once only after the expected update is committed and healthy', asy
   }}));
   const first=await page.goto(serviceURL);
   expect(first.headers()['cache-control']).toBe('no-store');
-  page.on('framenavigated',frame=>{if(frame===page.mainFrame())navigations++;});
-  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  page.on('domcontentloaded',()=>navigations++);
+  await page.getByRole('link',{name:'Settings',exact:true}).click();
   await page.getByRole('tab',{name:'Updates'}).click();
   await page.getByRole('button',{name:'Download',exact:true}).click();
   await page.getByRole('button',{name:'Restart to update'}).waitFor({timeout:15000});
@@ -42,7 +42,7 @@ test('reloads once only after the expected update is committed and healthy', asy
   phase='trial'; await pollOnce(); expect(navigations).toBe(0); // New version before launcher commit.
   phase='old'; await pollOnce(); expect(navigations).toBe(0); // Rollback.
   phase='unhealthy'; await pollOnce(); await expect.poll(()=>healthFails,{timeout:12000}).toBeGreaterThan(0); expect(navigations).toBe(0);
-  await page.getByRole('button',{name:/Root conversation/}).click();
+  await page.getByRole('link',{name:/Root conversation/}).click();
   const composer=page.getByLabel('Message Root');
   await composer.fill('Unsent draft');
   await page.locator('#file-input').setInputFiles({name:'draft.txt',mimeType:'text/plain',buffer:Buffer.from('unsent')});
@@ -56,12 +56,12 @@ test('reloads once only after the expected update is committed and healthy', asy
   await composer.fill('');
   await pollOnce();
   expect(navigations).toBe(0); // The in-memory attachment alone still defers reload.
-  const weekly=page.getByRole('button',{name:'Weekly · 53% left, open settings'});
+  const weekly=page.getByRole('link',{name:'Weekly · 53% left, open settings'});
   const warning=page.getByLabel('Warn when remaining allowance is at or below');
   await weekly.click();
   await warning.fill('50');
   await page.getByRole('tab',{name:'Updates'}).click();
-  await page.getByRole('button',{name:/Root conversation/}).click();
+  await page.getByRole('link',{name:/Root conversation/}).click();
   await page.getByRole('button',{name:'Remove draft.txt'}).click();
   await pollOnce(); expect(navigations).toBe(0);
   await weekly.click();
