@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS agent_model_providers (
  agent_id TEXT PRIMARY KEY REFERENCES agents(id), provider TEXT NOT NULL CHECK(provider!=''), port INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS worker_effort_fallbacks (agent_id TEXT PRIMARY KEY REFERENCES agents(id), requested_effort TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS local_model_providers (id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), port INTEGER NOT NULL CHECK(port BETWEEN 1 AND 65535));
 CREATE TABLE IF NOT EXISTS one_shot_workers (
  agent_id TEXT PRIMARY KEY REFERENCES agents(id),
@@ -211,6 +212,11 @@ CREATE TABLE IF NOT EXISTS model_preferences (
  precise_edits TEXT NOT NULL DEFAULT '', research TEXT NOT NULL DEFAULT '', routine_checks TEXT NOT NULL DEFAULT ''
 );
 INSERT OR IGNORE INTO model_preferences VALUES (1,'','','','','');
+CREATE TABLE IF NOT EXISTS reasoning_preferences (
+ id INTEGER PRIMARY KEY CHECK(id=1), reasoning TEXT NOT NULL DEFAULT '', implementation TEXT NOT NULL DEFAULT '',
+ precise_edits TEXT NOT NULL DEFAULT '', research TEXT NOT NULL DEFAULT '', routine_checks TEXT NOT NULL DEFAULT ''
+);
+INSERT OR IGNORE INTO reasoning_preferences VALUES (1,'','','','','');
 CREATE TABLE IF NOT EXISTS codex_source_settings (
  id INTEGER PRIMARY KEY CHECK(id=1), source TEXT NOT NULL CHECK(source IN ('managed','override'))
 );

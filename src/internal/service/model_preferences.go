@@ -127,6 +127,21 @@ func readModelPreferences(q interface{ QueryRow(string, ...any) *sql.Row }) (p m
 	err = q.QueryRow(`SELECT reasoning,implementation,precise_edits,research,routine_checks FROM model_preferences WHERE id=1`).Scan(&p.Reasoning, &p.Implementation, &p.PreciseEdits, &p.Research, &p.RoutineChecks)
 	return
 }
+func readReasoningPreferences(q interface{ QueryRow(string, ...any) *sql.Row }) (p modelPreferences, err error) {
+	err = q.QueryRow(`SELECT reasoning,implementation,precise_edits,research,routine_checks FROM reasoning_preferences WHERE id=1`).Scan(&p.Reasoning, &p.Implementation, &p.PreciseEdits, &p.Research, &p.RoutineChecks)
+	return
+}
+func modelEffortAllowed(details map[string]runtimeapi.ModelDescriptor, id, effort string) bool {
+	if effort == "" {
+		return true
+	}
+	for _, v := range details[id].Efforts {
+		if v == effort {
+			return true
+		}
+	}
+	return false
+}
 func (s *Service) currentModelSource() string {
 	if setup := s.runtimeSetup(); setup != nil {
 		st := setup.SetupStatus()
@@ -149,6 +164,19 @@ func (s *Service) cachedModels() ([]string, bool) {
 	}
 	return append([]string(nil), s.models...), true
 }
+func (s *Service) cachedModelDetails() map[string]runtimeapi.ModelDescriptor {
+	if _, ok := s.cachedModels(); !ok {
+		return nil
+	}
+	s.setupMu.RLock()
+	defer s.setupMu.RUnlock()
+	out := make(map[string]runtimeapi.ModelDescriptor, len(s.modelDetails))
+	for id, d := range s.modelDetails {
+		d.Efforts = append([]string(nil), d.Efforts...)
+		out[id] = d
+	}
+	return out
+}
 func (s *Service) refreshModels(ctx context.Context) ([]string, bool) {
 	source := s.currentModelSource()
 	s.usageMu.RLock()
@@ -170,15 +198,27 @@ func (s *Service) refreshModels(ctx context.Context) ([]string, bool) {
 	type catalogResult struct {
 		provider string
 		models   []string
+		details  []runtimeapi.ModelDescriptor
 	}
 	results := make(chan catalogResult, len(providers)+1)
 	count := 1
 	go func() {
+		if detailed, ok := catalog.(runtimeapi.DetailedModelCatalog); ok {
+			details, err := detailed.ModelDetails(ctx)
+			if err == nil && len(details) > 0 {
+				models := make([]string, 0, len(details))
+				for _, d := range details {
+					models = append(models, d.ID)
+				}
+				results <- catalogResult{"", models, details}
+				return
+			}
+		}
 		models, err := catalog.Models(ctx)
 		if err != nil {
 			models = nil
 		}
-		results <- catalogResult{"", models}
+		results <- catalogResult{"", models, nil}
 	}()
 	if local, ok := catalog.(runtimeapi.LocalModelCatalog); ok {
 		for _, p := range providers {
@@ -191,15 +231,19 @@ func (s *Service) refreshModels(ctx context.Context) ([]string, bool) {
 				if err != nil {
 					models = nil
 				}
-				results <- catalogResult{p.ID, models}
+				results <- catalogResult{p.ID, models, nil}
 			}(p)
 		}
 	}
 	var models []string
+	details := map[string]runtimeapi.ModelDescriptor{}
 collect:
 	for i := 0; i < count; i++ {
 		select {
 		case result := <-results:
+			for _, d := range result.details {
+				details[d.ID] = d
+			}
 			for _, model := range result.models {
 				if result.provider == "" {
 					models = append(models, model)
@@ -236,6 +280,7 @@ collect:
 		return nil, false
 	}
 	s.models = append([]string(nil), clean...)
+	s.modelDetails = details
 	s.modelsSource = source
 	s.modelsGeneration = generation
 	s.modelsLoadedConfigGeneration = configGeneration
@@ -245,6 +290,11 @@ collect:
 }
 func (s *Service) getModelPreferences(w http.ResponseWriter, r *http.Request) {
 	p, err := readModelPreferences(s.db)
+	if err != nil {
+		http.Error(w, "Preferences unavailable.", 500)
+		return
+	}
+	efforts, err := readReasoningPreferences(s.db)
 	if err != nil {
 		http.Error(w, "Preferences unavailable.", 500)
 		return
@@ -259,12 +309,15 @@ func (s *Service) getModelPreferences(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		models, ok = s.refreshModels(r.Context())
 	}
+	details := s.cachedModelDetails()
 	type model struct {
-		ID            string `json:"id"`
-		Model         string `json:"model"`
-		ProviderID    string `json:"provider_id"`
-		ProviderLabel string `json:"provider_label"`
-		Available     bool   `json:"available"`
+		ID                     string   `json:"id"`
+		Model                  string   `json:"model"`
+		ProviderID             string   `json:"provider_id"`
+		ProviderLabel          string   `json:"provider_label"`
+		Available              bool     `json:"available"`
+		ReasoningEfforts       []string `json:"reasoning_efforts"`
+		DefaultReasoningEffort string   `json:"default_reasoning_effort,omitempty"`
 	}
 	out := make([]model, 0, len(models))
 	seen := map[string]bool{}
@@ -285,7 +338,9 @@ func (s *Service) getModelPreferences(w http.ResponseWriter, r *http.Request) {
 		if label == "" {
 			label = "Unavailable provider"
 		}
-		out = append(out, model{id, slug, provider, label, available})
+		d := details[id]
+		levels := append([]string{}, d.Efforts...)
+		out = append(out, model{id, slug, provider, label, available, levels, d.DefaultEffort})
 		seen[id] = true
 		if available && provider == "" {
 			defaultAvailable = true
@@ -318,15 +373,17 @@ func (s *Service) getModelPreferences(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Preferences      modelPreferences `json:"preferences"`
+		ReasoningEfforts modelPreferences `json:"reasoning_efforts"`
 		Models           []model          `json:"models"`
 		CatalogAvailable bool             `json:"catalog_available"`
 		LocalProviders   []localProvider  `json:"local_providers"`
 		Providers        []providerStatus `json:"providers"`
-	}{p, out, ok, localProviders, providers})
+	}{p, efforts, out, ok, localProviders, providers})
 }
 func (s *Service) setModelPreferences(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Preferences modelPreferences `json:"preferences"`
+		Preferences      modelPreferences  `json:"preferences"`
+		ReasoningEfforts *modelPreferences `json:"reasoning_efforts"`
 	}
 	if err := requestJSON(w, r, &in); err != nil {
 		http.Error(w, "Invalid preferences.", 400)
@@ -335,6 +392,7 @@ func (s *Service) setModelPreferences(w http.ResponseWriter, r *http.Request) {
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
 	models, ok := s.cachedModels()
+	details := s.cachedModelDetails()
 	allowed := map[string]bool{}
 	for _, m := range models {
 		allowed[m] = true
@@ -346,12 +404,34 @@ func (s *Service) setModelPreferences(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		before := old.values()
+		oldEfforts, err := readReasoningPreferences(tx)
+		if err != nil {
+			return err
+		}
+		newEfforts := oldEfforts.values()
+		if in.ReasoningEfforts != nil {
+			newEfforts = in.ReasoningEfforts.values()
+		} else {
+			for i, v := range p.values() {
+				if v != before[i] {
+					newEfforts[i] = ""
+				}
+			}
+		}
 		for i, v := range p.values() {
 			if v != "" && v != before[i] && (!ok || !allowed[v]) {
 				return errInvalid
 			}
+			effort := newEfforts[i]
+			if effort != "" && (v == "" || ((v != before[i] || effort != oldEfforts.values()[i]) && (!ok || !modelEffortAllowed(details, v, effort)))) {
+				return errInvalid
+			}
 		}
 		_, err = tx.Exec(`UPDATE model_preferences SET reasoning=?,implementation=?,precise_edits=?,research=?,routine_checks=? WHERE id=1`, p.Reasoning, p.Implementation, p.PreciseEdits, p.Research, p.RoutineChecks)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`UPDATE reasoning_preferences SET reasoning=?,implementation=?,precise_edits=?,research=?,routine_checks=? WHERE id=1`, newEfforts[0], newEfforts[1], newEfforts[2], newEfforts[3], newEfforts[4])
 		return err
 	})
 	if err != nil {
@@ -402,6 +482,11 @@ func (s *Service) modelPreferenceGuidance(tx *sql.Tx, project string) (string, e
 	if !ok {
 		return "", nil
 	}
+	effortPrefs, err := readReasoningPreferences(tx)
+	if err != nil {
+		return "", err
+	}
+	details := s.cachedModelDetails()
 	allowed := map[string]bool{}
 	for _, m := range models {
 		allowed[m] = true
@@ -410,24 +495,36 @@ func (s *Service) modelPreferenceGuidance(tx *sql.Tx, project string) (string, e
 	var entries []string
 	for i, v := range p.values() {
 		if v != "" && allowed[v] {
-			entries = append(entries, labels[i]+": "+displayModelID(v))
+			value := labels[i] + ": " + displayModelID(v)
+			effort := effortPrefs.values()[i]
+			if effort != "" && modelEffortAllowed(details, v, effort) {
+				value += " (reasoning " + effort + ")"
+			}
+			entries = append(entries, value)
 		}
 	}
-	roster, err := querySlice(tx, `SELECT a.name,a.model,COALESCE(p.provider,'') FROM agents a LEFT JOIN agent_model_providers p ON p.agent_id=a.id WHERE a.project_id=? AND a.role='worker' ORDER BY a.name`, func(rows *sql.Rows) (string, error) {
-		var name, model, provider string
-		err := rows.Scan(&name, &model, &provider)
+	roster, err := querySlice(tx, `SELECT a.name,a.model,COALESCE(p.provider,''),a.effort FROM agents a LEFT JOIN agent_model_providers p ON p.agent_id=a.id WHERE a.project_id=? AND a.role='worker' ORDER BY a.name`, func(rows *sql.Rows) (string, error) {
+		var name, model, provider, effort string
+		err := rows.Scan(&name, &model, &provider, &effort)
 		if provider != "" {
 			model = provider + " / " + model
 		}
-		return name + " (" + model + ")", err
+		if effort == "" {
+			effort = "model default"
+		}
+		return name + " (" + model + ", reasoning " + effort + ")", err
 	}, project)
 	if err != nil {
 		return "", err
 	}
 	for i := range models {
-		models[i] = displayModelID(models[i])
+		id := models[i]
+		models[i] = displayModelID(id)
+		if len(details[id].Efforts) > 0 {
+			models[i] += " [reasoning: " + strings.Join(details[id].Efforts, ", ") + "]"
+		}
 	}
-	return "\nPreferred models for new workers: " + strings.Join(entries, "; ") + ". Use judgment for each task and reuse a suitable existing worker where possible. Available models: " + strings.Join(models, ", ") + ". For a named provider use its exact ID in provider and its exact model slug in model; for default Codex leave provider empty. On queue_work_item, include category (reasoning, implementation, precise_edits, research, routine_checks) and, if choosing a different model, a concise model_reason suitable for the operator; do not include private inputs. Preferences are not restrictions. Existing worker models: " + strings.Join(roster, ", ") + ".", nil
+	return "\nPreferred models for new workers: " + strings.Join(entries, "; ") + ". Use judgment for each task and reuse a suitable existing worker where possible. Available models: " + strings.Join(models, ", ") + ". For a named provider use its exact ID in provider and its exact model slug in model; for default Codex leave provider empty. For a new worker, optional effort must be an advertised level for that exact provider/model; leave it empty for model default. On queue_work_item, include category (reasoning, implementation, precise_edits, research, routine_checks) and, if choosing a different model or reasoning level, a concise model_reason suitable for the operator; do not include private inputs. Preferences are not restrictions. Existing worker models: " + strings.Join(roster, ", ") + ".", nil
 }
 func modelCategory(p modelPreferences, key string) string {
 	switch key {
@@ -444,25 +541,54 @@ func modelCategory(p modelPreferences, key string) string {
 	}
 	return ""
 }
-func (s *Service) notifyModelDeparture(tx *sql.Tx, project, task, category, chosen, reason string) error {
+func (s *Service) notifyModelDeparture(tx *sql.Tx, project, task, category, chosen, chosenEffort, omittedEffort, reason string) error {
 	p, err := readModelPreferences(tx)
 	if err != nil {
 		return err
 	}
 	preferred := modelCategory(p, category)
+	effortPrefs, err := readReasoningPreferences(tx)
+	if err != nil {
+		return err
+	}
+	preferredEffort := modelCategory(effortPrefs, category)
+	effectiveEffort := chosenEffort
+	if effectiveEffort == "" {
+		effectiveEffort = s.cachedModelDetails()[chosen].DefaultEffort
+	}
 	var text string
 	if preferred != "" && preferred != chosen {
 		text = fmt.Sprintf("Model choice for project %s, task %s: preferred %s; selected %s.", project, task, displayModelID(preferred), displayModelID(chosen))
+		if preferredEffort != "" {
+			actual := effectiveEffort
+			if actual == "" {
+				actual = "model default"
+			}
+			text += fmt.Sprintf(" Preferred reasoning %s; selected reasoning %s.", preferredEffort, actual)
+		}
+	} else if preferred != "" && preferred == chosen && preferredEffort != "" && effectiveEffort != "" && preferredEffort != effectiveEffort {
+		text = fmt.Sprintf("Model choice for project %s, task %s: %s; preferred reasoning %s; selected reasoning %s.", project, task, displayModelID(chosen), preferredEffort, effectiveEffort)
+	} else if preferred != "" && preferred == chosen && preferredEffort != "" && effectiveEffort == "" {
+		text = fmt.Sprintf("Model choice for project %s, task %s: %s; preferred reasoning %s; selected model default (unverified).", project, task, displayModelID(chosen), preferredEffort)
 	} else if category != "reasoning" && category != "implementation" && category != "precise_edits" && category != "research" && category != "routine_checks" {
 		differentPreference := false
 		for _, v := range p.values() {
 			differentPreference = differentPreference || (v != "" && v != chosen)
 		}
-		if !differentPreference {
-			return nil
+		if differentPreference {
+			text = fmt.Sprintf("Model choice for project %s, task %s: selected %s; no matching task category was supplied for the saved preferences.", project, task, displayModelID(chosen))
 		}
-		text = fmt.Sprintf("Model choice for project %s, task %s: selected %s; no matching task category was supplied for the saved preferences.", project, task, displayModelID(chosen))
-	} else {
+	}
+	if omittedEffort != "" {
+		if text == "" {
+			text = fmt.Sprintf("Model choice for project %s, task %s: selected %s.", project, task, displayModelID(chosen))
+		}
+		if len(omittedEffort) > 32 || strings.IndexFunc(omittedEffort, func(r rune) bool { return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_') }) >= 0 {
+			omittedEffort = "requested"
+		}
+		text += fmt.Sprintf(" Requested reasoning %s was unavailable; model default is used.", omittedEffort)
+	}
+	if text == "" {
 		return nil
 	}
 	reason = strings.TrimSpace(strings.Map(func(r rune) rune {

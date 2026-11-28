@@ -51,6 +51,7 @@ type Service struct {
 	setup                        runtimeapi.CodexSetup
 	modelCatalog                 runtimeapi.ModelCatalog
 	models                       []string
+	modelDetails                 map[string]runtimeapi.ModelDescriptor
 	modelsSource                 string
 	modelsAt                     time.Time
 	modelsGeneration             uint64

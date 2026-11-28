@@ -50,7 +50,7 @@ export function renderLocalModelProviders(busy: boolean, rerender: () => void, r
   const section = document.createElement('section');
   section.className = 'local-model-providers';
   section.setAttribute('aria-labelledby', 'local-providers-title');
-  section.innerHTML = `<h3 id="local-providers-title">Local model providers</h3>
+  section.innerHTML = `<h2 id="local-providers-title">Local model providers</h2>
     <p class="settings-muted">Codex requires an API that supports Responses. Use the server’s loopback port, for example <code>http://127.0.0.1:8000/v1</code>.</p>`;
 
   for (const provider of [...providers, undefined]) {

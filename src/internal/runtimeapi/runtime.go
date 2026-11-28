@@ -14,6 +14,15 @@ type ModelCatalog interface {
 	Models(context.Context) ([]string, error)
 }
 
+type ModelDescriptor struct {
+	ID            string   `json:"id"`
+	DefaultEffort string   `json:"default_effort,omitempty"`
+	Efforts       []string `json:"efforts,omitempty"`
+}
+type DetailedModelCatalog interface {
+	ModelDetails(context.Context) ([]ModelDescriptor, error)
+}
+
 type ProviderModelCatalog interface {
 	ModelsForProvider(context.Context, string) ([]string, error)
 }
@@ -94,6 +103,7 @@ type Result struct {
 }
 
 type Action struct {
+	Effort      string   `json:"effort,omitempty"`
 	Provider    string   `json:"provider,omitempty"`
 	Type        string   `json:"type"`
 	Model       string   `json:"model,omitempty"`
