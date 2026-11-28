@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.23.0](https://github.com/TKrisee/agent-chat/compare/v0.22.0...v0.23.0) (2026-11-28)
+
+
+### Features
+
+* add direct paths for chats and settings ([#88](https://github.com/TKrisee/agent-chat/issues/88)) ([e10239d](https://github.com/TKrisee/agent-chat/commit/e10239d39419dcf626d007c6afde51d20387755f))
+
 ## [0.22.0](https://github.com/TKrisee/agent-chat/compare/v0.21.0...v0.22.0) (2026-11-28)
 
 
