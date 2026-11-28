@@ -35,10 +35,10 @@ test('group and agent conversations stay in their own rooms', async ({ page, ser
   const leadId = await lead.getAttribute('data-agent');
   await expect(page.getByRole('button', {name:'@ Mention'})).toHaveCount(0);
   await group.pressSequentially('@');
-  await group.press('ArrowDown');
   const choice = page.locator(`[data-mention-choice="${leadId}"]`);
-  await expect(choice).toBeFocused();
-  await choice.press('Enter');
+  await expect(choice).toHaveAttribute('aria-selected','true');
+  await expect(group).toBeFocused();
+  await group.press('Enter');
   await group.press('End');
   await group.pressSequentially(' Shared tagged message');
   await group.press('Enter');
