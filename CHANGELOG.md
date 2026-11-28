@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.24.0](https://github.com/TKrisee/agent-chat/compare/v0.23.0...v0.24.0) (2026-11-28)
+
+
+### Features
+
+* support keyboard selection for mentions ([#90](https://github.com/TKrisee/agent-chat/issues/90)) ([1e82d81](https://github.com/TKrisee/agent-chat/commit/1e82d81c809a01fa49535566129ff907e7175702))
+
 ## [0.23.0](https://github.com/TKrisee/agent-chat/compare/v0.22.0...v0.23.0) (2026-11-28)
 
 
