@@ -197,7 +197,7 @@ jobs:
           go run ./cmd/packagecheck check $archive
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: agentchat-${{ matrix.platform }}
           path: |
